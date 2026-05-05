@@ -1,0 +1,119 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/oxiedraw-ui",
+  "crates/oxiedraw-core",
+  "crates/oxiedraw-utils",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-or-later"
+rust-version = "1.85"
+
+[workspace.dependencies]
+oxiedraw-ui = { path = "crates/oxiedraw-ui" }
+oxiedraw-core = { path = "crates/oxiedraw-core" }
+oxiedraw-utils = { path = "crates/oxiedraw-utils" }
+
+relm4 = { version = "0.11", features = ["libadwaita"] }
+relm4-components = "0.11"
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+adw = { package = "libadwaita", version = "0.9", features = ["v1_4"] }
+
+ash = "0.38"
+gpu-allocator = { version = "0.28", default-features = false, features = ["vulkan", "std"] }
+raw-window-handle = "0.6"
+
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+cosmic-text = "0.12"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tar = "0.4"
+png = "0.17"
+jpeg-encoder = "0.6"
+image = { version = "0.25", default-features = false, features = ["webp", "jpeg", "avif", "avif-native"] }
+ravif = { version = "0.11", default-features = false, features = ["threading"] }
+rgb = "0.8"
+
+[workspace.lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+
+# pedantic noise we live with
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+redundant_pub_crate = "allow"
+
+# unavoidable in GPU/render/pixel math
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+
+# standard naming in math/graphics code (w, h, x, y, r, g, b)
+similar_names = "allow"
+many_single_char_names = "allow"
+
+# style choices that don't affect correctness
+suboptimal_flops = "allow"
+while_float = "allow"
+too_many_lines = "allow"
+too_many_arguments = "allow"
+type_complexity = "allow"
+missing_const_for_fn = "allow"
+struct_excessive_bools = "allow"
+items_after_statements = "allow"
+needless_pass_by_value = "allow"
+cast_lossless = "allow"
+redundant_clone = "allow"
+
+# doc style
+doc_markdown = "allow"
+too_long_first_doc_paragraph = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
+# cargo group: GTK ecosystem and our skeleton trip these for reasons we can't fix here
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+
+# restriction: hand-picked, not the whole group
+unwrap_used = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+print_stdout = "warn"
+print_stderr = "warn"
+mem_forget = "warn"
+exit = "warn"
+empty_structs_with_brackets = "warn"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+unreachable_pub = "warn"
+
+[package]
+name = "oxiedraw"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+oxiedraw-ui.workspace = true
+oxiedraw-utils.workspace = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

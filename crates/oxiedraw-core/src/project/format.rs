@@ -1,0 +1,87 @@
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
+
+use crate::document::LayerKind;
+use crate::text::fonts::FontMeta;
+
+/// Current writer schema. Loaders accept any version listed in
+/// [`SUPPORTED_SCHEMA_VERSIONS`] and migrate as needed.
+///
+/// v3 adds the per-document component library (`components.json` +
+/// `components/<id>/layers/<id>.png`) and a `kind` on each main layer entry.
+/// v4 adds text layers (`LayerKind::Text`, stored inline in `kind`) and the
+/// embedded font files they use (`fonts.json` + `fonts/<hash>`).
+pub const SCHEMA_VERSION: u32 = 4;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4];
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Top-level archive metadata written to `manifest.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Manifest {
+    pub schema_version: u32,
+    pub app_version: String,
+    pub created_at: String,
+}
+
+/// One entry in the layer list inside `document.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LayerEntry {
+    /// Stable opaque id - matches the PNG filename in `layers/<id>.png`.
+    pub id: String,
+    pub name: String,
+    pub visible: bool,
+    /// Raster, or a component instance. Absent in pre-v3 files (defaults to
+    /// `Raster`).
+    #[serde(default)]
+    pub kind: LayerKind,
+}
+
+/// One raster layer inside a component (in `components.json`). Its pixels live
+/// at `components/<component id>/layers/<id>.png`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComponentLayerEntry {
+    pub id: String,
+    pub name: String,
+    pub visible: bool,
+}
+
+/// A component definition written to `components.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ComponentData {
+    pub id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub active_layer: Option<usize>,
+    pub layers: Vec<ComponentLayerEntry>,
+}
+
+/// Full document description written to `document.json`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DocumentData {
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+    pub dpi: f32,
+    pub active_layer: Option<usize>,
+    pub layers: Vec<LayerEntry>,
+}
+
+/// The complete in-memory representation of an `.oxiedrawproj` archive.
+///
+/// Produced by [`super::load::load`] and consumed by [`super::load::apply`];
+/// also built by [`super::save::save`] before writing the archive to disk.
+pub struct OxieProject {
+    pub manifest: Manifest,
+    pub document: DocumentData,
+    /// Layer pixel data keyed by [`LayerEntry::id`], BGRA8 row-major no padding.
+    pub layer_pixels: HashMap<String, Vec<u8>>,
+    /// Component definitions (empty for pre-v3 files).
+    pub components: Vec<ComponentData>,
+    /// Component layer pixels keyed by `"{component_id}/{layer_id}"`, BGRA8.
+    pub component_pixels: HashMap<String, Vec<u8>>,
+    /// Embedded font metadata (empty for pre-v4 files), from `fonts.json`.
+    pub fonts: Vec<FontMeta>,
+    /// Embedded font file bytes keyed by content hash (from `fonts/<hash>`).
+    pub font_bytes: HashMap<String, Vec<u8>>,
+}

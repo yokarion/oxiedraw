@@ -1,0 +1,156 @@
+//! Bucket-fill overlay GPU ops: upload the distance mask, record the
+//! per-frame overlay pass, and clear state on commit/cancel.
+
+use ash::vk;
+
+use super::super::RendererError;
+use super::super::fill_overlay::FILL_OVERLAY_PUSH_BYTES;
+use super::VulkanRenderer;
+
+impl VulkanRenderer {
+    /// Upload the R8 distance mask produced by `flood_fill` into the
+    /// canvas-sized overlay image. Called once at the start of a fill
+    /// animation; the per-frame timer afterwards only updates the
+    /// reveal push constant.
+    pub fn upload_fill_mask(&mut self, mask: &[u8]) -> Result<(), RendererError> {
+        {
+            let staging = self
+                .staging
+                .mapped_mut()
+                .ok_or(RendererError::StagingNotMapped)?;
+            let copy_len = mask.len().min(staging.len());
+            staging[..copy_len].copy_from_slice(&mask[..copy_len]);
+        }
+        let image = self.fill_overlay.mask.handle;
+        let extent = self.canvas.extent;
+        self.write_staging_to_image(image, extent)
+    }
+
+    /// Activate the fill overlay. The premultiplied colour and the
+    /// owning layer index are captured here so `render_preview` can pick
+    /// them up; per-frame radius updates go through `set_fill_reveal`.
+    pub fn begin_fill_overlay(
+        &mut self,
+        layer_idx: usize,
+        color_premul: [f32; 4],
+    ) -> Result<(), RendererError> {
+        if layer_idx >= self.layer_stack.slots.len() {
+            return Err(RendererError::LayerIndexOutOfRange);
+        }
+        self.fill_active = true;
+        self.fill_reveal = 0.0;
+        self.fill_color_premul = color_premul;
+        self.fill_layer_idx = layer_idx;
+        Ok(())
+    }
+
+    /// Update only the reveal-radius push value. Cheap - the caller
+    /// will trigger a present/preview render that re-binds the
+    /// overlay pipeline with this value.
+    pub const fn set_fill_reveal(&mut self, reveal: f32) {
+        self.fill_reveal = reveal.clamp(0.0, 1.0);
+    }
+
+    /// Clear all fill-overlay state. Called by commit + cancel paths
+    /// after the animation finishes (or is aborted).
+    pub const fn clear_fill_overlay(&mut self) {
+        self.fill_active = false;
+        self.fill_reveal = 0.0;
+    }
+
+    /// Whether the fill-overlay path should be used by present/preview.
+    #[must_use]
+    pub const fn fill_active(&self) -> bool {
+        self.fill_active
+    }
+
+    /// Render the preview image as: layer composite at the active fill
+    /// layer's z-order with the fill overlay spliced in just above it.
+    ///
+    /// Mirrors `render_preview` but uses the fill overlay instead of
+    /// the stroke overlay. `visibilities` follows the normal layer-
+    /// visibility convention.
+    pub fn render_fill_preview(&mut self, visibilities: &[bool]) -> Result<(), RendererError> {
+        let visible_indices: Vec<usize> = visibilities
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &v)| (v && i < self.layer_stack.slots.len()).then_some(i))
+            .collect();
+        let target_idx = self.fill_layer_idx;
+        let push_color = self.fill_color_premul;
+        let reveal = self.fill_reveal;
+
+        self.record_and_submit(|this| {
+            this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
+            let overlay_at = visible_indices.contains(&target_idx).then_some(target_idx);
+            for &idx in &visible_indices {
+                this.preview_compose_layer_for_fill(idx);
+                if overlay_at == Some(idx) {
+                    this.preview_compose_fill_overlay(push_color, reveal);
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// One layer-composite pass into the preview framebuffer.
+    /// Mirrors `preview::preview_compose_layer` - kept private here
+    /// because the original is in a sibling module.
+    fn preview_compose_layer_for_fill(&mut self, idx: usize) {
+        let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
+        let render_pass = self.canvas_target.render_pass;
+        let framebuffer = self.preview_framebuffer;
+        let pipeline = self.layer_composite_pipeline.pipeline;
+        let layout = self.layer_composite_pipeline.layout;
+        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+        }
+        self.cmd_end_fullscreen_pass();
+    }
+
+    /// Fill overlay pass - binds the overlay descriptor set, pushes
+    /// the colour + reveal radius, draws the fullscreen triangle.
+    fn preview_compose_fill_overlay(&mut self, color: [f32; 4], reveal: f32) {
+        let render_pass = self.canvas_target.render_pass;
+        let framebuffer = self.preview_framebuffer;
+        let pipeline = self.fill_overlay.pipeline;
+        let layout = self.fill_overlay.layout;
+        let descriptor_set = self.fill_overlay.descriptor_set;
+        // Match the shader's std430-like push block: vec4 color then
+        // float reveal (with vec4 alignment, GLSL packs the float at
+        // offset 16).
+        let push: [f32; 5] = [color[0], color[1], color[2], color[3], reveal];
+        debug_assert_eq!(std::mem::size_of_val(&push) as u32, FILL_OVERLAY_PUSH_BYTES);
+        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+            let push_bytes = std::slice::from_raw_parts(
+                push.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(&push),
+            );
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_bytes,
+            );
+        }
+        self.cmd_end_fullscreen_pass();
+    }
+}

@@ -1,0 +1,27 @@
+mod layer;
+mod properties;
+mod state;
+
+pub use layer::{ComponentInstance, Layer, LayerKind, Placement};
+pub use properties::DocumentProperties;
+pub use state::LayerState;
+
+use oxiedraw_utils::geometry::Size;
+
+#[derive(Debug, Clone)]
+pub struct Document {
+    pub properties: DocumentProperties,
+    pub layers: LayerState,
+}
+
+impl Document {
+    pub fn new(canvas: Size) -> Self {
+        let layers = LayerState::new();
+        layers.add("Background");
+        layers.set_active(Some(0));
+        Self {
+            properties: DocumentProperties { canvas, dpi: 96.0 },
+            layers,
+        }
+    }
+}

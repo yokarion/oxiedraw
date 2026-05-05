@@ -1,0 +1,2090 @@
+use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
+use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
+
+use crate::brush_engine::PaintTarget;
+use crate::color::Color;
+use crate::document::{LayerKind, LayerState};
+use crate::filters::FilterSpec;
+use crate::renderer::{
+    DmabufDescriptor, EdgesBuffer, RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
+};
+use crate::selection::SelectionShape;
+use crate::tools::{CropRect, SelectionMode};
+
+use super::stamp::{BatchStamp, StrokeStamp};
+
+/// Captured stroke context - what was true when the user pressed down.
+/// Held so a mid-drag change of color, opacity, or active layer
+/// doesn't take effect until the next stroke.
+#[derive(Debug, Clone, Copy)]
+struct StrokeContext {
+    color: Color,
+    opacity: f32,
+    layer_idx: usize,
+}
+
+/// Headless drawing surface.
+///
+/// Owns the Vulkan renderer + a shared [`LayerState`]. Brush strokes
+/// target the active layer; the displayable canvas image is a
+/// composite of all visible layers, rebuilt as needed.
+///
+/// This is the layer the UI talks to. It deliberately knows nothing
+/// about GTK - the canvas widget calls [`Canvas::present`] to drive
+/// the zero-copy dmabuf display path.
+pub struct Canvas {
+    renderer: VulkanRenderer,
+    layers: LayerState,
+    /// `Some` while a stroke is in flight (between `begin_stroke` and
+    /// `commit_stroke`/`discard_stroke`).
+    current_stroke: Option<StrokeContext>,
+    /// Monotonic counter bumped on every mutation that changes what
+    /// would be displayed. UI keys its frame cache on this.
+    pixels_version: u64,
+    /// Last `pixels_version` that was actually presented to the dmabuf
+    /// display image. `present()` short-circuits when this matches.
+    display_version: u64,
+}
+
+impl Canvas {
+    /// Construct a Canvas backed by the provided [`LayerState`]. The
+    /// renderer's per-layer image stack is initialised to mirror the
+    /// state - one GPU image per existing entry, all cleared to
+    /// transparent. The active layer is set to the first one if no
+    /// active selection is present.
+    pub fn new(size: Size, layers: LayerState) -> Result<Self, RendererError> {
+        let mut renderer = VulkanRenderer::new(size)?;
+        renderer.clear_stroke()?;
+        let initial_count = layers.len();
+        // Allocate one GPU image per existing layer.
+        for _ in 0..initial_count {
+            renderer.add_layer()?;
+        }
+        if layers.active().is_none() && initial_count > 0 {
+            layers.set_active(Some(0));
+        }
+        let mut canvas = Self {
+            renderer,
+            layers,
+            current_stroke: None,
+            pixels_version: 1,
+            display_version: 0,
+        };
+        // Initial canvas state == empty layer stack composited. Yields
+        // a fully-transparent canvas regardless of layer count.
+        canvas.recomposite_canvas()?;
+        Ok(canvas)
+    }
+
+    /// Convenience for tests: a Canvas with a single default
+    /// "Background" layer pre-created.
+    pub fn headless(size: Size) -> Result<Self, RendererError> {
+        let layers = LayerState::new();
+        layers.add("Background");
+        layers.set_active(Some(0));
+        Self::new(size, layers)
+    }
+
+    #[must_use]
+    pub const fn size(&self) -> Size {
+        self.renderer.canvas_size()
+    }
+
+    /// Read-only handle to the layer state. UI panels render from
+    /// this; mutations must go through the `add_layer` / `remove_layer`
+    /// / `reorder_layer` / `set_layer_visible` methods so the GPU
+    /// stack stays in sync.
+    #[must_use]
+    pub const fn layers(&self) -> &LayerState {
+        &self.layers
+    }
+
+    #[must_use]
+    pub const fn pixels_version(&self) -> u64 {
+        self.pixels_version
+    }
+
+    /// Per-layer content version (bumped whenever that layer's pixels change).
+    /// The layers panel uses it to re-read only the layers that changed instead
+    /// of all of them on every edit.
+    #[must_use]
+    pub fn layer_content_version(&self, idx: usize) -> u64 {
+        self.renderer.layer_content_version(idx)
+    }
+
+    const fn bump_version(&mut self) {
+        self.pixels_version = self.pixels_version.wrapping_add(1);
+    }
+
+    // ----------------------------------------------------------------
+    // Stroke lifecycle
+    // ----------------------------------------------------------------
+
+    /// Start a new stroke. Captures `(color, opacity)` *and* the
+    /// active layer index so the eventual commit targets the layer
+    /// the user actually picked when they pressed down. `erase` makes the
+    /// stroke remove coverage from the target layer instead of painting.
+    pub fn begin_stroke(
+        &mut self,
+        color: Color,
+        opacity: f32,
+        erase: bool,
+    ) -> Result<(), RendererError> {
+        let Some(layer_idx) = self.layers.active() else {
+            // No active layer = nothing to draw on. Silently skip;
+            // brush events will be no-ops because `is_drawing()` on
+            // the engine will stay false.
+            tracing::warn!("begin_stroke with no active layer - stroke ignored");
+            return Ok(());
+        };
+        if layer_idx >= self.renderer.layer_count() {
+            return Err(RendererError::LayerIndexOutOfRange);
+        }
+        self.renderer.set_stroke_erase(erase);
+        self.renderer.clear_stroke()?;
+        // New stroke target / fresh layer state: the cached below-stack
+        // composite must be rebuilt on the first preview of this stroke.
+        self.renderer.invalidate_preview_cache();
+        // Start a fresh dirty-rect so the history patch covers only this
+        // stroke's dabs.
+        self.renderer.reset_stroke_dirty();
+        self.current_stroke = Some(StrokeContext {
+            color,
+            opacity,
+            layer_idx,
+        });
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Run `paint` with a [`PaintTarget`] that stamps dabs into the
+    /// stroke buffer. Wraps each `BrushEngine::begin_stroke /
+    /// push_sample / end_stroke` call.
+    pub fn stamp<F>(&mut self, paint: F) -> Result<(), RendererError>
+    where
+        F: FnOnce(&mut dyn PaintTarget),
+    {
+        let mut adapter = StrokeStamp::new(&mut self.renderer);
+        paint(&mut adapter);
+        let result = adapter.into_result();
+        self.bump_version();
+        result
+    }
+
+    /// Composite the in-flight stroke buffer into the active layer
+    /// (the one captured by `begin_stroke`), then clear the stroke
+    /// buffer and re-composite the canvas from the layer stack so
+    /// `present()` shows the new state. No-op without a stroke.
+    pub fn commit_stroke(&mut self) -> Result<(), RendererError> {
+        let Some(ctx) = self.current_stroke.take() else {
+            return Ok(());
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        self.renderer
+            .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
+        // Clear erase mode now the stroke is done so a later composite that
+        // does not start with `begin_stroke` cannot inherit it.
+        self.renderer.set_stroke_erase(false);
+        self.renderer.invalidate_preview_cache();
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Build-up step: composite the current stroke buffer into the
+    /// captured layer at the captured (color, opacity), clear the
+    /// stroke buffer, and recomposite the canvas - WITHOUT taking the
+    /// stroke context. Subsequent `stamp` / `commit_stroke` calls keep
+    /// working as if the stroke hadn't ended.
+    pub fn flush_stroke(&mut self) -> Result<(), RendererError> {
+        let Some(ctx) = self.current_stroke else {
+            return Ok(());
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        self.renderer
+            .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
+        self.renderer.invalidate_preview_cache();
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Discard the in-flight stroke without compositing it.
+    pub fn discard_stroke(&mut self) -> Result<(), RendererError> {
+        self.current_stroke = None;
+        self.renderer.clear_stroke()?;
+        self.renderer.set_stroke_erase(false);
+        self.bump_version();
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Layer management
+    // ----------------------------------------------------------------
+
+    /// Append a new layer to the document. Both [`LayerState`] and the
+    /// renderer's image stack grow in lockstep; the canvas is
+    /// re-composited (no visible change since the new layer is empty).
+    pub fn add_layer(&mut self, name: impl Into<String>) -> Result<usize, RendererError> {
+        let idx = self.renderer.add_layer()?;
+        let state_idx = self.layers.add(name);
+        debug_assert_eq!(idx, state_idx, "renderer and state must stay in lockstep");
+        self.layers.set_active(Some(idx));
+        self.recomposite_canvas()?;
+        Ok(idx)
+    }
+
+    /// Remove the layer at `idx`. Active selection moves to the
+    /// previous layer (or `None` if the stack is now empty).
+    pub fn remove_layer(&mut self, idx: usize) -> Result<(), RendererError> {
+        self.renderer.remove_layer(idx)?;
+        self.layers.remove(idx);
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    // Folds the listed layers into the lowest-indexed one and drops the rest;
+    // returns the surviving layer's index. Needs at least two distinct indices.
+    pub fn merge_layers(&mut self, indices: &[usize]) -> Result<usize, RendererError> {
+        let mut sorted = indices.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.len() < 2 {
+            return Err(RendererError::LayerIndexOutOfRange);
+        }
+        if *sorted.last().expect("sorted has >=2 entries per check above") >= self.renderer.layer_count() {
+            return Err(RendererError::LayerIndexOutOfRange);
+        }
+
+        let n_pixels = (self.renderer.canvas_size().width * self.renderer.canvas_size().height) as usize * 4;
+        let mut merged = vec![0u8; n_pixels];
+        for &idx in &sorted {
+            let pixels = self.renderer.read_layer(idx)?;
+            alpha_over_premul_bgra8(&mut merged, &pixels);
+        }
+
+        let target = sorted[0];
+        self.renderer.write_layer(target, &merged)?;
+
+        for &idx in sorted[1..].iter().rev() {
+            self.renderer.remove_layer(idx)?;
+            self.layers.remove(idx);
+        }
+
+        self.recomposite_canvas()?;
+        Ok(target)
+    }
+
+    /// Duplicate the layer at `src_idx`. The copy is placed directly above
+    /// `src_idx`, named `"<original> copy"`, and becomes the active layer.
+    /// Returns the new layer's index.
+    pub fn duplicate_layer(&mut self, src_idx: usize) -> Result<usize, RendererError> {
+        let pixels = self.renderer.read_layer(src_idx)?;
+        let src_name = self
+            .layers
+            .snapshot()
+            .get(src_idx)
+            .map_or_else(|| "Layer".to_string(), |l| l.name.clone());
+        let new_name = format!("{src_name} copy");
+
+        let top_idx = self.renderer.add_layer()?;
+        let state_idx = self.layers.add(new_name);
+        debug_assert_eq!(
+            top_idx, state_idx,
+            "renderer and state must stay in lockstep"
+        );
+        self.renderer.write_layer(top_idx, &pixels)?;
+
+        let target_idx = src_idx + 1;
+        if target_idx < top_idx {
+            self.layers.reorder(top_idx, target_idx);
+            self.renderer.reorder_layer(top_idx, target_idx);
+        }
+
+        self.layers.set_active(Some(target_idx));
+        self.recomposite_canvas()?;
+        Ok(target_idx)
+    }
+
+    /// Add a new layer on top of the stack, fill it with the provided
+    /// BGRA8 pixel data (`canvas_w x canvas_h`, row-major), and make it
+    /// active. Returns the new layer's index.
+    pub fn add_layer_with_pixels(
+        &mut self,
+        name: impl Into<String>,
+        pixels: &[u8],
+    ) -> Result<usize, RendererError> {
+        let idx = self.renderer.add_layer()?;
+        let state_idx = self.layers.add(name);
+        debug_assert_eq!(idx, state_idx, "renderer and state must stay in lockstep");
+        self.renderer.write_layer(idx, pixels)?;
+        self.layers.set_active(Some(idx));
+        self.recomposite_canvas()?;
+        Ok(idx)
+    }
+
+    /// Move a layer from `from` to `to`. Both metadata + renderer
+    /// stack reorder identically; canvas is re-composited.
+    pub fn reorder_layer(&mut self, from: usize, to: usize) -> Result<(), RendererError> {
+        self.layers.reorder(from, to);
+        self.renderer.reorder_layer(from, to);
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Toggle a layer's visibility. Re-composites.
+    pub fn set_layer_visible(&mut self, idx: usize, visible: bool) -> Result<(), RendererError> {
+        self.layers.set_visible(idx, visible);
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Replace the entire layer stack with `(id, name, visible, bgra8_pixels)` entries.
+    /// Discards any in-flight stroke.
+    pub fn replace_all_layers(
+        &mut self,
+        layers: &[(String, String, bool, Vec<u8>)],
+    ) -> Result<(), RendererError> {
+        self.current_stroke = None;
+
+        while self.renderer.layer_count() > 0 {
+            self.renderer.remove_layer(0)?;
+        }
+        self.layers.clear();
+
+        for (id, name, visible, pixels) in layers {
+            let gpu_idx = self.renderer.add_layer()?;
+            let state_idx = self.layers.add_full(id.clone(), name.as_str(), *visible);
+            debug_assert_eq!(
+                gpu_idx, state_idx,
+                "renderer and state must stay in lockstep"
+            );
+            self.renderer.write_layer(gpu_idx, pixels)?;
+        }
+
+        if !layers.is_empty() {
+            self.layers.set_active(Some(0));
+        }
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Re-composite the canvas image from the current layer state.
+    /// Called automatically after any layer-affecting mutation.
+    fn recomposite_canvas(&mut self) -> Result<(), RendererError> {
+        let snapshot = self.layers.snapshot();
+        let visibilities: Vec<bool> = snapshot.iter().map(|l| l.visible).collect();
+        self.renderer.composite_layers_to_canvas(&visibilities)?;
+        // Layer images / stack changed: the cached preview below-stack is stale.
+        self.renderer.invalidate_preview_cache();
+        self.bump_version();
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Display + readback
+    // ----------------------------------------------------------------
+
+    /// Forget every pattern slice previously uploaded to this canvas's
+    /// atlas. Safe only when no stroke is in flight - the preview
+    /// canvas calls this between renders so it doesn't fill up after
+    /// 16 reloads of a textured brush (each reload mints a fresh
+    /// `Rc<PatternData>` the atlas can't dedup against the old one).
+    pub fn clear_pattern_atlas(&mut self) {
+        self.renderer.clear_pattern_atlas();
+    }
+
+    /// Clear the active layer to `color`. No-op if no active layer.
+    pub fn clear(&mut self, color: [f32; 4]) -> Result<(), RendererError> {
+        let Some(idx) = self.layers.active() else {
+            return Ok(());
+        };
+        self.renderer.clear_layer(idx, color)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Read back the canvas as BGRA8 bytes (row-major, no padding).
+    ///
+    /// During a stroke this returns the preview (canvas composite +
+    /// tinted in-flight stroke). Otherwise it returns the canvas
+    /// composite directly. Byte order is BGRA so the bytes drop
+    /// straight into `cairo::Format::ARgb32` and
+    /// `gdk::MemoryFormat::B8g8r8a8` on little-endian.
+    pub fn read_pixels(&mut self) -> Result<Vec<u8>, RendererError> {
+        match self.current_stroke {
+            Some(ctx) => {
+                let linear = ctx.color.to_linear_rgb();
+                let visibilities = self.visibilities();
+                self.renderer.render_preview_layered_and_read(
+                    &visibilities,
+                    ctx.layer_idx,
+                    linear,
+                    ctx.opacity,
+                )
+            }
+            None => self.renderer.read_canvas(),
+        }
+    }
+
+    /// Like [`Self::read_pixels`] but fills a caller-owned buffer instead
+    /// of allocating a fresh `Vec` each call. Use this for repeated
+    /// readbacks (e.g. layer-panel thumbnail refresh) to avoid churning a
+    /// full-canvas allocation every time.
+    pub fn read_pixels_into(&mut self, out: &mut Vec<u8>) -> Result<(), RendererError> {
+        match self.current_stroke {
+            Some(ctx) => {
+                let linear = ctx.color.to_linear_rgb();
+                let visibilities = self.visibilities();
+                self.renderer.render_preview_layered_into(
+                    &visibilities,
+                    ctx.layer_idx,
+                    linear,
+                    ctx.opacity,
+                    out,
+                )
+            }
+            None => self.renderer.read_canvas_into(out),
+        }
+    }
+
+    /// Like [`Self::read_layer`] but fills a caller-owned buffer.
+    pub fn read_layer_into(&mut self, idx: usize, out: &mut Vec<u8>) -> Result<(), RendererError> {
+        self.renderer.read_layer_into(idx, out)
+    }
+
+    /// Prepare the live transform preview's z-order. Reads back the visible
+    /// layers above `target_idx` into `out` (BGRA8, the overlay the UI draws on
+    /// top of the preview) and rebuilds the base canvas from only the layers up
+    /// to and including `target_idx`, so the upper layers aren't composited
+    /// twice. Any layer-mutating path (restore/apply) rebuilds the full canvas
+    /// again when the transform ends.
+    pub fn begin_transform_preview(
+        &mut self,
+        target_idx: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RendererError> {
+        let visibilities = self.visibilities();
+        self.renderer.read_layers_above(&visibilities, target_idx, out)?;
+        self.renderer
+            .composite_layers_below_to_canvas(&visibilities, target_idx)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Read a `w x h` sub-rectangle of layer `idx` at `(x, y)` into `out`
+    /// (BGRA8, tightly packed). Used to capture just a stroke's dirty
+    /// region for history instead of the whole layer.
+    pub fn read_layer_region_into(
+        &mut self,
+        idx: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RendererError> {
+        self.renderer.read_layer_region_into(idx, x, y, w, h, out)
+    }
+
+    /// Tight integer AABB `(x, y, w, h)` of everything stamped since the
+    /// last `begin_stroke`, clamped to the canvas. `None` if nothing was
+    /// painted. Stays valid across `commit_stroke` (reset only by the next
+    /// `begin_stroke`), so history can read it after committing.
+    #[must_use]
+    pub fn stroke_dirty_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        self.renderer.stroke_dirty_bounds()
+    }
+
+    fn visibilities(&self) -> Vec<bool> {
+        self.layers.snapshot().iter().map(|l| l.visible).collect()
+    }
+
+    /// Zero-copy display path. Ensures the dmabuf display image is up
+    /// to date for the current state (compositing the in-flight stroke
+    /// on top of the canvas during a stroke, or the fill overlay
+    /// during a bucket-fill animation) and returns the descriptor GTK
+    /// uses to import it.
+    pub fn present(&mut self) -> Result<DmabufDescriptor, RendererError> {
+        use crate::renderer::PresentSource;
+        if self.display_version != self.pixels_version {
+            if self.renderer.filter_active() {
+                let visibilities = self.visibilities();
+                self.renderer.render_filter_preview(&visibilities)?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.fill_active() {
+                let visibilities = self.visibilities();
+                self.renderer.render_fill_preview(&visibilities)?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.shape_active() {
+                let visibilities = self.visibilities();
+                self.renderer.render_shape_preview(&visibilities)?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
+            } else {
+                match self.current_stroke {
+                    Some(ctx) => {
+                        let linear = ctx.color.to_linear_rgb();
+                        let visibilities = self.visibilities();
+                        self.renderer.render_preview_and_present(
+                            &visibilities,
+                            ctx.layer_idx,
+                            linear,
+                            ctx.opacity,
+                        )?;
+                    }
+                    None => {
+                        self.renderer.present_to_display(PresentSource::Canvas)?;
+                    }
+                }
+            }
+            self.display_version = self.pixels_version;
+        }
+        Ok(self.renderer.display_descriptor())
+    }
+
+    /// Fast per-motion-event path: stamp the brush dabs AND refresh the
+    /// dmabuf display in a single GPU submit (one fence-wait instead of a
+    /// separate `stamp` + `present`). Falls back to `stamp` + `present`
+    /// when there is no in-flight stroke or a filter/fill overlay is
+    /// active. Returns the descriptor GTK imports.
+    pub fn stamp_and_present<F>(&mut self, paint: F) -> Result<DmabufDescriptor, RendererError>
+    where
+        F: FnOnce(&mut dyn PaintTarget),
+    {
+        let Some(ctx) = self.current_stroke else {
+            self.stamp(paint)?;
+            return self.present();
+        };
+        if self.renderer.filter_active()
+            || self.renderer.fill_active()
+            || self.renderer.shape_active()
+        {
+            self.stamp(paint)?;
+            return self.present();
+        }
+
+        let (family, instances) = {
+            let mut batch = BatchStamp::new(&mut self.renderer);
+            paint(&mut batch);
+            batch.into_result()?
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        self.renderer.stamp_preview_present(
+            family,
+            &instances,
+            ctx.layer_idx,
+            linear,
+            ctx.opacity,
+            &visibilities,
+        )?;
+        self.bump_version();
+        self.display_version = self.pixels_version;
+        Ok(self.renderer.display_descriptor())
+    }
+
+    /// Whether the dmabuf display image is currently out of date.
+    #[must_use]
+    pub const fn display_dirty(&self) -> bool {
+        self.pixels_version != self.display_version
+    }
+
+    /// Whether a stroke is currently in flight (between `begin_stroke`
+    /// and `commit_stroke`/`discard_stroke`).
+    #[must_use]
+    pub const fn is_drawing(&self) -> bool {
+        self.current_stroke.is_some()
+    }
+
+    /// Read back a single layer's pixels as BGRA8 bytes (row-major, no
+    /// padding). Caller should check `is_drawing()` first; reading
+    /// during a stroke returns the layer's committed pixels, not the
+    /// in-flight stroke.
+    pub fn read_layer(&mut self, idx: usize) -> Result<Vec<u8>, RendererError> {
+        self.renderer.read_layer(idx)
+    }
+
+    /// Sample the visible (composited) color at canvas pixel `(x, y)`.
+    /// Returns `None` for out-of-bounds coordinates. The composite is
+    /// premultiplied, so the stored RGB is un-premultiplied back to its
+    /// straight color before returning; a fully transparent pixel yields
+    /// black.
+    pub fn pick_color(&mut self, x: u32, y: u32) -> Option<Color> {
+        let size = self.size();
+        if x >= size.width || y >= size.height {
+            return None;
+        }
+        let mut buf = Vec::with_capacity(4);
+        self.renderer.read_canvas_region_into(x, y, 1, 1, &mut buf).ok()?;
+        let [b, g, r, a] = [*buf.first()?, *buf.get(1)?, *buf.get(2)?, *buf.get(3)?];
+        if a == 0 {
+            return Some(Color::BLACK);
+        }
+        // Un-premultiply: straight = premult * 255 / alpha, clamped.
+        let unpremult = |c: u8| -> u8 {
+            ((u16::from(c) * 255 + u16::from(a) / 2) / u16::from(a)).min(255) as u8
+        };
+        Some(Color::new(unpremult(r), unpremult(g), unpremult(b)))
+    }
+
+    /// Crop the canvas to the given rectangle and resize. Reads every layer's
+    /// pixels from the GPU, crops them, recreates the renderer at the new size,
+    /// and writes the cropped pixels back. Returns the new canvas size.
+    ///
+    /// The crop rectangle may extend beyond the current canvas - out-of-bounds
+    /// regions are filled with transparent pixels. This means passing a rect
+    /// with a negative origin or a size larger than the canvas effectively
+    /// expands the canvas.
+    pub fn apply_crop(&mut self, rect: CropRect) -> Result<Size, RendererError> {
+        let saved_active = self.layers.active();
+
+        let n = rect.normalized();
+        let crop_x = n.x.round() as i64;
+        let crop_y = n.y.round() as i64;
+        let w = n.w.round().max(1.0) as u32;
+        let h = n.h.round().max(1.0) as u32;
+        let new_size = Size::new(w, h);
+        let old_size = self.renderer.canvas_size();
+
+        let snap = self.layers.snapshot();
+        let mut cropped: Vec<(String, String, bool, Vec<u8>)> = Vec::with_capacity(snap.len());
+        let kinds: Vec<LayerKind> = snap.iter().map(|l| l.kind.clone()).collect();
+        for (idx, layer) in snap.iter().enumerate() {
+            let raw = self.renderer.read_layer(idx)?;
+            let pixels = crop_bgra8(&raw, old_size.width, old_size.height, crop_x, crop_y, w, h);
+            cropped.push((layer.id.clone(), layer.name.clone(), layer.visible, pixels));
+        }
+
+        self.renderer = VulkanRenderer::new(new_size)?;
+        self.current_stroke = None;
+        self.replace_all_layers(&cropped)?;
+
+        // replace_all_layers resets every layer to Raster; restore the original
+        // kinds with their text/component geometry shifted by the crop offset so
+        // boxes stay aligned with their now-translated pixels.
+        #[allow(clippy::cast_precision_loss)]
+        let (dx, dy) = (-(crop_x as f32), -(crop_y as f32));
+        for (idx, kind) in kinds.iter().enumerate() {
+            if !matches!(kind, LayerKind::Raster) {
+                self.layers.set_kind(idx, kind.translated(dx, dy));
+            }
+        }
+
+        // replace_all_layers always resets active to Some(0); restore the
+        // caller's active selection so downstream operations target the right layer.
+        if let Some(active) = saved_active
+            && active < self.layers.len() {
+                self.layers.set_active(Some(active));
+            }
+
+        Ok(new_size)
+    }
+
+    /// Recreate the renderer at `size` and load a fresh layer set. Used to
+    /// swap the canvas between the main document and a component's edit
+    /// surface (which may have a different size). `layers` are
+    /// `(id, name, visible, bgra8_pixels)` sized to `size`; `active` selects
+    /// the active layer afterwards. Discards any in-flight stroke.
+    pub fn resize_and_replace_layers(
+        &mut self,
+        size: Size,
+        layers: &[(String, String, bool, Vec<u8>)],
+        active: Option<usize>,
+    ) -> Result<(), RendererError> {
+        self.renderer = VulkanRenderer::new(size)?;
+        self.current_stroke = None;
+        self.replace_all_layers(layers)?;
+        if let Some(a) = active
+            && a < self.layers.len()
+        {
+            self.layers.set_active(Some(a));
+        }
+        Ok(())
+    }
+
+    /// Write raw BGRA8 pixels back to a GPU layer and re-composite.
+    /// Used by the transform cancel path to restore pixels without CPU remap.
+    pub fn restore_layer(&mut self, idx: usize, pixels: &[u8]) -> Result<(), RendererError> {
+        self.renderer.write_layer(idx, pixels)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Like [`Self::restore_layer`] but uploads only the `w x h` sub-rect at
+    /// `(x, y)` (clamped to the canvas); the rest of the layer is untouched.
+    /// `pixels` is tightly packed BGRA8 for the region. Used by the text editor
+    /// so a keystroke uploads just the box region instead of the whole canvas.
+    pub fn restore_layer_region(
+        &mut self,
+        idx: usize,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        pixels: &[u8],
+    ) -> Result<(), RendererError> {
+        self.renderer.write_layer_region(idx, x, y, w, h, pixels)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    // ----------------------------------------------------------------
+    // Bucket-fill GPU overlay
+    // ----------------------------------------------------------------
+
+    /// Begin a bucket-fill animation. Uploads the R8 distance mask
+    /// produced by `flood_fill` to the overlay image (one-shot
+    /// transfer, big on huge canvases) and arms the overlay path so
+    /// subsequent `present()` calls render the canvas + fill colour
+    /// clipped to the reveal radius. Bump `pixels_version` so the next
+    /// present is non-trivial.
+    pub fn begin_fill_overlay(
+        &mut self,
+        layer_idx: usize,
+        distance_mask: &[u8],
+        color: Color,
+    ) -> Result<(), RendererError> {
+        let linear = color.to_linear_rgb();
+        // Premultiplied with alpha = 1.0 since bucket fill is opaque;
+        // the OVER blend on the overlay pipeline matches this.
+        let color_premul = [linear[0], linear[1], linear[2], 1.0];
+        self.renderer.upload_fill_mask(distance_mask)?;
+        self.renderer.begin_fill_overlay(layer_idx, color_premul)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Update the reveal radius (0.0..=1.0 in normalised mask space)
+    /// and mark the display dirty so the next present picks it up.
+    pub const fn set_fill_reveal(&mut self, reveal: f32) {
+        self.renderer.set_fill_reveal(reveal);
+        self.bump_version();
+    }
+
+    /// Whether a fill overlay is currently active.
+    #[must_use]
+    pub const fn fill_overlay_active(&self) -> bool {
+        self.renderer.fill_active()
+    }
+
+    /// Commit the final filled pixels to the target layer and clear
+    /// the overlay. Returns the layer back to normal composition.
+    pub fn commit_fill_overlay(
+        &mut self,
+        layer_idx: usize,
+        pixels: &[u8],
+    ) -> Result<(), RendererError> {
+        self.renderer.write_layer(layer_idx, pixels)?;
+        self.renderer.clear_fill_overlay();
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Cancel an in-flight fill overlay without committing anything.
+    pub const fn cancel_fill_overlay(&mut self) {
+        self.renderer.clear_fill_overlay();
+        self.bump_version();
+    }
+
+    // ----------------------------------------------------------------
+    // Shape tool GPU overlay
+    // ----------------------------------------------------------------
+
+    /// Arm the GPU shape overlay for a drag on `layer_idx`. Subsequent
+    /// `set_shape_preview_params` + `present()` calls render the shape
+    /// directly into the preview image - no CPU rasterisation or
+    /// texture upload per frame.
+    pub fn begin_shape_overlay(&mut self, layer_idx: usize) {
+        self.renderer.begin_shape_overlay(layer_idx);
+        self.bump_version();
+    }
+
+    /// Update the in-flight shape's parameters. `color` is converted to
+    /// premultiplied linear RGB before being pushed.
+    ///
+    /// `rect` is `(x, y, w, h)` for box shapes; `(x0, y0, x1, y1)` for
+    /// `ShapeKind::Line`. `line_width` is only consulted for Line.
+    pub fn set_shape_preview_params(
+        &mut self,
+        kind: ShapeKind,
+        rect: [f32; 4],
+        color: Color,
+        antialias: bool,
+        line_width: f32,
+    ) {
+        let linear = color.to_linear_rgb();
+        let premul = [linear[0], linear[1], linear[2], 1.0];
+        self.renderer
+            .set_shape_preview_params(kind, rect, premul, antialias, line_width);
+        self.bump_version();
+    }
+
+    /// Whether a shape overlay is currently active.
+    #[must_use]
+    pub const fn shape_overlay_active(&self) -> bool {
+        self.renderer.shape_active()
+    }
+
+    /// Commit the shape into the target layer (GPU OVER blend), clear
+    /// the overlay, and recomposite the canvas.
+    pub fn commit_shape(
+        &mut self,
+        layer_idx: usize,
+        kind: ShapeKind,
+        rect: [f32; 4],
+        color: Color,
+        antialias: bool,
+        line_width: f32,
+    ) -> Result<(), RendererError> {
+        let linear = color.to_linear_rgb();
+        let premul = [linear[0], linear[1], linear[2], 1.0];
+        self.renderer
+            .commit_shape(layer_idx, kind, rect, premul, antialias, line_width)?;
+        self.recomposite_canvas()
+    }
+
+    /// Cancel an in-flight shape overlay without committing.
+    pub fn cancel_shape_overlay(&mut self) {
+        self.renderer.clear_shape_overlay();
+        self.bump_version();
+    }
+
+    // ----------------------------------------------------------------
+    // Filters (HSV / invert / blur / sharpen) - GPU live preview + apply
+    // ----------------------------------------------------------------
+
+    /// Arm the filter live-preview path. `indices` are the layers the filter
+    /// applies to; `spec` is the initial parameters. The layer images are
+    /// left untouched - `present` re-renders the preview through the filter
+    /// pipeline - so [`Self::cancel_filter`] is a clean no-op.
+    pub fn begin_filter(&mut self, indices: &[usize], spec: FilterSpec) {
+        self.renderer.begin_filter(indices.to_vec(), spec);
+        self.bump_version();
+    }
+
+    /// Update the previewed filter parameters (slider moved).
+    pub const fn update_filter(&mut self, spec: FilterSpec) {
+        self.renderer.update_filter_spec(spec);
+        self.bump_version();
+    }
+
+    /// Whether a filter preview is currently armed.
+    #[must_use]
+    pub const fn filter_active(&self) -> bool {
+        self.renderer.filter_active()
+    }
+
+    /// Commit the filter to every armed layer, writing the filtered pixels
+    /// into the layer images and re-compositing. History is captured by the
+    /// caller via `read_layer` before/after.
+    pub fn apply_filter(&mut self, indices: &[usize], spec: FilterSpec) -> Result<(), RendererError> {
+        for &idx in indices {
+            self.renderer.apply_filter_to_layer(idx, spec)?;
+        }
+        self.renderer.clear_filter();
+        self.recomposite_canvas()?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Render the armed filter preview and read it back as BGRA8. Intended
+    /// for tests/diagnostics; the live path presents straight to the display.
+    pub fn read_filter_preview(&mut self) -> Result<Vec<u8>, RendererError> {
+        let vis = self.visibilities();
+        self.renderer.read_filter_preview(&vis)
+    }
+
+    /// Cancel an in-flight filter preview. Layer images were never modified,
+    /// so this only disarms the preview path.
+    pub fn cancel_filter(&mut self) {
+        self.renderer.clear_filter();
+        self.bump_version();
+    }
+
+    /// Clear a specific layer (by index) to `color` and re-composite.
+    pub fn clear_layer_at(&mut self, idx: usize, color: [f32; 4]) -> Result<(), RendererError> {
+        self.renderer.clear_layer(idx, color)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Apply an affine transform to a single layer. `original` must be the
+    /// layer's BGRA8 pixels captured before the transform began (`src_w x
+    /// src_h`, row-major, no padding). `src_w`/`src_h` are the dimensions of
+    /// `original` - they may differ from the current canvas size when the
+    /// canvas was expanded after the transform was initiated. `original_rect`
+    /// is the tight bounding-box of non-transparent content in `original`
+    /// coordinates; `current_rect` is the live transform rect in the current
+    /// canvas coordinate space. Remaps `original_rect` -> `current_rect`.
+    /// Writes the transformed result back to the GPU layer and re-composites.
+    pub fn apply_layer_transform(
+        &mut self,
+        layer_idx: usize,
+        original: &[u8],
+        src_w: u32,
+        src_h: u32,
+        original_rect: TransformRect,
+        current_rect: TransformRect,
+        filter: TransformFilter,
+    ) -> Result<(), RendererError> {
+        let size = self.renderer.canvas_size();
+        let transformed = transform_bgra8(
+            original,
+            src_w,
+            src_h,
+            size.width,
+            size.height,
+            original_rect,
+            current_rect,
+            filter,
+        );
+        self.renderer.write_layer(layer_idx, &transformed)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Run the affine transform entirely in CPU and return the output buffer
+    /// without writing to the GPU layer. The caller controls the output size,
+    /// allowing buffers larger or smaller than the canvas.
+    pub fn compute_transform_pixels(
+        original: &[u8],
+        src_w: u32,
+        src_h: u32,
+        out_w: u32,
+        out_h: u32,
+        original_rect: TransformRect,
+        current_rect: TransformRect,
+        filter: TransformFilter,
+    ) -> Vec<u8> {
+        transform_bgra8(
+            original,
+            src_w,
+            src_h,
+            out_w,
+            out_h,
+            original_rect,
+            current_rect,
+            filter,
+        )
+    }
+
+    /// GPU transform apply. Renders the inverse affine through a Vulkan
+    /// graphics pipeline, blits the canvas-overlap directly into the active
+    /// layer image (GPU->GPU), and returns the full AABB pixels (for the
+    /// extension store) plus the AABB metadata so the caller can build a
+    /// `LayerExtension` without recomputing the bounding box.
+    ///
+    /// Returns `(pixels, ext_x, ext_y, out_w, out_h)`.
+    pub fn apply_layer_transform_gpu(
+        &mut self,
+        layer_idx: usize,
+        source_pixels: &[u8],
+        src_w: u32,
+        src_h: u32,
+        original_rect: TransformRect,
+        current_rect: TransformRect,
+    ) -> Result<(Vec<u8>, i32, i32, u32, u32), RendererError> {
+        // AABB of the rotated/scaled current_rect, snapped to pixel boundaries.
+        let (hw, hh) = (current_rect.half_w(), current_rect.half_h());
+        let corners = [
+            current_rect.local_to_canvas(-hw, -hh),
+            current_rect.local_to_canvas(hw, -hh),
+            current_rect.local_to_canvas(-hw, hh),
+            current_rect.local_to_canvas(hw, hh),
+        ];
+        let min_x = corners
+            .iter()
+            .map(|&(x, _)| x)
+            .fold(f32::INFINITY, f32::min);
+        let min_y = corners
+            .iter()
+            .map(|&(_, y)| y)
+            .fold(f32::INFINITY, f32::min);
+        let max_x = corners
+            .iter()
+            .map(|&(x, _)| x)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let max_y = corners
+            .iter()
+            .map(|&(_, y)| y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        #[allow(clippy::cast_possible_truncation)]
+        let ext_x = min_x.floor() as i32;
+        #[allow(clippy::cast_possible_truncation)]
+        let ext_y = min_y.floor() as i32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let out_w = (max_x.ceil() as i32 - ext_x).max(1) as u32;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let out_h = (max_y.ceil() as i32 - ext_y).max(1) as u32;
+
+        // Precompute the 2x3 inverse affine that maps the output framebuffer's
+        // [0,1] UV directly to the source texture's [0,1] UV. See the shader
+        // comment in transform.frag; the chain is:
+        //   v_uv -> output_px -> canvas_px -> current_local -> source_local ->
+        //   source_px -> source_uv
+        // collapsed to two row-vec3 dot products.
+        let ca = current_rect.angle.cos();
+        let sa = current_rect.angle.sin();
+        let kx = original_rect.w / current_rect.w;
+        let ky = original_rect.h / current_rect.h;
+        #[allow(clippy::cast_precision_loss)]
+        let ow = out_w as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let oh = out_h as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let ox = ext_x as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let oy = ext_y as f32;
+        let ccx = current_rect.cx;
+        let ccy = current_rect.cy;
+        let ocx = original_rect.cx;
+        let ocy = original_rect.cy;
+        #[allow(clippy::cast_precision_loss)]
+        let sw = src_w as f32;
+        #[allow(clippy::cast_precision_loss)]
+        let sh = src_h as f32;
+
+        let a1 = ow * ca;
+        let b1 = oh * sa;
+        let c1 = (ox - ccx).mul_add(ca, (oy - ccy) * sa);
+        let a2 = -ow * sa;
+        let b2 = oh * ca;
+        let c2 = (-(ox - ccx)).mul_add(sa, (oy - ccy) * ca);
+
+        let push = [
+            a1 * kx / sw,
+            b1 * kx / sw,
+            c1.mul_add(kx, ocx) / sw,
+            0.0,
+            a2 * ky / sh,
+            b2 * ky / sh,
+            c2.mul_add(ky, ocy) / sh,
+            0.0,
+        ];
+
+        let pixels = self.renderer.apply_layer_transform_gpu(
+            layer_idx,
+            source_pixels,
+            src_w,
+            src_h,
+            out_w,
+            out_h,
+            ext_x,
+            ext_y,
+            push,
+        )?;
+        self.recomposite_canvas()?;
+        Ok((pixels, ext_x, ext_y, out_w, out_h))
+    }
+}
+
+impl Canvas {
+    // ----------------------------------------------------------------
+    // Selection
+    // ----------------------------------------------------------------
+
+    /// Fill the entire mask. After this, `selection_active()` is true.
+    pub fn select_all(&mut self) -> Result<(), RendererError> {
+        self.renderer.select_all()?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Mark the mask as inert. The mask's contents are left in place
+    /// (they're don't-care while inactive) - the composite shader's
+    /// `selection_active` push constant gates whether they apply.
+    pub const fn deselect(&mut self) {
+        self.renderer.deselect();
+        self.bump_version();
+    }
+
+    /// Logical NOT of the current mask. No-op when no selection is active.
+    pub fn invert_selection(&mut self) -> Result<(), RendererError> {
+        self.renderer.invert_selection()?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Rasterise `shape` into an R8 buffer and blend it into the mask
+    /// with the GPU op corresponding to `mode`. After this,
+    /// `selection_active()` is true (unless `mode` was Subtract and no
+    /// selection existed, in which case the op was a no-op).
+    pub fn apply_selection_shape(
+        &mut self,
+        shape: &SelectionShape,
+        mode: SelectionMode,
+    ) -> Result<(), RendererError> {
+        let size = self.renderer.canvas_size();
+        let pixels = crate::selection::rasterise(shape, size.width, size.height);
+        let blend = match mode {
+            SelectionMode::Replace => SelectionBlendMode::Replace,
+            SelectionMode::Add => SelectionBlendMode::Add,
+            SelectionMode::Subtract => SelectionBlendMode::Subtract,
+            SelectionMode::Intersect => SelectionBlendMode::Intersect,
+        };
+        self.renderer.apply_selection_shape(&pixels, blend)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Whether the mask currently affects compositing.
+    #[must_use]
+    pub const fn selection_active(&self) -> bool {
+        self.renderer.selection_active()
+    }
+
+    /// Run the GPU edge/downsample pass and return the small R8 buffer.
+    /// The caller (the UI) feeds this to `crate::selection::marching_squares`
+    /// to get contour polylines, then scales each coordinate by
+    /// `canvas_w / edges_w` etc. to put them back in canvas-pixel space.
+    pub fn read_selection_edges(&mut self) -> Result<EdgesBuffer, RendererError> {
+        self.renderer.compute_selection_edges()
+    }
+
+    /// Read the full-resolution selection mask as a row-major R8 buffer.
+    /// Used by the pixel-perfect ants tracer.
+    pub fn read_selection_mask(&mut self) -> Result<Vec<u8>, RendererError> {
+        self.renderer.read_selection_mask()
+    }
+
+    /// Split the layer at `idx` into two BGRA8 buffers using the selection
+    /// mask: the *masked* pixels (layer x mask, used for transform / cut /
+    /// copy) and the *remaining* pixels (layer x (1-mask), which becomes
+    /// the layer's new content). Writes the remaining pixels back to the
+    /// GPU layer and clears the selection (the marquee no longer makes
+    /// sense once the pixels have been lifted).
+    ///
+    /// Returns `(masked_pixels, canvas_w, canvas_h)`. Returns `Ok(None)`
+    /// if no selection is currently active. The caller can compute tight
+    /// non-empty bounds from `masked_pixels` itself.
+    pub fn extract_selection_pixels(
+        &mut self,
+        idx: usize,
+    ) -> Result<Option<(Vec<u8>, u32, u32)>, RendererError> {
+        if !self.renderer.selection_active() {
+            return Ok(None);
+        }
+        let size = self.renderer.canvas_size();
+        let layer = self.renderer.read_layer(idx)?;
+        let mask = self.renderer.read_selection_mask()?;
+        let (masked, remaining) = split_layer_by_mask(&layer, &mask);
+        self.renderer.write_layer(idx, &remaining)?;
+        self.deselect();
+        self.recomposite_canvas()?;
+        Ok(Some((masked, size.width, size.height)))
+    }
+
+    /// Apply the selection mask to a copy of the layer pixels without
+    /// modifying the layer or the mask. Used by `Copy`. Returns the
+    /// canvas-sized BGRA8 buffer or `None` if no selection is active.
+    pub fn read_selection_pixels(
+        &mut self,
+        idx: usize,
+    ) -> Result<Option<(Vec<u8>, u32, u32)>, RendererError> {
+        if !self.renderer.selection_active() {
+            return Ok(None);
+        }
+        let size = self.renderer.canvas_size();
+        let layer = self.renderer.read_layer(idx)?;
+        let mask = self.renderer.read_selection_mask()?;
+        let (masked, _remaining) = split_layer_by_mask(&layer, &mask);
+        Ok(Some((masked, size.width, size.height)))
+    }
+
+    /// Clear only the selected pixels on the layer at `idx` (layer x
+    /// (1 - mask)) and deselect. Used by `Cut` after the masked pixels
+    /// have already been copied to the clipboard. No-op without a
+    /// selection.
+    pub fn clear_selection_from_layer(&mut self, idx: usize) -> Result<(), RendererError> {
+        if !self.renderer.selection_active() {
+            return Ok(());
+        }
+        let layer = self.renderer.read_layer(idx)?;
+        let mask = self.renderer.read_selection_mask()?;
+        let (_masked, remaining) = split_layer_by_mask(&layer, &mask);
+        self.renderer.write_layer(idx, &remaining)?;
+        self.deselect();
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Erase the selected pixels on the layer at `idx` (layer x (1 - mask))
+    /// while keeping the selection active. Used by the Delete key so the
+    /// marquee stays put and the user can keep editing inside it. No-op
+    /// without a selection.
+    pub fn erase_selection_in_layer(&mut self, idx: usize) -> Result<(), RendererError> {
+        if !self.renderer.selection_active() {
+            return Ok(());
+        }
+        let layer = self.renderer.read_layer(idx)?;
+        let mask = self.renderer.read_selection_mask()?;
+        let (_masked, remaining) = split_layer_by_mask(&layer, &mask);
+        self.renderer.write_layer(idx, &remaining)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Replace the selection mask with one derived from the alpha
+    /// channel of the layer at `idx`: a pixel is selected iff its alpha
+    /// is above 0. Used when clicking a layer's thumbnail in the panel.
+    pub fn select_from_layer_alpha(&mut self, idx: usize) -> Result<(), RendererError> {
+        let layer = self.renderer.read_layer(idx)?;
+        let n = layer.len() / 4;
+        let mut shape = vec![0u8; n];
+        for i in 0..n {
+            // BGRA8 -> alpha is byte 3.
+            if layer[i * 4 + 3] > 0 {
+                shape[i] = 255;
+            }
+        }
+        self.renderer
+            .apply_selection_shape(&shape, SelectionBlendMode::Replace)?;
+        self.bump_version();
+        Ok(())
+    }
+}
+
+/// Split BGRA8 `layer` by R8 `mask`: returns `(masked, remaining)` where
+/// `masked = layer * (mask/255)` and `remaining = layer * (1 - mask/255)`.
+/// All four channels (premultiplied alpha) are scaled, so the result is
+/// still premultiplied BGRA8.
+fn split_layer_by_mask(layer: &[u8], mask: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let n = mask.len().min(layer.len() / 4);
+    let mut masked = vec![0u8; n * 4];
+    let mut remaining = vec![0u8; n * 4];
+    for i in 0..n {
+        let m = u32::from(mask[i]);
+        let inv = 255 - m;
+        for c in 0..4 {
+            let v = u32::from(layer[i * 4 + c]);
+            // Round to nearest, divide by 255.
+            masked[i * 4 + c] = ((v * m + 127) / 255) as u8;
+            remaining[i * 4 + c] = ((v * inv + 127) / 255) as u8;
+        }
+    }
+    (masked, remaining)
+}
+
+// Porter-Duff "src over dst" on premultiplied BGRA8 buffers, in place on `dst`.
+fn alpha_over_premul_bgra8(dst: &mut [u8], src: &[u8]) {
+    debug_assert_eq!(dst.len(), src.len());
+    let n = dst.len() / 4;
+    for i in 0..n {
+        let sa = u32::from(src[i * 4 + 3]);
+        let inv = 255 - sa;
+        for c in 0..4 {
+            let s = u32::from(src[i * 4 + c]);
+            let d = u32::from(dst[i * 4 + c]);
+            dst[i * 4 + c] = (s + (d * inv + 127) / 255) as u8;
+        }
+    }
+}
+
+// CPU pixel helpers (crop_bgra8, transform_bgra8, sample_*) live in
+// oxiedraw_utils::pixels - see the use statement at the top of this file.
+
+impl std::fmt::Debug for Canvas {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Canvas")
+            .field("size", &self.size())
+            .field("layers", &self.layers.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use oxiedraw_utils::geometry::Point;
+
+    use crate::brush_engine::{BrushEngine, InputSample};
+
+    use super::*;
+
+    fn sample(x: f32, y: f32, t: u64) -> InputSample {
+        InputSample {
+            position: Point::new(x, y),
+            pressure: 1.0,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation: 0.0,
+            time_ms: t,
+        }
+    }
+
+    // Backs `erase_selection_in_layer` / `clear_selection_from_layer`: a fully
+    // masked pixel moves entirely into `masked`, an unmasked one stays in
+    // `remaining`, and a half-mask splits the value across both.
+    #[test]
+    fn split_layer_by_mask_partitions_pixels() {
+        // Three pixels, every channel = 200.
+        let layer = vec![200u8; 3 * 4];
+        let mask = [255u8, 0, 128];
+
+        let (masked, remaining) = split_layer_by_mask(&layer, &mask);
+
+        // mask = 255: all value to masked, none remains.
+        assert_eq!(&masked[0..4], &[200, 200, 200, 200]);
+        assert_eq!(&remaining[0..4], &[0, 0, 0, 0]);
+        // mask = 0: nothing masked, all remains.
+        assert_eq!(&masked[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&remaining[4..8], &[200, 200, 200, 200]);
+        // mask = 128: split. masked + remaining should reconstruct the original
+        // (within rounding) and each part is roughly half.
+        for c in 0..4 {
+            let m = i32::from(masked[8 + c]);
+            let r = i32::from(remaining[8 + c]);
+            assert!((m - 100).abs() <= 1, "masked half off: {m}");
+            assert!((r - 100).abs() <= 1, "remaining half off: {r}");
+            assert!((m + r - 200).abs() <= 1, "split must sum to original");
+        }
+    }
+
+    /// Drive a complete brush stroke through the brush engine and
+    /// `Canvas`, then assert the painted pixels look right. Exercises
+    /// the full path: `BrushEngine` -> `PaintTarget` adapter ->
+    /// `stamp_mask` -> `composite_stroke_into_layer` -> recomposite ->
+    /// readback.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn end_to_end_stroke() {
+        let size = Size::new(128, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let brush = BrushEngine::new();
+        brush.size.set(8.0);
+        brush.opacity.set(1.0);
+
+        let red = Color::new(255, 0, 0);
+
+        canvas.begin_stroke(red, 1.0, false).expect("begin_stroke");
+
+        let mut iter = (0_u32..10).map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let x = (i as f32).mul_add(10.0, 16.0);
+            sample(x, 32.0, u64::from(i) * 10)
+        });
+        let first = iter.next().expect("non-empty");
+        canvas
+            .stamp(|t| brush.begin_stroke(first, red, t))
+            .expect("brush.begin");
+        for s in iter {
+            canvas
+                .stamp(|t| brush.push_sample(s, t))
+                .expect("brush.push");
+        }
+        canvas.stamp(|t| brush.end_stroke(t)).expect("brush.end");
+
+        canvas.commit_stroke().expect("commit");
+
+        let bytes = canvas.read_pixels().expect("readback");
+
+        // Pixel under the stroke center should be solid red. Canvas
+        // format is BGRA so R is at center+2.
+        let center = (32 * 128 + 64) * 4;
+        assert!(bytes[center] <= 0x10, "stroke B={:02x}", bytes[center]);
+        assert!(
+            bytes[center + 1] <= 0x10,
+            "stroke G={:02x}",
+            bytes[center + 1]
+        );
+        assert!(
+            bytes[center + 2] >= 0xF0,
+            "stroke R={:02x}",
+            bytes[center + 2]
+        );
+        assert!(
+            bytes[center + 3] >= 0xF0,
+            "stroke A={:02x}",
+            bytes[center + 3]
+        );
+
+        // Far-from-stroke corner stays transparent.
+        assert_eq!(&bytes[..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// An eraser stroke on the top layer removes its coverage and reveals
+    /// the layer below, without touching the layer below. Drives the same
+    /// brush path with `erase = true`.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn end_to_end_eraser_reveals_lower_layer() {
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // BGRA8, opaque. Bottom = green, top = red.
+        let n = (size.width * size.height) as usize;
+        let green: Vec<u8> = [0u8, 255, 0, 255].iter().copied().cycle().take(n * 4).collect();
+        let red: Vec<u8> = [0u8, 0, 255, 255].iter().copied().cycle().take(n * 4).collect();
+        canvas.add_layer_with_pixels("bottom", &green).expect("bottom");
+        let top = canvas.add_layer_with_pixels("top", &red).expect("top");
+        assert_eq!(canvas.layers().active(), Some(top), "top layer active");
+
+        let brush = BrushEngine::new();
+        brush.size.set(12.0);
+        brush.opacity.set(1.0);
+        let stroke_color = Color::new(0, 0, 0);
+
+        canvas.begin_stroke(stroke_color, 1.0, true).expect("begin erase");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(32.0, 32.0, 0), stroke_color, t))
+            .expect("brush.begin");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("brush.end");
+        canvas.commit_stroke().expect("commit");
+
+        let bytes = canvas.read_pixels().expect("readback");
+        let at = |x: usize, y: usize| {
+            let i = (y * 64 + x) * 4;
+            (bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3])
+        };
+
+        // Under the eraser the top red is gone, so the green below shows
+        // through (opaque). BGRA: green is (0, 255, 0, 255).
+        let (b, g, r, a) = at(32, 32);
+        assert!(g >= 0xF0, "center should reveal green G={g:02x}");
+        assert!(r <= 0x10, "center red removed R={r:02x}");
+        assert!(b <= 0x10, "center B={b:02x}");
+        assert_eq!(a, 255, "center stays opaque (green below)");
+
+        // The top layer itself is transparent where erased.
+        let top_px = canvas.read_layer(top).expect("read top");
+        assert_eq!(top_px[(32 * 64 + 32) * 4 + 3], 0, "top erased to transparent");
+
+        // Far corner is untouched: top red still on top.
+        let (_, _, r_corner, a_corner) = at(2, 2);
+        assert!(r_corner >= 0xF0, "corner keeps red R={r_corner:02x}");
+        assert_eq!(a_corner, 255, "corner opaque");
+    }
+
+    /// Lift-and-apply with an identity transform should produce the
+    /// original pixels back on the layer. Proves Apply OVER-blends the
+    /// transformed pixels onto the unmasked region instead of replacing
+    /// it.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn transform_apply_preserves_unmasked_pixels() {
+        use crate::selection::{RectShape, SelectionShape};
+        use crate::tools::SelectionMode;
+        use oxiedraw_utils::geometry::TransformRect;
+
+        let size = Size::new(32, 32);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // Paint solid red across the whole layer.
+        let brush = BrushEngine::new();
+        brush.size.set(80.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(16.0, 16.0, 0), red, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        // Select the left half.
+        let shape = SelectionShape::Rect(RectShape {
+            x: 0.0,
+            y: 0.0,
+            w: 16.0,
+            h: 32.0,
+        });
+        canvas
+            .apply_selection_shape(&shape, SelectionMode::Replace)
+            .expect("apply selection");
+
+        // Lift: layer keeps right half, lifted = left half.
+        let (lifted, lw, lh) = canvas
+            .extract_selection_pixels(0)
+            .expect("extract")
+            .expect("had selection");
+
+        // Identity transform: original_rect == current_rect over the
+        // tight bounds of the lifted pixels.
+        let orig_rect = TransformRect::new(8.0, 16.0, 16.0, 32.0, 0.0);
+        let current_rect = orig_rect;
+        canvas
+            .apply_layer_transform_gpu(0, &lifted, lw, lh, orig_rect, current_rect)
+            .expect("apply gpu");
+
+        // Layer should now match the pre-lift state: both halves red.
+        let bytes = canvas.read_layer(0).expect("read");
+        let left_i = (16 * 32 + 8) * 4;
+        assert!(bytes[left_i + 2] >= 0xF0, "left half R={:02x}", bytes[left_i + 2]);
+        let right_i = (16 * 32 + 24) * 4;
+        assert!(
+            bytes[right_i + 2] >= 0xF0,
+            "right half R={:02x} (must be preserved by OVER blend)",
+            bytes[right_i + 2]
+        );
+    }
+
+    /// Translating a lifted selection by an integer pixel offset must
+    /// (a) place the moved pixels exactly at the new position with no
+    /// fractional bleeding, and (b) leave the rest of the layer alone
+    /// (i.e. the unmasked region must survive Apply).
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn translate_selection_lands_on_pixel_grid() {
+        use crate::selection::{RectShape, SelectionShape};
+        use crate::tools::SelectionMode;
+        use oxiedraw_utils::geometry::TransformRect;
+
+        let size = Size::new(32, 32);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // Paint a 4x4 red square at (4..8, 4..8) by stamping a dab.
+        let brush = BrushEngine::new();
+        brush.size.set(4.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(6.0, 6.0, 0), red, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        // Paint a separate green square at (20..24, 20..24) - unmasked
+        // by the selection below, must survive Apply.
+        let green = Color::new(0, 255, 0);
+        canvas.begin_stroke(green, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(22.0, 22.0, 0), green, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        // Select a region tightly around the red square.
+        canvas
+            .apply_selection_shape(
+                &SelectionShape::Rect(RectShape {
+                    x: 4.0,
+                    y: 4.0,
+                    w: 4.0,
+                    h: 4.0,
+                }),
+                SelectionMode::Replace,
+            )
+            .expect("select");
+
+        let (lifted, lw, lh) = canvas
+            .extract_selection_pixels(0)
+            .expect("extract")
+            .expect("had selection");
+
+        // Translate +8 px right, +8 px down (integer offset).
+        let orig_rect = TransformRect::new(6.0, 6.0, 4.0, 4.0, 0.0);
+        let current_rect = TransformRect::new(14.0, 14.0, 4.0, 4.0, 0.0);
+        canvas
+            .apply_layer_transform_gpu(0, &lifted, lw, lh, orig_rect, current_rect)
+            .expect("apply");
+
+        let bytes = canvas.read_layer(0).expect("read");
+        let px_at = |x: u32, y: u32| {
+            let i = ((y * 32 + x) * 4) as usize;
+            (bytes[i], bytes[i + 1], bytes[i + 2], bytes[i + 3])
+        };
+
+        // Red should now sit at the new centre (around (14, 14)). Sample
+        // the very centre.
+        let (b, g, r, a) = px_at(14, 14);
+        assert!(r > 0x80, "translated red R={:02x} at (14,14)", r);
+        assert!(a > 0x80);
+        let _ = (b, g);
+
+        // Green square must be untouched.
+        let (_, g, _, a) = px_at(22, 22);
+        assert!(g > 0x80, "green survived G={:02x}", g);
+        assert!(a > 0x80);
+
+        // Old position (4..8) must be empty (it was lifted).
+        let (_, _, _, a) = px_at(6, 6);
+        assert!(a < 0x10, "old red position should be transparent A={:02x}", a);
+    }
+
+    /// extract_selection_pixels lifts the masked pixels off the layer
+    /// and leaves the unmasked region behind.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn extract_selection_lifts_masked_pixels() {
+        use crate::selection::{RectShape, SelectionShape};
+        use crate::tools::SelectionMode;
+
+        let size = Size::new(32, 32);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // Paint a solid red square covering the canvas.
+        let brush = BrushEngine::new();
+        brush.size.set(80.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(16.0, 16.0, 0), red, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        // Selection: left half.
+        let shape = SelectionShape::Rect(RectShape {
+            x: 0.0,
+            y: 0.0,
+            w: 16.0,
+            h: 32.0,
+        });
+        canvas
+            .apply_selection_shape(&shape, SelectionMode::Replace)
+            .expect("apply selection");
+
+        let (lifted, w, h) = canvas
+            .extract_selection_pixels(0)
+            .expect("extract ok")
+            .expect("had selection");
+        assert_eq!(w, 32);
+        assert_eq!(h, 32);
+
+        // Lifted buffer: left half should be red, right half zero.
+        let left_i = (16 * 32 + 8) * 4;
+        assert!(lifted[left_i + 2] >= 0xF0, "lifted left R={:02x}", lifted[left_i + 2]);
+        let right_i = (16 * 32 + 24) * 4;
+        assert_eq!(
+            &lifted[right_i..right_i + 4],
+            &[0x00, 0x00, 0x00, 0x00],
+            "lifted right should be empty"
+        );
+
+        // Layer remaining: left half should be empty, right half still red.
+        let layer = canvas.read_layer(0).expect("read layer");
+        let l = (16 * 32 + 8) * 4;
+        assert_eq!(
+            &layer[l..l + 4],
+            &[0x00, 0x00, 0x00, 0x00],
+            "layer left should be cleared"
+        );
+        let r = (16 * 32 + 24) * 4;
+        assert!(layer[r + 2] >= 0xF0, "layer right R={:02x}", layer[r + 2]);
+
+        // Selection is cleared after the lift.
+        assert!(!canvas.selection_active(), "lift should deselect");
+    }
+
+    /// select_from_layer_alpha turns an arbitrary layer's non-zero alpha
+    /// region into a selection mask.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn select_from_layer_alpha_builds_mask() {
+        let size = Size::new(32, 32);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // Paint a red blob centred at (8, 16).
+        let brush = BrushEngine::new();
+        brush.size.set(10.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(8.0, 16.0, 0), red, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        canvas.select_from_layer_alpha(0).expect("select");
+        assert!(canvas.selection_active());
+
+        let mask = canvas.read_selection_mask().expect("read mask");
+        // Centre of the blob should be selected.
+        assert_eq!(mask[16 * 32 + 8], 0xFF);
+        // Far corner should be unselected.
+        assert_eq!(mask[31 * 32 + 31], 0x00);
+    }
+
+    /// Brush stroke composited through a selection mask gets clipped:
+    /// pixels inside the mask receive the stroke colour; pixels outside
+    /// stay transparent.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn brush_stroke_clipped_to_selection() {
+        use crate::selection::{RectShape, SelectionShape};
+        use crate::tools::SelectionMode;
+
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // Selection: left half of canvas.
+        let shape = SelectionShape::Rect(RectShape {
+            x: 0.0,
+            y: 0.0,
+            w: 32.0,
+            h: 64.0,
+        });
+        canvas
+            .apply_selection_shape(&shape, SelectionMode::Replace)
+            .expect("apply selection");
+        assert!(canvas.selection_active());
+
+        // Paint a stroke spanning the whole canvas horizontally.
+        let brush = BrushEngine::new();
+        brush.size.set(20.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(16.0, 32.0, 0), red, t))
+            .expect("stamp left");
+        canvas
+            .stamp(|t| brush.push_sample(sample(48.0, 32.0, 1), t))
+            .expect("stamp right");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        let bytes = canvas.read_pixels().expect("readback");
+
+        // Inside selection (x=16, y=32) - should be red.
+        let inside = (32 * 64 + 16) * 4;
+        assert!(bytes[inside + 2] >= 0xF0, "inside R={:02x}", bytes[inside + 2]);
+
+        // Outside selection (x=48, y=32) - should be untouched (transparent).
+        let outside = (32 * 64 + 48) * 4;
+        assert_eq!(
+            &bytes[outside..outside + 4],
+            &[0x00, 0x00, 0x00, 0x00],
+            "outside should be untouched"
+        );
+    }
+
+    /// During a stroke, `read_pixels` should return the preview
+    /// (canvas + tinted stroke). Discarding then reading should show
+    /// the canvas untouched.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn preview_during_stroke() {
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        let brush = BrushEngine::new();
+        brush.size.set(40.0);
+        brush.opacity.set(1.0);
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(32.0, 32.0, 0), red, t))
+            .expect("stamp");
+
+        let preview = canvas.read_pixels().expect("preview readback");
+        let center = (32 * 64 + 32) * 4;
+        assert!(
+            preview[center + 2] >= 0xF0,
+            "preview R={:02x}",
+            preview[center + 2]
+        );
+        assert!(
+            preview[center + 3] >= 0xF0,
+            "preview A={:02x}",
+            preview[center + 3]
+        );
+
+        canvas.discard_stroke().expect("discard");
+        let after = canvas.read_pixels().expect("after readback");
+        assert_eq!(
+            &after[center..center + 4],
+            &[0x00, 0x00, 0x00, 0x00],
+            "canvas should be untouched"
+        );
+    }
+
+    /// Multi-layer test: bottom layer red, top layer green at a
+    /// different position. Composite should show both colors at
+    /// their respective positions.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn two_layers_composite() {
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let brush = BrushEngine::new();
+        brush.size.set(20.0);
+        brush.opacity.set(1.0);
+
+        // Layer 0 (background): paint red at (16, 32).
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin red");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(16.0, 32.0, 0), red, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit red");
+
+        // Add a new layer, paint green at (48, 32).
+        canvas.add_layer("Top").expect("add layer");
+        let green = Color::new(0, 255, 0);
+        canvas.begin_stroke(green, 1.0, false).expect("begin green");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(48.0, 32.0, 0), green, t))
+            .expect("stamp");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit green");
+
+        let bytes = canvas.read_pixels().expect("read");
+
+        // Pixel (16, 32) should be red.
+        let red_i = (32 * 64 + 16) * 4;
+        assert!(bytes[red_i + 2] >= 0xF0, "red R={:02x}", bytes[red_i + 2]);
+        assert!(bytes[red_i + 1] <= 0x10, "red G={:02x}", bytes[red_i + 1]);
+
+        // Pixel (48, 32) should be green.
+        let green_i = (32 * 64 + 48) * 4;
+        assert!(
+            bytes[green_i + 1] >= 0xF0,
+            "green G={:02x}",
+            bytes[green_i + 1]
+        );
+        assert!(
+            bytes[green_i + 2] <= 0x10,
+            "green R={:02x}",
+            bytes[green_i + 2]
+        );
+    }
+
+    /// In-flight preview with the stroke on a *lower* layer and an opaque
+    /// layer above it. Exercises the cached below-stack composite, the
+    /// above-layer re-composite, and (by reading twice) cache reuse.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn region_upload_changes_only_region_and_bumps_version() {
+        let size = Size::new(16, 8);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        // A layer filled solid opaque red (BGRA premultiplied == straight here).
+        let red = [0u8, 0, 255, 255].repeat((size.width * size.height) as usize);
+        let idx = canvas.add_layer_with_pixels("L", &red).expect("add layer");
+        let v0 = canvas.layer_content_version(idx);
+
+        // Upload a 4x4 opaque-blue region at (2, 1).
+        let blue = [255u8, 0, 0, 255].repeat(4 * 4);
+        canvas
+            .restore_layer_region(idx, 2, 1, 4, 4, &blue)
+            .expect("region upload");
+
+        let v1 = canvas.layer_content_version(idx);
+        assert!(v1 > v0, "region upload must bump the layer version");
+
+        let out = canvas.read_layer(idx).expect("read layer");
+        let px = |x: usize, y: usize| {
+            let i = (y * size.width as usize + x) * 4;
+            [out[i], out[i + 1], out[i + 2], out[i + 3]]
+        };
+        // Inside the region: blue. Outside: untouched red.
+        assert_eq!(px(3, 2), [255, 0, 0, 255], "inside region should be blue");
+        assert_eq!(px(0, 0), [0, 0, 255, 255], "top-left should stay red");
+        assert_eq!(px(10, 6), [0, 0, 255, 255], "bottom-right should stay red");
+        // Region edges (x in 2..6, y in 1..5).
+        assert_eq!(px(2, 1), [255, 0, 0, 255], "region corner blue");
+        assert_eq!(px(6, 1), [0, 0, 255, 255], "just past region stays red");
+    }
+
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn preview_composites_above_layer_over_lower_stroke() {
+        use crate::brush_engine::Dab;
+
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let brush = BrushEngine::new();
+        brush.size.set(20.0);
+        brush.opacity.set(1.0);
+
+        // Top layer (1): opaque green disc on the left at (16, 32).
+        canvas.add_layer("Top").expect("add layer");
+        let green = Color::new(0, 255, 0);
+        canvas.begin_stroke(green, 1.0, false).expect("begin green");
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(16.0, 32.0, 0), green, t))
+            .expect("stamp green");
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end green");
+        canvas.commit_stroke().expect("commit green");
+
+        // Paint a red stroke on the BELOW layer (0): one dab under the
+        // green (16, 32) and one in the clear area (48, 32).
+        canvas.layers().set_active(Some(0));
+        let red = Color::new(255, 0, 0);
+        canvas.begin_stroke(red, 1.0, false).expect("begin red");
+        let dabs = [
+            Dab::round(Point::new(16.0, 32.0), 8.0, red),
+            Dab::round(Point::new(48.0, 32.0), 8.0, red),
+        ];
+        canvas.stamp(|t| t.paint_dabs(&dabs)).expect("stamp red");
+
+        // Read the in-flight preview twice: the first builds the below
+        // cache, the second must reuse it and match byte-for-byte.
+        let first = canvas.read_pixels().expect("read 1");
+        let second = canvas.read_pixels().expect("read 2");
+        assert_eq!(first, second, "cached preview must equal a fresh build");
+
+        // Under the green (16, 32): opaque green on top wins.
+        let g_i = (32 * 64 + 16) * 4;
+        assert!(first[g_i + 1] >= 0xF0, "green over stroke G={:02x}", first[g_i + 1]);
+        assert!(first[g_i + 2] <= 0x10, "green over stroke R={:02x}", first[g_i + 2]);
+
+        // Clear area (48, 32): the in-flight red stroke shows through.
+        let r_i = (32 * 64 + 48) * 4;
+        assert!(first[r_i + 2] >= 0xF0, "red stroke R={:02x}", first[r_i + 2]);
+        assert!(first[r_i + 1] <= 0x10, "red stroke G={:02x}", first[r_i + 1]);
+    }
+
+    /// An in-flight eraser stroke's preview must reveal the layer below
+    /// the target (where erased) while leaving the rest of the target on
+    /// top. Exercises the `record_layered_preview` erase branch (scratch
+    /// build + below-cache exclude) without committing.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn preview_eraser_reveals_lower_layer() {
+        use crate::brush_engine::Dab;
+
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let n = (size.width * size.height) as usize;
+        let green: Vec<u8> = [0u8, 255, 0, 255].iter().copied().cycle().take(n * 4).collect();
+        let red: Vec<u8> = [0u8, 0, 255, 255].iter().copied().cycle().take(n * 4).collect();
+        canvas.add_layer_with_pixels("bottom", &green).expect("bottom");
+        let top = canvas.add_layer_with_pixels("top", &red).expect("top");
+        assert_eq!(canvas.layers().active(), Some(top), "top active");
+
+        let stroke_color = Color::new(0, 0, 0);
+        canvas.begin_stroke(stroke_color, 1.0, true).expect("begin erase");
+        let dabs = [Dab::round(Point::new(32.0, 32.0), 10.0, stroke_color)];
+        canvas.stamp(|t| t.paint_dabs(&dabs)).expect("stamp erase");
+
+        // Two reads: the first builds the below cache (excluding the target),
+        // the second must reuse it and match byte-for-byte.
+        let first = canvas.read_pixels().expect("read 1");
+        let second = canvas.read_pixels().expect("read 2");
+        assert_eq!(first, second, "cached erase preview must equal a fresh build");
+
+        // Under the eraser (32, 32): top red removed, green below revealed.
+        let c = (32 * 64 + 32) * 4;
+        assert!(first[c + 1] >= 0xF0, "center reveal green G={:02x}", first[c + 1]);
+        assert!(first[c + 2] <= 0x10, "center red removed R={:02x}", first[c + 2]);
+        assert_eq!(first[c + 3], 255, "center opaque (green below)");
+
+        // Far corner: top red still shown.
+        let k = (2 * 64 + 2) * 4;
+        assert!(first[k + 2] >= 0xF0, "corner keeps red R={:02x}", first[k + 2]);
+        assert!(first[k + 1] <= 0x10, "corner G={:02x}", first[k + 1]);
+
+        // Discarding must restore the canvas: top red everywhere again.
+        canvas.discard_stroke().expect("discard");
+        let after = canvas.read_pixels().expect("read after discard");
+        let c2 = (32 * 64 + 32) * 4;
+        assert!(after[c2 + 2] >= 0xF0, "after discard red restored R={:02x}", after[c2 + 2]);
+    }
+
+    /// The fused stamp+present path must actually deposit the dab into the
+    /// stroke buffer (visible in the preview readback) and accumulate the
+    /// dirty rect, just like the separate stamp + present calls.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn stamp_and_present_lands_in_stroke() {
+        use crate::brush_engine::Dab;
+
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+        let red = Color::new(255, 0, 0);
+
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        let dabs = [Dab::round(Point::new(32.0, 32.0), 12.0, red)];
+        canvas
+            .stamp_and_present(|t| t.paint_dabs(&dabs))
+            .expect("stamp_and_present");
+
+        // The in-flight preview must show the red stroke at the dab centre.
+        let px = canvas.read_pixels().expect("read");
+        let i = (32 * 64 + 32) * 4;
+        assert!(px[i + 2] >= 0xF0, "R={:02x}", px[i + 2]);
+        assert!(px[i + 1] <= 0x10, "G={:02x}", px[i + 1]);
+
+        // History dirty-rect tracking must work through the fused path.
+        assert!(
+            canvas.stroke_dirty_bounds().is_some(),
+            "fused stamp must accumulate the dirty rect"
+        );
+    }
+
+    /// The dab-quad dirty rect must cover every changed pixel, and a patch
+    /// built from just that region must equal the canonical full-canvas
+    /// diff. This is the correctness guarantee behind the bounded history
+    /// capture that replaces the full readback + full diff on pen-up.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn stroke_dirty_bounds_patch_matches_full_diff() {
+        use crate::brush_engine::Dab;
+        use crate::history::{LayerPatch, PatchBounds};
+
+        let size = Size::new(128, 96);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+
+        let red = Color::new(255, 0, 0);
+        let before_full = canvas.read_layer(0).expect("read before");
+
+        canvas.begin_stroke(red, 1.0, false).expect("begin");
+        let dabs = [
+            Dab::round(Point::new(30.0, 40.0), 9.0, red),
+            Dab::round(Point::new(70.0, 50.0), 6.0, red),
+        ];
+        canvas.stamp(|t| t.paint_dabs(&dabs)).expect("stamp");
+
+        let (bx, by, bw, bh) = canvas.stroke_dirty_bounds().expect("dirty bounds");
+
+        canvas.commit_stroke().expect("commit");
+        let after_full = canvas.read_layer(0).expect("read after");
+
+        // Canonical patch from a full-canvas diff.
+        let full_patch =
+            LayerPatch::from_full_diff(&before_full, &after_full, size.width, size.height)
+                .expect("stroke changed pixels");
+
+        // The dab-quad dirty rect must be a superset of the true AABB.
+        assert!(bx <= full_patch.bounds.x, "left {bx} > {}", full_patch.bounds.x);
+        assert!(by <= full_patch.bounds.y, "top {by} > {}", full_patch.bounds.y);
+        assert!(
+            bx + bw >= full_patch.bounds.x + full_patch.bounds.w,
+            "right {} < {}",
+            bx + bw,
+            full_patch.bounds.x + full_patch.bounds.w
+        );
+        assert!(
+            by + bh >= full_patch.bounds.y + full_patch.bounds.h,
+            "bottom {} < {}",
+            by + bh,
+            full_patch.bounds.y + full_patch.bounds.h
+        );
+
+        // A patch built from only the dirty region must be byte-identical
+        // to the canonical full-diff patch.
+        let region = PatchBounds {
+            x: bx,
+            y: by,
+            w: bw,
+            h: bh,
+        };
+        let before_region = LayerPatch::crop_canvas_region(&before_full, size.width, region);
+        let after_region = LayerPatch::crop_canvas_region(&after_full, size.width, region);
+        let region_patch = LayerPatch::from_region_diff(
+            &before_region,
+            &after_region,
+            region,
+            size.width,
+            size.height,
+        )
+        .expect("region changed");
+
+        assert_eq!(region_patch.bounds.x, full_patch.bounds.x);
+        assert_eq!(region_patch.bounds.y, full_patch.bounds.y);
+        assert_eq!(region_patch.bounds.w, full_patch.bounds.w);
+        assert_eq!(region_patch.bounds.h, full_patch.bounds.h);
+        assert_eq!(region_patch.before, full_patch.before);
+        assert_eq!(region_patch.after, full_patch.after);
+    }
+}
