@@ -1131,6 +1131,10 @@ impl DocumentSession {
     // -- App-level action handlers (dispatched to the active document) ---
 
     pub(crate) fn undo(&self) {
+        // Land any in-flight shape-correction stroke as a real history entry
+        // first, so this undo pops a consistent canvas state instead of
+        // reverting an older action behind an unrecorded corrected shape.
+        self.viewport.flush_pending_correction();
         let canvas = self.viewport.canvas();
         let label = {
             let mut h = self.history.borrow_mut();
@@ -1160,6 +1164,7 @@ impl DocumentSession {
     }
 
     pub(crate) fn redo(&self) {
+        self.viewport.flush_pending_correction();
         let canvas = self.viewport.canvas();
         let label = {
             let mut h = self.history.borrow_mut();

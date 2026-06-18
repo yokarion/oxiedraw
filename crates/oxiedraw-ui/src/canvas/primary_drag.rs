@@ -44,6 +44,19 @@ struct PendingStroke {
     before_full: Option<Vec<u8>>,
 }
 
+/// The data needed to finalize an in-flight shape-correction stroke to its
+/// final corrected geometry. Held while the correction animation plays so
+/// that a pen-up, or an undo/redo, can commit + record the corrected shape
+/// immediately instead of leaving it unrecorded (or frozen mid-morph).
+struct PendingCorrection {
+    color: Color,
+    opacity: f32,
+    erase: bool,
+    /// Original samples (pen dynamics preserved) remapped onto the corrected
+    /// path - i.e. the stroke at animation end (`t == 1`).
+    final_samples: Vec<InputSample>,
+}
+
 pub(super) struct PrimaryDragHandler {
     // -- shared ----------------------------------------------------------
     canvas: Rc<RefCell<Canvas>>,
@@ -68,6 +81,10 @@ pub(super) struct PrimaryDragHandler {
     pending_opacity: Rc<Cell<f32>>,
     pending_erase: Rc<Cell<bool>>,
     pending_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    /// Set once a shape-correction animation is armed; lets pen-up and
+    /// undo/redo finalize the corrected shape. `None` for a plain freehand
+    /// stroke or once the correction has been committed.
+    pending_correction: Rc<RefCell<Option<PendingCorrection>>>,
     // -- crop ------------------------------------------------------------
     crop: CropState,
     crop_handle: Rc<Cell<CropHandle>>,
@@ -219,6 +236,7 @@ impl PrimaryDragHandler {
         if let Some(src) = self.pending_timer.borrow_mut().take() {
             src.remove();
         }
+        *self.pending_correction.borrow_mut() = None;
 
         let color = self.colors.current();
         let opacity = self.brush_engine.opacity.get();
@@ -346,6 +364,28 @@ impl PrimaryDragHandler {
             src.remove();
         }
 
+        // A shape-correction animation was still playing: snap straight to the
+        // final corrected shape and record that, instead of committing whatever
+        // half-morphed frame happens to be in the buffer.
+        if let Some(c) = self.pending_correction.borrow_mut().take() {
+            let mut canvas = self.canvas.borrow_mut();
+            if draw_corrected_into_buffer(
+                &mut canvas,
+                &self.brush_engine,
+                c.color,
+                c.opacity,
+                c.erase,
+                &c.final_samples,
+            ) {
+                commit_stroke_and_record(&mut canvas, &self.pending_capture, &self.history);
+            } else {
+                let _ = canvas.discard_stroke();
+                let _ = self.pending_capture.borrow_mut().take();
+            }
+            present_into_paintable(&mut canvas, &self.paintable, &self.area);
+            return;
+        }
+
         let mut canvas = self.canvas.borrow_mut();
         // end_stroke is a no-op if shape correction already ended the engine stroke.
         if let Err(e) = canvas.stamp(|target| {
@@ -387,6 +427,17 @@ impl PrimaryDragHandler {
         }
 
         present_into_paintable(&mut canvas, &self.paintable, &self.area);
+    }
+
+    /// Land any in-flight brush stroke immediately as a recorded history
+    /// entry. Used by undo/redo (which fire while the pen may still be held)
+    /// so a pending shape correction can't desync the canvas from the undo
+    /// stack. Reuses `brush_end`, which already commits the corrected shape
+    /// (animation in flight) or the freehand stroke (idle timer armed).
+    fn finalize_pending_brush(&self) {
+        if self.pending_correction.borrow().is_some() || self.brush_engine.is_drawing() {
+            self.brush_end();
+        }
     }
 
     /// Record a brush stroke into history as a tight `LayerPatch` over the
@@ -458,6 +509,9 @@ impl PrimaryDragHandler {
         let opacity = self.pending_opacity.get();
         let erase = self.pending_erase.get();
         let timer_handle = Rc::clone(&self.pending_timer);
+        let correction_handle = Rc::clone(&self.pending_correction);
+        let capture_handle = Rc::clone(&self.pending_capture);
+        let history_handle = Rc::clone(&self.history);
 
         let src = glib::timeout_add_local(
             std::time::Duration::from_millis(u64::from(sc.trigger_delay_ms)),
@@ -505,6 +559,24 @@ impl PrimaryDragHandler {
                 }
                 let corrected_pts = morph_path(&positions, &corrected_geo);
 
+                // Stash the final corrected geometry so a pen-up or an
+                // undo/redo can land the shape immediately instead of waiting
+                // on (or losing) the animation.
+                let final_samples: Vec<InputSample> = samples
+                    .iter()
+                    .zip(corrected_pts.iter())
+                    .map(|(s, &target)| InputSample {
+                        position: target,
+                        ..*s
+                    })
+                    .collect();
+                *correction_handle.borrow_mut() = Some(PendingCorrection {
+                    color,
+                    opacity,
+                    erase,
+                    final_samples,
+                });
+
                 let anim_src = start_shape_animation(
                     Rc::clone(&canvas_t),
                     paintable_t.clone(),
@@ -516,6 +588,9 @@ impl PrimaryDragHandler {
                     samples.clone(),
                     corrected_pts,
                     Rc::clone(&timer_handle),
+                    Rc::clone(&correction_handle),
+                    Rc::clone(&capture_handle),
+                    Rc::clone(&history_handle),
                     sc.animation_speed_ms,
                 );
                 *timer_handle.borrow_mut() = Some(anim_src);
@@ -1281,7 +1356,98 @@ fn selection_mode_from_modifiers(gesture: &gtk::GestureDrag) -> SelectionMode {
     }
 }
 
-pub(super) fn start_shape_animation(
+/// Redraw `samples` (the corrected stroke at its final geometry) into a fresh
+/// stroke buffer. Leaves the buffer ready to commit; the layer stays pristine.
+/// Returns false if any renderer call failed (caller should discard).
+fn draw_corrected_into_buffer(
+    canvas: &mut Canvas,
+    brush_engine: &BrushEngine,
+    color: Color,
+    opacity: f32,
+    erase: bool,
+    samples: &[InputSample],
+) -> bool {
+    if let Err(e) = canvas.discard_stroke() {
+        tracing::error!(error = %e, "correction: discard_stroke failed");
+        return false;
+    }
+    if let Err(e) = canvas.begin_stroke(color, opacity, erase) {
+        tracing::error!(error = %e, "correction: begin_stroke failed");
+        return false;
+    }
+    for (i, &sample) in samples.iter().enumerate() {
+        let result = if i == 0 {
+            canvas.stamp(|t| brush_engine.begin_stroke(sample, color, t))
+        } else {
+            canvas.stamp(|t| brush_engine.push_sample(sample, t))
+        };
+        if let Err(e) = result {
+            tracing::error!(error = %e, "correction: stamp failed");
+            return false;
+        }
+    }
+    if let Err(e) = canvas.stamp(|t| brush_engine.end_stroke(t)) {
+        tracing::error!(error = %e, "correction: end_stroke stamp failed");
+        return false;
+    }
+    true
+}
+
+/// Commit the in-flight stroke buffer into its layer and record it as a tight
+/// `HistoryAction::Stroke` over the committed dirty rect. Used by the
+/// shape-correction path: the layer is pristine until this commit, so the
+/// pre-commit region read is exactly the undo "before" state. Consumes
+/// `pending_capture` so the pen-up handler won't record the same stroke twice.
+fn commit_stroke_and_record(
+    canvas: &mut Canvas,
+    pending_capture: &Rc<RefCell<Option<PendingStroke>>>,
+    history: &Rc<RefCell<HistoryStack>>,
+) {
+    let bounds = canvas.stroke_dirty_bounds();
+    let pending = pending_capture.borrow_mut().take();
+    let (Some(p), Some((x, y, w, h))) = (pending, bounds) else {
+        if let Err(e) = canvas.commit_stroke() {
+            tracing::error!(error = %e, "correction: commit_stroke failed");
+        }
+        return;
+    };
+
+    let mut before = Vec::new();
+    let before_ok = match canvas.read_layer_region_into(p.idx, x, y, w, h, &mut before) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, "history: corrected before-region read failed");
+            false
+        }
+    };
+
+    if let Err(e) = canvas.commit_stroke() {
+        tracing::error!(error = %e, "correction: commit_stroke failed");
+    }
+    if !before_ok {
+        return;
+    }
+
+    let mut after = Vec::new();
+    if let Err(e) = canvas.read_layer_region_into(p.idx, x, y, w, h, &mut after) {
+        tracing::warn!(error = %e, "history: corrected after-region read failed");
+        return;
+    }
+    if before.len() != after.len() {
+        tracing::warn!("history: corrected region size mismatch - skipping");
+        return;
+    }
+
+    let cs = canvas.size();
+    let region = PatchBounds { x, y, w, h };
+    if let Some(patch) = LayerPatch::from_region_diff(&before, &after, region, cs.width, cs.height) {
+        history
+            .borrow_mut()
+            .record(HistoryAction::Stroke { layer_id: p.id, patch });
+    }
+}
+
+fn start_shape_animation(
     canvas: Rc<RefCell<Canvas>>,
     paintable: CanvasPaintable,
     area: gtk::Picture,
@@ -1292,6 +1458,9 @@ pub(super) fn start_shape_animation(
     freehand_samples: Vec<InputSample>,
     corrected_pts: Vec<Point>,
     pending_timer: Rc<RefCell<Option<glib::SourceId>>>,
+    pending_correction: Rc<RefCell<Option<PendingCorrection>>>,
+    pending_capture: Rc<RefCell<Option<PendingStroke>>>,
+    history: Rc<RefCell<HistoryStack>>,
     animation_speed_ms: u32,
 ) -> glib::SourceId {
     let frame = Rc::new(Cell::new(0_u32));
@@ -1362,10 +1531,14 @@ pub(super) fn start_shape_animation(
         let is_last = f + 1 >= TOTAL_FRAMES;
 
         if is_last || !stamp_ok {
-            if stamp_ok
-                && let Err(e) = canvas_ref.commit_stroke() {
-                    tracing::error!(error = %e, "animation: commit_stroke failed");
-                }
+            // The corrected shape is now fully painted into the stroke buffer;
+            // it is settled, so drop the finalizer state and record it.
+            *pending_correction.borrow_mut() = None;
+            if stamp_ok {
+                commit_stroke_and_record(&mut canvas_ref, &pending_capture, &history);
+            } else if let Err(e) = canvas_ref.discard_stroke() {
+                tracing::error!(error = %e, "animation: discard after stamp failure");
+            }
             present_into_paintable(&mut canvas_ref, &paintable, &area);
             *pending_timer.borrow_mut() = None;
             glib::ControlFlow::Break
@@ -1516,6 +1689,7 @@ pub(super) fn install_primary_drag(
         pending_opacity: Rc::new(Cell::new(1.0)),
         pending_erase: Rc::new(Cell::new(false)),
         pending_timer: Rc::new(RefCell::new(None)),
+        pending_correction: Rc::new(RefCell::new(None)),
         crop: crop.clone(),
         crop_handle: Rc::new(Cell::new(CropHandle::None)),
         crop_start: Rc::new(Cell::new(Point::ZERO)),
@@ -1556,6 +1730,15 @@ pub(super) fn install_primary_drag(
     {
         let h = Rc::clone(&handler);
         drag.connect_drag_end(move |_, _, _| h.on_end());
+    }
+
+    // Let undo/redo land an in-flight shape correction before they touch
+    // history, so the corrected shape is recorded rather than silently
+    // overwriting an older action's undo state.
+    {
+        let h = Rc::clone(&handler);
+        *viewport.flush_correction_handle().borrow_mut() =
+            Some(Box::new(move || h.finalize_pending_brush()));
     }
 
     area.add_controller(drag);

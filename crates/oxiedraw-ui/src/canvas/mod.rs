@@ -109,6 +109,11 @@ pub(crate) struct Viewport {
     redraw: RedrawHandle,
     canvas_size: Rc<Cell<Size>>,
     picture: Rc<RefCell<Option<gtk::Picture>>>,
+    /// Set by the brush handler while a shape-correction stroke is mid-flight
+    /// (idle timer armed or animation playing). undo/redo invoke it first so
+    /// the in-flight stroke is committed and recorded before history mutates,
+    /// keeping the canvas and the undo stack in sync.
+    flush_correction: Rc<RefCell<Option<Box<dyn Fn()>>>>,
 }
 
 impl std::fmt::Debug for Viewport {
@@ -138,6 +143,24 @@ impl Viewport {
             redraw: RedrawHandle::default(),
             canvas_size: Rc::new(Cell::new(canvas_size)),
             picture: Rc::new(RefCell::new(None)),
+            flush_correction: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Cloneable slot the brush handler installs its "finalize the in-flight
+    /// shape-correction stroke" callback into. Lives on the viewport so the
+    /// app-level undo/redo handlers can drive it without reaching into the
+    /// gesture internals.
+    pub(crate) fn flush_correction_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
+        Rc::clone(&self.flush_correction)
+    }
+
+    /// Commit + record any in-flight shape-correction stroke. No-op when
+    /// nothing is pending. Called by undo/redo before they touch history so a
+    /// half-corrected stroke can't desync the canvas from the undo stack.
+    pub(crate) fn flush_pending_correction(&self) {
+        if let Some(cb) = self.flush_correction.borrow().as_ref() {
+            cb();
         }
     }
 
