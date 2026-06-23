@@ -59,14 +59,19 @@ pub(super) fn install_layer_actions(
             let result = canvas.borrow_mut().duplicate_layer(idx);
             match result {
                 Ok(new_idx) => {
-                    let (new_id, new_name, new_kind, new_pixels) = {
+                    let (new_id, new_name, new_kind, new_blend, new_opacity, new_pixels) = {
                         let mut c = canvas.borrow_mut();
                         let snap = c.layers().snapshot();
                         let id = snap.get(new_idx).map(|l| l.id.clone()).unwrap_or_default();
                         let name = snap.get(new_idx).map(|l| l.name.clone()).unwrap_or_default();
                         let kind = snap.get(new_idx).map(|l| l.kind.clone()).unwrap_or_default();
+                        let blend = snap.get(new_idx).map_or(
+                            oxiedraw_core::document::BlendMode::Normal,
+                            |l| l.blend,
+                        );
+                        let opacity = snap.get(new_idx).map_or(1.0, |l| l.opacity);
                         let pixels = c.read_layer(new_idx).unwrap_or_default();
-                        (id, name, kind, pixels)
+                        (id, name, kind, blend, opacity, pixels)
                     };
                     history.borrow_mut().record(HistoryAction::LayerDuplicate {
                         src_idx: idx,
@@ -74,6 +79,8 @@ pub(super) fn install_layer_actions(
                         new_id,
                         new_name,
                         layer_kind: new_kind,
+                        blend: new_blend,
+                        opacity: new_opacity,
                         pixels: new_pixels,
                     });
                     sync_height(&area, &ui);
@@ -118,19 +125,25 @@ pub(super) fn install_layer_actions(
                     let name = layer.name.clone();
                     let visible = layer.visible;
                     let kind = layer.kind.clone();
-                    c.read_layer(idx).ok().map(|pixels| (id, name, visible, kind, pixels))
+                    let blend = layer.blend;
+                    let opacity = layer.opacity;
+                    c.read_layer(idx)
+                        .ok()
+                        .map(|pixels| (id, name, visible, kind, blend, opacity, pixels))
                 })
             };
             let result = canvas.borrow_mut().remove_layer(idx);
             match result {
                 Ok(()) => {
-                    if let Some((id, name, visible, kind, pixels)) = pre {
+                    if let Some((id, name, visible, kind, blend, opacity, pixels)) = pre {
                         history.borrow_mut().record(HistoryAction::LayerRemove {
                             idx,
                             id,
                             name,
                             visible,
                             layer_kind: kind,
+                            blend,
+                            opacity,
                             pixels,
                         });
                     }
@@ -203,12 +216,20 @@ pub(super) fn install_layer_actions(
                             id: layer.id.clone(),
                             name: layer.name.clone(),
                             visible: layer.visible,
+                            blend: layer.blend,
+                            opacity: layer.opacity,
                             pixels,
                         })
                     })
                     .collect();
                 (survivor_pre, folded)
             };
+
+            let (survivor_blend, survivor_opacity) = snap
+                .get(sorted[0])
+                .map_or((oxiedraw_core::document::BlendMode::Normal, 1.0), |l| {
+                    (l.blend, l.opacity)
+                });
 
             let result = canvas.borrow_mut().merge_layers(&sorted);
             match result {
@@ -219,6 +240,8 @@ pub(super) fn install_layer_actions(
                         survivor_idx: sorted[0],
                         survivor_pre,
                         survivor_post,
+                        survivor_blend,
+                        survivor_opacity,
                         folded,
                     });
                     let mut tree = ui.tree.borrow_mut();
@@ -283,13 +306,15 @@ pub(super) fn install_layer_actions(
                     tracing::error!(error = %e, "group-delete: remove_layer failed");
                     continue;
                 }
-                if let Some((id, name, visible, kind, pixels)) = captured {
+                if let Some((id, name, visible, kind, blend, opacity, pixels)) = captured {
                     removals.push(HistoryAction::LayerRemove {
                         idx,
                         id,
                         name,
                         visible,
                         layer_kind: kind,
+                        blend,
+                        opacity,
                         pixels,
                     });
                 }
@@ -401,7 +426,9 @@ pub(super) fn install_layer_actions(
                     else {
                         continue;
                     };
-                    if let Some((id, name, visible, kind, pixels)) = capture_layer(&mut c, idx) {
+                    if let Some((id, name, visible, kind, blend, opacity, pixels)) =
+                        capture_layer(&mut c, idx)
+                    {
                         adds.push((
                             idx,
                             HistoryAction::LayerAdd {
@@ -410,6 +437,8 @@ pub(super) fn install_layer_actions(
                                 name,
                                 visible,
                                 layer_kind: kind,
+                                blend,
+                                opacity,
                                 pixels,
                             },
                         ));
@@ -623,7 +652,7 @@ pub(super) fn layer_paste(
         let result = canvas.borrow_mut().add_layer_with_pixels(name, &pixels);
         match result {
             Ok(new_idx) => {
-                if let Some((id, name, visible, kind, px)) =
+                if let Some((id, name, visible, kind, blend, opacity, px)) =
                     capture_layer(&mut canvas.borrow_mut(), new_idx)
                 {
                     history.borrow_mut().record(HistoryAction::LayerAdd {
@@ -632,6 +661,8 @@ pub(super) fn layer_paste(
                         name,
                         visible,
                         layer_kind: kind,
+                        blend,
+                        opacity,
                         pixels: px,
                     });
                 }
@@ -780,7 +811,7 @@ fn paste_as_new_layer(
     let result = canvas.borrow_mut().add_layer_with_pixels(name, &pixels);
     match result {
         Ok(new_idx) => {
-            if let Some((id, name, visible, kind, px)) =
+            if let Some((id, name, visible, kind, blend, opacity, px)) =
                 capture_layer(&mut canvas.borrow_mut(), new_idx)
             {
                 history.borrow_mut().record(HistoryAction::LayerAdd {
@@ -789,6 +820,8 @@ fn paste_as_new_layer(
                     name,
                     visible,
                     layer_kind: kind,
+                    blend,
+                    opacity,
                     pixels: px,
                 });
             }

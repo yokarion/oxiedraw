@@ -266,7 +266,7 @@ impl Viewport {
     pub(crate) fn load_layers_resized(
         &self,
         size: Size,
-        layers: &[(String, String, bool, Vec<u8>)],
+        layers: &[(String, String, bool, oxiedraw_core::document::BlendMode, f32, Vec<u8>)],
         active: Option<usize>,
     ) -> bool {
         {

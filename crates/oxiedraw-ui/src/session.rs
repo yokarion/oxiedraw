@@ -257,6 +257,8 @@ impl DocumentSession {
                                 visible: l.visible,
                                 pixels: px,
                                 kind: l.kind.clone(),
+                                blend: l.blend,
+                                opacity: l.opacity,
                             })
                         })
                         .collect();
@@ -279,6 +281,8 @@ impl DocumentSession {
                                     visible: l.visible,
                                     pixels: px,
                                     kind: l.kind.clone(),
+                                    blend: l.blend,
+                                    opacity: l.opacity,
                                 })
                             })
                             .collect();
@@ -314,6 +318,9 @@ impl DocumentSession {
             let components_c = Rc::clone(&components);
             let text_engine_c = Rc::clone(&global.text_engine);
             Rc::new(move || {
+                // End any live GPU blend preview before restoring/recompositing.
+                canvas_c.borrow_mut().clear_transform_preview();
+                paintable_c.set_transform_gpu_preview(false);
                 // Text layer transform: re-render the text at its (unchanged)
                 // box and restore - the box geometry was never modified.
                 if transform_c.text.borrow().is_some() {
@@ -446,6 +453,9 @@ impl DocumentSession {
             let components_c = Rc::clone(&components);
             let text_engine_c = Rc::clone(&global.text_engine);
             Rc::new(move || {
+                // End any live GPU blend preview; the commit recomposites below.
+                canvas_c.borrow_mut().clear_transform_preview();
+                paintable_c.set_transform_gpu_preview(false);
                 // Text layer transform: the natural layout (box w/h, font) is
                 // unchanged - the transform only updates the box centre/angle and
                 // the anamorphic display scale, so a scale squishes the glyphs and
@@ -657,6 +667,8 @@ impl DocumentSession {
                             name,
                             visible,
                             layer_kind: LayerKind::Raster,
+                            blend: oxiedraw_core::document::BlendMode::Normal,
+                            opacity: 1.0,
                             pixels: after_px,
                         });
                     } else {
@@ -1368,6 +1380,8 @@ struct StashedLayer {
     name: String,
     visible: bool,
     kind: LayerKind,
+    blend: oxiedraw_core::document::BlendMode,
+    opacity: f32,
     pixels: Vec<u8>,
 }
 
@@ -1387,6 +1401,8 @@ fn capture_canvas(viewport: &Viewport) -> (Size, Vec<StashedLayer>, Option<usize
             name: l.name.clone(),
             visible: l.visible,
             kind: l.kind.clone(),
+            blend: l.blend,
+            opacity: l.opacity,
             pixels,
         });
     }
@@ -1472,6 +1488,8 @@ fn do_exit_component_edit(
                     id: l.id,
                     name: l.name,
                     visible: l.visible,
+                    blend: l.blend,
+                    opacity: l.opacity,
                     pixels: l.pixels,
                 })
                 .collect();
@@ -1479,13 +1497,22 @@ fn do_exit_component_edit(
         }
     }
 
-    // Restore the main canvas, then re-apply the layer kinds that
-    // replace_all_layers reset to Raster.
-    let main_tuples: Vec<(String, String, bool, Vec<u8>)> = ctx
-        .main_layers
-        .iter()
-        .map(|l| (l.id.clone(), l.name.clone(), l.visible, l.pixels.clone()))
-        .collect();
+    // Restore the main canvas (with each layer's blend), then re-apply the
+    // layer kinds that replace_all_layers reset to Raster.
+    let main_tuples: Vec<(String, String, bool, oxiedraw_core::document::BlendMode, f32, Vec<u8>)> =
+        ctx.main_layers
+            .iter()
+            .map(|l| {
+                (
+                    l.id.clone(),
+                    l.name.clone(),
+                    l.visible,
+                    l.blend,
+                    l.opacity,
+                    l.pixels.clone(),
+                )
+            })
+            .collect();
     viewport.load_layers_resized(ctx.main_size, &main_tuples, ctx.main_active);
     {
         let canvas = viewport.canvas();
@@ -1611,7 +1638,7 @@ fn do_place_component(
         }),
     );
 
-    if let Some((id, lname, visible, kind, px)) =
+    if let Some((id, lname, visible, kind, blend, opacity, px)) =
         oxiedraw_core::history::capture_layer(&mut canvas.borrow_mut(), idx)
     {
         history.borrow_mut().record(HistoryAction::LayerAdd {
@@ -1620,6 +1647,8 @@ fn do_place_component(
             name: lname,
             visible,
             layer_kind: kind,
+            blend,
+            opacity,
             pixels: px,
         });
     }
@@ -1673,6 +1702,41 @@ fn capture_transform_above(
             paintable.set_transform_above(Some(&above), cs.width, cs.height);
         }
         Err(e) => tracing::error!(error = %e, "transform: begin_transform_preview failed"),
+    }
+}
+
+/// Eagerly start the live GPU blend preview from the now-populated transform
+/// state, so a non-Normal layer shows its real blend at rest - before any drag.
+/// Reads the captured source + geometry; falls back to the GSK overlay if it
+/// can't start (e.g. a dims/pixels mismatch). One submit at tool-enter; the
+/// per-drag path is unchanged, so dragging stays smooth.
+fn start_transform_gpu_preview(
+    canvas: &Rc<RefCell<Canvas>>,
+    paintable: &crate::canvas_paintable::CanvasPaintable,
+    transform: &TransformState,
+) {
+    let (Some(idx), Some((w, h)), Some(orig), Some(rect)) = (
+        transform.original_layer_idx.get(),
+        transform.original_src_dims.get(),
+        transform.original_rect.get(),
+        transform.rect.get(),
+    ) else {
+        return;
+    };
+    let Some(pixels) = transform.original_pixels.borrow().clone() else {
+        return;
+    };
+    if pixels.len() != (w as usize) * (h as usize) * 4 {
+        return;
+    }
+    let mut c = canvas.borrow_mut();
+    match c.begin_transform_preview_gpu(idx, &pixels, w, h) {
+        Ok(()) => {
+            c.set_transform_preview(orig, rect, w, h);
+            drop(c);
+            paintable.set_transform_gpu_preview(true);
+        }
+        Err(e) => tracing::error!(error = %e, "transform: begin_transform_preview_gpu failed"),
     }
 }
 
@@ -1743,6 +1807,7 @@ fn build_apply_tool(
                 if let Some(idx) = transform_for_tool.original_layer_idx.get() {
                     capture_transform_above(&canvas_for_tool, &paintable, idx);
                 }
+                start_transform_gpu_preview(&canvas_for_tool, &paintable, &transform_for_tool);
                 redraw_for_tool.request();
                 transform_for_tool.notify_changed();
             } else {
@@ -1777,6 +1842,11 @@ fn build_apply_tool(
                                 Some((inst.component_id, placement_rect));
                             transform_for_tool.notify_changed();
                             paintable.set_transform_rect(Some(placement_rect));
+                            start_transform_gpu_preview(
+                                &canvas_for_tool,
+                                &paintable,
+                                &transform_for_tool,
+                            );
                             redraw_for_tool.request();
                         }
                         return;
@@ -1819,6 +1889,11 @@ fn build_apply_tool(
                         }
                         transform_for_tool.notify_changed();
                         paintable.set_transform_rect(Some(current_rect));
+                        start_transform_gpu_preview(
+                            &canvas_for_tool,
+                            &paintable,
+                            &transform_for_tool,
+                        );
                         redraw_for_tool.request();
                         return;
                     }
@@ -1877,6 +1952,12 @@ fn build_apply_tool(
                         transform_for_tool.is_paste.set(false);
                         transform_for_tool.notify_changed();
                         paintable.set_transform_rect(Some(current_rect));
+                        start_transform_gpu_preview(
+                            &canvas_for_tool,
+                            &paintable,
+                            &transform_for_tool,
+                        );
+                        redraw_for_tool.request();
                     } else {
                         let lift_idx = selection_for_sat
                             .source_layer
@@ -1942,16 +2023,26 @@ fn build_apply_tool(
                             );
                             *transform_for_tool.original_pixels.borrow_mut() = Some(pixels);
                             transform_for_tool.original_layer_idx.set(Some(target_idx));
+                            transform_for_tool.original_src_dims.set(Some((src_w, src_h)));
                             transform_for_tool.is_paste.set(false);
                             transform_for_tool.rect.set(Some(orig_rect));
                             transform_for_tool.notify_changed();
                             paintable.set_transform_rect(Some(orig_rect));
+                            start_transform_gpu_preview(
+                                &canvas_for_tool,
+                                &paintable,
+                                &transform_for_tool,
+                            );
+                            redraw_for_tool.request();
                         }
                     }
                 }
             }
         } else {
             // Switching away from Transform without apply/cancel - silently cancel.
+            // End any live GPU blend preview first.
+            canvas_for_tool.borrow_mut().clear_transform_preview();
+            paintable.set_transform_gpu_preview(false);
             // Text layer: re-render at its (unchanged) box and restore.
             if transform_for_tool.text.borrow().is_some() {
                 if let Some(idx) = transform_for_tool.original_layer_idx.get() {

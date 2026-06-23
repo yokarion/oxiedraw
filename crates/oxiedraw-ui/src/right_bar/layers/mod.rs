@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::document::{LayerKind, LayerState};
+use oxiedraw_core::document::{BlendMode, LayerKind, LayerState};
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 use relm4::gtk::cairo;
@@ -150,6 +150,9 @@ pub(super) struct Ui {
     pub(super) multi_selected: Rc<RefCell<HashSet<String>>>,
     // Mutually exclusive with `state.active()`: only one of layer/group is primary.
     pub(super) active_group: Rc<RefCell<Option<String>>>,
+    // Late-bound callback that reloads the blend-mode/opacity controls from the
+    // current selection. Invoked whenever the selection changes.
+    pub(super) blend_sync: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 }
 
 impl Ui {
@@ -168,7 +171,25 @@ impl Ui {
             thumbnails: Rc::new(RefCell::new(Vec::new())),
             multi_selected: Rc::new(RefCell::new(HashSet::new())),
             active_group: Rc::new(RefCell::new(None)),
+            blend_sync: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Reload the blend-mode/opacity controls from the current selection.
+    fn sync_blend_controls(&self) {
+        let cb = self.blend_sync.borrow().clone();
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
+
+    /// Selected layers as flat canvas indices, in stack order.
+    fn selected_indices(&self) -> Vec<usize> {
+        let snapshot = self.state.snapshot();
+        self.selected_layer_ids_in_order()
+            .iter()
+            .filter_map(|id| snapshot.iter().position(|l| &l.id == id))
+            .collect()
     }
 
     fn active_id(&self) -> Option<String> {
@@ -949,6 +970,7 @@ fn build_layers_page(
     start_thumbnail_refresh(&ui, Rc::clone(canvas), area.clone());
 
     page.append(&build_layers_header(&ui, &area, canvas, redraw, toaster, history));
+    page.append(&build_blend_controls(&ui, canvas, redraw, history));
 
     let scroll = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
@@ -973,6 +995,7 @@ fn build_layers_page(
             sync_tree_order_from_canvas(&mut ui.tree.borrow_mut(), &c);
             drop(c);
             sync_height(&area, &ui);
+            ui.sync_blend_controls();
             area.queue_draw();
         }) as Rc<dyn Fn()>
     };
@@ -1062,9 +1085,12 @@ fn build_layers_header(
                         name,
                         visible: true,
                         layer_kind: oxiedraw_core::document::LayerKind::Raster,
+                        blend: oxiedraw_core::document::BlendMode::Normal,
+                        opacity: 1.0,
                         pixels: new_pixels,
                     });
                     sync_height(&area, &ui);
+                    ui.sync_blend_controls();
                     area.queue_draw();
                     redraw.request();
                 }
@@ -1107,6 +1133,255 @@ fn build_layers_footer() -> gtk::Box {
     footer.append(&dup_btn);
     footer.append(&merge_btn);
     footer
+}
+
+/// Blend-mode dropdown + opacity slider, shown between the header and the layer
+/// list. Both span the panel width and apply to every selected layer; a control
+/// is only pushed onto its layers when the user actually touches it (a guard
+/// suppresses the programmatic updates the sync callback makes on selection).
+fn build_blend_controls(
+    ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
+    redraw: &RedrawHandle,
+    history: &Rc<RefCell<HistoryStack>>,
+) -> gtk::Box {
+    let controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(TAB_SPACING)
+        .build();
+
+    let labels: Vec<&str> = BlendMode::ALL.iter().map(|m| m.label()).collect();
+    let mode_dropdown = gtk::DropDown::from_strings(&labels);
+    mode_dropdown.set_hexpand(true);
+    mode_dropdown.set_tooltip_text(Some("Blend mode of the selected layers"));
+
+    let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
+    opacity.set_hexpand(true);
+    opacity.set_draw_value(false);
+    opacity.set_tooltip_text(Some("Opacity of the selected layers"));
+
+    let opacity_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(TAB_SPACING)
+        .build();
+    let opacity_label = gtk::Label::builder()
+        .label("100%")
+        .width_chars(4)
+        .xalign(1.0)
+        .build();
+    opacity_label.add_css_class("dim-label");
+    opacity_row.append(&opacity);
+    opacity_row.append(&opacity_label);
+
+    controls.append(&mode_dropdown);
+    controls.append(&opacity_row);
+
+    // True while the sync callback is writing the widgets, so their change
+    // handlers don't treat the programmatic update as a user edit.
+    let guard = Rc::new(std::cell::Cell::new(false));
+    // Per-layer (id, blend, opacity) captured at the start of a slider drag, so
+    // the whole drag commits as one undoable history entry on settle. Keyed by
+    // id so a reorder during the debounce window can't mis-attribute it.
+    let drag_origin: Rc<RefCell<Option<Vec<(String, BlendMode, f32)>>>> =
+        Rc::new(RefCell::new(None));
+    let commit_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+
+    // Record the in-progress opacity drag as one history entry, comparing each
+    // origin layer (by id) against its current opacity. Safe when no drag is
+    // active. Does not touch the debounce timer; callers manage that slot.
+    let commit_opacity: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let history = Rc::clone(history);
+        let drag_origin = Rc::clone(&drag_origin);
+        Rc::new(move || {
+            let Some(origin) = drag_origin.borrow_mut().take() else {
+                return;
+            };
+            let snapshot = ui.state.snapshot();
+            let actions: Vec<HistoryAction> = origin
+                .iter()
+                .filter_map(|(id, old_blend, old_op)| {
+                    let layer = snapshot.iter().find(|l| &l.id == id)?;
+                    if (layer.opacity - old_op).abs() < f32::EPSILON {
+                        return None;
+                    }
+                    Some(HistoryAction::LayerBlend {
+                        id: id.clone(),
+                        old_blend: *old_blend,
+                        old_opacity: *old_op,
+                        new_blend: layer.blend,
+                        new_opacity: layer.opacity,
+                    })
+                })
+                .collect();
+            record_blend_actions(&history, actions);
+        })
+    };
+
+    // --- sync: reload the controls from the current selection ---
+    let sync: Rc<dyn Fn()> = {
+        let ui = ui.clone();
+        let guard = Rc::clone(&guard);
+        let mode_dropdown = mode_dropdown.clone();
+        let opacity = opacity.clone();
+        let opacity_label = opacity_label.clone();
+        let commit_opacity = Rc::clone(&commit_opacity);
+        let commit_source = Rc::clone(&commit_source);
+        Rc::new(move || {
+            // A selection change ends any in-progress opacity drag: flush its
+            // pending history entry now so the next drag starts clean.
+            if let Some(src) = commit_source.borrow_mut().take() {
+                src.remove();
+            }
+            commit_opacity();
+            let indices = ui.selected_indices();
+            let sensitive = !indices.is_empty();
+            mode_dropdown.set_sensitive(sensitive);
+            opacity.set_sensitive(sensitive);
+            // Show the primary (active) layer's values, falling back to the
+            // first selected one.
+            let primary = ui.state.active().filter(|i| indices.contains(i))
+                .or_else(|| indices.first().copied());
+            let (blend, op) = primary
+                .and_then(|i| ui.state.blend(i))
+                .unwrap_or((BlendMode::Normal, 1.0));
+            guard.set(true);
+            mode_dropdown.set_selected(blend.to_index());
+            opacity.set_value(f64::from(op));
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            opacity_label.set_label(&format!("{}%", (op * 100.0).round() as i32));
+            guard.set(false);
+        })
+    };
+    sync();
+    *ui.blend_sync.borrow_mut() = Some(Rc::clone(&sync));
+
+    // --- blend mode changed: applies to every selected layer at once ---
+    {
+        let ui = ui.clone();
+        let canvas = Rc::clone(canvas);
+        let redraw = redraw.clone();
+        let history = Rc::clone(history);
+        let guard = Rc::clone(&guard);
+        let sync = Rc::clone(&sync);
+        mode_dropdown.connect_selected_notify(move |dd| {
+            if guard.get() {
+                return;
+            }
+            let new_blend = BlendMode::from_index(dd.selected());
+            let indices = ui.selected_indices();
+            if indices.is_empty() {
+                return;
+            }
+            let mut changes = Vec::with_capacity(indices.len());
+            let mut actions = Vec::with_capacity(indices.len());
+            for &idx in &indices {
+                let Some((old_blend, op)) = ui.state.blend(idx) else { continue };
+                if old_blend == new_blend {
+                    continue;
+                }
+                let Some(id) = ui.state.snapshot().get(idx).map(|l| l.id.clone()) else {
+                    continue;
+                };
+                changes.push((idx, new_blend, op));
+                actions.push(HistoryAction::LayerBlend {
+                    id,
+                    old_blend,
+                    old_opacity: op,
+                    new_blend,
+                    new_opacity: op,
+                });
+            }
+            if changes.is_empty() {
+                return;
+            }
+            if let Err(e) = canvas.borrow_mut().set_layers_blend(&changes) {
+                tracing::error!(error = %e, "set_layers_blend (mode) failed");
+                return;
+            }
+            record_blend_actions(&history, actions);
+            redraw.request();
+            sync();
+        });
+    }
+
+    // --- opacity changed: live apply each event, one history entry per drag ---
+    {
+        let ui = ui.clone();
+        let canvas = Rc::clone(canvas);
+        let redraw = redraw.clone();
+        let guard = Rc::clone(&guard);
+        let drag_origin = Rc::clone(&drag_origin);
+        let commit_source = Rc::clone(&commit_source);
+        let commit_opacity = Rc::clone(&commit_opacity);
+        let opacity_label = opacity_label.clone();
+        opacity.connect_value_changed(move |scale| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let new_op = scale.value() as f32;
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            opacity_label.set_label(&format!("{}%", (new_op * 100.0).round() as i32));
+            if guard.get() {
+                return;
+            }
+            let indices = ui.selected_indices();
+            if indices.is_empty() {
+                return;
+            }
+            // Capture the pre-drag state once, on the first event of a drag.
+            // Keyed by id so the commit survives a reorder mid-debounce.
+            if drag_origin.borrow().is_none() {
+                let snapshot = ui.state.snapshot();
+                let origin: Vec<(String, BlendMode, f32)> = indices
+                    .iter()
+                    .filter_map(|&i| {
+                        let layer = snapshot.get(i)?;
+                        Some((layer.id.clone(), layer.blend, layer.opacity))
+                    })
+                    .collect();
+                *drag_origin.borrow_mut() = Some(origin);
+            }
+            let changes: Vec<(usize, BlendMode, f32)> = indices
+                .iter()
+                .filter_map(|&i| ui.state.blend(i).map(|(b, _)| (i, b, new_op)))
+                .collect();
+            if let Err(e) = canvas.borrow_mut().set_layers_blend(&changes) {
+                tracing::error!(error = %e, "set_layers_blend (opacity) failed");
+                return;
+            }
+            redraw.request();
+
+            // Debounce: commit one history entry once the drag settles.
+            if let Some(src) = commit_source.borrow_mut().take() {
+                src.remove();
+            }
+            let commit_opacity = Rc::clone(&commit_opacity);
+            let commit_source_inner = Rc::clone(&commit_source);
+            let src = glib::timeout_add_local_once(
+                std::time::Duration::from_millis(300),
+                move || {
+                    commit_source_inner.borrow_mut().take();
+                    commit_opacity();
+                },
+            );
+            *commit_source.borrow_mut() = Some(src);
+        });
+    }
+
+    controls
+}
+
+/// Record one or more `LayerBlend` actions as a single undoable unit (a bare
+/// action for one layer, a `Batch` for several). No-op when empty.
+fn record_blend_actions(history: &Rc<RefCell<HistoryStack>>, mut actions: Vec<HistoryAction>) {
+    let action = match actions.len() {
+        0 => return,
+        1 => actions.remove(0),
+        _ => HistoryAction::Batch {
+            label: "Change layer blend".to_string(),
+            actions,
+        },
+    };
+    history.borrow_mut().record(action);
 }
 
 // --- Height ---
@@ -2043,6 +2318,7 @@ fn install_list_input(
                             }
                         }
                         actions::refresh_action_sensitivity(&ui);
+                        ui.sync_blend_controls();
                         area_w.queue_draw();
                     }
                 }

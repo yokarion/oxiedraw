@@ -453,7 +453,7 @@ impl TextEdit {
         }
 
         if a.created {
-            if let Some((lid, name, visible, kind, px)) =
+            if let Some((lid, name, visible, kind, blend, opacity, px)) =
                 oxiedraw_core::history::capture_layer(&mut self.canvas.borrow_mut(), idx)
             {
                 self.history.borrow_mut().record(HistoryAction::LayerAdd {
@@ -462,6 +462,8 @@ impl TextEdit {
                     name,
                     visible,
                     layer_kind: kind,
+                    blend,
+                    opacity,
                     pixels: px,
                 });
             }

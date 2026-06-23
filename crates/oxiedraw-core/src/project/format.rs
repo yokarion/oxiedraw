@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::LayerKind;
+use crate::document::{BlendMode, LayerKind};
 use crate::text::fonts::FontMeta;
 
 /// Current writer schema. Loaders accept any version listed in
@@ -12,8 +12,9 @@ use crate::text::fonts::FontMeta;
 /// `components/<id>/layers/<id>.png`) and a `kind` on each main layer entry.
 /// v4 adds text layers (`LayerKind::Text`, stored inline in `kind`) and the
 /// embedded font files they use (`fonts.json` + `fonts/<hash>`).
-pub const SCHEMA_VERSION: u32 = 4;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4];
+/// v5 adds per-layer `blend` mode and `opacity`.
+pub const SCHEMA_VERSION: u32 = 5;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -35,6 +36,16 @@ pub struct LayerEntry {
     /// `Raster`).
     #[serde(default)]
     pub kind: LayerKind,
+    /// Composite blend mode. Absent in pre-v5 files (defaults to `Normal`).
+    #[serde(default)]
+    pub blend: BlendMode,
+    /// Layer opacity in `0.0..=1.0`. Absent in pre-v5 files (defaults to 1.0).
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+}
+
+fn default_opacity() -> f32 {
+    1.0
 }
 
 /// One raster layer inside a component (in `components.json`). Its pixels live
@@ -44,6 +55,11 @@ pub struct ComponentLayerEntry {
     pub id: String,
     pub name: String,
     pub visible: bool,
+    /// Composite blend mode + opacity. Absent in pre-v5 files (Normal / 1.0).
+    #[serde(default)]
+    pub blend: BlendMode,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
 }
 
 /// A component definition written to `components.json`.

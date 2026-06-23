@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::snapshot::LayerPatch;
 use crate::components::ComponentSnapshot;
-use crate::document::{LayerKind, Placement};
+use crate::document::{BlendMode, LayerKind, Placement};
 use crate::text::TextContent;
 
 /// Direction of replay. Forward = redo or first apply; Backward = undo.
@@ -84,6 +84,12 @@ pub enum HistoryAction {
         visible: bool,
         /// Raster, or a component instance (so placement survives undo/redo).
         layer_kind: LayerKind,
+        /// Blend mode at time of add (absent in older files -> Normal). Lets a
+        /// duplicate of a blended layer keep its blend through undo/redo.
+        #[serde(default = "default_blend")]
+        blend: BlendMode,
+        #[serde(default = "default_opacity")]
+        opacity: f32,
         /// Full-canvas BGRA8 pixels at time of add (e.g. paste content).
         pixels: Vec<u8>,
     },
@@ -94,6 +100,11 @@ pub enum HistoryAction {
         name: String,
         visible: bool,
         layer_kind: LayerKind,
+        /// Blend mode at removal time (absent in older files -> Normal).
+        #[serde(default = "default_blend")]
+        blend: BlendMode,
+        #[serde(default = "default_opacity")]
+        opacity: f32,
         pixels: Vec<u8>,
     },
     /// Layer moved from `from` to `to` in the z-order.
@@ -106,6 +117,16 @@ pub enum HistoryAction {
     },
     /// Layer visibility toggled.
     LayerVisibility { id: String, old: bool, new: bool },
+    /// Layer blend mode and/or opacity changed (keyed by layer id so it is
+    /// stable across reorders). Both old and new carry the full pair so a
+    /// dropdown-only or slider-only change round-trips exactly.
+    LayerBlend {
+        id: String,
+        old_blend: BlendMode,
+        old_opacity: f32,
+        new_blend: BlendMode,
+        new_opacity: f32,
+    },
     /// A text layer was edited (typed, restyled, resized). The patch carries
     /// the slot pixel diff; the before/after content let undo/redo restore the
     /// layer's `Text` kind metadata in lock-step with the pixels.
@@ -133,6 +154,10 @@ pub enum HistoryAction {
         new_id: String,
         new_name: String,
         layer_kind: LayerKind,
+        #[serde(default = "default_blend")]
+        blend: BlendMode,
+        #[serde(default = "default_opacity")]
+        opacity: f32,
         pixels: Vec<u8>,
     },
     /// Several layers merged into one. `folded` describes each removed
@@ -141,6 +166,13 @@ pub enum HistoryAction {
         survivor_idx: usize,
         survivor_pre: Vec<u8>,
         survivor_post: Vec<u8>,
+        /// The survivor's blend/opacity before the merge; the merge bakes the
+        /// blend into the pixels and resets the slot to Normal, so undo must
+        /// restore these.
+        #[serde(default = "default_blend")]
+        survivor_blend: BlendMode,
+        #[serde(default = "default_opacity")]
+        survivor_opacity: f32,
         folded: Vec<FoldedLayer>,
     },
     /// Selection mask state changed (marquee, select-all, invert, deselect,
@@ -194,6 +226,10 @@ pub struct FoldedLayer {
     pub name: String,
     pub visible: bool,
     pub pixels: Vec<u8>,
+    #[serde(default = "default_blend")]
+    pub blend: BlendMode,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +242,18 @@ pub struct CropLayer {
     /// coordinate space, so undo/redo of a crop preserves non-raster layers.
     #[serde(default)]
     pub kind: LayerKind,
+    #[serde(default = "default_blend")]
+    pub blend: BlendMode,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
+}
+
+const fn default_blend() -> BlendMode {
+    BlendMode::Normal
+}
+
+const fn default_opacity() -> f32 {
+    1.0
 }
 
 impl HistoryAction {
@@ -225,6 +273,7 @@ impl HistoryAction {
             Self::LayerReorder { .. } => "Reorder layer",
             Self::LayerRename { .. } => "Rename layer",
             Self::LayerVisibility { .. } => "Toggle layer visibility",
+            Self::LayerBlend { .. } => "Change layer blend",
             Self::LayerDuplicate { .. } => "Duplicate layer",
             Self::LayerMerge { .. } => "Merge layers",
             Self::SelectionChange { .. } => "Selection",

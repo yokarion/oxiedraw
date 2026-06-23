@@ -61,6 +61,73 @@ pub struct ComponentInstance {
     pub placement: Placement,
 }
 
+/// How a layer's pixels are composited over the layers below it. The integer
+/// values are the contract with `layer_blend.frag` (see [`Self::to_gpu`]) and
+/// must not be reordered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    Multiply,
+    Addition,
+    Darken,
+    Screen,
+    Overlay,
+}
+
+impl BlendMode {
+    /// Every mode in dropdown order.
+    pub const ALL: [Self; 6] = [
+        Self::Normal,
+        Self::Multiply,
+        Self::Addition,
+        Self::Darken,
+        Self::Screen,
+        Self::Overlay,
+    ];
+
+    /// Human-readable name for the UI dropdown.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::Multiply => "Multiply",
+            Self::Addition => "Addition",
+            Self::Darken => "Darken",
+            Self::Screen => "Screen",
+            Self::Overlay => "Overlay",
+        }
+    }
+
+    /// Index passed to the blend shader's push constant.
+    #[must_use]
+    pub const fn to_gpu(self) -> u32 {
+        match self {
+            Self::Normal => 0,
+            Self::Multiply => 1,
+            Self::Addition => 2,
+            Self::Darken => 3,
+            Self::Screen => 4,
+            Self::Overlay => 5,
+        }
+    }
+
+    /// Map a dropdown position back to a mode (clamped to `Normal`).
+    #[must_use]
+    pub fn from_index(index: u32) -> Self {
+        Self::ALL.get(index as usize).copied().unwrap_or(Self::Normal)
+    }
+
+    /// Position of this mode in `ALL` (its dropdown row). Paired with
+    /// `from_index`; kept separate from `to_gpu` so the UI order and the shader
+    /// contract can change independently.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn to_index(self) -> u32 {
+        Self::ALL.iter().position(|&m| m == self).unwrap_or(0) as u32
+    }
+}
+
 /// What a layer holds.
 ///
 /// `Raster` is the normal painted layer. `Component` is a pre-rendered,
@@ -107,6 +174,10 @@ pub struct Layer {
     pub name: String,
     pub visible: bool,
     pub kind: LayerKind,
+    /// How this layer composites over the layers below it.
+    pub blend: BlendMode,
+    /// Layer opacity in `0.0..=1.0` (1.0 = fully opaque).
+    pub opacity: f32,
 }
 
 impl Layer {
@@ -117,6 +188,8 @@ impl Layer {
             name: name.into(),
             visible: true,
             kind: LayerKind::Raster,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
         }
     }
 
@@ -126,6 +199,8 @@ impl Layer {
             name: name.into(),
             visible,
             kind: LayerKind::Raster,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
         }
     }
 
@@ -163,5 +238,33 @@ impl Layer {
             LayerKind::Text(content) => Some(content),
             LayerKind::Raster | LayerKind::Component(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BlendMode;
+
+    // The dropdown index (to_index/from_index) round-trips for every mode and is
+    // independent of the shader contract (to_gpu).
+    #[test]
+    fn blend_mode_dropdown_index_round_trips() {
+        for mode in BlendMode::ALL {
+            assert_eq!(BlendMode::from_index(mode.to_index()), mode);
+        }
+        // Normal is the clamp target for an out-of-range dropdown row.
+        assert_eq!(BlendMode::from_index(99), BlendMode::Normal);
+    }
+
+    // to_gpu is the shader push value (0..5) and must stay fixed regardless of
+    // dropdown ordering.
+    #[test]
+    fn blend_mode_gpu_indices_are_stable() {
+        assert_eq!(BlendMode::Normal.to_gpu(), 0);
+        assert_eq!(BlendMode::Multiply.to_gpu(), 1);
+        assert_eq!(BlendMode::Addition.to_gpu(), 2);
+        assert_eq!(BlendMode::Darken.to_gpu(), 3);
+        assert_eq!(BlendMode::Screen.to_gpu(), 4);
+        assert_eq!(BlendMode::Overlay.to_gpu(), 5);
     }
 }

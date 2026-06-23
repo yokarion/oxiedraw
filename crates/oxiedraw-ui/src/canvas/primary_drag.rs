@@ -687,6 +687,9 @@ impl PrimaryDragHandler {
             let a = (canvas_pos.y - rect.cy).atan2(canvas_pos.x - rect.cx);
             self.transform_drag_start_rotation_angle.set(a);
         }
+        // Show the blended preview the moment the layer is grabbed, before any
+        // movement, so a non-Normal layer doesn't flash Normal on press.
+        self.update_transform_gpu_preview(rect);
     }
 
     fn transform_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
@@ -711,6 +714,52 @@ impl PrimaryDragHandler {
         self.transform.rect.set(Some(new_rect));
         self.transform.notify_changed();
         self.paintable.set_transform_rect(Some(new_rect));
+
+        self.update_transform_gpu_preview(new_rect);
+    }
+
+    /// Refresh the live GPU blend preview for `rect`: start it if needed (the
+    /// GSK overlay can't show the layer's blend mode), then warp + blend +
+    /// present through Vulkan. No-op when the GPU preview couldn't start.
+    fn update_transform_gpu_preview(&self, rect: TransformRect) {
+        self.ensure_transform_gpu_preview();
+        if let Some((sw, sh)) = self.transform.original_src_dims.get()
+            && let Some(orig) = self.transform.original_rect.get()
+        {
+            let mut canvas = self.canvas.borrow_mut();
+            if canvas.transform_preview_active() {
+                canvas.set_transform_preview(orig, rect, sw, sh);
+                present_into_paintable(&mut canvas, &self.paintable, &self.area);
+            }
+        }
+    }
+
+    /// Begin the live GPU transform preview if it isn't already running. Reads
+    /// the source pixels + dims the active transform captured.
+    fn ensure_transform_gpu_preview(&self) {
+        let mut canvas = self.canvas.borrow_mut();
+        if canvas.transform_preview_active() {
+            return;
+        }
+        let Some(idx) = self.transform.original_layer_idx.get() else {
+            return;
+        };
+        let Some((w, h)) = self.transform.original_src_dims.get() else {
+            return;
+        };
+        let pixels = self.transform.original_pixels.borrow().clone();
+        let Some(pixels) = pixels else {
+            return;
+        };
+        // Guard against a dims/pixels mismatch uploading garbage; fall back to
+        // the GSK overlay if they disagree.
+        if pixels.len() != (w as usize) * (h as usize) * 4 {
+            return;
+        }
+        match canvas.begin_transform_preview_gpu(idx, &pixels, w, h) {
+            Ok(()) => self.paintable.set_transform_gpu_preview(true),
+            Err(e) => tracing::error!(error = %e, "begin_transform_preview_gpu failed"),
+        }
     }
 
     // -- selection ---------------------------------------------------------

@@ -35,7 +35,7 @@ use std::process::ExitCode;
 
 use relm4::RelmApp;
 
-const APP_ID: &str = "io.github.yokarion.OxieDraw";
+const APP_ID: &str = "com.yokarion.oxiedraw";
 
 /// Resource path the icon tree is registered under; see `build.rs`.
 const ICON_RESOURCE_PATH: &str = "/io/github/yokarion/OxieDraw/icons";

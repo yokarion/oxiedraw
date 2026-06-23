@@ -3,7 +3,7 @@ use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
 use crate::brush_engine::PaintTarget;
 use crate::color::Color;
-use crate::document::{LayerKind, LayerState};
+use crate::document::{BlendMode, LayerKind, LayerState};
 use crate::filters::FilterSpec;
 use crate::renderer::{
     DmabufDescriptor, EdgesBuffer, RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
@@ -256,15 +256,18 @@ impl Canvas {
             return Err(RendererError::LayerIndexOutOfRange);
         }
 
-        let n_pixels = (self.renderer.canvas_size().width * self.renderer.canvas_size().height) as usize * 4;
-        let mut merged = vec![0u8; n_pixels];
-        for &idx in &sorted {
-            let pixels = self.renderer.read_layer(idx)?;
-            alpha_over_premul_bgra8(&mut merged, &pixels);
-        }
+        // Composite the selected layers together honoring each one's blend
+        // mode + opacity, so the flattened raster matches what the user saw.
+        let mut merged = Vec::new();
+        self.renderer.read_layers_composited(&sorted, &mut merged)?;
 
         let target = sorted[0];
         self.renderer.write_layer(target, &merged)?;
+        // The blend is now baked into the pixels; the survivor composites
+        // Normal/opaque from here so it is not blended a second time.
+        self.layers.set_blend(target, BlendMode::Normal, 1.0);
+        self.renderer
+            .set_layer_blend(target, BlendMode::Normal.to_gpu(), 1.0);
 
         for &idx in sorted[1..].iter().rev() {
             self.renderer.remove_layer(idx)?;
@@ -287,6 +290,11 @@ impl Canvas {
             .map_or_else(|| "Layer".to_string(), |l| l.name.clone());
         let new_name = format!("{src_name} copy");
 
+        let (src_blend, src_opacity) = self
+            .layers
+            .blend(src_idx)
+            .unwrap_or((BlendMode::Normal, 1.0));
+
         let top_idx = self.renderer.add_layer()?;
         let state_idx = self.layers.add(new_name);
         debug_assert_eq!(
@@ -300,6 +308,11 @@ impl Canvas {
             self.layers.reorder(top_idx, target_idx);
             self.renderer.reorder_layer(top_idx, target_idx);
         }
+
+        // The duplicate inherits the source's blend mode + opacity.
+        self.layers.set_blend(target_idx, src_blend, src_opacity);
+        self.renderer
+            .set_layer_blend(target_idx, src_blend.to_gpu(), src_opacity);
 
         self.layers.set_active(Some(target_idx));
         self.recomposite_canvas()?;
@@ -339,11 +352,36 @@ impl Canvas {
         Ok(())
     }
 
-    /// Replace the entire layer stack with `(id, name, visible, bgra8_pixels)` entries.
-    /// Discards any in-flight stroke.
+    /// Set the blend mode + opacity of one or more layers and re-composite the
+    /// canvas once. Both the document state and the GPU layer slots are updated
+    /// so the change survives the next composite and a save/load round-trip.
+    pub fn set_layers_blend(
+        &mut self,
+        changes: &[(usize, BlendMode, f32)],
+    ) -> Result<(), RendererError> {
+        for &(idx, blend, opacity) in changes {
+            self.layers.set_blend(idx, blend, opacity);
+            self.renderer.set_layer_blend(idx, blend.to_gpu(), opacity);
+        }
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Set the blend mode + opacity of a single layer (convenience wrapper).
+    pub fn set_layer_blend(
+        &mut self,
+        idx: usize,
+        blend: BlendMode,
+        opacity: f32,
+    ) -> Result<(), RendererError> {
+        self.set_layers_blend(&[(idx, blend, opacity)])
+    }
+
+    /// Replace the entire layer stack with `(id, name, visible, blend, opacity,
+    /// bgra8_pixels)` entries. Discards any in-flight stroke.
     pub fn replace_all_layers(
         &mut self,
-        layers: &[(String, String, bool, Vec<u8>)],
+        layers: &[(String, String, bool, BlendMode, f32, Vec<u8>)],
     ) -> Result<(), RendererError> {
         self.current_stroke = None;
 
@@ -352,13 +390,15 @@ impl Canvas {
         }
         self.layers.clear();
 
-        for (id, name, visible, pixels) in layers {
+        for (id, name, visible, blend, opacity, pixels) in layers {
             let gpu_idx = self.renderer.add_layer()?;
             let state_idx = self.layers.add_full(id.clone(), name.as_str(), *visible);
             debug_assert_eq!(
                 gpu_idx, state_idx,
                 "renderer and state must stay in lockstep"
             );
+            self.layers.set_blend(state_idx, *blend, *opacity);
+            self.renderer.set_layer_blend(gpu_idx, blend.to_gpu(), *opacity);
             self.renderer.write_layer(gpu_idx, pixels)?;
         }
 
@@ -520,6 +560,10 @@ impl Canvas {
                 let visibilities = self.visibilities();
                 self.renderer.render_shape_preview(&visibilities)?;
                 self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.transform_preview_active() {
+                let visibilities = self.visibilities();
+                self.renderer.render_transform_preview(&visibilities)?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
             } else {
                 match self.current_stroke {
                     Some(ctx) => {
@@ -647,12 +691,20 @@ impl Canvas {
         let old_size = self.renderer.canvas_size();
 
         let snap = self.layers.snapshot();
-        let mut cropped: Vec<(String, String, bool, Vec<u8>)> = Vec::with_capacity(snap.len());
+        let mut cropped: Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> =
+            Vec::with_capacity(snap.len());
         let kinds: Vec<LayerKind> = snap.iter().map(|l| l.kind.clone()).collect();
         for (idx, layer) in snap.iter().enumerate() {
             let raw = self.renderer.read_layer(idx)?;
             let pixels = crop_bgra8(&raw, old_size.width, old_size.height, crop_x, crop_y, w, h);
-            cropped.push((layer.id.clone(), layer.name.clone(), layer.visible, pixels));
+            cropped.push((
+                layer.id.clone(),
+                layer.name.clone(),
+                layer.visible,
+                layer.blend,
+                layer.opacity,
+                pixels,
+            ));
         }
 
         self.renderer = VulkanRenderer::new(new_size)?;
@@ -683,12 +735,13 @@ impl Canvas {
     /// Recreate the renderer at `size` and load a fresh layer set. Used to
     /// swap the canvas between the main document and a component's edit
     /// surface (which may have a different size). `layers` are
-    /// `(id, name, visible, bgra8_pixels)` sized to `size`; `active` selects
-    /// the active layer afterwards. Discards any in-flight stroke.
+    /// `(id, name, visible, blend, opacity, bgra8_pixels)` sized to `size`;
+    /// `active` selects the active layer afterwards. Discards any in-flight
+    /// stroke.
     pub fn resize_and_replace_layers(
         &mut self,
         size: Size,
-        layers: &[(String, String, bool, Vec<u8>)],
+        layers: &[(String, String, bool, BlendMode, f32, Vec<u8>)],
         active: Option<usize>,
     ) -> Result<(), RendererError> {
         self.renderer = VulkanRenderer::new(size)?;
@@ -1017,50 +1070,16 @@ impl Canvas {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let out_h = (max_y.ceil() as i32 - ext_y).max(1) as u32;
 
-        // Precompute the 2x3 inverse affine that maps the output framebuffer's
-        // [0,1] UV directly to the source texture's [0,1] UV. See the shader
-        // comment in transform.frag; the chain is:
-        //   v_uv -> output_px -> canvas_px -> current_local -> source_local ->
-        //   source_px -> source_uv
-        // collapsed to two row-vec3 dot products.
-        let ca = current_rect.angle.cos();
-        let sa = current_rect.angle.sin();
-        let kx = original_rect.w / current_rect.w;
-        let ky = original_rect.h / current_rect.h;
-        #[allow(clippy::cast_precision_loss)]
-        let ow = out_w as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let oh = out_h as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let ox = ext_x as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let oy = ext_y as f32;
-        let ccx = current_rect.cx;
-        let ccy = current_rect.cy;
-        let ocx = original_rect.cx;
-        let ocy = original_rect.cy;
-        #[allow(clippy::cast_precision_loss)]
-        let sw = src_w as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let sh = src_h as f32;
-
-        let a1 = ow * ca;
-        let b1 = oh * sa;
-        let c1 = (ox - ccx).mul_add(ca, (oy - ccy) * sa);
-        let a2 = -ow * sa;
-        let b2 = oh * ca;
-        let c2 = (-(ox - ccx)).mul_add(sa, (oy - ccy) * ca);
-
-        let push = [
-            a1 * kx / sw,
-            b1 * kx / sw,
-            c1.mul_add(kx, ocx) / sw,
-            0.0,
-            a2 * ky / sh,
-            b2 * ky / sh,
-            c2.mul_add(ky, ocy) / sh,
-            0.0,
-        ];
+        let push = compute_transform_push(
+            original_rect,
+            current_rect,
+            src_w,
+            src_h,
+            out_w,
+            out_h,
+            ext_x,
+            ext_y,
+        );
 
         let pixels = self.renderer.apply_layer_transform_gpu(
             layer_idx,
@@ -1076,6 +1095,128 @@ impl Canvas {
         self.recomposite_canvas()?;
         Ok((pixels, ext_x, ext_y, out_w, out_h))
     }
+
+    /// Start the live GPU transform preview for `layer_idx`. `source_pixels`
+    /// are the upright `src_w x src_h` pixels being transformed (already lifted
+    /// out of the layer, which the caller has cleared). The caller then drives
+    /// it per drag-frame with [`Self::set_transform_preview`].
+    pub fn begin_transform_preview_gpu(
+        &mut self,
+        layer_idx: usize,
+        source_pixels: &[u8],
+        src_w: u32,
+        src_h: u32,
+    ) -> Result<(), RendererError> {
+        self.renderer
+            .begin_transform_preview_gpu(layer_idx, source_pixels, src_w, src_h)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Update the live transform preview to `current_rect` and refresh the
+    /// display. No-op if no preview session is active.
+    pub fn set_transform_preview(
+        &mut self,
+        original_rect: TransformRect,
+        current_rect: TransformRect,
+        src_w: u32,
+        src_h: u32,
+    ) {
+        let cs = self.renderer.canvas_size();
+        let push = compute_transform_push(
+            original_rect,
+            current_rect,
+            src_w,
+            src_h,
+            cs.width,
+            cs.height,
+            0,
+            0,
+        );
+        self.renderer.set_transform_preview_push(push);
+        self.bump_version();
+    }
+
+    /// Whether the live GPU transform preview is active.
+    #[must_use]
+    pub fn transform_preview_active(&self) -> bool {
+        self.renderer.transform_preview_active()
+    }
+
+    /// Render the live transform preview and read it back as BGRA8. Diagnostic /
+    /// test helper; the interactive path presents it instead.
+    pub fn read_transform_preview(&mut self) -> Result<Vec<u8>, RendererError> {
+        let visibilities = self.visibilities();
+        self.renderer.read_transform_preview(&visibilities)
+    }
+
+    /// Tear down the live transform preview (on apply/cancel/tool-switch).
+    /// No-op (and no version bump) when no preview session is active.
+    pub fn clear_transform_preview(&mut self) {
+        if self.renderer.transform_preview_active() {
+            self.renderer.clear_transform_preview_gpu();
+            self.bump_version();
+        }
+    }
+}
+
+/// Precompute the 2x3 inverse affine that maps an output framebuffer's `[0,1]`
+/// UV directly to the source texture's `[0,1]` UV. See the shader comment in
+/// `transform.frag`; the chain is:
+///   v_uv -> output_px -> canvas_px -> current_local -> source_local ->
+///   source_px -> source_uv
+/// collapsed to two row-vec3 dot products. `out_w/out_h/ext_x/ext_y` describe
+/// the output framebuffer (the AABB for a commit, or the full canvas at origin
+/// for the live preview).
+#[allow(clippy::too_many_arguments)]
+fn compute_transform_push(
+    original_rect: TransformRect,
+    current_rect: TransformRect,
+    src_w: u32,
+    src_h: u32,
+    out_w: u32,
+    out_h: u32,
+    ext_x: i32,
+    ext_y: i32,
+) -> [f32; 8] {
+    let ca = current_rect.angle.cos();
+    let sa = current_rect.angle.sin();
+    let kx = original_rect.w / current_rect.w;
+    let ky = original_rect.h / current_rect.h;
+    #[allow(clippy::cast_precision_loss)]
+    let ow = out_w as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let oh = out_h as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let ox = ext_x as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let oy = ext_y as f32;
+    let ccx = current_rect.cx;
+    let ccy = current_rect.cy;
+    let ocx = original_rect.cx;
+    let ocy = original_rect.cy;
+    #[allow(clippy::cast_precision_loss)]
+    let sw = src_w as f32;
+    #[allow(clippy::cast_precision_loss)]
+    let sh = src_h as f32;
+
+    let a1 = ow * ca;
+    let b1 = oh * sa;
+    let c1 = (ox - ccx).mul_add(ca, (oy - ccy) * sa);
+    let a2 = -ow * sa;
+    let b2 = oh * ca;
+    let c2 = (-(ox - ccx)).mul_add(sa, (oy - ccy) * ca);
+
+    [
+        a1 * kx / sw,
+        b1 * kx / sw,
+        c1.mul_add(kx, ocx) / sw,
+        0.0,
+        a2 * ky / sh,
+        b2 * ky / sh,
+        c2.mul_add(ky, ocy) / sh,
+        0.0,
+    ]
 }
 
 impl Canvas {
@@ -1263,21 +1404,6 @@ fn split_layer_by_mask(layer: &[u8], mask: &[u8]) -> (Vec<u8>, Vec<u8>) {
         }
     }
     (masked, remaining)
-}
-
-// Porter-Duff "src over dst" on premultiplied BGRA8 buffers, in place on `dst`.
-fn alpha_over_premul_bgra8(dst: &mut [u8], src: &[u8]) {
-    debug_assert_eq!(dst.len(), src.len());
-    let n = dst.len() / 4;
-    for i in 0..n {
-        let sa = u32::from(src[i * 4 + 3]);
-        let inv = 255 - sa;
-        for c in 0..4 {
-            let s = u32::from(src[i * 4 + c]);
-            let d = u32::from(dst[i * 4 + c]);
-            dst[i * 4 + c] = (s + (d * inv + 127) / 255) as u8;
-        }
-    }
 }
 
 // CPU pixel helpers (crop_bgra8, transform_bgra8, sample_*) live in

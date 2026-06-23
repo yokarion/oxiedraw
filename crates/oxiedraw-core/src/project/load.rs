@@ -134,6 +134,8 @@ pub fn build_components(project: &OxieProject) -> ComponentLibrary {
                     id: l.id.clone(),
                     name: l.name.clone(),
                     visible: l.visible,
+                    blend: l.blend,
+                    opacity: l.opacity,
                     pixels: project.component_pixels.get(&key).cloned().unwrap_or_default(),
                 }
             })
@@ -169,7 +171,7 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
         return Err(ProjectError::NoLayers);
     }
 
-    let layers: Vec<(String, String, bool, Vec<u8>)> = doc
+    let layers: Vec<(String, String, bool, crate::document::BlendMode, f32, Vec<u8>)> = doc
         .layers
         .iter()
         .map(|entry| {
@@ -178,7 +180,14 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
                 .get(&entry.id)
                 .cloned()
                 .unwrap_or_default();
-            (entry.id.clone(), entry.name.clone(), entry.visible, pixels)
+            (
+                entry.id.clone(),
+                entry.name.clone(),
+                entry.visible,
+                entry.blend,
+                entry.opacity,
+                pixels,
+            )
         })
         .collect();
 
@@ -204,6 +213,7 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::BlendMode;
     use crate::project::format::{
         ComponentLayerEntry, DocumentData, Manifest, APP_VERSION, SCHEMA_VERSION,
     };
@@ -235,6 +245,8 @@ mod tests {
                     id: "l1".to_string(),
                     name: "L1".to_string(),
                     visible: true,
+                    blend: BlendMode::Normal,
+                    opacity: 1.0,
                 }],
             }],
             component_pixels: HashMap::from([("c1/l1".to_string(), pixels.clone())]),

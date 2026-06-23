@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use super::{Layer, LayerKind};
+use super::{BlendMode, Layer, LayerKind};
 
 /// Layer list + active selection. Index 0 is the bottom of the z-order stack.
 ///
@@ -112,6 +112,20 @@ impl LayerState {
         if let Some(layer) = self.layers.borrow_mut().get_mut(index) {
             layer.visible = visible;
         }
+    }
+
+    /// Set the blend mode + opacity of the layer at `index`. No-op if out of
+    /// range. Opacity is clamped to `0.0..=1.0`.
+    pub fn set_blend(&self, index: usize, blend: BlendMode, opacity: f32) {
+        if let Some(layer) = self.layers.borrow_mut().get_mut(index) {
+            layer.blend = blend;
+            layer.opacity = opacity.clamp(0.0, 1.0);
+        }
+    }
+
+    /// Blend mode + opacity of the layer at `index`, or `None` if out of range.
+    pub fn blend(&self, index: usize) -> Option<(BlendMode, f32)> {
+        self.layers.borrow().get(index).map(|l| (l.blend, l.opacity))
     }
 
     /// Move layer at `from` to position `to`. Adjusts the active

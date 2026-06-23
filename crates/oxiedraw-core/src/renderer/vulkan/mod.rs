@@ -21,6 +21,7 @@ mod selection_ops;
 mod shape_ops;
 mod stroke;
 mod transform_ops;
+mod transform_preview;
 
 pub use shape_ops::ShapeKind;
 
@@ -40,7 +41,8 @@ use super::erase::ErasePreview;
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
 use super::instance::{self, DebugMessenger};
-use super::layers::{LayerCompositePipeline, LayerStack};
+use super::layers::{LayerBlendPipeline, LayerCompositePipeline, LayerStack};
+use transform_preview::TransformPreview;
 use super::mask::{DabPipelineSet, MaskPipelineSet};
 use super::pattern_atlas::PatternAtlas;
 use super::resources::{Buffer, Image};
@@ -137,7 +139,18 @@ pub struct VulkanRenderer {
     pub(super) pattern_cache: std::collections::HashMap<usize, u32>,
     pub(super) composite_pipeline: ManuallyDrop<CompositePipeline>,
     pub(super) layer_composite_pipeline: ManuallyDrop<LayerCompositePipeline>,
+    /// Blend pipeline (per-layer mode + opacity), driven by `cmd_compose_layer_blended`.
+    pub(super) layer_blend_pipeline: ManuallyDrop<LayerBlendPipeline>,
+    /// Canvas-sized scratch holding a copy of the current accumulator so the
+    /// blend pass can sample the destination while writing it. Paired with
+    /// `blend_scratch_dst_set` (binds its view as the blend pipeline's set 1).
+    pub(super) blend_scratch: ManuallyDrop<Image>,
+    pub(super) blend_scratch_dst_set: vk::DescriptorSet,
+    pub(super) blend_descriptor_pool: vk::DescriptorPool,
     pub(super) transform_pipeline: ManuallyDrop<TransformPipeline>,
+    /// Reusable resources for the live GPU transform preview, present only
+    /// while the transform tool is dragging.
+    pub(super) transform_preview: Option<TransformPreview>,
     pub(super) layer_stack: ManuallyDrop<LayerStack>,
     pub(super) selection: ManuallyDrop<SelectionResources>,
     /// Whether the selection mask currently holds a real selection. When
@@ -325,6 +338,26 @@ impl VulkanRenderer {
         )?;
         let layer_composite_pipeline =
             LayerCompositePipeline::new(&dev.device, canvas_target.render_pass)?;
+        let layer_blend_pipeline = LayerBlendPipeline::new(
+            &dev.device,
+            canvas_target.render_pass,
+            layer_composite_pipeline.descriptor_set_layout,
+        )?;
+        let blend_scratch = Image::new_2d(
+            &dev.device,
+            &mut allocator,
+            "blend-scratch",
+            CANVAS_FORMAT,
+            extent,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let (blend_descriptor_pool, blend_scratch_dst_set) = create_sampled_image_set(
+            &dev.device,
+            layer_composite_pipeline.descriptor_set_layout,
+            layer_composite_pipeline.sampler,
+            blend_scratch.view,
+        )?;
         let erase_preview = ErasePreview::new(
             &dev.device,
             &mut allocator,
@@ -386,7 +419,12 @@ impl VulkanRenderer {
             pattern_cache: std::collections::HashMap::new(),
             composite_pipeline: ManuallyDrop::new(composite_pipeline),
             layer_composite_pipeline: ManuallyDrop::new(layer_composite_pipeline),
+            layer_blend_pipeline: ManuallyDrop::new(layer_blend_pipeline),
+            blend_scratch: ManuallyDrop::new(blend_scratch),
+            blend_scratch_dst_set,
+            blend_descriptor_pool,
             transform_pipeline: ManuallyDrop::new(transform_pipeline),
+            transform_preview: None,
             layer_stack: ManuallyDrop::new(layer_stack),
             selection: ManuallyDrop::new(selection),
             selection_active: false,
@@ -506,6 +544,11 @@ impl VulkanRenderer {
                 ),
                 full_image_barrier(
                     this.erase_preview.scratch.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                ),
+                full_image_barrier(
+                    this.blend_scratch.handle,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::GENERAL,
                 ),
@@ -690,6 +733,86 @@ impl VulkanRenderer {
         }
     }
 
+    /// Composite one premultiplied BGRA layer (via `src_set`) onto the
+    /// accumulator image `acc_img` (rendered through `acc_fb`) using the
+    /// layer's blend `mode` + `opacity`. Because the blend math needs to read
+    /// the destination while writing it, the accumulator is first copied into
+    /// `blend_scratch`, which the blend pass samples as its second input.
+    /// Caller must be inside a `record_and_submit` closure.
+    /// Composite one premultiplied BGRA image (via `descriptor_set`) onto
+    /// `framebuffer` with the layer-composite pipeline (premultiplied OVER).
+    pub(super) fn cmd_compose_image(
+        &self,
+        framebuffer: vk::Framebuffer,
+        descriptor_set: vk::DescriptorSet,
+    ) {
+        let render_pass = self.canvas_target.render_pass;
+        let pipeline = self.layer_composite_pipeline.pipeline;
+        let layout = self.layer_composite_pipeline.layout;
+        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[descriptor_set],
+                &[],
+            );
+        }
+        self.cmd_end_fullscreen_pass();
+    }
+
+    pub(super) fn cmd_compose_layer_blended(
+        &self,
+        acc_img: vk::Image,
+        acc_fb: vk::Framebuffer,
+        src_set: vk::DescriptorSet,
+        mode: u32,
+        opacity: f32,
+    ) {
+        // Normal at full opacity is plain premultiplied OVER, which the
+        // fixed-function blend pipeline does without reading the destination.
+        // Skip the scratch copy + extra pass on this (overwhelmingly common)
+        // path.
+        if mode == 0 && opacity >= 1.0 {
+            self.cmd_compose_image(acc_fb, src_set);
+            self.barrier(acc_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            return;
+        }
+        // blend_scratch := current accumulator (the destination).
+        self.cmd_copy_image_full(acc_img, self.blend_scratch.handle);
+
+        let render_pass = self.canvas_target.render_pass;
+        let pipeline = self.layer_blend_pipeline.pipeline;
+        let layout = self.layer_blend_pipeline.layout;
+        self.cmd_begin_fullscreen_pass(render_pass, acc_fb, pipeline);
+        let sets = [src_set, self.blend_scratch_dst_set];
+        let mut push = [0u8; 8];
+        push[0..4].copy_from_slice(&mode.to_ne_bytes());
+        push[4..8].copy_from_slice(&opacity.clamp(0.0, 1.0).to_ne_bytes());
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &sets,
+                &[],
+            );
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &push,
+            );
+        }
+        self.cmd_end_fullscreen_pass();
+        // Make this layer's write visible to the next composite's sampler.
+        self.barrier(acc_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+    }
+
     /// Draw the fullscreen triangle (3 vertices, 1 instance) and end the
     /// render pass started by `cmd_begin_fullscreen_pass`.
     pub(super) fn cmd_end_fullscreen_pass(&self) {
@@ -733,12 +856,17 @@ impl VulkanRenderer {
 
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
+        self.clear_transform_preview_gpu();
         unsafe {
             let _ = self.device.device_wait_idle();
             self.device.destroy_fence(self.fence, None);
             self.device.destroy_command_pool(self.command_pool, None);
             ManuallyDrop::take(&mut self.layer_stack).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.transform_pipeline).destroy(&self.device);
+            self.device
+                .destroy_descriptor_pool(self.blend_descriptor_pool, None);
+            ManuallyDrop::take(&mut self.blend_scratch).destroy(&self.device, &mut self.allocator);
+            ManuallyDrop::take(&mut self.layer_blend_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.layer_composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.filter_resources)

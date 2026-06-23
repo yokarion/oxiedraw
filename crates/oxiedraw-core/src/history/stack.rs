@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use super::action::{Direction, HistoryAction};
 use crate::canvas::Canvas;
 use crate::components::ComponentLibrary;
-use crate::document::{ComponentInstance, LayerKind};
+use crate::document::{BlendMode, ComponentInstance, LayerKind};
 use crate::renderer::RendererError;
 
 /// Maximum number of undo entries kept in memory.
@@ -225,10 +225,22 @@ fn apply_direction(
             name,
             visible,
             layer_kind,
+            blend,
+            opacity,
             pixels,
         } => match direction {
             Direction::Forward => {
-                recreate_layer(canvas, *idx, id, name, *visible, layer_kind, pixels)?;
+                recreate_layer(
+                    canvas,
+                    *idx,
+                    id,
+                    name,
+                    *visible,
+                    layer_kind,
+                    *blend,
+                    *opacity,
+                    pixels,
+                )?;
                 Ok(())
             }
             Direction::Backward => {
@@ -244,6 +256,8 @@ fn apply_direction(
             name,
             visible,
             layer_kind,
+            blend,
+            opacity,
             pixels,
         } => match direction {
             Direction::Forward => {
@@ -253,7 +267,17 @@ fn apply_direction(
                 Ok(())
             }
             Direction::Backward => {
-                recreate_layer(canvas, *idx, id, name, *visible, layer_kind, pixels)?;
+                recreate_layer(
+                    canvas,
+                    *idx,
+                    id,
+                    name,
+                    *visible,
+                    layer_kind,
+                    *blend,
+                    *opacity,
+                    pixels,
+                )?;
                 Ok(())
             }
         },
@@ -285,16 +309,44 @@ fn apply_direction(
             }
             Ok(())
         }
+        HistoryAction::LayerBlend {
+            id,
+            old_blend,
+            old_opacity,
+            new_blend,
+            new_opacity,
+        } => {
+            if let Some(idx) = find_layer_idx(canvas, id) {
+                let (blend, opacity) = match direction {
+                    Direction::Forward => (*new_blend, *new_opacity),
+                    Direction::Backward => (*old_blend, *old_opacity),
+                };
+                canvas.set_layer_blend(idx, blend, opacity)?;
+            }
+            Ok(())
+        }
         HistoryAction::LayerDuplicate {
             src_idx: _,
             new_idx,
             new_id,
             new_name,
             layer_kind,
+            blend,
+            opacity,
             pixels,
         } => match direction {
             Direction::Forward => {
-                recreate_layer(canvas, *new_idx, new_id, new_name, true, layer_kind, pixels)?;
+                recreate_layer(
+                    canvas,
+                    *new_idx,
+                    new_id,
+                    new_name,
+                    true,
+                    layer_kind,
+                    *blend,
+                    *opacity,
+                    pixels,
+                )?;
                 Ok(())
             }
             Direction::Backward => {
@@ -308,10 +360,15 @@ fn apply_direction(
             survivor_idx,
             survivor_pre,
             survivor_post,
+            survivor_blend,
+            survivor_opacity,
             folded,
         } => match direction {
             Direction::Forward => {
                 canvas.restore_layer(*survivor_idx, survivor_post)?;
+                // Merge bakes the blend into the pixels, so the survivor
+                // composites Normal/opaque afterwards.
+                canvas.set_layer_blend(*survivor_idx, BlendMode::Normal, 1.0)?;
                 for f in folded.iter().rev() {
                     if let Some(cur) = find_layer_idx(canvas, &f.id) {
                         canvas.remove_layer(cur)?;
@@ -320,9 +377,6 @@ fn apply_direction(
                 Ok(())
             }
             Direction::Backward => {
-                if let Some(idx) = find_layer_idx(canvas, "") {
-                    let _ = idx; // unused
-                }
                 // Restore folded layers at their original indices. Merge bakes to
                 // raster, so folded layers come back as plain raster layers.
                 for f in folded {
@@ -333,10 +387,13 @@ fn apply_direction(
                         &f.name,
                         f.visible,
                         &LayerKind::Raster,
+                        f.blend,
+                        f.opacity,
                         &f.pixels,
                     )?;
                 }
                 canvas.restore_layer(*survivor_idx, survivor_pre)?;
+                canvas.set_layer_blend(*survivor_idx, *survivor_blend, *survivor_opacity)?;
                 Ok(())
             }
         },
@@ -382,9 +439,18 @@ fn apply_direction(
                 );
                 canvas.apply_crop(rect)?;
             }
-            let layers: Vec<(String, String, bool, Vec<u8>)> = target_layers
+            let layers: Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> = target_layers
                 .iter()
-                .map(|l| (l.id.clone(), l.name.clone(), l.visible, l.pixels.clone()))
+                .map(|l| {
+                    (
+                        l.id.clone(),
+                        l.name.clone(),
+                        l.visible,
+                        l.blend,
+                        l.opacity,
+                        l.pixels.clone(),
+                    )
+                })
                 .collect();
             canvas.replace_all_layers(&layers)?;
             // replace_all_layers resets kinds to Raster; restore the snapshot's
@@ -451,6 +517,7 @@ fn find_layer_idx(canvas: &Canvas, id: &str) -> Option<usize> {
 
 /// Recreate a layer with the given id/name/visibility/pixels at index
 /// `target_idx`. The layer is appended on top, then reordered into place.
+#[allow(clippy::too_many_arguments)]
 fn recreate_layer(
     canvas: &mut Canvas,
     target_idx: usize,
@@ -458,25 +525,28 @@ fn recreate_layer(
     name: &str,
     visible: bool,
     kind: &LayerKind,
+    blend: BlendMode,
+    opacity: f32,
     pixels: &[u8],
 ) -> Result<(), RendererError> {
     // Rebuild the whole stack with the layer reinserted at target_idx.
     // `replace_all_layers` resets every kind to Raster, so we capture the
     // existing kinds (and the recreated layer's) and re-apply them after.
     let snap = canvas.layers().snapshot();
-    let mut entries: Vec<(String, String, bool, Vec<u8>)> = Vec::with_capacity(snap.len() + 1);
+    let mut entries: Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> =
+        Vec::with_capacity(snap.len() + 1);
     let mut kinds: Vec<LayerKind> = Vec::with_capacity(snap.len() + 1);
     for (i, l) in snap.iter().enumerate() {
         if i == target_idx {
-            entries.push((id.to_string(), name.to_string(), visible, pixels.to_vec()));
+            entries.push((id.to_string(), name.to_string(), visible, blend, opacity, pixels.to_vec()));
             kinds.push(kind.clone());
         }
         let px = canvas.read_layer(i)?;
-        entries.push((l.id.clone(), l.name.clone(), l.visible, px));
+        entries.push((l.id.clone(), l.name.clone(), l.visible, l.blend, l.opacity, px));
         kinds.push(l.kind.clone());
     }
     if target_idx >= snap.len() {
-        entries.push((id.to_string(), name.to_string(), visible, pixels.to_vec()));
+        entries.push((id.to_string(), name.to_string(), visible, blend, opacity, pixels.to_vec()));
         kinds.push(kind.clone());
     }
     canvas.replace_all_layers(&entries)?;

@@ -15,6 +15,14 @@ impl VulkanRenderer {
         self.layer_stack.version(idx)
     }
 
+    /// Set layer `idx`'s blend-mode index (matches `layer_blend.frag`) and
+    /// opacity. Pure GPU-side metadata; caller re-composites the canvas.
+    pub fn set_layer_blend(&mut self, idx: usize, mode: u32, opacity: f32) {
+        self.layer_stack.set_blend(idx, mode, opacity);
+        // The cached below-stack may include this layer; force a rebuild.
+        self.preview_cache_valid = false;
+    }
+
     /// Append a new layer image and clear it to fully transparent.
     pub fn add_layer(&mut self) -> Result<usize, RendererError> {
         let extent = vk::Extent2D {
@@ -142,6 +150,7 @@ impl VulkanRenderer {
         out: &mut Vec<u8>,
     ) -> Result<(), RendererError> {
         let visible_indices = self.visible_layer_indices(visibilities);
+        let preview_img = self.preview.handle;
         let preview_fb = self.preview_framebuffer;
         self.record_and_submit(|this| {
             this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
@@ -149,7 +158,35 @@ impl VulkanRenderer {
                 if idx <= target_idx {
                     continue;
                 }
-                this.preview_compose_layer(preview_fb, idx);
+                this.preview_compose_layer(preview_img, preview_fb, idx);
+            }
+            Ok(())
+        })?;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes_into(out)
+    }
+
+    /// Composite the given layer indices (bottom-up, each at its own blend
+    /// mode + opacity) over transparent into the preview image and read the
+    /// result back as BGRA8. Used by layer merge so the flattened raster
+    /// matches what the layers looked like composited together.
+    pub fn read_layers_composited(
+        &mut self,
+        indices: &[usize],
+        out: &mut Vec<u8>,
+    ) -> Result<(), RendererError> {
+        for &idx in indices {
+            if idx >= self.layer_stack.slots.len() {
+                return Err(RendererError::LayerIndexOutOfRange);
+            }
+        }
+        let preview_img = self.preview.handle;
+        let preview_fb = self.preview_framebuffer;
+        self.record_and_submit(|this| {
+            this.cmd_clear_image(preview_img, [0.0, 0.0, 0.0, 0.0]);
+            for &idx in indices {
+                this.preview_compose_layer(preview_img, preview_fb, idx);
             }
             Ok(())
         })?;
@@ -197,24 +234,12 @@ impl VulkanRenderer {
     /// `record_and_submit`.
     pub(super) fn cmd_composite_layers_to_canvas(&self, visible_indices: &[usize]) {
         self.cmd_clear_image(self.canvas.handle, [0.0, 0.0, 0.0, 0.0]);
+        let canvas_img = self.canvas.handle;
+        let canvas_fb = self.canvas_target.framebuffer;
         for &idx in visible_indices {
             let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
-            let render_pass = self.canvas_target.render_pass;
-            let framebuffer = self.canvas_target.framebuffer;
-            let pipeline = self.layer_composite_pipeline.pipeline;
-            let layout = self.layer_composite_pipeline.layout;
-            self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
-            unsafe {
-                self.device.cmd_bind_descriptor_sets(
-                    self.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[descriptor_set],
-                    &[],
-                );
-            }
-            self.cmd_end_fullscreen_pass();
+            let (mode, opacity) = self.layer_stack.blend(idx);
+            self.cmd_compose_layer_blended(canvas_img, canvas_fb, descriptor_set, mode, opacity);
         }
     }
 

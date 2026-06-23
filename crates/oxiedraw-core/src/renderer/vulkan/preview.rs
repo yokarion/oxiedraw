@@ -195,17 +195,18 @@ impl VulkanRenderer {
         stroke_push: [f32; 4],
     ) {
         let erase = self.stroke_erase;
+        // Cache the layers strictly below the target, each with its blend mode
+        // + opacity. The target (with its in-flight stroke merged) and the
+        // layers above are re-composited every event.
         if !self.preview_cache_valid {
+            let below_img = self.preview_below.handle;
             let below_fb = self.preview_below_framebuffer;
             self.cmd_clear_image(self.preview_below.handle, [0.0, 0.0, 0.0, 0.0]);
             for &idx in visible_indices {
-                // Erasing rebuilds the target each event (with the stroke
-                // punched out), so the cache must exclude it; the brush
-                // composites its stroke over a cache that includes it.
-                if (erase && idx >= target_idx) || (!erase && idx > target_idx) {
+                if idx >= target_idx {
                     break;
                 }
-                self.preview_compose_layer(below_fb, idx);
+                self.preview_compose_layer(below_img, below_fb, idx);
             }
             self.preview_cache_valid = true;
         }
@@ -213,73 +214,59 @@ impl VulkanRenderer {
         // preview := cached below stack.
         self.cmd_copy_image_full(self.preview_below.handle, self.preview.handle);
 
-        // The in-flight stroke, spliced at the target layer's z-order (only
-        // if the target is visible).
+        // The target layer with the in-flight stroke merged in, blended at the
+        // target's own mode + opacity (only if the target is visible).
         if visible_indices.contains(&target_idx) {
-            if erase {
-                self.preview_compose_erased_target(target_idx, stroke_push);
-            } else {
-                self.cmd_composite_stroke(self.preview_framebuffer, stroke_push, false);
-            }
+            self.preview_compose_stroked_target(target_idx, stroke_push, erase);
         }
 
         // Layers above the target, re-composited each event.
+        let preview_img = self.preview.handle;
         let preview_fb = self.preview_framebuffer;
         for &idx in visible_indices {
             if idx <= target_idx {
                 continue;
             }
-            self.preview_compose_layer(preview_fb, idx);
+            self.preview_compose_layer(preview_img, preview_fb, idx);
         }
     }
 
-    pub(super) fn preview_compose_layer(&self, framebuffer: vk::Framebuffer, idx: usize) {
+    /// Blend-composite layer `idx` onto the accumulator (`acc_img` / `acc_fb`)
+    /// using its stored blend mode + opacity.
+    pub(super) fn preview_compose_layer(
+        &self,
+        acc_img: vk::Image,
+        acc_fb: vk::Framebuffer,
+        idx: usize,
+    ) {
         let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
-        self.cmd_compose_image(framebuffer, descriptor_set);
+        let (mode, opacity) = self.layer_stack.blend(idx);
+        self.cmd_compose_layer_blended(acc_img, acc_fb, descriptor_set, mode, opacity);
     }
 
-    /// Build the target layer with the stroke coverage punched out into the
-    /// erase scratch, then composite that over the below-cache already in
-    /// `preview`. This reveals the layers below where the eraser passed,
-    /// without touching them.
-    fn preview_compose_erased_target(&self, target_idx: usize, push: [f32; 4]) {
+    /// Build the target layer with the in-flight stroke merged into a scratch
+    /// (OVER for paint, DST_OUT for erase), then blend that scratch over the
+    /// below-cache already in `preview` using the target's mode + opacity. This
+    /// keeps a non-Normal target layer's blend applied to its live stroke.
+    fn preview_compose_stroked_target(&self, target_idx: usize, push: [f32; 4], erase: bool) {
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
-        // scratch := the target layer. Copy the layer image directly (one
-        // transfer) instead of clearing + compositing it (the layer is already
-        // a standalone premultiplied image, so a copy is identical and cheaper).
+        // scratch := the target layer pixels (a copy is identical to a clear +
+        // OVER-composite of the standalone premultiplied layer, and cheaper).
         let layer_image = self.layer_stack.slots[target_idx].image.handle;
         self.cmd_copy_image_full(layer_image, scratch);
-        // Punch out the stroke coverage (DST_OUT) from the target copy.
-        self.cmd_composite_stroke(scratch_fb, push, true);
-        // Make the scratch writes visible to the sampler reads below.
+        // Merge the stroke into the target copy.
+        self.cmd_composite_stroke(scratch_fb, push, erase);
+        // Make the scratch writes visible to the blend pass's sampler reads.
         self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-        // erased target OVER the below-cache already in preview.
+        let (mode, opacity) = self.layer_stack.blend(target_idx);
         let set = self.erase_preview.composite_set;
-        self.cmd_compose_image(self.preview_framebuffer, set);
-    }
-
-    /// Composite one premultiplied BGRA image (via `descriptor_set`) onto
-    /// `framebuffer` with the layer-composite pipeline (premultiplied OVER).
-    pub(super) fn cmd_compose_image(
-        &self,
-        framebuffer: vk::Framebuffer,
-        descriptor_set: vk::DescriptorSet,
-    ) {
-        let render_pass = self.canvas_target.render_pass;
-        let pipeline = self.layer_composite_pipeline.pipeline;
-        let layout = self.layer_composite_pipeline.layout;
-        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
-        unsafe {
-            self.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-        }
-        self.cmd_end_fullscreen_pass();
+        self.cmd_compose_layer_blended(
+            self.preview.handle,
+            self.preview_framebuffer,
+            set,
+            mode,
+            opacity,
+        );
     }
 }

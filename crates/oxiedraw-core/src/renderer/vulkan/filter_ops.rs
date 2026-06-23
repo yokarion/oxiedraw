@@ -67,7 +67,7 @@ impl VulkanRenderer {
         for idx in visible_indices {
             if affected.contains(&idx) {
                 let result = self.produce_filtered_layer(idx, spec)?;
-                self.composite_scratch_into_preview(result)?;
+                self.composite_scratch_into_preview(result, idx)?;
             } else {
                 self.composite_layer_into_preview(idx)?;
             }
@@ -355,50 +355,43 @@ impl VulkanRenderer {
         })
     }
 
-    /// OVER-blend one plain layer image into the preview framebuffer.
+    /// Blend one plain layer image into the preview framebuffer at the layer's
+    /// own blend mode + opacity.
     fn composite_layer_into_preview(&mut self, idx: usize) -> Result<(), RendererError> {
         let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
-        self.composite_set_into_preview(descriptor_set)
+        let (mode, opacity) = self.layer_stack.blend(idx);
+        self.composite_set_into_preview(descriptor_set, mode, opacity)
     }
 
-    /// OVER-blend a finished scratch image into the preview framebuffer.
-    fn composite_scratch_into_preview(&mut self, which: Scratch) -> Result<(), RendererError> {
+    /// Blend a finished scratch image (an affected layer's filtered result)
+    /// into the preview at the source layer's blend mode + opacity.
+    fn composite_scratch_into_preview(
+        &mut self,
+        which: Scratch,
+        idx: usize,
+    ) -> Result<(), RendererError> {
         let src_img = self.filter_resources.scratch_handle(which);
         let descriptor_set = self.filter_resources.composite_set(which);
         self.record_and_submit(|this| {
             this.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
             Ok(())
         })?;
-        self.composite_set_into_preview(descriptor_set)
+        let (mode, opacity) = self.layer_stack.blend(idx);
+        self.composite_set_into_preview(descriptor_set, mode, opacity)
     }
 
-    /// Shared body: OVER-blend whatever `descriptor_set` binds (a layer or a
-    /// scratch image) into the preview using the layer-composite pipeline.
+    /// Shared body: blend whatever `descriptor_set` binds (a layer or a scratch
+    /// image) into the preview using the layer-blend pipeline.
     fn composite_set_into_preview(
         &mut self,
         descriptor_set: vk::DescriptorSet,
+        mode: u32,
+        opacity: f32,
     ) -> Result<(), RendererError> {
-        let render_pass = self.canvas_target.render_pass;
-        let framebuffer = self.preview_framebuffer;
-        let pipeline = self.layer_composite_pipeline.pipeline;
-        let layout = self.layer_composite_pipeline.layout;
         let preview_img = self.preview.handle;
+        let preview_fb = self.preview_framebuffer;
         self.record_and_submit(|this| {
-            // Each composite is its own submission, so make the prior layer's
-            // OVER-write to the preview visible to this pass's LOAD.
-            this.barrier(preview_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            this.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
-            unsafe {
-                this.device.cmd_bind_descriptor_sets(
-                    this.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[descriptor_set],
-                    &[],
-                );
-            }
-            this.cmd_end_fullscreen_pass();
+            this.cmd_compose_layer_blended(preview_img, preview_fb, descriptor_set, mode, opacity);
             Ok(())
         })
     }

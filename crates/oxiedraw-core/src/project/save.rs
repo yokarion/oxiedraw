@@ -55,6 +55,8 @@ pub fn snapshot(
             name: l.name.clone(),
             visible: l.visible,
             kind: l.kind.clone(),
+            blend: l.blend,
+            opacity: l.opacity,
         })
         .collect();
 
@@ -89,6 +91,8 @@ pub fn snapshot(
                     id: l.id.clone(),
                     name: l.name.clone(),
                     visible: l.visible,
+                    blend: l.blend,
+                    opacity: l.opacity,
                 })
                 .collect(),
         });

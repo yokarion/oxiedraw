@@ -12,7 +12,11 @@ use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
 use oxiedraw_utils::pixels::transform_bgra8;
 use serde::{Deserialize, Serialize};
 
-use crate::document::Placement;
+use crate::document::{BlendMode, Placement};
+
+fn default_opacity() -> f32 {
+    1.0
+}
 
 /// Default edit canvas for a freshly created component.
 pub const DEFAULT_COMPONENT_SIZE: Size = Size {
@@ -34,6 +38,12 @@ pub struct ComponentLayer {
     pub id: String,
     pub name: String,
     pub visible: bool,
+    /// Blend mode + opacity, so a layer's blend survives leaving edit mode and
+    /// shows in the flattened master (absent in older files -> Normal/1.0).
+    #[serde(default)]
+    pub blend: BlendMode,
+    #[serde(default = "default_opacity")]
+    pub opacity: f32,
     pub pixels: Vec<u8>,
 }
 
@@ -96,6 +106,8 @@ impl Component {
                 id: format!("{}-0", generate_component_id()),
                 name: "Layer 1".to_string(),
                 visible: true,
+                blend: BlendMode::Normal,
+                opacity: 1.0,
                 pixels: blank.clone(),
             }],
             active_layer: Some(0),
@@ -153,12 +165,22 @@ impl Component {
         }
     }
 
-    /// `(id, name, visible, pixels)` tuples for `Canvas::replace_all_layers`.
+    /// `(id, name, visible, blend, opacity, pixels)` tuples for loading into a
+    /// `Canvas` edit surface.
     #[must_use]
-    pub fn layer_tuples(&self) -> Vec<(String, String, bool, Vec<u8>)> {
+    pub fn layer_tuples(&self) -> Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> {
         self.layers
             .iter()
-            .map(|l| (l.id.clone(), l.name.clone(), l.visible, l.pixels.clone()))
+            .map(|l| {
+                (
+                    l.id.clone(),
+                    l.name.clone(),
+                    l.visible,
+                    l.blend,
+                    l.opacity,
+                    l.pixels.clone(),
+                )
+            })
             .collect()
     }
 
@@ -265,6 +287,8 @@ impl ComponentLibrary {
                 id: format!("{}-{}", generate_component_id(), l.id),
                 name: l.name.clone(),
                 visible: l.visible,
+                blend: l.blend,
+                opacity: l.opacity,
                 pixels: l.pixels.clone(),
             })
             .collect();
@@ -282,8 +306,10 @@ impl ComponentLibrary {
     }
 }
 
-/// Composite visible layers bottom-to-top with premultiplied OVER into a fresh
-/// `w x h` BGRA8 buffer. Layers that mismatch the expected length are skipped.
+/// Composite visible layers bottom-to-top into a fresh `w x h` BGRA8 buffer,
+/// honoring each layer's blend mode + opacity. Matches the GPU `layer_blend.frag`
+/// (blend math in linear light) so the master looks like the edit-mode preview.
+/// Layers that mismatch the expected length are skipped.
 #[must_use]
 pub fn flatten(layers: &[ComponentLayer], w: u32, h: u32) -> Vec<u8> {
     let n = (w * h * 4) as usize;
@@ -292,9 +318,77 @@ pub fn flatten(layers: &[ComponentLayer], w: u32, h: u32) -> Vec<u8> {
         if !layer.visible || layer.pixels.len() != n {
             continue;
         }
-        alpha_over_premul_bgra8(&mut out, &layer.pixels);
+        blend_layer_over(&mut out, &layer.pixels, layer.blend, layer.opacity);
     }
     out
+}
+
+fn srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.003_130_8 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+// Blend `src` (premultiplied BGRA8) over `dst` in place using `mode` + `opacity`.
+// Mirrors layer_blend.frag: unpremultiply, blend in linear light, W3C src-over.
+fn blend_layer_over(dst: &mut [u8], src: &[u8], mode: BlendMode, opacity: f32) {
+    let opacity = opacity.clamp(0.0, 1.0);
+    let n = dst.len().min(src.len()) / 4;
+    for px in 0..n {
+        let o = px * 4;
+        // Premultiplied linear samples (sRGB decode mimics the GPU sampler).
+        let sa = f32::from(src[o + 3]) / 255.0 * opacity;
+        let da = f32::from(dst[o + 3]) / 255.0;
+        let s = [
+            srgb_to_linear(f32::from(src[o]) / 255.0) * opacity,
+            srgb_to_linear(f32::from(src[o + 1]) / 255.0) * opacity,
+            srgb_to_linear(f32::from(src[o + 2]) / 255.0) * opacity,
+        ];
+        let d = [
+            srgb_to_linear(f32::from(dst[o]) / 255.0),
+            srgb_to_linear(f32::from(dst[o + 1]) / 255.0),
+            srgb_to_linear(f32::from(dst[o + 2]) / 255.0),
+        ];
+        // Unpremultiply for the blend math.
+        let unpre = |c: f32, a: f32| if a > 0.0 { c / a } else { 0.0 };
+        let mut out = [0u8; 4];
+        for ch in 0..3 {
+            let sc = unpre(s[ch], sa);
+            let dc = unpre(d[ch], da);
+            let blended = match mode {
+                BlendMode::Normal => sc,
+                BlendMode::Multiply => sc * dc,
+                BlendMode::Addition => (sc + dc).min(1.0),
+                BlendMode::Darken => sc.min(dc),
+                BlendMode::Screen => sc + dc - sc * dc,
+                BlendMode::Overlay => {
+                    if dc <= 0.5 {
+                        2.0 * dc * sc
+                    } else {
+                        1.0 - 2.0 * (1.0 - dc) * (1.0 - sc)
+                    }
+                }
+            };
+            // Source colour mixed toward the blended colour by backdrop alpha,
+            // then standard premultiplied src-over.
+            let src_color = sc + (blended - sc) * da;
+            let out_lin = src_color * sa + d[ch] * (1.0 - sa);
+            out[ch] = (linear_to_srgb(out_lin).clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+        let out_a = sa + da * (1.0 - sa);
+        out[3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
+        dst[o..o + 4].copy_from_slice(&out);
+    }
 }
 
 /// Affine-resample a master texture into a `canvas_w x canvas_h` slot at
@@ -330,20 +424,6 @@ pub fn render_instance(
     )
 }
 
-/// Porter-Duff "src over dst" on premultiplied BGRA8 buffers, in place on `dst`.
-fn alpha_over_premul_bgra8(dst: &mut [u8], src: &[u8]) {
-    let n = dst.len().min(src.len()) / 4;
-    for i in 0..n {
-        let sa = u32::from(src[i * 4 + 3]);
-        let inv = 255 - sa;
-        for c in 0..4 {
-            let s = u32::from(src[i * 4 + c]);
-            let d = u32::from(dst[i * 4 + c]);
-            dst[i * 4 + c] = (s + (d * inv + 127) / 255) as u8;
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,18 +453,50 @@ mod tests {
             id: "b".into(),
             name: "b".into(),
             visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
             pixels: solid(w, h, [255, 0, 0, 255]), // blue
         };
         let top = ComponentLayer {
             id: "t".into(),
             name: "t".into(),
             visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
             pixels: solid(w, h, [0, 0, 255, 255]), // red
         };
         let out = flatten(&[bottom, top], w, h);
         // Opaque top fully covers: every pixel is red.
         assert_eq!(&out[0..4], &[0, 0, 255, 255]);
         assert_eq!(&out[4..8], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn flatten_honors_blend_mode_and_opacity() {
+        let (w, h) = (1, 1);
+        let grey = |blend, opacity| ComponentLayer {
+            id: "x".into(),
+            name: "x".into(),
+            visible: true,
+            blend,
+            opacity,
+            pixels: solid(w, h, [180, 180, 180, 255]),
+        };
+        let base = grey(BlendMode::Normal, 1.0);
+
+        // Multiply of two mid-greys is darker than the plain (Normal) top.
+        let normal = flatten(&[base.clone(), grey(BlendMode::Normal, 1.0)], w, h);
+        let multiply = flatten(&[base.clone(), grey(BlendMode::Multiply, 1.0)], w, h);
+        assert!(
+            multiply[0] < normal[0],
+            "multiply should darken the master: {} !< {}",
+            multiply[0],
+            normal[0]
+        );
+
+        // A fully transparent (opacity 0) top leaves the base untouched.
+        let faded = flatten(&[base, grey(BlendMode::Multiply, 0.0)], w, h);
+        assert_eq!(&faded[0..3], &[180, 180, 180], "opacity 0 top is invisible");
     }
 
     #[test]
@@ -395,12 +507,16 @@ mod tests {
             id: "b".into(),
             name: "b".into(),
             visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
             pixels: solid(w, h, [255, 0, 0, 255]),
         };
         let hidden = ComponentLayer {
             id: "t".into(),
             name: "t".into(),
             visible: false,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
             pixels: solid(w, h, [0, 0, 255, 255]),
         };
         let out = flatten(&[bottom, hidden], w, h);
@@ -503,6 +619,8 @@ mod tests {
                 id: "l".into(),
                 name: "l".into(),
                 visible: true,
+                blend: BlendMode::Normal,
+                opacity: 1.0,
                 pixels: solid(2, 2, [0, 0, 255, 255]),
             }],
             Some(0),

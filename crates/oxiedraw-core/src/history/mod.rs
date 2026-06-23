@@ -26,16 +26,24 @@ use crate::canvas::Canvas;
 
 /// Read a layer's identity + kind + full BGRA8 pixels for history capture.
 ///
-/// Returns `(id, name, visible, kind, pixels)`, or `None` if `idx` is out of
-/// range or the GPU readback fails. Centralises the boilerplate every
-/// layer-level history site (`LayerAdd`, `LayerRemove`, `LayerDuplicate`, ...)
-/// needs.
+/// Returns `(id, name, visible, kind, blend, opacity, pixels)`, or `None` if
+/// `idx` is out of range or the GPU readback fails. Centralises the boilerplate
+/// every layer-level history site (`LayerAdd`, `LayerRemove`,
+/// `LayerDuplicate`, ...) needs.
 #[must_use]
 pub fn capture_layer(
     canvas: &mut Canvas,
     idx: usize,
-) -> Option<(String, String, bool, crate::document::LayerKind, Vec<u8>)> {
-    let (id, name, visible, kind) = {
+) -> Option<(
+    String,
+    String,
+    bool,
+    crate::document::LayerKind,
+    crate::document::BlendMode,
+    f32,
+    Vec<u8>,
+)> {
+    let (id, name, visible, kind, blend, opacity) = {
         let snap = canvas.layers().snapshot();
         let layer = snap.get(idx)?;
         (
@@ -43,10 +51,12 @@ pub fn capture_layer(
             layer.name.clone(),
             layer.visible,
             layer.kind.clone(),
+            layer.blend,
+            layer.opacity,
         )
     };
     let pixels = canvas.read_layer(idx).ok()?;
-    Some((id, name, visible, kind, pixels))
+    Some((id, name, visible, kind, blend, opacity, pixels))
 }
 
 #[cfg(test)]

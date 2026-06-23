@@ -80,47 +80,42 @@ impl VulkanRenderer {
         let push_color = self.fill_color_premul;
         let reveal = self.fill_reveal;
 
+        let overlay_at = visible_indices.contains(&target_idx).then_some(target_idx);
         self.record_and_submit(|this| {
+            let preview_img = this.preview.handle;
+            let preview_fb = this.preview_framebuffer;
             this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
-            let overlay_at = visible_indices.contains(&target_idx).then_some(target_idx);
             for &idx in &visible_indices {
-                this.preview_compose_layer_for_fill(idx);
                 if overlay_at == Some(idx) {
-                    this.preview_compose_fill_overlay(push_color, reveal);
+                    // Build (target layer + fill overlay) in a scratch, then
+                    // blend it over the preview at the target's mode + opacity.
+                    let scratch = this.erase_preview.scratch.handle;
+                    let scratch_fb = this.erase_preview.framebuffer;
+                    let layer_image = this.layer_stack.slots[idx].image.handle;
+                    this.cmd_copy_image_full(layer_image, scratch);
+                    this.cmd_compose_fill_overlay(scratch_fb, push_color, reveal);
+                    this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+                    let (mode, opacity) = this.layer_stack.blend(idx);
+                    let set = this.erase_preview.composite_set;
+                    this.cmd_compose_layer_blended(preview_img, preview_fb, set, mode, opacity);
+                } else {
+                    this.preview_compose_layer(preview_img, preview_fb, idx);
                 }
             }
             Ok(())
         })
     }
 
-    /// One layer-composite pass into the preview framebuffer.
-    /// Mirrors `preview::preview_compose_layer` - kept private here
-    /// because the original is in a sibling module.
-    fn preview_compose_layer_for_fill(&mut self, idx: usize) {
-        let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
-        let render_pass = self.canvas_target.render_pass;
-        let framebuffer = self.preview_framebuffer;
-        let pipeline = self.layer_composite_pipeline.pipeline;
-        let layout = self.layer_composite_pipeline.layout;
-        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
-        unsafe {
-            self.device.cmd_bind_descriptor_sets(
-                self.command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                layout,
-                0,
-                &[descriptor_set],
-                &[],
-            );
-        }
-        self.cmd_end_fullscreen_pass();
-    }
-
     /// Fill overlay pass - binds the overlay descriptor set, pushes
-    /// the colour + reveal radius, draws the fullscreen triangle.
-    fn preview_compose_fill_overlay(&mut self, color: [f32; 4], reveal: f32) {
+    /// the colour + reveal radius, draws the fullscreen triangle into
+    /// `framebuffer` (the target-plus-overlay scratch).
+    fn cmd_compose_fill_overlay(
+        &mut self,
+        framebuffer: vk::Framebuffer,
+        color: [f32; 4],
+        reveal: f32,
+    ) {
         let render_pass = self.canvas_target.render_pass;
-        let framebuffer = self.preview_framebuffer;
         let pipeline = self.fill_overlay.pipeline;
         let layout = self.fill_overlay.layout;
         let descriptor_set = self.fill_overlay.descriptor_set;

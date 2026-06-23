@@ -2,7 +2,7 @@ mod layer;
 mod properties;
 mod state;
 
-pub use layer::{ComponentInstance, Layer, LayerKind, Placement};
+pub use layer::{BlendMode, ComponentInstance, Layer, LayerKind, Placement};
 pub use properties::DocumentProperties;
 pub use state::LayerState;
 

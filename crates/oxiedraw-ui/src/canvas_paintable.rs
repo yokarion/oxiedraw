@@ -114,7 +114,17 @@ impl CanvasPaintable {
         imp.transform_active.set(active);
         if !active {
             *imp.transform_above_texture.borrow_mut() = None;
+            imp.transform_gpu_preview.set(false);
         }
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
+    /// When the live GPU transform preview is driving the canvas (so the warped
+    /// layer is already composited - with its blend mode - into the presented
+    /// dmabuf), the GSK overlay must not also draw the source texture, or it
+    /// would double the layer. The handle box still draws.
+    pub(crate) fn set_transform_gpu_preview(&self, active: bool) {
+        self.imp().transform_gpu_preview.set(active);
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
@@ -1177,6 +1187,9 @@ mod imp {
         // transform overlay
         pub(super) transform_rect: Cell<Option<TransformRect>>,
         pub(super) transform_active: Cell<bool>,
+        /// True while the renderer composites the warped layer itself (live GPU
+        /// blend preview); the GSK source/above overlay is then suppressed.
+        pub(super) transform_gpu_preview: Cell<bool>,
         /// GPU texture holding the captured source pixels for live preview.
         /// Sampled with an affine transform by GSK at draw time.
         pub(super) transform_source_texture: RefCell<Option<gdk::Texture>>,
@@ -1242,6 +1255,7 @@ mod imp {
                 crop_active: Cell::new(false),
                 transform_rect: Cell::new(None),
                 transform_active: Cell::new(false),
+                transform_gpu_preview: Cell::new(false),
                 transform_source_texture: RefCell::new(None),
                 transform_original_rect: Cell::new(None),
                 transform_above_texture: RefCell::new(None),
@@ -1438,7 +1452,11 @@ mod imp {
             //     nearest-neighbour threshold (the filter only applies to
             //     scale-to-fit inside the node's bounds, so the bounds have
             //     to absorb the outer canvas zoom).
+            // When the GPU preview is live, the warped layer (with its blend
+            // mode) is already in the presented dmabuf; skip the GSK overlay so
+            // it isn't drawn twice. The handle box is drawn separately below.
             if self.transform_active.get()
+                && !self.transform_gpu_preview.get()
                 && let (Some(texture), Some(rect), Some(orig)) = (
                     self.transform_source_texture.borrow().clone(),
                     self.transform_rect.get(),
