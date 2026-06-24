@@ -292,6 +292,27 @@ fn register_window_actions(
         app.add_action(&action);
     }
 
+    // Adjustment layers (create / edit non-destructive effects).
+    {
+        let manager = Rc::clone(manager);
+        let win = root.clone();
+        let toaster = global.toaster.clone();
+        let action = gio::SimpleAction::new("layer-add-adjustment", None);
+        action.connect_activate(move |_, _| {
+            let Some(s) = manager.active() else { return };
+            let ctx = crate::adjustments::AdjustmentContext {
+                window: win.clone(),
+                canvas: s.viewport.canvas(),
+                redraw: s.viewport.redraw_handle(),
+                history: Rc::clone(&s.history),
+                toaster: toaster.clone(),
+                refresh_layers: Rc::clone(&s.refresh_layers),
+            };
+            crate::adjustments::add_or_edit(&ctx);
+        });
+        app.add_action(&action);
+    }
+
     // Filters (build a context from the active document on each invocation).
     {
         let filter_actions: &[(&str, fn(&crate::filters::FilterContext))] = &[

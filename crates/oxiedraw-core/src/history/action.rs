@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use super::snapshot::LayerPatch;
 use crate::components::ComponentSnapshot;
 use crate::document::{BlendMode, LayerKind, Placement};
+use crate::effects::AdjustmentData;
 use crate::text::TextContent;
 
 /// Direction of replay. Forward = redo or first apply; Backward = undo.
@@ -126,6 +127,16 @@ pub enum HistoryAction {
         old_opacity: f32,
         new_blend: BlendMode,
         new_opacity: f32,
+    },
+    /// An adjustment layer's effect stack changed (added / removed / reordered
+    /// an effect, toggled one, or edited its parameters). Keyed by layer id so
+    /// it is stable across reorders; both snapshots carry the whole stack so any
+    /// change round-trips exactly. The mask (the layer's pixels) is not part of
+    /// this action - mask painting goes through `Stroke`.
+    EffectEdit {
+        layer_id: String,
+        before: AdjustmentData,
+        after: AdjustmentData,
     },
     /// A text layer was edited (typed, restyled, resized). The patch carries
     /// the slot pixel diff; the before/after content let undo/redo restore the
@@ -274,6 +285,7 @@ impl HistoryAction {
             Self::LayerRename { .. } => "Rename layer",
             Self::LayerVisibility { .. } => "Toggle layer visibility",
             Self::LayerBlend { .. } => "Change layer blend",
+            Self::EffectEdit { .. } => "Edit adjustment effects",
             Self::LayerDuplicate { .. } => "Duplicate layer",
             Self::LayerMerge { .. } => "Merge layers",
             Self::SelectionChange { .. } => "Selection",

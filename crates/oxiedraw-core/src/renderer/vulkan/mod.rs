@@ -10,6 +10,7 @@
 //! - `present` - the dmabuf display path
 //! - `transform_ops` - GPU affine transform applied to a single layer
 
+mod adjust_ops;
 mod fill_ops;
 mod filter_ops;
 mod io;
@@ -120,6 +121,19 @@ pub struct VulkanRenderer {
     /// patch without a full-canvas readback + diff. `None` until the
     /// first dab of a stroke.
     pub(super) stroke_dirty: Option<(f32, f32, f32, f32)>,
+    /// AABB of the dabs stamped since the last preview frame was presented.
+    /// Drives the incremental preview: only this region is recomposited +
+    /// copied to the display each frame instead of the whole canvas. Consumed
+    /// (reset) by each preview build.
+    pub(super) preview_pending_dirty: Option<(f32, f32, f32, f32)>,
+    /// Forces the next preview frame to rebuild the whole canvas (stroke start
+    /// or any layer mutation), after which incremental updates take over.
+    pub(super) preview_needs_full: bool,
+    /// When `Some`, `cmd_copy_image_full` / `cmd_begin_fullscreen_pass` /
+    /// `record_present_copy` restrict their work to this canvas-pixel rect. Set
+    /// only around the per-frame incremental preview update and reset right
+    /// after, so every other path stays full-canvas.
+    pub(super) clip: Option<vk::Rect2D>,
     pub(super) staging: ManuallyDrop<Buffer>,
 
     pub(super) canvas_target: ManuallyDrop<ImageTarget>,
@@ -408,6 +422,9 @@ impl VulkanRenderer {
             erase_preview: ManuallyDrop::new(erase_preview),
             stroke_erase: false,
             stroke_dirty: None,
+            preview_pending_dirty: None,
+            preview_needs_full: true,
+            clip: None,
             staging: ManuallyDrop::new(staging),
             canvas_target: ManuallyDrop::new(canvas_target),
             stroke_target: ManuallyDrop::new(stroke_target),
@@ -636,6 +653,43 @@ impl VulkanRenderer {
     /// mutation.
     pub fn invalidate_preview_cache(&mut self) {
         self.preview_cache_valid = false;
+        // The below-stack changed, so the next preview frame must rebuild the
+        // whole canvas before incremental updates resume.
+        self.preview_needs_full = true;
+        self.preview_pending_dirty = None;
+    }
+
+    /// The clip rect for the next incremental preview frame: the pending dab
+    /// region clamped to the canvas, or `None` (rebuild the whole canvas) when a
+    /// full frame is forced or nothing was stamped. Consumes the pending state.
+    pub(super) fn take_preview_clip(&mut self) -> Option<vk::Rect2D> {
+        if self.preview_needs_full {
+            self.preview_needs_full = false;
+            self.preview_pending_dirty = None;
+            return None;
+        }
+        let dirty = self.preview_pending_dirty.take();
+        let (min_x, min_y, max_x, max_y) = dirty?;
+        #[allow(clippy::cast_precision_loss)]
+        let (cw, ch) = (self.canvas.extent.width as f32, self.canvas.extent.height as f32);
+        let x0 = min_x.floor().clamp(0.0, cw);
+        let y0 = min_y.floor().clamp(0.0, ch);
+        let x1 = max_x.ceil().clamp(0.0, cw);
+        let y1 = max_y.ceil().clamp(0.0, ch);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        Some(vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x0 as i32,
+                y: y0 as i32,
+            },
+            extent: vk::Extent2D {
+                width: (x1 - x0) as u32,
+                height: (y1 - y0) as u32,
+            },
+        })
     }
 
     /// Copy one canvas-sized image into another. Both transition
@@ -658,12 +712,29 @@ impl VulkanRenderer {
             base_array_layer: 0,
             layer_count: 1,
         };
+        // Honor an active clip rect so the incremental preview copies only the
+        // dirty region; otherwise copy the whole canvas.
+        let (offset, extent) = match self.clip {
+            Some(r) => (
+                vk::Offset3D {
+                    x: r.offset.x,
+                    y: r.offset.y,
+                    z: 0,
+                },
+                vk::Extent3D {
+                    width: r.extent.width,
+                    height: r.extent.height,
+                    depth: 1,
+                },
+            ),
+            None => (vk::Offset3D::default(), self.canvas.extent),
+        };
         let copy = vk::ImageCopy::default()
             .src_subresource(subresource)
-            .src_offset(vk::Offset3D::default())
+            .src_offset(offset)
             .dst_subresource(subresource)
-            .dst_offset(vk::Offset3D::default())
-            .extent(self.canvas.extent);
+            .dst_offset(offset)
+            .extent(extent);
         unsafe {
             self.device.cmd_copy_image(
                 self.command_buffer,
@@ -704,17 +775,18 @@ impl VulkanRenderer {
             min_depth: 0.0,
             max_depth: 1.0,
         };
-        let scissor = vk::Rect2D {
+        // The viewport stays full-canvas (the fullscreen triangle's UVs must map
+        // to canvas pixels); the clip rect only narrows the scissor + render
+        // area so fragments outside the dirty region are not touched.
+        let area = self.clip.unwrap_or(vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent,
-        };
+        });
+        let scissor = area;
         let begin = vk::RenderPassBeginInfo::default()
             .render_pass(render_pass)
             .framebuffer(framebuffer)
-            .render_area(vk::Rect2D {
-                offset: vk::Offset2D::default(),
-                extent,
-            });
+            .render_area(area);
         unsafe {
             self.device.cmd_begin_render_pass(
                 self.command_buffer,

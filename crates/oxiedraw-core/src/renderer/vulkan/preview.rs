@@ -25,13 +25,17 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let visible_indices = self.visible_layer_indices(visibilities);
+        self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
+        let clip = self.take_preview_clip();
         let display_old_layout = self.display_old_layout();
-        self.record_and_submit(|this| {
-            this.record_layered_preview(&visible_indices, target_idx, push);
+        let result = self.record_and_submit(|this| {
+            this.record_layered_preview(&visible_indices, target_idx, push, clip);
             let preview_image = this.preview.handle;
             this.record_present_copy(preview_image, display_old_layout);
             Ok(())
-        })?;
+        });
+        self.clip = None;
+        result?;
         self.display_initialised = true;
         Ok(())
     }
@@ -67,8 +71,10 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let visible_indices = self.visible_layer_indices(visibilities);
+        self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
+        let clip = self.take_preview_clip();
         let display_old_layout = self.display_old_layout();
-        self.record_and_submit(|this| {
+        let result = self.record_and_submit(|this| {
             if n > 0 {
                 // Stamp the dab mask into the stroke buffer.
                 this.cmd_dab_pass(family, pipeline, layout, stroke_rp, stroke_fb, n);
@@ -80,11 +86,13 @@ impl VulkanRenderer {
                     vk::ImageLayout::GENERAL,
                 );
             }
-            this.record_layered_preview(&visible_indices, target_idx, push);
+            this.record_layered_preview(&visible_indices, target_idx, push, clip);
             let preview_image = this.preview.handle;
             this.record_present_copy(preview_image, display_old_layout);
             Ok(())
-        })?;
+        });
+        self.clip = None;
+        result?;
         self.display_initialised = true;
         Ok(())
     }
@@ -99,6 +107,37 @@ impl VulkanRenderer {
         opacity: f32,
     ) -> Result<Vec<u8>, RendererError> {
         self.record_preview_to_staging(visibilities, target_idx, color_linear, opacity)?;
+        self.copy_staging_bytes()
+    }
+
+    /// Drive the *incremental* preview (dab-region clip via `take_preview_clip`)
+    /// and read the resulting `preview` image back. Test/diagnostic helper: the
+    /// live path presents to the display rather than reading. Lets a test assert
+    /// the incremental result matches a full rebuild.
+    pub fn render_preview_incremental_and_read(
+        &mut self,
+        visibilities: &[bool],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<Vec<u8>, RendererError> {
+        let push: [f32; 4] = [
+            color_linear[0],
+            color_linear[1],
+            color_linear[2],
+            opacity.clamp(0.0, 1.0),
+        ];
+        let visible_indices = self.visible_layer_indices(visibilities);
+        self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
+        let clip = self.take_preview_clip();
+        let extent = self.canvas.extent;
+        let result = self.record_and_submit(|this| {
+            this.record_layered_preview(&visible_indices, target_idx, push, clip);
+            Ok(())
+        });
+        self.clip = None;
+        result?;
+        self.read_image_to_staging(self.preview.handle, extent)?;
         self.copy_staging_bytes()
     }
 
@@ -133,8 +172,11 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let visible_indices = self.visible_layer_indices(visibilities);
+        self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
+        // Readback (export / thumbnails / tests) must return the whole canvas,
+        // so force a full preview rather than an incremental dab-region update.
         self.record_and_submit(|this| {
-            this.record_layered_preview(&visible_indices, target_idx, push);
+            this.record_layered_preview(&visible_indices, target_idx, push, None);
             this.barrier(
                 this.preview.handle,
                 vk::ImageLayout::GENERAL,
@@ -193,11 +235,14 @@ impl VulkanRenderer {
         visible_indices: &[usize],
         target_idx: usize,
         stroke_push: [f32; 4],
+        clip: Option<vk::Rect2D>,
     ) {
         let erase = self.stroke_erase;
         // Cache the layers strictly below the target, each with its blend mode
         // + opacity. The target (with its in-flight stroke merged) and the
-        // layers above are re-composited every event.
+        // layers above are re-composited every event. The cache rebuild is
+        // always full-canvas; the per-frame update below honors `clip`.
+        self.clip = None;
         if !self.preview_cache_valid {
             let below_img = self.preview_below.handle;
             let below_fb = self.preview_below_framebuffer;
@@ -211,7 +256,12 @@ impl VulkanRenderer {
             self.preview_cache_valid = true;
         }
 
-        // preview := cached below stack.
+        // Incremental: restore + recomposite only the dab region; the rest of
+        // `preview` keeps the previous frame's (still-correct) content. The
+        // caller's present copy reads `self.clip` too, so leave it set.
+        self.clip = clip;
+
+        // preview := cached below stack (in the clip region).
         self.cmd_copy_image_full(self.preview_below.handle, self.preview.handle);
 
         // The target layer with the in-flight stroke merged in, blended at the
@@ -233,12 +283,23 @@ impl VulkanRenderer {
 
     /// Blend-composite layer `idx` onto the accumulator (`acc_img` / `acc_fb`)
     /// using its stored blend mode + opacity.
+    ///
+    /// Adjustment layers are skipped: their slot is a grayscale mask, not
+    /// color, so compositing it here would paint the mask (a white block by
+    /// default) over the canvas. Their effect is applied only in the committed
+    /// recomposite (`composite_layers_to_canvas_adjusted`); the live in-stroke
+    /// preview leaves the backdrop unadjusted until commit. The one case where
+    /// an adjustment slot *should* show is when it is the layer being painted -
+    /// that goes through `preview_compose_stroked_target`, not this helper.
     pub(super) fn preview_compose_layer(
         &self,
         acc_img: vk::Image,
         acc_fb: vk::Framebuffer,
         idx: usize,
     ) {
+        if self.layer_stack.slots[idx].adjustment.is_some() {
+            return;
+        }
         let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
         let (mode, opacity) = self.layer_stack.blend(idx);
         self.cmd_compose_layer_blended(acc_img, acc_fb, descriptor_set, mode, opacity);
@@ -248,7 +309,12 @@ impl VulkanRenderer {
     /// (OVER for paint, DST_OUT for erase), then blend that scratch over the
     /// below-cache already in `preview` using the target's mode + opacity. This
     /// keeps a non-Normal target layer's blend applied to its live stroke.
-    fn preview_compose_stroked_target(&self, target_idx: usize, push: [f32; 4], erase: bool) {
+    pub(super) fn preview_compose_stroked_target(
+        &self,
+        target_idx: usize,
+        push: [f32; 4],
+        erase: bool,
+    ) {
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
         // scratch := the target layer pixels (a copy is identical to a clear +

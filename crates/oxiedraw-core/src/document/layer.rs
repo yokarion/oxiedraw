@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use oxiedraw_utils::geometry::TransformRect;
 use serde::{Deserialize, Serialize};
 
+use crate::effects::AdjustmentData;
 use crate::text::TextContent;
 
 static LAYER_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -133,13 +134,18 @@ impl BlendMode {
 /// `Raster` is the normal painted layer. `Component` is a pre-rendered,
 /// rescalable instance of a component: its slot pixels are re-rendered from
 /// the component's master texture. `Text` is an editable text box re-rendered
-/// from its [`TextContent`]. Both non-raster kinds reject raster operations.
+/// from its [`TextContent`]. `Adjustment` is a non-destructive effect layer:
+/// it holds no color, its image slot is a grayscale mask, and at composite
+/// time it filters everything below it. All non-raster kinds reject raster
+/// operations except `Adjustment`, whose slot accepts brush strokes (to paint
+/// the mask).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub enum LayerKind {
     #[default]
     Raster,
     Component(ComponentInstance),
     Text(TextContent),
+    Adjustment(AdjustmentData),
 }
 
 impl LayerKind {
@@ -162,6 +168,9 @@ impl LayerKind {
                 content.box_rect.cy += dy;
                 Self::Text(content)
             }
+            // The mask follows the layer's pixels (which crop already moves);
+            // the effect parameters carry no canvas geometry.
+            Self::Adjustment(data) => Self::Adjustment(data.clone()),
         }
     }
 }
@@ -222,12 +231,37 @@ impl Layer {
         matches!(self.kind, LayerKind::Raster)
     }
 
+    /// `true` for adjustment (non-destructive effect) layers. Their image slot
+    /// is a grayscale mask rather than color, so brush strokes are allowed but
+    /// composited as a mask.
+    #[must_use]
+    pub const fn is_adjustment(&self) -> bool {
+        matches!(self.kind, LayerKind::Adjustment(_))
+    }
+
+    /// The effect stack of this layer, if it is an adjustment layer.
+    #[must_use]
+    pub fn adjustment(&self) -> Option<&AdjustmentData> {
+        match &self.kind {
+            LayerKind::Adjustment(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the effect stack, if this is an adjustment layer.
+    pub fn adjustment_mut(&mut self) -> Option<&mut AdjustmentData> {
+        match &mut self.kind {
+            LayerKind::Adjustment(data) => Some(data),
+            _ => None,
+        }
+    }
+
     /// The component this instance renders, if any.
     #[must_use]
     pub fn component_id(&self) -> Option<&str> {
         match &self.kind {
             LayerKind::Component(inst) => Some(inst.component_id.as_str()),
-            LayerKind::Raster | LayerKind::Text(_) => None,
+            LayerKind::Raster | LayerKind::Text(_) | LayerKind::Adjustment(_) => None,
         }
     }
 
@@ -236,7 +270,7 @@ impl Layer {
     pub fn text_content(&self) -> Option<&TextContent> {
         match &self.kind {
             LayerKind::Text(content) => Some(content),
-            LayerKind::Raster | LayerKind::Component(_) => None,
+            LayerKind::Raster | LayerKind::Component(_) | LayerKind::Adjustment(_) => None,
         }
     }
 }

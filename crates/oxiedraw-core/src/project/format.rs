@@ -13,8 +13,11 @@ use crate::text::fonts::FontMeta;
 /// v4 adds text layers (`LayerKind::Text`, stored inline in `kind`) and the
 /// embedded font files they use (`fonts.json` + `fonts/<hash>`).
 /// v5 adds per-layer `blend` mode and `opacity`.
-pub const SCHEMA_VERSION: u32 = 5;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5];
+/// v6 adds adjustment layers (`LayerKind::Adjustment`, effect stack stored
+/// inline in `kind`); the layer's grayscale mask rides the existing
+/// `layers/<id>.png`, so no new archive entries are needed.
+pub const SCHEMA_VERSION: u32 = 6;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.

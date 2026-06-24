@@ -26,17 +26,34 @@ const INVERT_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_
 const BOX_BLUR_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_box_blur.frag.spv"));
 const SHARPEN_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_sharpen.frag.spv"));
+const STROKE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/adjust_stroke.frag.spv"));
 const MASK_MIX_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_mask_mix.frag.spv"));
 
 /// 16 bytes: one `vec4` of parameters (meaning depends on the bound pipeline).
 pub(super) const FILTER_PUSH_BYTES: u32 = 16;
+/// Size of the input-set ring. Caps how many filter passes the batched
+/// adjustment preview can record into a single submit before falling back to
+/// the per-submit path.
+pub(super) const INPUT_RING: usize = 16;
+/// Stroke pass push: 3x vec4 (color, params, texel). See `adjust_stroke.frag`.
+pub(super) const STROKE_PUSH_BYTES: u32 = 48;
 
 /// Which scratch image currently holds a pass's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Scratch {
     A,
     B,
+}
+
+impl Scratch {
+    /// The opposite slot - the natural destination when ping-ponging.
+    pub(super) const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
 }
 
 pub(super) struct FilterResources {
@@ -51,8 +68,11 @@ pub(super) struct FilterResources {
     /// Three-sampler input layout shared by every filter pipeline.
     pub input_set_layout: vk::DescriptorSetLayout,
     pub input_pool: vk::DescriptorPool,
-    /// Reusable input set, rewritten via [`Self::write_input`] before each pass.
-    pub input_set: vk::DescriptorSet,
+    /// Ring of input sets. The submit-per-pass filters only ever need one (they
+    /// fence between passes, so the set can be rewritten), but the batched
+    /// adjustment preview records several passes into one command buffer and so
+    /// needs a distinct set per pass. `write_input` targets a chosen set.
+    pub input_sets: Vec<vk::DescriptorSet>,
 
     /// Layout shared by every filter pipeline (input set + 16-byte push).
     pub pipeline_layout: vk::PipelineLayout,
@@ -62,6 +82,12 @@ pub(super) struct FilterResources {
     pub box_blur: vk::Pipeline,
     pub sharpen: vk::Pipeline,
     pub mask_mix: vk::Pipeline,
+
+    /// Adjustment-layer stroke pass. Reuses the 3-sampler `input_set` (backdrop
+    /// on binding 0, mask on binding 1) but needs a wider 48-byte push, so it
+    /// has its own pipeline layout.
+    pub stroke_layout: vk::PipelineLayout,
+    pub stroke: vk::Pipeline,
 
     /// Descriptor sets that bind each scratch image for the layer-composite
     /// pipeline, so a finished scratch image can be drawn into the preview.
@@ -109,13 +135,12 @@ impl FilterResources {
         let sampler = create_sampler(device)?;
         let input_set_layout = create_input_set_layout(device)?;
         let input_pool = create_input_pool(device)?;
-        let input_set = {
-            let layouts = [input_set_layout];
+        let input_sets = {
+            let layouts = vec![input_set_layout; INPUT_RING];
             let info = vk::DescriptorSetAllocateInfo::default()
                 .descriptor_pool(input_pool)
                 .set_layouts(&layouts);
-            let sets = unsafe { device.allocate_descriptor_sets(&info)? };
-            sets[0]
+            unsafe { device.allocate_descriptor_sets(&info)? }
         };
 
         let pipeline_layout = create_pipeline_layout(device, input_set_layout)?;
@@ -127,6 +152,10 @@ impl FilterResources {
             create_pipeline(device, pipeline_layout, canvas_render_pass, SHARPEN_FRAG_SPV)?;
         let mask_mix =
             create_pipeline(device, pipeline_layout, canvas_render_pass, MASK_MIX_FRAG_SPV)?;
+
+        let stroke_layout =
+            create_pipeline_layout_sized(device, input_set_layout, STROKE_PUSH_BYTES)?;
+        let stroke = create_pipeline(device, stroke_layout, canvas_render_pass, STROKE_FRAG_SPV)?;
 
         let composite_pool = create_composite_pool(device)?;
         let composite_set_a = allocate_composite_set(
@@ -152,13 +181,15 @@ impl FilterResources {
             sampler,
             input_set_layout,
             input_pool,
-            input_set,
+            input_sets,
             pipeline_layout,
             hsv,
             invert,
             box_blur,
             sharpen,
             mask_mix,
+            stroke_layout,
+            stroke,
             composite_pool,
             composite_set_a,
             composite_set_b,
@@ -170,6 +201,14 @@ impl FilterResources {
         match which {
             Scratch::A => self.scratch_a.handle,
             Scratch::B => self.scratch_b.handle,
+        }
+    }
+
+    /// Image view for a scratch slot (for binding as a sampler source).
+    pub(super) const fn scratch_view(&self, which: Scratch) -> vk::ImageView {
+        match which {
+            Scratch::A => self.scratch_a.view,
+            Scratch::B => self.scratch_b.view,
         }
     }
 
@@ -191,9 +230,15 @@ impl FilterResources {
 
     /// Rewrite the three input bindings of the reusable filter set. Pass the
     /// same view for bindings that the active pipeline does not read.
+    /// The input set at ring position `i` (wraps).
+    pub(super) fn input_set(&self, i: usize) -> vk::DescriptorSet {
+        self.input_sets[i % self.input_sets.len()]
+    }
+
     pub(super) fn write_input(
         &self,
         device: &Device,
+        set: vk::DescriptorSet,
         primary: vk::ImageView,
         secondary: vk::ImageView,
         mask: vk::ImageView,
@@ -214,17 +259,17 @@ impl FilterResources {
         ];
         let writes = [
             vk::WriteDescriptorSet::default()
-                .dst_set(self.input_set)
+                .dst_set(set)
                 .dst_binding(0)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[0..1]),
             vk::WriteDescriptorSet::default()
-                .dst_set(self.input_set)
+                .dst_set(set)
                 .dst_binding(1)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[1..2]),
             vk::WriteDescriptorSet::default()
-                .dst_set(self.input_set)
+                .dst_set(set)
                 .dst_binding(2)
                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                 .image_info(&infos[2..3]),
@@ -241,6 +286,8 @@ impl FilterResources {
             device.destroy_pipeline(self.box_blur, None);
             device.destroy_pipeline(self.sharpen, None);
             device.destroy_pipeline(self.mask_mix, None);
+            device.destroy_pipeline(self.stroke, None);
+            device.destroy_pipeline_layout(self.stroke_layout, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.composite_pool, None);
             device.destroy_descriptor_pool(self.input_pool, None);
@@ -275,11 +322,11 @@ fn binding(slot: u32) -> vk::DescriptorSetLayoutBinding<'static> {
 fn create_input_pool(device: &Device) -> Result<vk::DescriptorPool, RendererError> {
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 3,
+        descriptor_count: 3 * INPUT_RING as u32,
     }];
     let info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&sizes)
-        .max_sets(1);
+        .max_sets(INPUT_RING as u32);
     Ok(unsafe { device.create_descriptor_pool(&info, None)? })
 }
 
@@ -323,11 +370,19 @@ fn create_pipeline_layout(
     device: &Device,
     set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, RendererError> {
+    create_pipeline_layout_sized(device, set_layout, FILTER_PUSH_BYTES)
+}
+
+fn create_pipeline_layout_sized(
+    device: &Device,
+    set_layout: vk::DescriptorSetLayout,
+    push_bytes: u32,
+) -> Result<vk::PipelineLayout, RendererError> {
     let set_layouts = [set_layout];
     let push_ranges = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
         .offset(0)
-        .size(FILTER_PUSH_BYTES)];
+        .size(push_bytes)];
     let info = vk::PipelineLayoutCreateInfo::default()
         .set_layouts(&set_layouts)
         .push_constant_ranges(&push_ranges);

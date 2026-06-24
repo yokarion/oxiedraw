@@ -52,7 +52,23 @@ impl VulkanRenderer {
         src_image: vk::Image,
         display_old_layout: vk::ImageLayout,
     ) {
-        let extent = self.canvas.extent;
+        // Honor an active clip rect so only the dirty region is pushed to the
+        // display (the rest is already correct from the previous present).
+        let (clip_offset, clip_extent) = match self.clip {
+            Some(r) => (
+                vk::Offset3D {
+                    x: r.offset.x,
+                    y: r.offset.y,
+                    z: 0,
+                },
+                vk::Extent3D {
+                    width: r.extent.width,
+                    height: r.extent.height,
+                    depth: 1,
+                },
+            ),
+            None => (vk::Offset3D::default(), self.canvas.extent),
+        };
         // No queue-family transfer to FOREIGN_EXT - we rely on implicit
         // dma-buf sync (kernel propagates the GPU fence).
         unsafe {
@@ -83,15 +99,15 @@ impl VulkanRenderer {
                 base_array_layer: 0,
                 layer_count: 1,
             })
-            .src_offset(vk::Offset3D::default())
+            .src_offset(clip_offset)
             .dst_subresource(vk::ImageSubresourceLayers {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 mip_level: 0,
                 base_array_layer: 0,
                 layer_count: 1,
             })
-            .dst_offset(vk::Offset3D::default())
-            .extent(extent);
+            .dst_offset(clip_offset)
+            .extent(clip_extent);
         unsafe {
             self.device.cmd_copy_image(
                 self.command_buffer,

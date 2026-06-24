@@ -7,6 +7,7 @@
 //! realized widget and call `canvas::wire(...)`.
 
 mod actions;
+mod adjustments;
 mod app;
 mod brush_manager;
 mod brush_picker;

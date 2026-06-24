@@ -14,6 +14,7 @@ use gpu_allocator::vulkan::Allocator;
 
 use super::RendererError;
 use super::resources::Image;
+use crate::effects::AdjustmentData;
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/layer_composite.frag.spv"));
@@ -111,6 +112,11 @@ pub(super) struct LayerSlot {
     pub blend_mode: u32,
     /// Layer opacity in `0.0..=1.0`. New slots start at 1.0 (opaque).
     pub opacity: f32,
+    /// When `Some`, this slot is an adjustment layer: its image is a grayscale
+    /// mask, and at composite time the effect stack is applied to everything
+    /// below it instead of the slot being drawn as color. New slots start
+    /// `None` (a plain raster/color layer).
+    pub adjustment: Option<AdjustmentData>,
 }
 
 pub(super) struct LayerStack {
@@ -150,6 +156,20 @@ impl LayerStack {
     /// Blend-mode index + opacity of slot `idx` (Normal / opaque if out of range).
     pub(super) fn blend(&self, idx: usize) -> (u32, f32) {
         self.slots.get(idx).map_or((0, 1.0), |s| (s.blend_mode, s.opacity))
+    }
+
+    /// Mark slot `idx` as an adjustment layer with the given effect stack, or
+    /// clear it back to a plain color layer with `None`. No-op if out of range.
+    pub(super) fn set_adjustment(&mut self, idx: usize, data: Option<AdjustmentData>) {
+        if let Some(slot) = self.slots.get_mut(idx) {
+            slot.adjustment = data;
+        }
+    }
+
+    /// `true` if any slot is an adjustment layer (the composite must then take
+    /// the slower per-layer-submit path that can run effect chains).
+    pub(super) fn has_adjustments(&self) -> bool {
+        self.slots.iter().any(|s| s.adjustment.is_some())
     }
 
     /// Allocate a new layer slot and append it to the stack. Returns
@@ -194,6 +214,7 @@ impl LayerStack {
             content_version: 0,
             blend_mode: 0,
             opacity: 1.0,
+            adjustment: None,
         });
         Ok(self.slots.len() - 1)
     }

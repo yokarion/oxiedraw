@@ -16,6 +16,7 @@ pub mod color;
 pub mod components;
 pub mod compositor;
 pub mod document;
+pub mod effects;
 pub mod export;
 pub mod filters;
 pub mod history;

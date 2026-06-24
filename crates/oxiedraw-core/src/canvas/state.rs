@@ -4,6 +4,7 @@ use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 use crate::brush_engine::PaintTarget;
 use crate::color::Color;
 use crate::document::{BlendMode, LayerKind, LayerState};
+use crate::effects::AdjustmentData;
 use crate::filters::FilterSpec;
 use crate::renderer::{
     DmabufDescriptor, EdgesBuffer, RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
@@ -44,6 +45,11 @@ pub struct Canvas {
     /// Last `pixels_version` that was actually presented to the dmabuf
     /// display image. `present()` short-circuits when this matches.
     display_version: u64,
+    /// The adjustment layer (if any) whose mask is currently shown on the
+    /// canvas because it is the active layer. Tracked so `present()` re-renders
+    /// when the selection switches into or out of mask view, independent of
+    /// `pixels_version`.
+    displayed_mask_idx: Option<usize>,
 }
 
 impl Canvas {
@@ -69,6 +75,7 @@ impl Canvas {
             current_stroke: None,
             pixels_version: 1,
             display_version: 0,
+            displayed_mask_idx: None,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -232,6 +239,51 @@ impl Canvas {
         self.layers.set_active(Some(idx));
         self.recomposite_canvas()?;
         Ok(idx)
+    }
+
+    /// Add a non-destructive adjustment layer on top of the stack. Its image
+    /// slot is its grayscale mask, initialised to opaque white (the effects
+    /// apply everywhere until the user paints the mask). Returns the new
+    /// layer's index.
+    pub fn add_adjustment_layer(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<usize, RendererError> {
+        let idx = self.renderer.add_layer()?;
+        let state_idx = self.layers.add(name);
+        debug_assert_eq!(idx, state_idx, "renderer and state must stay in lockstep");
+        let data = AdjustmentData::default();
+        self.layers
+            .set_kind(idx, LayerKind::Adjustment(data.clone()));
+        // White mask = full-strength effect across the whole canvas.
+        self.renderer.clear_layer(idx, [1.0, 1.0, 1.0, 1.0])?;
+        self.renderer.set_layer_adjustment(idx, Some(data));
+        self.layers.set_active(Some(idx));
+        self.recomposite_canvas()?;
+        Ok(idx)
+    }
+
+    /// Replace the effect stack of the adjustment layer at `idx` and
+    /// re-composite. The mask (the layer's pixels) is untouched.
+    pub fn set_layer_effects(
+        &mut self,
+        idx: usize,
+        data: AdjustmentData,
+    ) -> Result<(), RendererError> {
+        self.layers
+            .set_kind(idx, LayerKind::Adjustment(data.clone()));
+        self.renderer.set_layer_adjustment(idx, Some(data));
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// The effect stack of the adjustment layer at `idx`, if it is one.
+    #[must_use]
+    pub fn layer_effects(&self, idx: usize) -> Option<AdjustmentData> {
+        match self.layers.kind(idx) {
+            Some(LayerKind::Adjustment(data)) => Some(data),
+            _ => None,
+        }
     }
 
     /// Remove the layer at `idx`. Active selection moves to the
@@ -456,15 +508,56 @@ impl Canvas {
             Some(ctx) => {
                 let linear = ctx.color.to_linear_rgb();
                 let visibilities = self.visibilities();
-                self.renderer.render_preview_layered_and_read(
-                    &visibilities,
-                    ctx.layer_idx,
-                    linear,
-                    ctx.opacity,
-                )
+                if self.effective_adjustment_above(ctx.layer_idx) {
+                    self.renderer.render_preview_adjusted_and_read(
+                        &visibilities,
+                        ctx.layer_idx,
+                        linear,
+                        ctx.opacity,
+                    )
+                } else {
+                    self.renderer.render_preview_layered_and_read(
+                        &visibilities,
+                        ctx.layer_idx,
+                        linear,
+                        ctx.opacity,
+                    )
+                }
             }
             None => self.renderer.read_canvas(),
         }
+    }
+
+    /// Test/diagnostic: drive the incremental (dab-region-clipped) preview for
+    /// the in-flight stroke and read the result. Returns the composited canvas
+    /// when no stroke is active.
+    pub fn read_incremental_preview(&mut self) -> Result<Vec<u8>, RendererError> {
+        let Some(ctx) = self.current_stroke else {
+            return self.renderer.read_canvas();
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        if self.effective_adjustment_above(ctx.layer_idx) {
+            self.renderer.render_preview_adjusted_incremental_and_read(
+                &visibilities,
+                ctx.layer_idx,
+                linear,
+                ctx.opacity,
+            )
+        } else {
+            self.renderer.render_preview_incremental_and_read(
+                &visibilities,
+                ctx.layer_idx,
+                linear,
+                ctx.opacity,
+            )
+        }
+    }
+
+    /// Test/diagnostic: force the next preview frame to rebuild the whole canvas
+    /// (drops the incremental dab-region state).
+    pub fn force_full_preview(&mut self) {
+        self.renderer.invalidate_preview_cache();
     }
 
     /// Like [`Self::read_pixels`] but fills a caller-owned buffer instead
@@ -547,7 +640,12 @@ impl Canvas {
     /// uses to import it.
     pub fn present(&mut self) -> Result<DmabufDescriptor, RendererError> {
         use crate::renderer::PresentSource;
-        if self.display_version != self.pixels_version {
+        // When an adjustment layer is the active selection (and nothing else is
+        // in flight), the canvas shows its grayscale mask so it can be edited.
+        let want_mask = self.mask_view_idx();
+        let dirty =
+            self.display_version != self.pixels_version || want_mask != self.displayed_mask_idx;
+        if dirty {
             if self.renderer.filter_active() {
                 let visibilities = self.visibilities();
                 self.renderer.render_filter_preview(&visibilities)?;
@@ -569,21 +667,72 @@ impl Canvas {
                     Some(ctx) => {
                         let linear = ctx.color.to_linear_rgb();
                         let visibilities = self.visibilities();
-                        self.renderer.render_preview_and_present(
-                            &visibilities,
-                            ctx.layer_idx,
-                            linear,
-                            ctx.opacity,
-                        )?;
+                        // Live effect preview: when an effective adjustment sits
+                        // above the painted layer, composite the in-flight stroke
+                        // through the effect chain so the canvas shows the
+                        // adjusted result while drawing.
+                        if self.effective_adjustment_above(ctx.layer_idx) {
+                            self.renderer.render_preview_adjusted_and_present(
+                                &visibilities,
+                                ctx.layer_idx,
+                                linear,
+                                ctx.opacity,
+                            )?;
+                        } else {
+                            self.renderer.render_preview_and_present(
+                                &visibilities,
+                                ctx.layer_idx,
+                                linear,
+                                ctx.opacity,
+                            )?;
+                        }
                     }
                     None => {
-                        self.renderer.present_to_display(PresentSource::Canvas)?;
+                        if let Some(idx) = want_mask {
+                            self.renderer.render_mask_preview(idx)?;
+                            self.renderer.present_to_display(PresentSource::Preview)?;
+                        } else {
+                            self.renderer.present_to_display(PresentSource::Canvas)?;
+                        }
                     }
                 }
             }
             self.display_version = self.pixels_version;
+            self.displayed_mask_idx = want_mask;
         }
         Ok(self.renderer.display_descriptor())
+    }
+
+    /// The adjustment layer whose mask should be shown on the canvas right now:
+    /// the active layer, when it is an adjustment and no stroke is in flight
+    /// (a stroke on the adjustment renders the mask + the live dab instead).
+    fn mask_view_idx(&self) -> Option<usize> {
+        if self.current_stroke.is_some() {
+            return None;
+        }
+        let idx = self.layers.active()?;
+        self.layer_is_adjustment(idx).then_some(idx)
+    }
+
+    fn layer_is_adjustment(&self, idx: usize) -> bool {
+        matches!(self.layers.kind(idx), Some(LayerKind::Adjustment(_)))
+    }
+
+    /// `true` when a visible adjustment layer with a non-empty effect stack sits
+    /// *above* `target` (higher z-index). Only then does a stroke on `target`
+    /// need the slow per-frame adjusted preview - the effect reprocesses the
+    /// changing stroke every frame. Strokes that no effective adjustment
+    /// influences keep the fast cached preview path.
+    fn effective_adjustment_above(&self, target: usize) -> bool {
+        self.layers
+            .snapshot()
+            .iter()
+            .enumerate()
+            .any(|(idx, l)| {
+                idx > target
+                    && l.visible
+                    && matches!(&l.kind, LayerKind::Adjustment(d) if !d.is_noop())
+            })
     }
 
     /// Fast per-motion-event path: stamp the brush dabs AND refresh the
@@ -599,9 +748,15 @@ impl Canvas {
             self.stamp(paint)?;
             return self.present();
         };
+        // The fast single-submit preview can't run effect chains, so when an
+        // effective adjustment above this layer would alter the stroke's result
+        // fall back to the slower stamp + present (the adjusted preview path).
+        // Strokes no adjustment influences keep the fast path - no slowdown.
+        let needs_adjusted_preview = self.effective_adjustment_above(ctx.layer_idx);
         if self.renderer.filter_active()
             || self.renderer.fill_active()
             || self.renderer.shape_active()
+            || needs_adjusted_preview
         {
             self.stamp(paint)?;
             return self.present();
@@ -1526,6 +1681,57 @@ mod tests {
 
         // Far-from-stroke corner stays transparent.
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// The incremental (dab-region-clipped) preview must produce the same image
+    /// as a full rebuild: dabs from earlier frames are retained outside the
+    /// current dab region, and the current region is recomposited correctly.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn incremental_preview_matches_full_rebuild() {
+        let size = Size::new(64, 64);
+        let mut canvas = Canvas::headless(size).expect("init");
+        let red: Vec<u8> = (0..size.width * size.height)
+            .flat_map(|_| [0u8, 0, 255, 255])
+            .collect();
+        let base = canvas.add_layer_with_pixels("base", &red).expect("base");
+        canvas.layers().set_active(Some(base));
+
+        let brush = BrushEngine::new();
+        brush.size.set(6.0);
+        brush.opacity.set(1.0);
+        let white = Color::new(255, 255, 255);
+        canvas.begin_stroke(white, 1.0, false).expect("begin");
+
+        // Frame 1 (full): a dab near the top-left.
+        canvas
+            .stamp(|t| brush.begin_stroke(sample(12.0, 12.0, 0), white, t))
+            .expect("b");
+        canvas
+            .stamp(|t| brush.push_sample(sample(16.0, 12.0, 10), t))
+            .expect("p");
+        let _ = canvas.read_incremental_preview().expect("inc1");
+
+        // Frame 2 (incremental): extend the stroke toward the bottom-right.
+        canvas
+            .stamp(|t| brush.push_sample(sample(48.0, 50.0, 20), t))
+            .expect("p");
+        canvas
+            .stamp(|t| brush.push_sample(sample(52.0, 52.0, 30), t))
+            .expect("p");
+        let incremental = canvas.read_incremental_preview().expect("inc2");
+
+        // Full rebuild of the same stroke state.
+        canvas.force_full_preview();
+        let full = canvas.read_incremental_preview().expect("full");
+
+        assert_eq!(incremental.len(), full.len());
+        let diff = incremental
+            .iter()
+            .zip(full.iter())
+            .filter(|(a, b)| (i32::from(**a) - i32::from(**b)).abs() > 2)
+            .count();
+        assert_eq!(diff, 0, "incremental diverged from full rebuild in {diff} bytes");
     }
 
     /// An eraser stroke on the top layer removes its coverage and reveals

@@ -193,11 +193,17 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
 
     canvas.replace_all_layers(&layers)?;
 
-    // Restore layer kinds (component instances). replace_all_layers resets
-    // everything to Raster, so re-apply the saved kinds by index.
+    // Restore layer kinds. replace_all_layers resets everything to Raster, so
+    // re-apply the saved kinds by index. Adjustment layers must also push their
+    // effect stack to the renderer slot (and re-composite) - set_layer_effects
+    // does both; the loaded pixels are already the mask.
     for (idx, entry) in doc.layers.iter().enumerate() {
-        if entry.kind != crate::document::LayerKind::Raster {
-            canvas.layers().set_kind(idx, entry.kind.clone());
+        match &entry.kind {
+            crate::document::LayerKind::Raster => {}
+            crate::document::LayerKind::Adjustment(data) => {
+                canvas.set_layer_effects(idx, data.clone())?;
+            }
+            other => canvas.layers().set_kind(idx, other.clone()),
         }
     }
 

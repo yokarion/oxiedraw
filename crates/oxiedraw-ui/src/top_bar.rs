@@ -208,6 +208,14 @@ fn build_filters_menu() -> gio::Menu {
     blur_sharpen.append_item(&item("Sharpen...", "app.filter-sharpen", None));
     menu.append_submenu(Some("Blur/Sharpen"), &blur_sharpen);
 
+    let nondestructive = gio::Menu::new();
+    nondestructive.append_item(&item(
+        "New Adjustment Layer...",
+        "app.layer-add-adjustment",
+        None,
+    ));
+    menu.append_section(None, &nondestructive);
+
     menu
 }
 

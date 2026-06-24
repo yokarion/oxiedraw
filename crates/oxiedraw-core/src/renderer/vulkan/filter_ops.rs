@@ -158,6 +158,45 @@ impl VulkanRenderer {
     ) -> Result<Scratch, RendererError> {
         let layer_view = self.layer_stack.slots[idx].image.view;
         let layer_img = self.layer_stack.slots[idx].image.handle;
+
+        let pre = self.produce_filtered_passes(layer_view, layer_img, spec)?;
+
+        // Mask-mix: filtered = pre, original = layer, mask = selection mask,
+        // written into the opposite scratch slot.
+        let dst = pre.other();
+        let pre_view = self.filter_resources.scratch_view(pre);
+        let pre_img = self.filter_resources.scratch_handle(pre);
+        let mask_view = self.selection.mask.view;
+        let mask_img = self.selection.mask.handle;
+        let sel_active = f32::from(u8::from(self.selection_active));
+        self.filter_pass3(
+            self.filter_resources.mask_mix,
+            dst,
+            pre_view,
+            pre_img,
+            layer_view,
+            layer_img,
+            mask_view,
+            mask_img,
+            [sel_active, 0.0, 0.0, 0.0],
+        )?;
+        Ok(dst)
+    }
+
+    /// Run only the per-spec effect passes against an arbitrary source image
+    /// (a layer's pixels for destructive filters, or the canvas accumulator
+    /// for adjustment layers), ping-ponging the scratch slots. Returns the
+    /// scratch slot holding the filtered (not yet mask-mixed) result. The
+    /// source image is read but never written, so the caller can use it as
+    /// the "original" in a following mask-mix.
+    pub(super) fn produce_filtered_passes(
+        &mut self,
+        src_view: vk::ImageView,
+        src_img: vk::Image,
+        spec: FilterSpec,
+    ) -> Result<Scratch, RendererError> {
+        let layer_view = src_view;
+        let layer_img = src_img;
         #[allow(clippy::cast_precision_loss)]
         let inv_w = 1.0 / self.canvas.extent.width as f32;
         #[allow(clippy::cast_precision_loss)]
@@ -236,33 +275,7 @@ impl VulkanRenderer {
                 Scratch::A
             }
         };
-
-        // Mask-mix: filtered = pre, original = layer, mask = selection mask,
-        // written into the opposite scratch slot.
-        let dst = match pre {
-            Scratch::A => Scratch::B,
-            Scratch::B => Scratch::A,
-        };
-        let pre_view = match pre {
-            Scratch::A => self.filter_resources.scratch_a.view,
-            Scratch::B => self.filter_resources.scratch_b.view,
-        };
-        let pre_img = self.filter_resources.scratch_handle(pre);
-        let mask_view = self.selection.mask.view;
-        let mask_img = self.selection.mask.handle;
-        let sel_active = f32::from(u8::from(self.selection_active));
-        self.filter_pass3(
-            self.filter_resources.mask_mix,
-            dst,
-            pre_view,
-            pre_img,
-            layer_view,
-            layer_img,
-            mask_view,
-            mask_img,
-            [sel_active, 0.0, 0.0, 0.0],
-        )?;
-        Ok(dst)
+        Ok(pre)
     }
 
     /// Single-source filter pass (binding 0 = source; bindings 1/2 padded).
@@ -300,7 +313,7 @@ impl VulkanRenderer {
     /// distinct source image to ensure prior writes are visible, then runs
     /// the fullscreen pass into `target`'s framebuffer.
     #[allow(clippy::too_many_arguments)]
-    fn filter_pass3(
+    pub(super) fn filter_pass3(
         &mut self,
         pipeline: vk::Pipeline,
         target: Scratch,
@@ -312,47 +325,134 @@ impl VulkanRenderer {
         img2: vk::Image,
         push: [f32; 4],
     ) -> Result<(), RendererError> {
+        let set = self.filter_resources.input_set(0);
         self.filter_resources
-            .write_input(&self.device, view0, view1, view2);
+            .write_input(&self.device, set, view0, view1, view2);
         let layout = self.filter_resources.pipeline_layout;
-        let set = self.filter_resources.input_set;
         let render_pass = self.canvas_target.render_pass;
         let framebuffer = self.filter_resources.framebuffer(target);
-
         self.record_and_submit(|this| {
-            // Make prior writes to the source images visible to the sampler.
-            this.barrier(img0, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            if img1 != img0 {
-                this.barrier(img1, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            }
-            if img2 != img0 && img2 != img1 {
-                this.barrier(img2, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            }
-            this.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
-            unsafe {
-                this.device.cmd_bind_descriptor_sets(
-                    this.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    layout,
-                    0,
-                    &[set],
-                    &[],
-                );
-                let push_bytes = std::slice::from_raw_parts(
-                    push.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&push),
-                );
-                this.device.cmd_push_constants(
-                    this.command_buffer,
-                    layout,
-                    vk::ShaderStageFlags::FRAGMENT,
-                    0,
-                    push_bytes,
-                );
-            }
-            this.cmd_end_fullscreen_pass();
+            this.cmd_filter_pass3(
+                set, layout, pipeline, render_pass, framebuffer, img0, img1, img2, push,
+            );
             Ok(())
         })
+    }
+
+    /// Record (no submit) a three-source fullscreen filter pass into the current
+    /// command buffer. The descriptor `set` must already be written. Barriers
+    /// each distinct source GENERAL->GENERAL so prior writes are visible. Lets
+    /// several passes be batched into one submission (the adjustment preview).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cmd_filter_pass3(
+        &mut self,
+        set: vk::DescriptorSet,
+        layout: vk::PipelineLayout,
+        pipeline: vk::Pipeline,
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        img0: vk::Image,
+        img1: vk::Image,
+        img2: vk::Image,
+        push: [f32; 4],
+    ) {
+        self.barrier(img0, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        if img1 != img0 {
+            self.barrier(img1, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        }
+        if img2 != img0 && img2 != img1 {
+            self.barrier(img2, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        }
+        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+            let push_bytes =
+                std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), std::mem::size_of_val(&push));
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_bytes,
+            );
+        }
+        self.cmd_end_fullscreen_pass();
+    }
+
+    /// Run the adjustment stroke pass: trace the backdrop's alpha edge (binding
+    /// 0) gated by the mask (binding 1) and write the premultiplied stroke band
+    /// into scratch A. Uses the wider 48-byte push layout. The result lives in
+    /// `Scratch::A`; the caller OVER-composites it onto the canvas.
+    pub(super) fn run_stroke_pass(
+        &mut self,
+        backdrop_view: vk::ImageView,
+        backdrop_img: vk::Image,
+        mask_view: vk::ImageView,
+        mask_img: vk::Image,
+        push: [f32; 12],
+    ) -> Result<(), RendererError> {
+        let set = self.filter_resources.input_set(0);
+        self.filter_resources
+            .write_input(&self.device, set, backdrop_view, mask_view, mask_view);
+        let layout = self.filter_resources.stroke_layout;
+        let pipeline = self.filter_resources.stroke;
+        let render_pass = self.canvas_target.render_pass;
+        let framebuffer = self.filter_resources.framebuffer(Scratch::A);
+        self.record_and_submit(|this| {
+            this.cmd_run_stroke_pass(
+                set, layout, pipeline, render_pass, framebuffer, backdrop_img, mask_img, push,
+            );
+            Ok(())
+        })
+    }
+
+    /// Record (no submit) the stroke band pass into the current buffer. `set`
+    /// must already be written (backdrop on 0, mask on 1). Lets the batched
+    /// adjustment preview include a Stroke effect in its single submit.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn cmd_run_stroke_pass(
+        &mut self,
+        set: vk::DescriptorSet,
+        layout: vk::PipelineLayout,
+        pipeline: vk::Pipeline,
+        render_pass: vk::RenderPass,
+        framebuffer: vk::Framebuffer,
+        backdrop_img: vk::Image,
+        mask_img: vk::Image,
+        push: [f32; 12],
+    ) {
+        self.barrier(backdrop_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        if mask_img != backdrop_img {
+            self.barrier(mask_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        }
+        self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
+        unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                layout,
+                0,
+                &[set],
+                &[],
+            );
+            let push_bytes =
+                std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), std::mem::size_of_val(&push));
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                push_bytes,
+            );
+        }
+        self.cmd_end_fullscreen_pass();
     }
 
     /// Blend one plain layer image into the preview framebuffer at the layer's

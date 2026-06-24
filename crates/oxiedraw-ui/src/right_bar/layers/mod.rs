@@ -110,6 +110,10 @@ pub(super) enum RowKind {
 pub(super) struct VisibleRow {
     pub(super) kind: RowKind,
     pub(super) depth: usize,
+    // Extra visual indent (in depth steps) from adjustment layers above this row
+    // in its sibling list. Separate from `depth` so structural/drag logic keys
+    // off the true tree depth while the row still draws indented.
+    pub(super) adjust_indent: usize,
     // `None` parent means this row sits at the tree root.
     pub(super) parent_id: Option<String>,
     pub(super) idx_in_parent: usize,
@@ -243,7 +247,7 @@ fn compute_visible_rows(
     snapshot: &[oxiedraw_core::document::Layer],
 ) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
-    collect_rows(tree, snapshot, 0, None, &mut rows);
+    collect_rows(tree, snapshot, 0, 0, None, &mut rows);
     rows
 }
 
@@ -251,10 +255,19 @@ fn collect_rows(
     nodes: &[LayerNode],
     snapshot: &[oxiedraw_core::document::Layer],
     depth: usize,
+    base_extra: usize,
     parent_id: Option<&str>,
     rows: &mut Vec<VisibleRow>,
 ) {
+    // An adjustment layer affects everything below it (the rows after it in this
+    // sibling list, which are lower in z-order), so those rows get an extra
+    // indent step - as if the adjustment opened a group around them. This is
+    // purely visual (`adjust_indent`); `depth` stays the true tree depth so the
+    // drag/group logic is unaffected. `base_extra` carries an enclosing group's
+    // accumulated adjustment indent down to its children.
+    let mut extra = 0usize;
     for (i, node) in nodes.iter().enumerate() {
+        let indent_here = base_extra + extra;
         match node {
             LayerNode::Layer(id) => {
                 if let Some((flat_idx, layer)) = snapshot
@@ -270,9 +283,13 @@ fn collect_rows(
                             flat_idx,
                         },
                         depth,
+                        adjust_indent: indent_here,
                         parent_id: parent_id.map(str::to_string),
                         idx_in_parent: i,
                     });
+                    if layer.is_adjustment() {
+                        extra += 1;
+                    }
                 }
             }
             LayerNode::Group(g) => {
@@ -284,11 +301,12 @@ fn collect_rows(
                         expanded: g.expanded,
                     },
                     depth,
+                    adjust_indent: indent_here,
                     parent_id: parent_id.map(str::to_string),
                     idx_in_parent: i,
                 });
                 if g.expanded {
-                    collect_rows(&g.children, snapshot, depth + 1, Some(&g.id), rows);
+                    collect_rows(&g.children, snapshot, depth + 1, indent_here, Some(&g.id), rows);
                 }
             }
         }
@@ -1104,6 +1122,15 @@ fn build_layers_header(
         });
     }
     header.append(&add_btn);
+
+    let add_adjustment_btn = gtk::Button::builder()
+        .icon_name("oxiedraw-layer-adjustment-symbolic")
+        .tooltip_text("Add adjustment layer")
+        .css_classes(["flat", "circular"])
+        .action_name("app.layer-add-adjustment")
+        .build();
+    header.append(&add_adjustment_btn);
+
     header
 }
 
@@ -1462,7 +1489,7 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             };
             let is_component = row_is_component(&ui, row);
             let is_text = row_is_text(&ui, row);
-            draw_row(ctx, &palette, width, y, row, row.depth as f64, is_active, is_multi, thumb, is_component, is_text);
+            draw_row(ctx, &palette, width, y, row, (row.depth + row.adjust_indent) as f64, is_active, is_multi, thumb, is_component, is_text);
         }
 
         if let Some((from, span, _)) = drag_handle
@@ -1492,7 +1519,7 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                         RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
                         RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
                     };
-                    let depth_f = (row.depth as f64 + anim).max(0.0);
+                    let depth_f = ((row.depth + row.adjust_indent) as f64 + anim).max(0.0);
                     let is_component = row_is_component(&ui, row);
                     let is_text = row_is_text(&ui, row);
                     draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text);
@@ -1979,7 +2006,7 @@ fn install_list_input(
             let width = f64::from(area_w.allocated_width());
             let y_in_row = y - slot_top(row_idx);
             let is_group = matches!(row.kind, RowKind::Group { .. });
-            let zone = hit_zone(x, y_in_row, width, row.depth, is_group);
+            let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group);
 
             *ui.drag.borrow_mut() = Some(Drag {
                 from_row: row_idx,
@@ -2320,6 +2347,10 @@ fn install_list_input(
                         actions::refresh_action_sensitivity(&ui);
                         ui.sync_blend_controls();
                         area_w.queue_draw();
+                        // Re-present the canvas so it switches into / out of the
+                        // adjustment mask view as the active layer changes.
+                        // Cheap when nothing changed: present() short-circuits.
+                        redraw.request();
                     }
                 }
             }
@@ -2387,7 +2418,7 @@ fn install_list_input(
                     let row = &rows[row_idx];
                     let y_in_row = y - slot_top(row_idx);
                     let is_group = matches!(row.kind, RowKind::Group { .. });
-                    let zone = hit_zone(x, y_in_row, width, row.depth, is_group);
+                    let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group);
                     matches!(zone, HitZone::Handle | HitZone::Eye | HitZone::Chevron | HitZone::Swatch)
                 });
             let c = if cursor {
@@ -2630,6 +2661,7 @@ mod tests {
                 flat_idx: 0,
             },
             depth,
+            adjust_indent: 0,
             parent_id: parent_id.map(str::to_owned),
             idx_in_parent,
         }
@@ -2650,6 +2682,7 @@ mod tests {
                 expanded,
             },
             depth,
+            adjust_indent: 0,
             parent_id: parent_id.map(str::to_owned),
             idx_in_parent,
         }

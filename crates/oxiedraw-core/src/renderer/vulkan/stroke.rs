@@ -70,10 +70,18 @@ impl VulkanRenderer {
             let half = d.radius * (1.0 + d.aspect * d.aspect).sqrt() + 1.0;
             let (cx, cy) = (d.center[0], d.center[1]);
             let (nx0, ny0, nx1, ny1) = (cx - half, cy - half, cx + half, cy + half);
-            self.stroke_dirty = Some(match self.stroke_dirty {
-                Some((x0, y0, x1, y1)) => (x0.min(nx0), y0.min(ny0), x1.max(nx1), y1.max(ny1)),
-                None => (nx0, ny0, nx1, ny1),
-            });
+            let grow = |dirty: Option<(f32, f32, f32, f32)>| {
+                Some(match dirty {
+                    Some((x0, y0, x1, y1)) => {
+                        (x0.min(nx0), y0.min(ny0), x1.max(nx1), y1.max(ny1))
+                    }
+                    None => (nx0, ny0, nx1, ny1),
+                })
+            };
+            // Cumulative (for the history patch) and per-preview-frame (for the
+            // incremental preview, reset by each preview build).
+            self.stroke_dirty = grow(self.stroke_dirty);
+            self.preview_pending_dirty = grow(self.preview_pending_dirty);
         }
     }
 

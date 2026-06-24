@@ -122,6 +122,11 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let visible_indices = self.visible_layer_indices(visibilities);
+        // Adjustment layers run a multi-submit effect chain, so their canvas
+        // rebuild can't share this single submit. Without an adjustment the
+        // canvas rebuild stays folded into the stroke-commit submit (the fast,
+        // common path).
+        let has_adjustments = self.has_adjustment_layers();
         self.record_and_submit(|this| {
             // 1. Stroke buffer -> target layer.
             this.cmd_composite_pass(framebuffer, push);
@@ -131,11 +136,19 @@ impl VulkanRenderer {
             this.barrier(layer_image, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
             // 3. Reset the stroke buffer for the next stroke / stamp.
             this.cmd_clear_image(this.stroke.handle, [0.0, 0.0, 0.0, 0.0]);
-            // 4. Rebuild the canvas from the layer stack.
-            this.cmd_composite_layers_to_canvas(&visible_indices);
+            // 4. Rebuild the canvas from the layer stack (no-adjustment path).
+            if !has_adjustments {
+                this.cmd_composite_layers_to_canvas(&visible_indices);
+            }
             Ok(())
         })?;
         self.layer_stack.touch(layer_idx);
+        // 4b. With adjustment layers present, rebuild the canvas through the
+        //     per-layer-submit path so each effect's chain applies to the
+        //     accumulator instead of the slot being drawn as its raw mask.
+        if has_adjustments {
+            self.composite_layers_to_canvas_adjusted(&visible_indices)?;
+        }
         Ok(())
     }
 
@@ -202,6 +215,11 @@ impl VulkanRenderer {
         visibilities: &[bool],
     ) -> Result<(), RendererError> {
         let visible_indices = self.visible_layer_indices(visibilities);
+        // Adjustment layers run multi-pass effect chains that can't share a
+        // single command submission, so fall back to the per-layer path.
+        if self.has_adjustment_layers() {
+            return self.composite_layers_to_canvas_adjusted(&visible_indices);
+        }
         self.record_and_submit(|this| {
             this.cmd_composite_layers_to_canvas(&visible_indices);
             Ok(())

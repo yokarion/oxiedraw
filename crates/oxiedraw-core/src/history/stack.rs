@@ -325,6 +325,20 @@ fn apply_direction(
             }
             Ok(())
         }
+        HistoryAction::EffectEdit {
+            layer_id,
+            before,
+            after,
+        } => {
+            if let Some(idx) = find_layer_idx(canvas, layer_id) {
+                let data = match direction {
+                    Direction::Forward => after,
+                    Direction::Backward => before,
+                };
+                canvas.set_layer_effects(idx, data.clone())?;
+            }
+            Ok(())
+        }
         HistoryAction::LayerDuplicate {
             src_idx: _,
             new_idx,
