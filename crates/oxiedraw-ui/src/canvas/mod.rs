@@ -769,6 +769,10 @@ pub(super) fn present_into_paintable(
             return;
         }
     };
+    // Feed the perf overlay (only worth polling the GPU timestamps when shown).
+    if paintable.perf_enabled() {
+        paintable.record_gpu_timings(canvas.frame_timings());
+    }
     apply_descriptor_to_paintable(&desc, paintable, area);
 }
 

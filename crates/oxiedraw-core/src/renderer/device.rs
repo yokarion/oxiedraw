@@ -22,6 +22,8 @@ pub(super) struct DeviceBundle {
     pub queue_family: u32,
     pub device: Device,
     pub queue: vk::Queue,
+    /// Nanoseconds per timestamp-query tick (0 if the queue lacks timestamps).
+    pub timestamp_period: f32,
     /// Loader for `VK_KHR_external_memory_fd` - used by the dmabuf
     /// display image to export an fd from the allocated memory.
     pub external_memory_fd: external_memory_fd::Device,
@@ -97,6 +99,7 @@ pub(super) fn create(instance: &Instance) -> Result<DeviceBundle, RendererError>
         queue_family,
         device,
         queue,
+        timestamp_period: props.limits.timestamp_period,
         external_memory_fd,
         image_drm_format_modifier,
     })

@@ -31,8 +31,8 @@ const OX: f64 = 12.0;
 const OY: f64 = 12.0;
 const PAD: f64 = 10.0;
 const PANEL_W: f64 = 234.0;
-const PANEL_H: f64 = 198.0;
-const GRAPH_H: f64 = 44.0;
+const PANEL_H: f64 = 260.0;
+const GRAPH_H: f64 = 40.0;
 
 #[derive(Clone, Copy, Default)]
 struct SystemStats {
@@ -51,7 +51,12 @@ struct GpuPaths {
 
 pub(crate) struct PerfGraph {
     enabled: bool,
-    frame_ms: VecDeque<f32>,
+    /// Wall time per displayed frame (ms).
+    total_ms: VecDeque<f32>,
+    /// GPU render time per frame (ms), from timestamp queries.
+    render_ms: VecDeque<f32>,
+    /// GPU present (dmabuf copy) time per frame (ms).
+    present_ms: VecDeque<f32>,
     last_frame: Option<Instant>,
     stats: SystemStats,
     last_stat_sample: Option<Instant>,
@@ -65,7 +70,9 @@ impl Default for PerfGraph {
     fn default() -> Self {
         Self {
             enabled: false,
-            frame_ms: VecDeque::with_capacity(HISTORY),
+            total_ms: VecDeque::with_capacity(HISTORY),
+            render_ms: VecDeque::with_capacity(HISTORY),
+            present_ms: VecDeque::with_capacity(HISTORY),
             last_frame: None,
             stats: SystemStats::default(),
             last_stat_sample: None,
@@ -86,21 +93,24 @@ impl PerfGraph {
         self.enabled = !self.enabled;
         self.last_frame = None;
         if !self.enabled {
-            self.frame_ms.clear();
+            self.total_ms.clear();
+            self.render_ms.clear();
+            self.present_ms.clear();
         }
     }
 
-    /// Record one rendered frame and refresh the system stats if due. Called at
-    /// the top of every snapshot while the overlay is visible.
-    fn tick(&mut self) {
+    /// Record one displayed frame and refresh the system stats if due. Called at
+    /// the top of every snapshot while the overlay is visible. `gpu` is the most
+    /// recent frame's `(render_ms, present_ms)` GPU timings, if available.
+    fn tick(&mut self, gpu: Option<(f32, f32)>) {
         let now = Instant::now();
         if let Some(prev) = self.last_frame {
             let dt_ms = now.duration_since(prev).as_secs_f32() * 1000.0;
             if dt_ms <= IDLE_GAP_MS {
-                if self.frame_ms.len() == HISTORY {
-                    self.frame_ms.pop_front();
-                }
-                self.frame_ms.push_back(dt_ms);
+                push_sample(&mut self.total_ms, dt_ms);
+                let (render, present) = gpu.unwrap_or((0.0, 0.0));
+                push_sample(&mut self.render_ms, render);
+                push_sample(&mut self.present_ms, present);
             }
         }
         self.last_frame = Some(now);
@@ -141,20 +151,20 @@ impl PerfGraph {
         }
     }
 
-    /// Mean of the most recent frame samples, for a steady on-screen readout.
+    /// Mean of the most recent total-frame samples, for a steady readout.
     fn smoothed_ms(&self) -> f32 {
-        let n = 20.min(self.frame_ms.len());
+        let n = 20.min(self.total_ms.len());
         if n == 0 {
             return 0.0;
         }
-        let sum: f32 = self.frame_ms.iter().rev().take(n).sum();
+        let sum: f32 = self.total_ms.iter().rev().take(n).sum();
         sum / n as f32
     }
 
     /// Tick the counters and paint the panel. `cr` is a full-widget cairo
     /// context appended by the paintable snapshot.
-    pub(crate) fn render(&mut self, cr: &gtk::cairo::Context) {
-        self.tick();
+    pub(crate) fn render(&mut self, cr: &gtk::cairo::Context, gpu: Option<(f32, f32)>) {
+        self.tick(gpu);
 
         // Panel background + subtle border.
         rounded_rect(cr, OX, OY, PANEL_W, PANEL_H, 8.0);
@@ -171,35 +181,23 @@ impl PerfGraph {
         text(cr, inner_x, y, "PERFORMANCE GRAPH", 10.0, 0.6);
         y += 17.0;
 
-        // Frame-time graph.
-        let frame_ms = self.smoothed_ms();
-        text(cr, inner_x, y, "Frame time", 11.0, 0.85);
-        text_right(
-            cr,
-            inner_x + inner_w,
-            y,
-            &format!("{frame_ms:.2} ms"),
-            11.0,
-            0.95,
-        );
-        y += 6.0;
-        let frames: Vec<f32> = self.frame_ms.iter().copied().collect();
-        let frame_max = frames.iter().copied().fold(0.0_f32, f32::max);
-        draw_plot(cr, inner_x, y, inner_w, GRAPH_H, &frames, (frame_max * 1.2).max(33.4));
-        y += GRAPH_H + 8.0;
-
-        // FPS graph (derived from the same samples).
-        let fps_now = if frame_ms > 0.0 { 1000.0 / frame_ms } else { 0.0 };
-        text(cr, inner_x, y, "FPS", 11.0, 0.85);
-        text_right(cr, inner_x + inner_w, y, &format!("{fps_now:.0}"), 11.0, 0.95);
-        y += 6.0;
-        let fps: Vec<f32> = frames
-            .iter()
-            .map(|&ms| if ms > 0.0 { 1000.0 / ms } else { 0.0 })
-            .collect();
-        let fps_max = fps.iter().copied().fold(0.0_f32, f32::max);
-        draw_plot(cr, inner_x, y, inner_w, GRAPH_H, &fps, (fps_max * 1.2).max(60.0));
-        y += GRAPH_H + 10.0;
+        // Three traces: total wall frame time, GPU render time, GPU present time.
+        let last = |q: &VecDeque<f32>| q.back().copied().unwrap_or(0.0);
+        let total_now = self.smoothed_ms();
+        for (label, samples, now, floor) in [
+            ("Total frame", &self.total_ms, total_now, 16.7_f32),
+            ("Render (GPU)", &self.render_ms, last(&self.render_ms), 0.5),
+            ("Present (GPU)", &self.present_ms, last(&self.present_ms), 0.5),
+        ] {
+            text(cr, inner_x, y, label, 11.0, 0.85);
+            text_right(cr, inner_x + inner_w, y, &format!("{now:.2} ms"), 11.0, 0.95);
+            y += 6.0;
+            let data: Vec<f32> = samples.iter().copied().collect();
+            let max = data.iter().copied().fold(0.0_f32, f32::max);
+            draw_plot(cr, inner_x, y, inner_w, GRAPH_H, &data, (max * 1.2).max(floor));
+            y += GRAPH_H + 8.0;
+        }
+        y += 2.0;
 
         // Stat columns: VRAM / RAM / CPU / GPU.
         let cols = [
@@ -215,6 +213,14 @@ impl PerfGraph {
             text(cr, cx, y + 15.0, value, 12.0, 0.95);
         }
     }
+}
+
+/// Push a value into a fixed-capacity rolling buffer (drops the oldest).
+fn push_sample(q: &mut VecDeque<f32>, v: f32) {
+    if q.len() == HISTORY {
+        q.pop_front();
+    }
+    q.push_back(v);
 }
 
 // -- cairo helpers -------------------------------------------------------------

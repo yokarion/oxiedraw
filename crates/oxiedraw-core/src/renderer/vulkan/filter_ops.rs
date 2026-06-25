@@ -331,6 +331,9 @@ impl VulkanRenderer {
         let layout = self.filter_resources.pipeline_layout;
         let render_pass = self.canvas_target.render_pass;
         let framebuffer = self.filter_resources.framebuffer(target);
+        // Blocking: this rewrites the shared input_set(0) per pass, so the pass
+        // must finish before the next call overwrites it (the per-frame batched
+        // adjustment path uses distinct ring sets instead).
         self.record_and_submit(|this| {
             this.cmd_filter_pass3(
                 set, layout, pipeline, render_pass, framebuffer, img0, img1, img2, push,
@@ -405,6 +408,7 @@ impl VulkanRenderer {
         let pipeline = self.filter_resources.stroke;
         let render_pass = self.canvas_target.render_pass;
         let framebuffer = self.filter_resources.framebuffer(Scratch::A);
+        // Blocking: rewrites the shared input_set(0) (see filter_pass3).
         self.record_and_submit(|this| {
             this.cmd_run_stroke_pass(
                 set, layout, pipeline, render_pass, framebuffer, backdrop_img, mask_img, push,

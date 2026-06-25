@@ -633,6 +633,14 @@ impl Canvas {
         self.layers.snapshot().iter().map(|l| l.visible).collect()
     }
 
+    /// Non-blocking GPU timings of the most recent drawing frame, in
+    /// milliseconds: `(render_ms, present_ms)`. `None` until results are ready
+    /// or if the device lacks timestamp queries. For the perf overlay.
+    #[must_use]
+    pub fn frame_timings(&self) -> Option<(f32, f32)> {
+        self.renderer.poll_frame_timings()
+    }
+
     /// Zero-copy display path. Ensures the dmabuf display image is up
     /// to date for the current state (compositing the in-flight stroke
     /// on top of the canvas during a stroke, or the fill overlay

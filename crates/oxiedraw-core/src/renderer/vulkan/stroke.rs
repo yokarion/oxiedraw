@@ -138,7 +138,9 @@ impl VulkanRenderer {
         framebuffer: vk::Framebuffer,
         instance_count: u32,
     ) -> Result<(), RendererError> {
-        self.record_and_submit(|this| {
+        // Async: the brush dab is the hot input path. The dab pass binds fixed
+        // resources, so submission order keeps the following preview correct.
+        self.record_and_submit_async(|this| {
             this.cmd_dab_pass(family, pipeline, layout, render_pass, framebuffer, instance_count);
             Ok(())
         })

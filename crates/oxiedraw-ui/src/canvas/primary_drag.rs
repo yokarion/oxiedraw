@@ -66,11 +66,6 @@ pub(super) struct PrimaryDragHandler {
     canvas_size: Rc<Cell<Size>>,
     tools: ToolState,
     area: gtk::Picture,
-    /// Set when a drag handler has mutated the canvas and a present is owed.
-    /// A one-shot frame-clock tick coalesces a burst of pointer-rate motion
-    /// events into a single GPU composite + dmabuf publish per displayed
-    /// frame (see [`Self::request_present`]).
-    present_scheduled: Rc<Cell<bool>>,
     /// For the "can't draw on a component layer" notification.
     toaster: crate::toaster::Toaster,
     // -- brush -----------------------------------------------------------
@@ -342,20 +337,14 @@ impl PrimaryDragHandler {
     /// call this; the actual `present()` runs once on the next tick. Stamps
     /// accumulate in the stroke buffer, so the single present shows every
     /// dab from the burst.
+    /// Present the current state to the display. With frames-in-flight, the
+    /// present submit is async (non-blocking) and the command-buffer ring
+    /// throttles us by GPU readiness - the CPU runs at most `RING_FRAMES` ahead
+    /// before a slot-reuse wait. GTK coalesces the `queue_draw`s to one snapshot
+    /// per displayed frame, so presenting per input event just keeps the dmabuf
+    /// as fresh as possible (lowest latency) without blocking the input loop.
     fn request_present(&self) {
-        // A tick is already pending; the burst collapses into it.
-        if self.present_scheduled.replace(true) {
-            return;
-        }
-        let canvas = Rc::clone(&self.canvas);
-        let paintable = self.paintable.clone();
-        let area = self.area.clone();
-        let scheduled = Rc::clone(&self.present_scheduled);
-        self.area.add_tick_callback(move |_area, _clock| {
-            scheduled.set(false);
-            present_into_paintable(&mut canvas.borrow_mut(), &paintable, &area);
-            glib::ControlFlow::Break
-        });
+        present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
     }
 
     fn brush_end(&self) {
@@ -1729,7 +1718,6 @@ pub(super) fn install_primary_drag(
         canvas_size: Rc::clone(&viewport.canvas_size),
         tools: tools.clone(),
         area: area.clone(),
-        present_scheduled: Rc::new(Cell::new(false)),
         toaster: toaster.clone(),
         brush_engine: brush_engine.clone(),
         colors: colors.clone(),

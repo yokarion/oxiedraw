@@ -74,6 +74,9 @@ pub const STROKE_FORMAT: vk::Format = vk::Format::R8_UNORM;
 /// BGRA8 is 4 bytes per pixel. Used to size staging buffers and the
 /// readback `Vec<u8>` returned to callers.
 pub(super) const CANVAS_BYTES_PER_PIXEL: u64 = 4;
+/// Command buffers / fences kept in flight. The CPU may run up to this many
+/// submits ahead of the GPU before a `record_and_submit` has to wait.
+pub(super) const RING_FRAMES: usize = 3;
 
 /// What source the dmabuf display image should mirror.
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +215,22 @@ pub struct VulkanRenderer {
     pub(super) display_initialised: bool,
 
     pub(super) command_pool: vk::CommandPool,
+    /// Ring of command buffers + fences for frames-in-flight: `record_and_submit`
+    /// cycles through them so a submit doesn't have to fence-wait before the CPU
+    /// continues. `command_buffer` / `fence` always point at the slot the current
+    /// `record_and_submit` is using, so the cmd-recording helpers and closures
+    /// keep working unchanged.
+    pub(super) ring_cmds: Vec<vk::CommandBuffer>,
+    pub(super) ring_fences: Vec<vk::Fence>,
+    pub(super) ring_cursor: usize,
+    /// Slot index of the most recent submit (for blocking waits / timestamp readback).
+    pub(super) last_slot: usize,
+    /// Timestamp query pool: 3 timestamps per ring slot (frame start, after the
+    /// preview render, after the present copy) for the perf overlay.
+    pub(super) timestamp_pool: vk::QueryPool,
+    pub(super) timestamp_period: f32,
+    /// Ring slot of the most recent frame that recorded timestamps.
+    pub(super) frame_timing_slot: Option<usize>,
     pub(super) command_buffer: vk::CommandBuffer,
     pub(super) fence: vk::Fence,
 
@@ -406,10 +425,19 @@ impl VulkanRenderer {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(command_pool)
             .level(vk::CommandBufferLevel::PRIMARY)
-            .command_buffer_count(1);
-        let command_buffer = unsafe { dev.device.allocate_command_buffers(&alloc_info)? }[0];
+            .command_buffer_count(RING_FRAMES as u32);
+        let ring_cmds = unsafe { dev.device.allocate_command_buffers(&alloc_info)? };
         let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
-        let fence = unsafe { dev.device.create_fence(&fence_info, None)? };
+        let ring_fences = (0..RING_FRAMES)
+            .map(|_| unsafe { dev.device.create_fence(&fence_info, None) })
+            .collect::<Result<Vec<_>, _>>()?;
+        let command_buffer = ring_cmds[0];
+        let fence = ring_fences[0];
+
+        let ts_info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(RING_FRAMES as u32 * 3);
+        let timestamp_pool = unsafe { dev.device.create_query_pool(&ts_info, None)? };
 
         let mut renderer = Self {
             canvas_size,
@@ -463,6 +491,13 @@ impl VulkanRenderer {
             display: ManuallyDrop::new(display),
             display_initialised: false,
             command_pool,
+            ring_cmds,
+            ring_fences,
+            ring_cursor: 0,
+            last_slot: 0,
+            timestamp_pool,
+            timestamp_period: dev.timestamp_period,
+            frame_timing_slot: None,
             command_buffer,
             fence,
             queue: dev.queue,
@@ -894,12 +929,18 @@ impl VulkanRenderer {
         }
     }
 
-    /// Record a one-shot command buffer, submit, fence-wait. Used by
-    /// every public operation while we don't have proper frame pacing.
-    pub(super) fn record_and_submit<F>(&mut self, record: F) -> Result<(), RendererError>
+    /// Record a one-shot command buffer into the next ring slot and submit it.
+    /// Does NOT wait. Private primitive shared by the blocking + async wrappers.
+    fn submit_to_ring<F>(&mut self, record: F) -> Result<(), RendererError>
     where
         F: FnOnce(&mut Self) -> Result<(), RendererError>,
     {
+        let slot = self.ring_cursor;
+        self.command_buffer = self.ring_cmds[slot];
+        self.fence = self.ring_fences[slot];
+        // The slot's previous submission must finish before we reuse its command
+        // buffer. Fences start signaled, so the first use is a no-op.
+        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
         unsafe { self.device.reset_fences(&[self.fence])? };
         unsafe {
             self.device
@@ -921,8 +962,125 @@ impl VulkanRenderer {
             self.device
                 .queue_submit(self.queue, &[submit], self.fence)?;
         }
-        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+        self.last_slot = slot;
+        self.ring_cursor = (slot + 1) % RING_FRAMES;
         Ok(())
+    }
+
+    /// Record, submit, and **block** until the GPU finishes. The default for all
+    /// paths - safe for descriptor-rewrite-between-passes and CPU readback.
+    pub(super) fn record_and_submit<F>(&mut self, record: F) -> Result<(), RendererError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), RendererError>,
+    {
+        self.submit_to_ring(record)?;
+        self.wait_last()
+    }
+
+    /// Record + submit and return WITHOUT waiting (frames-in-flight). Use ONLY on
+    /// the hot drawing path (stamp / preview composite / present), which binds
+    /// fixed per-slot descriptors - no shared set is rewritten between submits,
+    /// so same-queue submission order keeps it correct.
+    pub(super) fn record_and_submit_async<F>(&mut self, record: F) -> Result<(), RendererError>
+    where
+        F: FnOnce(&mut Self) -> Result<(), RendererError>,
+    {
+        self.submit_to_ring(record)
+    }
+
+    /// Wait for the most recent submission to finish.
+    pub(super) fn wait_last(&self) -> Result<(), RendererError> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.ring_fences[self.last_slot]], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
+    /// Poll (non-blocking) whether the most recent submission has finished.
+    #[must_use]
+    pub fn last_submit_done(&self) -> bool {
+        unsafe {
+            self.device
+                .get_fence_status(self.ring_fences[self.last_slot])
+                .unwrap_or(true)
+        }
+    }
+
+    // -- Frame GPU timestamps (perf overlay) --------------------------------
+    // Three timestamps per ring slot: [0] frame start, [1] after the preview
+    // render, [2] after the present copy. Recorded inside the frame command
+    // buffer; read back (non-blocking) one or more frames later.
+
+    fn timing_base(&self) -> u32 {
+        self.ring_cursor as u32 * 3
+    }
+
+    /// Reset this slot's queries and stamp the frame-start timestamp. Call at the
+    /// very start of a frame command buffer (outside any render pass).
+    pub(super) fn cmd_frame_timing_begin(&self) {
+        if self.timestamp_period <= 0.0 {
+            return;
+        }
+        let base = self.timing_base();
+        unsafe {
+            self.device
+                .cmd_reset_query_pool(self.command_buffer, self.timestamp_pool, base, 3);
+            self.device.cmd_write_timestamp(
+                self.command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.timestamp_pool,
+                base,
+            );
+        }
+    }
+
+    /// Stamp timestamp `n` (1 = after render, 2 = after present) of this frame.
+    pub(super) fn cmd_frame_timing_mark(&self, n: u32) {
+        if self.timestamp_period <= 0.0 {
+            return;
+        }
+        unsafe {
+            self.device.cmd_write_timestamp(
+                self.command_buffer,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.timestamp_pool,
+                self.timing_base() + n,
+            );
+        }
+    }
+
+    /// Mark the just-submitted frame as the one to read timings from next.
+    pub(super) fn note_frame_timing(&mut self) {
+        if self.timestamp_period > 0.0 {
+            self.frame_timing_slot = Some(self.last_slot);
+        }
+    }
+
+    /// Non-blocking read of the most recent timestamped frame's GPU durations
+    /// `(render_ms, present_ms)`. `None` until the results are available.
+    #[must_use]
+    pub fn poll_frame_timings(&self) -> Option<(f32, f32)> {
+        let slot = self.frame_timing_slot?;
+        let base = slot as u32 * 3;
+        let mut data = [0u64; 3];
+        let ok = unsafe {
+            self.device.get_query_pool_results(
+                self.timestamp_pool,
+                base,
+                &mut data,
+                vk::QueryResultFlags::TYPE_64,
+            )
+        };
+        if ok.is_err() {
+            return None; // NOT_READY or error
+        }
+        // timestamp_period is ns/tick; convert tick deltas to milliseconds.
+        let to_ms =
+            |ticks: u64| (ticks as f64 * f64::from(self.timestamp_period) / 1_000_000.0) as f32;
+        let render = to_ms(data[1].saturating_sub(data[0]));
+        let present = to_ms(data[2].saturating_sub(data[1]));
+        Some((render, present))
     }
 }
 
@@ -931,7 +1089,10 @@ impl Drop for VulkanRenderer {
         self.clear_transform_preview_gpu();
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_fence(self.fence, None);
+            self.device.destroy_query_pool(self.timestamp_pool, None);
+            for &f in &self.ring_fences {
+                self.device.destroy_fence(f, None);
+            }
             self.device.destroy_command_pool(self.command_pool, None);
             ManuallyDrop::take(&mut self.layer_stack).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.transform_pipeline).destroy(&self.device);

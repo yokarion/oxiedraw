@@ -284,6 +284,9 @@ impl VulkanRenderer {
         let below_cached = self.preview_cache_valid;
         let visible_indices = visible_indices.to_vec();
         let display_old_layout = self.display_old_layout();
+        // Blocking: the per-frame effect chain rewrites the shared input-set
+        // ring, so this frame's passes must finish before the next frame reuses
+        // those sets. The work is one cheap (dirty-rect) submit.
         let _ = self.record_and_submit(|this| {
             // The seed + stroked target use the wider `outer` region so the
             // effect samples correct (raw) input where it reaches past `inner`.

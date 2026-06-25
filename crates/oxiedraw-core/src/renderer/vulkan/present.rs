@@ -25,7 +25,10 @@ impl VulkanRenderer {
             PresentSource::Preview => self.preview.handle,
         };
         let display_old_layout = self.display_old_layout();
-        self.record_and_submit(|this| {
+        // Async: don't stall the input loop on the dmabuf copy. GTK syncs to our
+        // GPU writes via dma-buf implicit sync, and same-queue order keeps the
+        // next preview write after this copy.
+        self.record_and_submit_async(|this| {
             this.record_present_copy(src_image, display_old_layout);
             Ok(())
         })?;

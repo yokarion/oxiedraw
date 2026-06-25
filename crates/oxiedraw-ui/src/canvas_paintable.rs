@@ -309,6 +309,20 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
+    /// `true` while the perf overlay is shown (so the present path only bothers
+    /// polling GPU timings when they're needed).
+    pub(crate) fn perf_enabled(&self) -> bool {
+        self.imp().perf.borrow().enabled()
+    }
+
+    /// Stash the latest GPU `(render_ms, present_ms)` for the perf overlay. Keeps
+    /// the previous value when `t` is `None` (results not yet available).
+    pub(crate) fn record_gpu_timings(&self, t: Option<(f32, f32)>) {
+        if t.is_some() {
+            self.imp().gpu_timings.set(t);
+        }
+    }
+
     /// Toggle caret visibility (blink) without disturbing the rest of the
     /// overlay.
     pub(crate) fn set_text_caret_visible(&self, visible: bool) {
@@ -1235,14 +1249,18 @@ mod imp {
         /// `text_edit_box` is the natural box; caret/selection/handles are in
         /// natural-local coords, so the overlay applies this scale when drawing.
         pub(super) text_scale: Cell<(f32, f32)>,
-        /// Frame-time/FPS performance overlay (toggle with F3). Records one
-        /// sample per snapshot and paints itself in the top-left corner.
+        /// Performance overlay (toggle with F3). Records one sample per snapshot
+        /// and paints itself in the top-left corner.
         pub(super) perf: RefCell<super::PerfGraph>,
+        /// Latest GPU `(render_ms, present_ms)` from the renderer's timestamp
+        /// queries, stashed by the present path and read by the snapshot.
+        pub(super) gpu_timings: Cell<Option<(f32, f32)>>,
     }
 
     impl Default for CanvasPaintable {
         fn default() -> Self {
             Self {
+                gpu_timings: Cell::new(None),
                 texture: RefCell::new(None),
                 checker: RefCell::new(None),
                 canvas_w: Cell::new(0),
@@ -1736,7 +1754,7 @@ mod imp {
                 if perf.enabled() {
                     let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                     let cr = gtk_snap.append_cairo(&widget_rect);
-                    perf.render(&cr);
+                    perf.render(&cr, self.gpu_timings.get());
                 }
             }
         }
