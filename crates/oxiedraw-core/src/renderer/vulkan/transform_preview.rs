@@ -16,6 +16,7 @@ use ash::vk;
 use super::super::RendererError;
 use super::super::resources::{Buffer, Image};
 use super::{CANVAS_BYTES_PER_PIXEL, CANVAS_FORMAT, VulkanRenderer, full_image_barrier};
+use crate::document::CompositeStep;
 
 /// Reusable GPU resources for one transform-preview session.
 pub(in crate::renderer) struct TransformPreview {
@@ -40,6 +41,12 @@ impl VulkanRenderer {
     #[must_use]
     pub fn transform_preview_active(&self) -> bool {
         self.transform_preview.is_some()
+    }
+
+    /// The layer the active transform preview targets, if any.
+    #[must_use]
+    pub fn transform_preview_target(&self) -> Option<usize> {
+        self.transform_preview.as_ref().map(|tp| tp.target_idx)
     }
 
     /// Begin a transform-preview session: upload `source_pixels` and allocate
@@ -218,6 +225,55 @@ impl VulkanRenderer {
             }
             Ok(())
         })
+    }
+
+    /// Folder-scoped transform preview: warp the source, then run the same
+    /// accumulator-stack walk as the stroke preview with the warped layer as the
+    /// in-flight target content, so an adjustment above the transformed layer is
+    /// applied (and clipped to its folder). Builds into the preview image; the
+    /// caller presents `PresentSource::Preview`. No-op without an active session.
+    pub fn render_transform_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        visibilities: &[bool],
+    ) -> Result<(), RendererError> {
+        let Some(tp) = self.transform_preview.as_ref() else {
+            return Ok(());
+        };
+        let target_idx = tp.target_idx;
+        let warped_fb = tp.warped_framebuffer;
+        let warped_img = tp.warped.handle;
+        let src_set = tp.src_set;
+        let warped_set = tp.warped_set;
+        let push = tp.push;
+        let (mode, opacity) = self.layer_stack.blend(target_idx);
+        let visible = visibilities.get(target_idx).copied().unwrap_or(false);
+        // Warp the source into the scratch up front; the walk then composes it.
+        self.record_and_submit(|this| {
+            this.cmd_transform_warp(warped_fb, src_set, push);
+            this.barrier(warped_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        let target = super::adjust_ops::PreviewTarget::Warp {
+            set: warped_set,
+            mode,
+            opacity,
+            visible,
+        };
+        self.build_preview_scoped(steps, target_idx, target)
+    }
+
+    /// As [`Self::render_transform_preview_scoped`] but reads the preview back
+    /// to host memory instead of presenting (diagnostic / tests).
+    pub fn read_transform_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        visibilities: &[bool],
+    ) -> Result<Vec<u8>, RendererError> {
+        self.render_transform_preview_scoped(steps, visibilities)?;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes()
     }
 
     /// Render the transform preview and read it back as BGRA8. Test/diagnostic

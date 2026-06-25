@@ -11,11 +11,38 @@
 use ash::vk;
 
 use super::super::RendererError;
-use super::VulkanRenderer;
+use super::{create_framebuffer_for_view, create_sampled_image_set, VulkanRenderer, CANVAS_FORMAT};
+use crate::renderer::resources::Image;
+use crate::document::CompositeStep;
 use crate::effects::{AdjustmentData, EffectKind};
 use crate::filters::FilterSpec;
 use crate::renderer::PresentSource;
 use crate::renderer::filters::INPUT_RING;
+
+/// A canvas-sized sub-accumulator for one folder nesting level: an image to
+/// composite the folder's contents into, plus the descriptor set that samples
+/// it when the finished folder is blended onto its parent.
+pub(in crate::renderer) struct GroupAccumulator {
+    pub(super) image: std::mem::ManuallyDrop<Image>,
+    pub(super) framebuffer: vk::Framebuffer,
+    descriptor_pool: vk::DescriptorPool,
+    pub(super) descriptor_set: vk::DescriptorSet,
+}
+
+impl GroupAccumulator {
+    /// Release the GPU resources. Caller must hold the device idle.
+    pub(super) unsafe fn destroy(
+        &mut self,
+        device: &ash::Device,
+        allocator: &mut gpu_allocator::vulkan::Allocator,
+    ) {
+        unsafe {
+            device.destroy_framebuffer(self.framebuffer, None);
+            device.destroy_descriptor_pool(self.descriptor_pool, None);
+            std::mem::ManuallyDrop::take(&mut self.image).destroy(device, allocator);
+        }
+    }
+}
 
 /// The accumulator an adjustment chain reads + writes: the committed canvas
 /// during a recomposite, or the preview image during a live stroke.
@@ -24,6 +51,15 @@ struct Accumulator {
     image: vk::Image,
     view: vk::ImageView,
     framebuffer: vk::Framebuffer,
+}
+
+/// How the live in-flight content is merged into the target layer when building
+/// a folder-scoped preview: a brush stroke over the target, or a warped copy of
+/// the target (the transform tool's live preview).
+#[derive(Clone, Copy)]
+pub(super) enum PreviewTarget {
+    Stroke { push: [f32; 4], erase: bool },
+    Warp { set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
 }
 
 /// Map an adjustment effect to the destructive [`FilterSpec`] pass chain it
@@ -83,6 +119,258 @@ impl VulkanRenderer {
             }
         }
         Ok(())
+    }
+
+    /// Folder-scoped rebuild: like `composite_layers_to_canvas_adjusted` but
+    /// walks a bracketed step stream. Each `EnterGroup` pushes a fresh
+    /// transparent sub-accumulator; adjustments apply to the top-of-stack
+    /// accumulator, so they clip to their enclosing folder; `ExitGroup`
+    /// OVER-composites the finished folder onto its parent.
+    pub fn composite_layers_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+    ) -> Result<(), RendererError> {
+        let root = self.canvas_accumulator();
+        self.record_and_submit(|this| {
+            this.cmd_clear_image(root.image, [0.0, 0.0, 0.0, 0.0]);
+            Ok(())
+        })?;
+        // Stack of (accumulator, pool depth). depth 0 = canvas root.
+        let mut stack: Vec<Accumulator> = vec![root];
+        let mut depth = 0usize;
+        for step in steps {
+            match *step {
+                CompositeStep::Layer(idx) => {
+                    let acc = *stack.last().expect("non-empty accumulator stack");
+                    if self.layer_stack.slots[idx].adjustment.is_some() {
+                        self.apply_adjustment_to(acc, idx)?;
+                    } else {
+                        self.compose_layer_into(acc, idx)?;
+                    }
+                }
+                CompositeStep::EnterGroup => {
+                    let acc = self.ensure_group_accumulator(depth)?;
+                    self.record_and_submit(|this| {
+                        this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                        Ok(())
+                    })?;
+                    stack.push(acc);
+                    depth += 1;
+                }
+                CompositeStep::ExitGroup => {
+                    let group_acc = stack.pop().expect("ExitGroup without EnterGroup");
+                    depth -= 1;
+                    let parent = *stack.last().expect("folder nested above the canvas root");
+                    let src_set = self.group_accumulators[depth].descriptor_set;
+                    self.record_and_submit(|this| {
+                        // Make the folder's writes visible to the compose sampler.
+                        this.barrier(
+                            group_acc.image,
+                            vk::ImageLayout::GENERAL,
+                            vk::ImageLayout::GENERAL,
+                        );
+                        this.cmd_compose_layer_blended(
+                            parent.image,
+                            parent.framebuffer,
+                            src_set,
+                            0,
+                            1.0,
+                        );
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Folder-scoped live preview: same accumulator-stack walk as
+    /// `composite_layers_scoped`, but built into the preview image with the
+    /// in-flight stroke merged into the target layer at its place in the tree,
+    /// then presented. Used while painting a layer below a folder-bounded
+    /// adjustment so the live preview clips like the committed result will.
+    /// Full rebuild per frame (no below-cache / dirty-rect), which is acceptable
+    /// for this narrow case.
+    pub fn render_preview_scoped_and_present(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<(), RendererError> {
+        let erase = self.stroke_erase;
+        let push = [color_linear[0], color_linear[1], color_linear[2], opacity.clamp(0.0, 1.0)];
+        self.build_preview_scoped(steps, target_idx, PreviewTarget::Stroke { push, erase })?;
+        self.present_to_display(PresentSource::Preview)
+    }
+
+    /// As [`Self::render_preview_scoped_and_present`] but reads the preview back
+    /// to host memory (in-stroke export / tests) instead of presenting it.
+    pub fn render_preview_scoped_and_read(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<Vec<u8>, RendererError> {
+        let erase = self.stroke_erase;
+        let push = [color_linear[0], color_linear[1], color_linear[2], opacity.clamp(0.0, 1.0)];
+        self.build_preview_scoped(steps, target_idx, PreviewTarget::Stroke { push, erase })?;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes()
+    }
+
+    pub(super) fn build_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        target: PreviewTarget,
+    ) -> Result<(), RendererError> {
+        self.clip = None;
+        let root = self.preview_accumulator();
+        self.record_and_submit(|this| {
+            this.cmd_clear_image(root.image, [0.0, 0.0, 0.0, 0.0]);
+            Ok(())
+        })?;
+        let mut stack: Vec<Accumulator> = vec![root];
+        let mut depth = 0usize;
+        for step in steps {
+            match *step {
+                CompositeStep::Layer(idx) => {
+                    let acc = *stack.last().expect("non-empty accumulator stack");
+                    if idx == target_idx {
+                        self.record_and_submit(|this| {
+                            this.cmd_compose_preview_target(acc, target_idx, target);
+                            Ok(())
+                        })?;
+                    } else if self.layer_stack.slots[idx].adjustment.is_some() {
+                        self.apply_adjustment_to(acc, idx)?;
+                    } else {
+                        self.compose_layer_into(acc, idx)?;
+                    }
+                }
+                CompositeStep::EnterGroup => {
+                    let acc = self.ensure_group_accumulator(depth)?;
+                    self.record_and_submit(|this| {
+                        this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                        Ok(())
+                    })?;
+                    stack.push(acc);
+                    depth += 1;
+                }
+                CompositeStep::ExitGroup => {
+                    let group_acc = stack.pop().expect("ExitGroup without EnterGroup");
+                    depth -= 1;
+                    let parent = *stack.last().expect("folder nested above the canvas root");
+                    let src_set = self.group_accumulators[depth].descriptor_set;
+                    self.record_and_submit(|this| {
+                        this.barrier(
+                            group_acc.image,
+                            vk::ImageLayout::GENERAL,
+                            vk::ImageLayout::GENERAL,
+                        );
+                        this.cmd_compose_layer_blended(
+                            parent.image,
+                            parent.framebuffer,
+                            src_set,
+                            0,
+                            1.0,
+                        );
+                        Ok(())
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record (no submit) the in-flight target content into `acc` per the
+    /// preview's [`PreviewTarget`]: a stroked target copy or the warped layer.
+    fn cmd_compose_preview_target(
+        &self,
+        acc: Accumulator,
+        target_idx: usize,
+        target: PreviewTarget,
+    ) {
+        match target {
+            PreviewTarget::Stroke { push, erase } => {
+                self.preview_compose_stroked_target_into(
+                    acc.image,
+                    acc.framebuffer,
+                    target_idx,
+                    push,
+                    erase,
+                );
+            }
+            PreviewTarget::Warp { set, mode, opacity, visible } => {
+                if visible {
+                    self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
+                }
+            }
+        }
+    }
+
+    /// Return (allocating on first use) the sub-accumulator for folder nesting
+    /// `depth`. Canvas-sized; reused across frames.
+    fn ensure_group_accumulator(&mut self, depth: usize) -> Result<Accumulator, RendererError> {
+        while self.group_accumulators.len() <= depth {
+            let acc = self.create_group_accumulator()?;
+            self.group_accumulators.push(acc);
+        }
+        let ga = &self.group_accumulators[depth];
+        Ok(Accumulator {
+            image: ga.image.handle,
+            view: ga.image.view,
+            framebuffer: ga.framebuffer,
+        })
+    }
+
+    fn create_group_accumulator(&mut self) -> Result<GroupAccumulator, RendererError> {
+        let extent = vk::Extent2D {
+            width: self.canvas_size.width,
+            height: self.canvas_size.height,
+        };
+        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_SRC
+            | vk::ImageUsageFlags::TRANSFER_DST
+            | vk::ImageUsageFlags::SAMPLED;
+        let image = Image::new_2d(
+            &self.device,
+            &mut self.allocator,
+            "group-accumulator",
+            CANVAS_FORMAT,
+            extent,
+            usage,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let framebuffer = create_framebuffer_for_view(
+            &self.device,
+            self.canvas_target.render_pass,
+            extent,
+            image.view,
+        )?;
+        let (descriptor_pool, descriptor_set) = create_sampled_image_set(
+            &self.device,
+            self.layer_composite_pipeline.descriptor_set_layout,
+            self.layer_composite_pipeline.sampler,
+            image.view,
+        )?;
+        // Start in GENERAL so the first clear / compose sees a defined layout.
+        self.record_and_submit(|this| {
+            this.barrier(
+                image.handle,
+                vk::ImageLayout::UNDEFINED,
+                vk::ImageLayout::GENERAL,
+            );
+            Ok(())
+        })?;
+        Ok(GroupAccumulator {
+            image: std::mem::ManuallyDrop::new(image),
+            framebuffer,
+            descriptor_pool,
+            descriptor_set,
+        })
     }
 
     /// Live in-stroke version of the adjusted composite: build into the preview

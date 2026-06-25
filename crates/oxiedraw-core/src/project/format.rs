@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlendMode, LayerKind};
+use crate::document::{BlendMode, LayerKind, LayerTreeNode};
 use crate::text::fonts::FontMeta;
 
 /// Current writer schema. Loaders accept any version listed in
@@ -16,8 +16,10 @@ use crate::text::fonts::FontMeta;
 /// v6 adds adjustment layers (`LayerKind::Adjustment`, effect stack stored
 /// inline in `kind`); the layer's grayscale mask rides the existing
 /// `layers/<id>.png`, so no new archive entries are needed.
-pub const SCHEMA_VERSION: u32 = 6;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6];
+/// v7 adds the layer folder tree (`layer_tree`), so adjustment layers can be
+/// scoped to their enclosing folder. Absent in pre-v7 files (loads as flat).
+pub const SCHEMA_VERSION: u32 = 7;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -84,6 +86,10 @@ pub struct DocumentData {
     pub dpi: f32,
     pub active_layer: Option<usize>,
     pub layers: Vec<LayerEntry>,
+    /// Folder structure over `layers` (canvas order, bottom-to-top). Empty or
+    /// absent (pre-v7) = flat, no folders.
+    #[serde(default)]
+    pub layer_tree: Vec<LayerTreeNode>,
 }
 
 /// The complete in-memory representation of an `.oxiedrawproj` archive.

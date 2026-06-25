@@ -39,6 +39,7 @@ use super::dab::DabBuffers;
 use super::device;
 use super::dmabuf::DmabufImage;
 use super::erase::ErasePreview;
+use adjust_ops::GroupAccumulator;
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
 use super::instance::{self, DebugMessenger};
@@ -164,6 +165,10 @@ pub struct VulkanRenderer {
     pub(super) blend_scratch: ManuallyDrop<Image>,
     pub(super) blend_scratch_dst_set: vk::DescriptorSet,
     pub(super) blend_descriptor_pool: vk::DescriptorPool,
+    /// Lazily-grown pool of canvas-sized sub-accumulators, one per folder
+    /// nesting level, used by the folder-scoped composite so an adjustment
+    /// clips to its enclosing folder. Indexed by depth (0 = first folder).
+    pub(super) group_accumulators: Vec<GroupAccumulator>,
     pub(super) transform_pipeline: ManuallyDrop<TransformPipeline>,
     /// Reusable resources for the live GPU transform preview, present only
     /// while the transform tool is dragging.
@@ -467,6 +472,7 @@ impl VulkanRenderer {
             layer_blend_pipeline: ManuallyDrop::new(layer_blend_pipeline),
             blend_scratch: ManuallyDrop::new(blend_scratch),
             blend_scratch_dst_set,
+            group_accumulators: Vec::new(),
             blend_descriptor_pool,
             transform_pipeline: ManuallyDrop::new(transform_pipeline),
             transform_preview: None,
@@ -1099,6 +1105,9 @@ impl Drop for VulkanRenderer {
             self.device
                 .destroy_descriptor_pool(self.blend_descriptor_pool, None);
             ManuallyDrop::take(&mut self.blend_scratch).destroy(&self.device, &mut self.allocator);
+            for mut ga in self.group_accumulators.drain(..) {
+                ga.destroy(&self.device, &mut self.allocator);
+            }
             ManuallyDrop::take(&mut self.layer_blend_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.layer_composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);

@@ -21,9 +21,9 @@ use crate::clipboard::LayerClipboard;
 use crate::toaster::Toaster;
 
 use super::{
-    GroupData, LayerNode, RowKind, Ui, compute_visible_rows, find_group, find_group_position,
-    group_leaf_ids, group_nodes, insert_at_in_group, item_at, mirror_tree, new_group_id,
-    sync_canvas_order, sync_height, take_node, ungroup_node,
+    GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
+    find_group_position, group_leaf_ids, group_nodes, insert_at_in_group, item_at, mirror_tree,
+    new_group_id, sync_canvas_order, sync_height, take_node, ungroup_node,
 };
 
 pub(super) fn install_layer_actions(
@@ -84,6 +84,7 @@ pub(super) fn install_layer_actions(
                         pixels: new_pixels,
                     });
                     sync_height(&area, &ui);
+                    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                     area.queue_draw();
                     redraw.request();
                     refresh_action_sensitivity(&ui);
@@ -148,6 +149,7 @@ pub(super) fn install_layer_actions(
                         });
                     }
                     sync_height(&area, &ui);
+                    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                     area.queue_draw();
                     redraw.request();
                     refresh_action_sensitivity(&ui);
@@ -162,6 +164,7 @@ pub(super) fn install_layer_actions(
     {
         let ui = ui.clone();
         let area = area.clone();
+        let canvas = Rc::clone(canvas);
         let action = gio::SimpleAction::new("layer-group", None);
         action.connect_activate(move |_, _| {
             let ids = ui.selected_layer_ids_in_order();
@@ -170,6 +173,7 @@ pub(super) fn install_layer_actions(
             }
             group_nodes(&mut ui.tree.borrow_mut(), &ids, "Group");
             ui.multi_selected.borrow_mut().clear();
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
             area.queue_draw();
             refresh_action_sensitivity(&ui);
@@ -251,6 +255,7 @@ pub(super) fn install_layer_actions(
                     drop(tree);
                     ui.multi_selected.borrow_mut().clear();
                     sync_height(&area, &ui);
+                    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                     area.queue_draw();
                     redraw.request();
                     refresh_action_sensitivity(&ui);
@@ -272,6 +277,7 @@ pub(super) fn install_layer_actions(
             ungroup_node(&mut ui.tree.borrow_mut(), &gid);
             *ui.active_group.borrow_mut() = None;
             sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
             area.queue_draw();
             refresh_action_sensitivity(&ui);
@@ -328,6 +334,7 @@ pub(super) fn install_layer_actions(
             take_node(&mut ui.tree.borrow_mut(), &gid);
             *ui.active_group.borrow_mut() = None;
             ui.multi_selected.borrow_mut().clear();
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
             area.queue_draw();
             redraw.request();
@@ -414,6 +421,7 @@ pub(super) fn install_layer_actions(
             }
 
             sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
 
             // Record the created layers as one undoable unit. Capture each new
             // layer at its final index (post-reorder) and order ascending so a
@@ -667,6 +675,7 @@ pub(super) fn layer_paste(
                     });
                 }
                 sync_height(area, ui);
+                commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                 area.queue_draw();
                 redraw.request();
                 toaster.info("Layer pasted!");
@@ -826,6 +835,7 @@ fn paste_as_new_layer(
                 });
             }
             sync_height(area, ui);
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             area.queue_draw();
             redraw.request();
             toaster.info("External image pasted!");

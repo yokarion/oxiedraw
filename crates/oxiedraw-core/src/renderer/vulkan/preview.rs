@@ -323,6 +323,27 @@ impl VulkanRenderer {
         push: [f32; 4],
         erase: bool,
     ) {
+        self.preview_compose_stroked_target_into(
+            self.preview.handle,
+            self.preview_framebuffer,
+            target_idx,
+            push,
+            erase,
+        );
+    }
+
+    /// As [`Self::preview_compose_stroked_target`], but composites the stroked
+    /// target into an arbitrary accumulator (`acc_img`/`acc_fb`) instead of the
+    /// preview image. Used by the folder-scoped preview, where the target sits
+    /// in a folder's sub-accumulator.
+    pub(super) fn preview_compose_stroked_target_into(
+        &self,
+        acc_img: vk::Image,
+        acc_fb: vk::Framebuffer,
+        target_idx: usize,
+        push: [f32; 4],
+        erase: bool,
+    ) {
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
         // scratch := the target layer pixels (a copy is identical to a clear +
@@ -335,12 +356,6 @@ impl VulkanRenderer {
         self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
         let (mode, opacity) = self.layer_stack.blend(target_idx);
         let set = self.erase_preview.composite_set;
-        self.cmd_compose_layer_blended(
-            self.preview.handle,
-            self.preview_framebuffer,
-            set,
-            mode,
-            opacity,
-        );
+        self.cmd_compose_layer_blended(acc_img, acc_fb, set, mode, opacity);
     }
 }

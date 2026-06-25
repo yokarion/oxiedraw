@@ -3,7 +3,9 @@ use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
 use crate::brush_engine::PaintTarget;
 use crate::color::Color;
-use crate::document::{BlendMode, LayerKind, LayerState};
+use crate::document::{
+    build_composite_steps, BlendMode, CompositeStep, LayerKind, LayerState, LayerTreeNode,
+};
 use crate::effects::AdjustmentData;
 use crate::filters::FilterSpec;
 use crate::renderer::{
@@ -50,6 +52,10 @@ pub struct Canvas {
     /// when the selection switches into or out of mask view, independent of
     /// `pixels_version`.
     displayed_mask_idx: Option<usize>,
+    /// Folder structure over the flat layer stack, pushed from the UI. Empty =
+    /// flat. Used to scope adjustment layers to their enclosing folder at
+    /// composite time and persisted with the document.
+    layer_tree: Vec<LayerTreeNode>,
 }
 
 impl Canvas {
@@ -76,6 +82,7 @@ impl Canvas {
             pixels_version: 1,
             display_version: 0,
             displayed_mask_idx: None,
+            layer_tree: Vec::new(),
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -190,6 +197,9 @@ impl Canvas {
         let visibilities = self.visibilities();
         self.renderer
             .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
+        // commit_stroke_into_layer composites flat; redo it folder-scoped if any
+        // folder bounds an adjustment, so the committed result clips correctly.
+        self.rescope_composite()?;
         // Clear erase mode now the stroke is done so a later composite that
         // does not start with `begin_stroke` cannot inherit it.
         self.renderer.set_stroke_erase(false);
@@ -211,8 +221,20 @@ impl Canvas {
         let visibilities = self.visibilities();
         self.renderer
             .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
+        self.rescope_composite()?;
         self.renderer.invalidate_preview_cache();
         self.bump_version();
+        Ok(())
+    }
+
+    /// Re-run the composite with folder scoping when a folder bounds an
+    /// adjustment. No-op (cheap check) otherwise. Used after composite paths
+    /// that build the canvas flat (the stroke commit/flush).
+    fn rescope_composite(&mut self) -> Result<(), RendererError> {
+        let snapshot = self.layers.snapshot();
+        if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+            self.renderer.composite_layers_scoped(&steps)?;
+        }
         Ok(())
     }
 
@@ -461,16 +483,83 @@ impl Canvas {
         Ok(())
     }
 
+    /// Replace the folder structure (pushed from the UI layers panel) and
+    /// recomposite, since folder bounds scope adjustment layers. Children are in
+    /// canvas order (bottom-to-top). Empty = flat.
+    pub fn set_layer_tree(&mut self, tree: Vec<LayerTreeNode>) -> Result<(), RendererError> {
+        self.layer_tree = tree;
+        self.recomposite_canvas()
+    }
+
+    /// Replace the folder structure without recompositing. For metadata-only
+    /// changes (folder renamed or expanded/collapsed) that do not alter the
+    /// composited image but should still be persisted.
+    pub fn set_layer_tree_quiet(&mut self, tree: Vec<LayerTreeNode>) {
+        self.layer_tree = tree;
+    }
+
+    /// The current folder structure (for persistence / the UI to read back).
+    #[must_use]
+    pub fn layer_tree(&self) -> &[LayerTreeNode] {
+        &self.layer_tree
+    }
+
     /// Re-composite the canvas image from the current layer state.
     /// Called automatically after any layer-affecting mutation.
     fn recomposite_canvas(&mut self) -> Result<(), RendererError> {
         let snapshot = self.layers.snapshot();
         let visibilities: Vec<bool> = snapshot.iter().map(|l| l.visible).collect();
-        self.renderer.composite_layers_to_canvas(&visibilities)?;
+        // Folder-scoped path only when there are adjustments to clip AND the
+        // tree actually nests them; otherwise the flat composite is identical.
+        if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+            self.renderer.composite_layers_scoped(&steps)?;
+        } else {
+            self.renderer.composite_layers_to_canvas(&visibilities)?;
+        }
         // Layer images / stack changed: the cached preview below-stack is stale.
         self.renderer.invalidate_preview_cache();
         self.bump_version();
         Ok(())
+    }
+
+    /// Composite steps for a preview: folder-scoped when folders bound an
+    /// adjustment, otherwise a flat list of the visible layers in canvas order.
+    /// Always covers every visible layer.
+    fn preview_steps(&self, snapshot: &[crate::document::Layer]) -> Vec<CompositeStep> {
+        self.folder_scoped_steps(snapshot).unwrap_or_else(|| {
+            snapshot
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| l.visible.then_some(CompositeStep::Layer(i)))
+                .collect()
+        })
+    }
+
+    /// Build the bracketed composite step stream when folder-scoped compositing
+    /// is needed and possible: there is a folder tree, it has adjustment layers
+    /// to scope, it actually contains a folder, and it matches the live stack.
+    /// `None` falls back to the flat composite path.
+    fn folder_scoped_steps(&self, snapshot: &[crate::document::Layer]) -> Option<Vec<CompositeStep>> {
+        if self.layer_tree.is_empty() || !self.renderer.has_adjustment_layers() {
+            return None;
+        }
+        let visible: Vec<usize> = snapshot
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.visible.then_some(i))
+            .collect();
+        let resolve = |id: &str| {
+            snapshot
+                .iter()
+                .position(|l| l.id == id)
+                .filter(|&i| snapshot[i].visible)
+        };
+        let steps = build_composite_steps(&self.layer_tree, &resolve, &visible);
+        // No folders left after dropping hidden/empty ones -> flat is identical.
+        steps
+            .iter()
+            .any(|s| matches!(s, CompositeStep::EnterGroup))
+            .then_some(steps)
     }
 
     // ----------------------------------------------------------------
@@ -509,12 +598,22 @@ impl Canvas {
                 let linear = ctx.color.to_linear_rgb();
                 let visibilities = self.visibilities();
                 if self.effective_adjustment_above(ctx.layer_idx) {
-                    self.renderer.render_preview_adjusted_and_read(
-                        &visibilities,
-                        ctx.layer_idx,
-                        linear,
-                        ctx.opacity,
-                    )
+                    let snapshot = self.layers.snapshot();
+                    if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+                        self.renderer.render_preview_scoped_and_read(
+                            &steps,
+                            ctx.layer_idx,
+                            linear,
+                            ctx.opacity,
+                        )
+                    } else {
+                        self.renderer.render_preview_adjusted_and_read(
+                            &visibilities,
+                            ctx.layer_idx,
+                            linear,
+                            ctx.opacity,
+                        )
+                    }
                 } else {
                     self.renderer.render_preview_layered_and_read(
                         &visibilities,
@@ -668,7 +767,17 @@ impl Canvas {
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.transform_preview_active() {
                 let visibilities = self.visibilities();
-                self.renderer.render_transform_preview(&visibilities)?;
+                // Run the adjustment chain (folder-scoped) over the transform
+                // preview when an effective adjustment sits above the target, so
+                // transforming a layer below an adjustment previews adjusted.
+                let target = self.renderer.transform_preview_target();
+                if target.is_some_and(|t| self.effective_adjustment_above(t)) {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_transform_preview_scoped(&steps, &visibilities)?;
+                } else {
+                    self.renderer.render_transform_preview(&visibilities)?;
+                }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else {
                 match self.current_stroke {
@@ -680,12 +789,25 @@ impl Canvas {
                         // through the effect chain so the canvas shows the
                         // adjusted result while drawing.
                         if self.effective_adjustment_above(ctx.layer_idx) {
-                            self.renderer.render_preview_adjusted_and_present(
-                                &visibilities,
-                                ctx.layer_idx,
-                                linear,
-                                ctx.opacity,
-                            )?;
+                            // Folder-scoped preview when a folder bounds an
+                            // adjustment, so the live result clips like the
+                            // commit will; otherwise the fast global path.
+                            let snapshot = self.layers.snapshot();
+                            if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+                                self.renderer.render_preview_scoped_and_present(
+                                    &steps,
+                                    ctx.layer_idx,
+                                    linear,
+                                    ctx.opacity,
+                                )?;
+                            } else {
+                                self.renderer.render_preview_adjusted_and_present(
+                                    &visibilities,
+                                    ctx.layer_idx,
+                                    linear,
+                                    ctx.opacity,
+                                )?;
+                            }
                         } else {
                             self.renderer.render_preview_and_present(
                                 &visibilities,
@@ -1310,7 +1432,14 @@ impl Canvas {
     /// test helper; the interactive path presents it instead.
     pub fn read_transform_preview(&mut self) -> Result<Vec<u8>, RendererError> {
         let visibilities = self.visibilities();
-        self.renderer.read_transform_preview(&visibilities)
+        let target = self.renderer.transform_preview_target();
+        if target.is_some_and(|t| self.effective_adjustment_above(t)) {
+            let snapshot = self.layers.snapshot();
+            let steps = self.preview_steps(&snapshot);
+            self.renderer.read_transform_preview_scoped(&steps, &visibilities)
+        } else {
+            self.renderer.read_transform_preview(&visibilities)
+        }
     }
 
     /// Tear down the live transform preview (on apply/cancel/tool-switch).

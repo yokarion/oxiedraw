@@ -66,6 +66,7 @@ pub fn snapshot(
         dpi: props.dpi,
         active_layer,
         layers,
+        layer_tree: canvas.layer_tree().to_vec(),
     };
 
     let mut layer_pixels = Vec::with_capacity(layer_snapshot.len());

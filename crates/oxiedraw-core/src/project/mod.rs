@@ -165,6 +165,67 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    /// The folder tree (schema v7) survives a save/load round-trip and is
+    /// re-applied to the reloaded canvas, so folder-scoped adjustments persist.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn folder_tree_round_trip() {
+        use crate::document::{LayerGroup, LayerTreeNode};
+
+        let size = Size::new(32, 32);
+        let mut canvas = Canvas::headless(size).expect("canvas");
+        let px = vec![0u8; (32 * 32 * 4) as usize];
+        let a = canvas.add_layer_with_pixels("A", &px).expect("add A");
+        let b = canvas.add_layer_with_pixels("B", &px).expect("add B");
+        let snap = canvas.layers().snapshot();
+        let tree = vec![
+            LayerTreeNode::layer(snap[a].id.clone()),
+            LayerTreeNode::Group(LayerGroup {
+                id: "g1".to_string(),
+                name: "Folder".to_string(),
+                expanded: true,
+                children: vec![LayerTreeNode::layer(snap[b].id.clone())],
+            }),
+        ];
+        canvas.set_layer_tree(tree.clone()).expect("set tree");
+
+        let props = DocumentProperties { canvas: size, dpi: 96.0 };
+        let path = std::env::temp_dir().join("oxiedraw_folder_round_trip.oxiedrawproj");
+        save::save(
+            &mut canvas,
+            &props,
+            &crate::components::ComponentLibrary::new(),
+            &crate::text::fonts::FontRegistry::new(),
+            &path,
+        )
+        .expect("save");
+
+        let project = load::load(&path).expect("load");
+        assert_eq!(project.document.layer_tree, tree, "tree must survive JSON");
+
+        let mut canvas2 = Canvas::new(size, LayerState::new()).expect("canvas2");
+        load::apply(&project, &mut canvas2).expect("apply");
+        assert_eq!(canvas2.layer_tree(), tree.as_slice(), "tree must re-apply");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A pre-v7 `document.json` (no `layer_tree` field) deserializes with an
+    /// empty tree, so older projects load as flat.
+    #[test]
+    fn pre_v7_document_loads_flat() {
+        let json = r#"{
+            "canvas_width": 16,
+            "canvas_height": 16,
+            "dpi": 96.0,
+            "active_layer": 0,
+            "layers": []
+        }"#;
+        let doc: super::format::DocumentData =
+            serde_json::from_str(json).expect("pre-v7 document must still parse");
+        assert!(doc.layer_tree.is_empty(), "missing tree must default to flat");
+    }
+
     /// Loading a project saved at one canvas size into a canvas of a different
     /// size must fail with a clear `CanvasSizeMismatch` error.
     #[test]

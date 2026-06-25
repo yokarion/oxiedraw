@@ -213,6 +213,10 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
         canvas.layers().set_active(Some(active));
     }
 
+    // Restore the folder tree last: kinds/effects are now in place, so the
+    // recompose it triggers can scope adjustments to their folders.
+    canvas.set_layer_tree(doc.layer_tree.clone())?;
+
     Ok(())
 }
 
@@ -239,6 +243,7 @@ mod tests {
                 dpi: 96.0,
                 active_layer: None,
                 layers: Vec::new(),
+                layer_tree: Vec::new(),
             },
             layer_pixels: HashMap::new(),
             components: vec![ComponentData {

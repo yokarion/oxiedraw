@@ -549,3 +549,351 @@ fn stroke_colours_the_silhouette_edge() {
     let (_, _, _, corner_a) = at(0, 0);
     assert!(corner_a < 16, "far corner should stay transparent, got A{corner_a}");
 }
+
+/// Build BGRA8 pixels: opaque red in the left half (`x < width/2`), transparent
+/// elsewhere. Used to tell folder-scoped from global adjustments.
+fn left_half_red(size: Size) -> Vec<u8> {
+    let mut px = vec![0u8; (size.width * size.height) as usize * 4];
+    for y in 0..size.height {
+        for x in 0..size.width / 2 {
+            let i = ((y * size.width + x) * 4) as usize;
+            px[i..i + 4].copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    px
+}
+
+/// An adjustment inside a folder must affect only the folder's contents, not
+/// layers below the folder. Stack (bottom->top): blue A (outside), folder { red
+/// left-half B, brightness-0 adjustment }. Brightness 0 blackens the folder
+/// accumulator; A below the folder must stay blue where B is transparent.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn adjustment_is_clipped_to_its_folder() {
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("A-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let b = canvas
+        .add_layer_with_pixels("B-red", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    // Ids in canvas order (bottom-first): A at root, then a folder holding B+adj.
+    let snap = canvas.layers().snapshot();
+    let (id_a, id_b, id_adj) = (snap[a].id.clone(), snap[b].id.clone(), snap[adj].id.clone());
+    let folded = vec![
+        LayerTreeNode::layer(id_a),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![LayerTreeNode::layer(id_b), LayerTreeNode::layer(id_adj)],
+        }),
+    ];
+    canvas.set_layer_tree(folded).unwrap();
+
+    let at = |out: &[u8], x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+
+    let out = canvas.read_pixels().unwrap();
+    // Left half: B was opaque red, blackened by the folder's adjustment.
+    let (lb, lg, lr) = at(&out, 16, 32);
+    assert!(
+        lb <= 6 && lg <= 6 && lr <= 6,
+        "folder content should be blackened, got B{lb} G{lg} R{lr}"
+    );
+    // Right half: only A (blue) shows. The folder's adjustment must NOT reach it.
+    let (rb, rg, rr) = at(&out, 48, 32);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "layer below the folder must stay blue, got B{rb} G{rg} R{rr}"
+    );
+
+    // Flattening the tree (no folders) returns to global scope: the adjustment
+    // now blackens A too, so the right half goes black.
+    canvas.set_layer_tree(Vec::new()).unwrap();
+    let flat = canvas.read_pixels().unwrap();
+    let (rb2, rg2, rr2) = at(&flat, 48, 32);
+    assert!(
+        rb2 <= 6 && rg2 <= 6 && rr2 <= 6,
+        "without a folder the adjustment should reach A, got B{rb2} G{rg2} R{rr2}"
+    );
+}
+
+/// The stroke-commit path (not just recompose) must respect folder scoping:
+/// painting on a layer inside a folder with a brightness-0 adjustment must not
+/// blacken a layer sitting below the folder.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn committed_stroke_respects_folder_scope() {
+    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+    use oxiedraw_utils::geometry::Point;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("A-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let paint = canvas
+        .add_layer_with_pixels("paint", &vec![0u8; (size.width * size.height) as usize * 4])
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let snap = canvas.layers().snapshot();
+    let tree = vec![
+        LayerTreeNode::layer(snap[a].id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![
+                LayerTreeNode::layer(snap[paint].id.clone()),
+                LayerTreeNode::layer(snap[adj].id.clone()),
+            ],
+        }),
+    ];
+    canvas.set_layer_tree(tree).unwrap();
+
+    // Stroke a short red dab in the left half on the paint layer, then commit.
+    let brush = BrushEngine::new();
+    brush.size.set(10.0);
+    brush.opacity.set(1.0);
+    let red = Color::new(255, 0, 0);
+    canvas.layers().set_active(Some(paint));
+    canvas.begin_stroke(red, 1.0, false).unwrap();
+    let s = |x: f32, y: f32, t: u64| InputSample {
+        position: Point::new(x, y),
+        pressure: 1.0,
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+        time_ms: t,
+    };
+    canvas.stamp(|t| brush.begin_stroke(s(14.0, 32.0, 0), red, t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(s(18.0, 32.0, 10), t)).unwrap();
+    canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+    canvas.commit_stroke().unwrap();
+
+    let out = canvas.read_pixels().unwrap();
+    let at = |x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+    // Right half: only A (blue) shows; the folder's adjustment must not reach it.
+    let (rb, rg, rr) = at(48, 32);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "committed stroke leaked the folder adjustment onto A: B{rb} G{rg} R{rr}"
+    );
+}
+
+/// The LIVE in-stroke preview must also respect folder scoping: while painting
+/// inside a folder with a brightness-0 adjustment, the previewed canvas must not
+/// blacken a layer below the folder (matches what the commit will produce).
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn live_preview_respects_folder_scope() {
+    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+    use oxiedraw_utils::geometry::Point;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("A-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let paint = canvas
+        .add_layer_with_pixels("paint", &vec![0u8; (size.width * size.height) as usize * 4])
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let snap = canvas.layers().snapshot();
+    let tree = vec![
+        LayerTreeNode::layer(snap[a].id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![
+                LayerTreeNode::layer(snap[paint].id.clone()),
+                LayerTreeNode::layer(snap[adj].id.clone()),
+            ],
+        }),
+    ];
+    canvas.set_layer_tree(tree).unwrap();
+
+    // Begin a stroke on the paint layer (inside the folder) and read the live
+    // preview WITHOUT committing.
+    let brush = BrushEngine::new();
+    brush.size.set(10.0);
+    brush.opacity.set(1.0);
+    let red = Color::new(255, 0, 0);
+    canvas.layers().set_active(Some(paint));
+    canvas.begin_stroke(red, 1.0, false).unwrap();
+    let s = |x: f32, y: f32, t: u64| InputSample {
+        position: Point::new(x, y),
+        pressure: 1.0,
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+        time_ms: t,
+    };
+    canvas.stamp(|t| brush.begin_stroke(s(14.0, 32.0, 0), red, t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(s(18.0, 32.0, 10), t)).unwrap();
+
+    let out = canvas.read_pixels().unwrap();
+    let i = ((32 * size.width + 48) * 4) as usize; // right half, only A shows
+    let (rb, rg, rr) = (out[i], out[i + 1], out[i + 2]);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "live preview leaked the folder adjustment onto A: B{rb} G{rg} R{rr}"
+    );
+}
+
+/// The live TRANSFORM preview must run the adjustment chain (folder-scoped):
+/// transforming a layer inside a folder with a brightness-0 adjustment must
+/// blacken the transformed content but not a layer below the folder.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_respects_folder_scope() {
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("A-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let target = canvas
+        .add_layer_with_pixels("target", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let snap = canvas.layers().snapshot();
+    let tree = vec![
+        LayerTreeNode::layer(snap[a].id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![
+                LayerTreeNode::layer(snap[target].id.clone()),
+                LayerTreeNode::layer(snap[adj].id.clone()),
+            ],
+        }),
+    ];
+    canvas.set_layer_tree(tree).unwrap();
+
+    // Start an identity transform on the target (warped == source).
+    canvas.layers().set_active(Some(target));
+    canvas
+        .begin_transform_preview_gpu(target, &left_half_red(size), 64, 64)
+        .unwrap();
+    let rect = TransformRect { cx: 32.0, cy: 32.0, w: 64.0, h: 64.0, angle: 0.0 };
+    canvas.set_transform_preview(rect, rect, 64, 64);
+
+    let out = canvas.read_transform_preview().unwrap();
+    let at = |x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+    // Left half: transformed red content, blackened by the folder adjustment.
+    let (lb, lg, lr) = at(16, 32);
+    assert!(
+        lb <= 6 && lg <= 6 && lr <= 6,
+        "transformed content should be adjusted (blackened), got B{lb} G{lg} R{lr}"
+    );
+    // Right half: only A (blue) shows; the folder adjustment must not reach it.
+    let (rb, rg, rr) = at(48, 32);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "transform preview leaked the folder adjustment onto A: B{rb} G{rg} R{rr}"
+    );
+}
+
+/// Transform preview runs the adjustment chain even without folders: an
+/// adjustment above the transformed layer (flat stack) must adjust the warped
+/// content live.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_applies_flat_adjustment() {
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let target = canvas
+        .add_layer_with_pixels("target", &solid(size, 0, 0, 255))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    canvas.layers().set_active(Some(target));
+    canvas
+        .begin_transform_preview_gpu(target, &solid(size, 0, 0, 255), 64, 64)
+        .unwrap();
+    let rect = TransformRect { cx: 32.0, cy: 32.0, w: 64.0, h: 64.0, angle: 0.0 };
+    canvas.set_transform_preview(rect, rect, 64, 64);
+
+    let out = canvas.read_transform_preview().unwrap();
+    assert!(
+        out[0] <= 6 && out[1] <= 6 && out[2] <= 6,
+        "flat adjustment must blacken the transformed layer, got B{} G{} R{}",
+        out[0], out[1], out[2]
+    );
+}

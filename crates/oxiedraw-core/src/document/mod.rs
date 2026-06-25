@@ -1,7 +1,11 @@
+mod grouping;
 mod layer;
 mod properties;
 mod state;
 
+pub use grouping::{
+    build_composite_steps, collect_leaf_ids, CompositeStep, LayerGroup, LayerTreeNode,
+};
 pub use layer::{BlendMode, ComponentInstance, Layer, LayerKind, Placement};
 pub use properties::DocumentProperties;
 pub use state::LayerState;

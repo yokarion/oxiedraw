@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::document::{BlendMode, LayerKind, LayerState};
+use oxiedraw_core::document::{BlendMode, LayerGroup, LayerKind, LayerState, LayerTreeNode};
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 use relm4::gtk::cairo;
@@ -537,6 +537,59 @@ pub(super) fn sync_canvas_order(tree: &[LayerNode], canvas: &mut Canvas) {
     }
 }
 
+// Convert the panel tree (top-first) into the core folder tree (canvas order,
+// bottom-first) and push it to the canvas so adjustments scope to their folder.
+fn node_to_core(node: &LayerNode) -> LayerTreeNode {
+    match node {
+        LayerNode::Layer(id) => LayerTreeNode::layer(id.clone()),
+        LayerNode::Group(g) => LayerTreeNode::Group(LayerGroup {
+            id: g.id.clone(),
+            name: g.name.clone(),
+            expanded: g.expanded,
+            children: tree_to_core(&g.children),
+        }),
+    }
+}
+
+fn tree_to_core(nodes: &[LayerNode]) -> Vec<LayerTreeNode> {
+    nodes.iter().rev().map(node_to_core).collect()
+}
+
+fn node_from_core(node: &LayerTreeNode) -> LayerNode {
+    match node {
+        LayerTreeNode::Layer { id } => LayerNode::Layer(id.clone()),
+        LayerTreeNode::Group(g) => LayerNode::Group(GroupData {
+            id: g.id.clone(),
+            name: g.name.clone(),
+            expanded: g.expanded,
+            visible: true,
+            children: tree_from_core(&g.children),
+            masked_leaves: HashSet::new(),
+        }),
+    }
+}
+
+// Rebuild the panel tree (top-first) from the core folder tree (bottom-first),
+// used when a saved document is loaded.
+pub(super) fn tree_from_core(nodes: &[LayerTreeNode]) -> Vec<LayerNode> {
+    nodes.iter().rev().map(node_from_core).collect()
+}
+
+// Push the current panel folder structure to the canvas (recomposites so
+// folder-scoped adjustments update). Call after any folder-structure change.
+pub(super) fn commit_groups(tree: &[LayerNode], canvas: &mut Canvas) {
+    if let Err(e) = canvas.set_layer_tree(tree_to_core(tree)) {
+        tracing::error!(error = %e, "failed to push folder tree to canvas");
+    }
+}
+
+// Like `commit_groups` but for metadata-only changes (rename / expand) that
+// don't change the composite: stores the tree for persistence without a
+// recomposite.
+pub(super) fn commit_groups_quiet(tree: &[LayerNode], canvas: &mut Canvas) {
+    canvas.set_layer_tree_quiet(tree_to_core(tree));
+}
+
 // Wraps the listed nodes in a new group at the topmost position any of them held.
 pub(super) fn group_nodes(
     tree: &mut Vec<LayerNode>,
@@ -943,6 +996,14 @@ fn build_layers_page(
         .build();
 
     let ui = Ui::new((*layers).clone());
+    // A loaded document carries its folder tree on the canvas; seed the panel
+    // from it so saved folders reappear. Reconciled below against the snapshot.
+    {
+        let core_tree = canvas.borrow().layer_tree().to_vec();
+        if !core_tree.is_empty() {
+            *ui.tree.borrow_mut() = tree_from_core(&core_tree);
+        }
+    }
 
     let area = gtk::DrawingArea::builder().hexpand(true).build();
     sync_height(&area, &ui);
@@ -1012,6 +1073,7 @@ fn build_layers_page(
             reconcile_tree(&mut ui.tree.borrow_mut(), &snap);
             sync_tree_order_from_canvas(&mut ui.tree.borrow_mut(), &c);
             drop(c);
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
             ui.sync_blend_controls();
             area.queue_draw();
@@ -1029,8 +1091,9 @@ fn build_layers_page(
     let begin_rename = {
         let area = area.clone();
         let ui = ui.clone();
+        let canvas = Rc::clone(canvas);
         let history = Rc::clone(history);
-        Rc::new(move || begin_rename_active(&area, &ui, &history)) as Rc<dyn Fn()>
+        Rc::new(move || begin_rename_active(&area, &ui, &canvas, &history)) as Rc<dyn Fn()>
     };
 
     (page, refresh, selected_ids, reinstall_actions, begin_rename)
@@ -1108,6 +1171,7 @@ fn build_layers_header(
                         pixels: new_pixels,
                     });
                     sync_height(&area, &ui);
+                    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                     ui.sync_blend_controls();
                     area.queue_draw();
                     redraw.request();
@@ -2223,6 +2287,7 @@ fn install_list_input(
                         && let RowKind::Group { id, .. } = &rows[d.from_row].kind {
                             let id = id.clone();
                             toggle_group_expanded(&mut ui.tree.borrow_mut(), &id);
+                            commit_groups_quiet(&ui.tree.borrow(), &mut canvas.borrow_mut());
                             sync_height(&area_w, &ui);
                             area_w.queue_draw();
                         }
@@ -2265,6 +2330,7 @@ fn install_list_input(
                                 &ui.tree.borrow().clone(),
                                 &mut canvas.borrow_mut(),
                             );
+                            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
 
                             let after_order: Vec<String> = canvas.borrow().layers()
                                 .snapshot().iter().map(|l| l.id.clone()).collect();
@@ -2365,6 +2431,7 @@ fn install_list_input(
     {
         let area_w = area.clone();
         let ui_c = ui.clone();
+        let canvas_c = Rc::clone(&canvas);
         let history = Rc::clone(history);
         let on_edit_component = Rc::clone(on_edit_component);
         rename_click.connect_pressed(move |gesture, n_press, _x, y| {
@@ -2394,6 +2461,7 @@ fn install_list_input(
                 current_name,
                 is_layer,
                 &ui_c,
+                &canvas_c,
                 slot_top(row_idx),
                 &history,
             );
@@ -2491,6 +2559,7 @@ fn show_rename_popover(
     current_name: String,
     is_layer: bool,
     ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
     row_top: f64,
     history: &Rc<RefCell<HistoryStack>>,
 ) {
@@ -2512,6 +2581,7 @@ fn show_rename_popover(
 
     let ui = ui.clone();
     let area = area.clone();
+    let canvas = Rc::clone(canvas);
     let pop_c = Rc::clone(&popover_rc);
     let history = Rc::clone(history);
     entry.connect_activate(move |e| {
@@ -2532,6 +2602,8 @@ fn show_rename_popover(
             }
         } else {
             rename_group_in_tree(&mut ui.tree.borrow_mut(), &id, new_name.trim().to_string());
+            // Folder name is metadata-only (no composite change) but must persist.
+            commit_groups_quiet(&ui.tree.borrow(), &mut canvas.borrow_mut());
         }
         area.queue_draw();
         pop_c.popdown();
@@ -2555,6 +2627,7 @@ fn show_rename_popover(
 pub(super) fn begin_rename_active(
     area: &gtk::DrawingArea,
     ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
     history: &Rc<RefCell<HistoryStack>>,
 ) {
     // Unmapped means the layers panel is hidden (e.g. the Crop tool swapped in
@@ -2581,7 +2654,7 @@ pub(super) fn begin_rename_active(
     let current_name = match &rows[row_idx].kind {
         RowKind::Layer { name, .. } | RowKind::Group { name, .. } => name.clone(),
     };
-    show_rename_popover(area, target_id, current_name, is_layer, ui, slot_top(row_idx), history);
+    show_rename_popover(area, target_id, current_name, is_layer, ui, canvas, slot_top(row_idx), history);
 }
 
 pub(super) fn item_at(y: f64, count: usize) -> Option<usize> {
