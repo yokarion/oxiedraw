@@ -918,6 +918,14 @@ pub(super) fn install_context_menu(
     layer_menu.append(Some("Copy Layer"), Some("app.copy"));
     layer_menu.append(Some("Delete Layer"), Some("app.layer-delete"));
 
+    // Same as a regular layer, plus the entry that re-opens the effect editor.
+    let adjustment_menu = gio::Menu::new();
+    adjustment_menu.append(Some("Edit Adjustment"), Some("app.layer-add-adjustment"));
+    adjustment_menu.append(Some("Rename Layer"), Some("app.rename"));
+    adjustment_menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
+    adjustment_menu.append(Some("Copy Layer"), Some("app.copy"));
+    adjustment_menu.append(Some("Delete Layer"), Some("app.layer-delete"));
+
     let group_menu = gio::Menu::new();
     group_menu.append(Some("Rename Group"), Some("app.rename"));
     group_menu.append(Some("Duplicate Group"), Some("app.group-duplicate"));
@@ -936,6 +944,7 @@ pub(super) fn install_context_menu(
         let popover = Rc::clone(&popover);
         let layer_clipboard = Rc::clone(layer_clipboard);
         let layer_menu = layer_menu.clone();
+        let adjustment_menu = adjustment_menu.clone();
         let group_menu = group_menu.clone();
         click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -951,7 +960,11 @@ pub(super) fn install_context_menu(
                 RowKind::Layer { flat_idx, .. } => {
                     ui.state.select_index(*flat_idx);
                     *ui.active_group.borrow_mut() = None;
-                    popover.set_menu_model(Some(&layer_menu));
+                    if super::row_is_adjustment(&ui, row) {
+                        popover.set_menu_model(Some(&adjustment_menu));
+                    } else {
+                        popover.set_menu_model(Some(&layer_menu));
+                    }
                 }
                 RowKind::Group { id, .. } => {
                     *ui.active_group.borrow_mut() = Some(id.clone());

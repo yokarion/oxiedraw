@@ -233,10 +233,25 @@ impl PrimaryDragHandler {
         }
         *self.pending_correction.borrow_mut() = None;
 
-        let color = self.colors.current();
         let opacity = self.brush_engine.opacity.get();
         let buildup = self.brush_engine.active_brush().buildup;
-        let erase = self.tools.eraser.get();
+
+        // Adjustment-layer masks are grayscale and can't be erased; mirror the
+        // core invariant here so the live preview matches the committed stroke.
+        let on_adjustment = {
+            let canvas = self.canvas.borrow();
+            canvas
+                .layers()
+                .active()
+                .and_then(|idx| canvas.layers().kind(idx))
+                .is_some_and(|k| k.is_adjustment())
+        };
+        let color = if on_adjustment {
+            self.colors.current().to_grayscale()
+        } else {
+            self.colors.current()
+        };
+        let erase = !on_adjustment && self.tools.eraser.get();
 
         // Capture context so the idle timer can re-draw with the same settings.
         self.pending_color.set(color);

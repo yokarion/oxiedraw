@@ -122,6 +122,18 @@ impl Color {
         color_math::rgb_to_hex(self.r, self.g, self.b)
     }
 
+    /// Collapse to a neutral gray using Rec. 709 luma weights. Used when
+    /// painting an adjustment-layer mask, which must stay black-gray-white.
+    #[must_use]
+    pub fn to_grayscale(self) -> Self {
+        let luma = 0.2126 * f32::from(self.r)
+            + 0.7152 * f32::from(self.g)
+            + 0.0722 * f32::from(self.b);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let v = luma.round().clamp(0.0, 255.0) as u8;
+        Self { r: v, g: v, b: v }
+    }
+
     /// Convert sRGB-encoded 8-bit channels to linear floats in [0, 1].
     /// The Vulkan composite pipeline expects linear input because the
     /// canvas attachment is `R8G8B8A8_SRGB`.
@@ -132,5 +144,22 @@ impl Color {
             color_math::srgb_to_linear(self.g),
             color_math::srgb_to_linear(self.b),
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Color;
+
+    #[test]
+    fn grayscale_is_neutral_and_preserves_extremes() {
+        assert_eq!(Color::WHITE.to_grayscale(), Color::WHITE);
+        assert_eq!(Color::BLACK.to_grayscale(), Color::BLACK);
+
+        let g = Color::new(0, 255, 0).to_grayscale();
+        assert_eq!(g.r, g.g);
+        assert_eq!(g.g, g.b);
+        // Green dominates Rec. 709 luma.
+        assert_eq!(g.r, 182);
     }
 }

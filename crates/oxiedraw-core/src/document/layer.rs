@@ -149,6 +149,13 @@ pub enum LayerKind {
 }
 
 impl LayerKind {
+    /// `true` for adjustment (non-destructive effect) layers, whose image slot
+    /// is a grayscale mask rather than color pixels.
+    #[must_use]
+    pub const fn is_adjustment(&self) -> bool {
+        matches!(self, Self::Adjustment(_))
+    }
+
     /// Return a copy with any positional geometry shifted by `(dx, dy)` canvas
     /// pixels. Crop moves every layer's pixels by the crop offset, so text
     /// boxes and component placements must move with them to stay aligned.

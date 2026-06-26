@@ -897,3 +897,67 @@ fn transform_preview_applies_flat_adjustment() {
         out[0], out[1], out[2]
     );
 }
+
+// Deleting a selection on an adjustment layer must refill the hole with white
+// (full effect), not leave transparency. Mask slots stay opaque black-gray-white.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn delete_selection_refills_adjustment_mask_white() {
+    let (mut canvas, adj) = adjustment_with_left_selection();
+    canvas.erase_selection_in_layer(adj).unwrap();
+    assert_mask_white(&mut canvas, adj);
+}
+
+// The cut path (clear_selection_from_layer) must also refill the hole white.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn cut_selection_refills_adjustment_mask_white() {
+    let (mut canvas, adj) = adjustment_with_left_selection();
+    canvas.clear_selection_from_layer(adj).unwrap();
+    assert_mask_white(&mut canvas, adj);
+}
+
+// The selection-move lift (extract_selection_pixels) must also refill white.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn lift_selection_refills_adjustment_mask_white() {
+    let (mut canvas, adj) = adjustment_with_left_selection();
+    canvas.extract_selection_pixels(adj).unwrap();
+    assert_mask_white(&mut canvas, adj);
+}
+
+/// Headless canvas with one adjustment layer (active) and the left half selected.
+fn adjustment_with_left_selection() -> (Canvas, usize) {
+    use oxiedraw_core::selection::{RectShape, SelectionShape};
+    use oxiedraw_core::tools::SelectionMode;
+
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas.layers().set_active(Some(adj));
+    #[allow(clippy::cast_precision_loss)]
+    canvas
+        .apply_selection_shape(
+            &SelectionShape::Rect(RectShape {
+                x: 0.0,
+                y: 0.0,
+                w: (size.width / 2) as f32,
+                h: size.height as f32,
+            }),
+            SelectionMode::Replace,
+        )
+        .unwrap();
+    (canvas, adj)
+}
+
+/// The whole 16x16 mask must read opaque white (deleted region refilled, rest
+/// untouched).
+fn assert_mask_white(canvas: &mut Canvas, adj: usize) {
+    let out = canvas.read_layer(adj).unwrap();
+    let px = |x: usize, y: usize| {
+        let i = (y * 16 + x) * 4;
+        (out[i], out[i + 1], out[i + 2], out[i + 3])
+    };
+    assert_eq!(px(2, 8), (255, 255, 255, 255), "deleted region must be white");
+    assert_eq!(px(12, 8), (255, 255, 255, 255), "kept region stays white");
+}

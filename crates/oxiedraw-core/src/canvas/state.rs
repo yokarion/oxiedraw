@@ -52,6 +52,10 @@ pub struct Canvas {
     /// when the selection switches into or out of mask view, independent of
     /// `pixels_version`.
     displayed_mask_idx: Option<usize>,
+    /// Id of the adjustment layer whose mask the user has toggled into view (via
+    /// the layer-row mask button). The mask is shown on the canvas only while
+    /// this matches an adjustment layer; otherwise the normal composite shows.
+    mask_view_id: Option<String>,
     /// Folder structure over the flat layer stack, pushed from the UI. Empty =
     /// flat. Used to scope adjustment layers to their enclosing folder at
     /// composite time and persisted with the document.
@@ -82,6 +86,7 @@ impl Canvas {
             pixels_version: 1,
             display_version: 0,
             displayed_mask_idx: None,
+            mask_view_id: None,
             layer_tree: Vec::new(),
         };
         // Initial canvas state == empty layer stack composited. Yields
@@ -154,6 +159,19 @@ impl Canvas {
         if layer_idx >= self.renderer.layer_count() {
             return Err(RendererError::LayerIndexOutOfRange);
         }
+
+        // An adjustment layer's slot is a grayscale mask: keep paint neutral and
+        // never erase (erasing would punch transparency the mask can't hold).
+        let is_adjustment = self
+            .layers
+            .kind(layer_idx)
+            .is_some_and(|k| k.is_adjustment());
+        let (color, erase) = if is_adjustment {
+            (color.to_grayscale(), false)
+        } else {
+            (color, erase)
+        };
+
         self.renderer.set_stroke_erase(erase);
         self.renderer.clear_stroke()?;
         // New stroke target / fresh layer state: the cached below-stack
@@ -522,6 +540,38 @@ impl Canvas {
         Ok(())
     }
 
+    /// An adjustment-layer slot is a mask: it must stay black-gray-white and
+    /// fully opaque (white = full effect). After any op that writes the slot
+    /// (paint, fill, shape, transform, delete) this re-imposes that invariant -
+    /// fill sub-255 alpha by compositing over opaque white, then collapse each
+    /// pixel to neutral gray. No-op for non-adjustment layers; does not
+    /// recomposite (callers do that right after).
+    fn normalize_adjustment_slot(&mut self, idx: usize) -> Result<(), RendererError> {
+        if !self.layers.kind(idx).is_some_and(|k| k.is_adjustment()) {
+            return Ok(());
+        }
+        let mut px = self.renderer.read_layer(idx)?;
+        for p in px.chunks_exact_mut(4) {
+            // Premultiplied BGRA OVER opaque white: c' = c + 255 * (1 - a). The
+            // result is opaque, so the channels are now straight (un-premult).
+            let inv = 255 - p[3];
+            let b = f32::from(p[0].saturating_add(inv));
+            let g = f32::from(p[1].saturating_add(inv));
+            let r = f32::from(p[2].saturating_add(inv));
+            // Rec. 709 luma -> neutral gray (BGRA byte order).
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let v = (0.0722 * b + 0.7152 * g + 0.2126 * r)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            p[0] = v;
+            p[1] = v;
+            p[2] = v;
+            p[3] = 255;
+        }
+        self.renderer.write_layer(idx, &px)?;
+        Ok(())
+    }
+
     /// Composite steps for a preview: folder-scoped when folders bound an
     /// adjustment, otherwise a flat list of the visible layers in canvas order.
     /// Always covers every visible layer.
@@ -834,14 +884,30 @@ impl Canvas {
     }
 
     /// The adjustment layer whose mask should be shown on the canvas right now:
-    /// the active layer, when it is an adjustment and no stroke is in flight
-    /// (a stroke on the adjustment renders the mask + the live dab instead).
+    /// the one the user toggled into mask view, when no stroke is in flight (a
+    /// stroke on the adjustment renders the mask + the live dab instead).
     fn mask_view_idx(&self) -> Option<usize> {
         if self.current_stroke.is_some() {
             return None;
         }
-        let idx = self.layers.active()?;
+        let id = self.mask_view_id.as_deref()?;
+        let idx = self.layers.snapshot().iter().position(|l| l.id == id)?;
         self.layer_is_adjustment(idx).then_some(idx)
+    }
+
+    /// Id of the adjustment layer whose mask is toggled into view, if any.
+    #[must_use]
+    pub fn mask_view(&self) -> Option<&str> {
+        self.mask_view_id.as_deref()
+    }
+
+    /// Show (`Some(layer_id)`) or hide (`None`) an adjustment layer's mask on the
+    /// canvas. Only takes visible effect for ids that name an adjustment layer.
+    pub fn set_mask_view(&mut self, id: Option<String>) {
+        if self.mask_view_id != id {
+            self.mask_view_id = id;
+            self.bump_version();
+        }
     }
 
     fn layer_is_adjustment(&self, idx: usize) -> bool {
@@ -1082,6 +1148,12 @@ impl Canvas {
         distance_mask: &[u8],
         color: Color,
     ) -> Result<(), RendererError> {
+        // Adjustment masks are grayscale: match the committed (normalized) result.
+        let color = if self.layers.kind(layer_idx).is_some_and(|k| k.is_adjustment()) {
+            color.to_grayscale()
+        } else {
+            color
+        };
         let linear = color.to_linear_rgb();
         // Premultiplied with alpha = 1.0 since bucket fill is opaque;
         // the OVER blend on the overlay pipeline matches this.
@@ -1114,6 +1186,7 @@ impl Canvas {
     ) -> Result<(), RendererError> {
         self.renderer.write_layer(layer_idx, pixels)?;
         self.renderer.clear_fill_overlay();
+        self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()?;
         Ok(())
     }
@@ -1178,6 +1251,7 @@ impl Canvas {
         let premul = [linear[0], linear[1], linear[2], 1.0];
         self.renderer
             .commit_shape(layer_idx, kind, rect, premul, antialias, line_width)?;
+        self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()
     }
 
@@ -1277,6 +1351,7 @@ impl Canvas {
             filter,
         );
         self.renderer.write_layer(layer_idx, &transformed)?;
+        self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()?;
         Ok(())
     }
@@ -1377,6 +1452,7 @@ impl Canvas {
             ext_y,
             push,
         )?;
+        self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()?;
         Ok((pixels, ext_x, ext_y, out_w, out_h))
     }
@@ -1602,6 +1678,7 @@ impl Canvas {
         let mask = self.renderer.read_selection_mask()?;
         let (masked, remaining) = split_layer_by_mask(&layer, &mask);
         self.renderer.write_layer(idx, &remaining)?;
+        self.normalize_adjustment_slot(idx)?;
         self.deselect();
         self.recomposite_canvas()?;
         Ok(Some((masked, size.width, size.height)))
@@ -1636,6 +1713,7 @@ impl Canvas {
         let mask = self.renderer.read_selection_mask()?;
         let (_masked, remaining) = split_layer_by_mask(&layer, &mask);
         self.renderer.write_layer(idx, &remaining)?;
+        self.normalize_adjustment_slot(idx)?;
         self.deselect();
         self.recomposite_canvas()?;
         Ok(())
@@ -1653,6 +1731,7 @@ impl Canvas {
         let mask = self.renderer.read_selection_mask()?;
         let (_masked, remaining) = split_layer_by_mask(&layer, &mask);
         self.renderer.write_layer(idx, &remaining)?;
+        self.normalize_adjustment_slot(idx)?;
         self.recomposite_canvas()?;
         Ok(())
     }

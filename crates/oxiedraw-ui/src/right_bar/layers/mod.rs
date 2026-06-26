@@ -17,6 +17,7 @@ use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 use relm4::gtk::cairo;
 use relm4::gtk::gdk;
+use relm4::gtk::gio;
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
@@ -44,6 +45,9 @@ const HANDLE_LINE_THICKNESS: f64 = 1.5;
 const HANDLE_LINE_GAP: f64 = 4.0;
 
 const EYE_RADIUS: f64 = 9.0;   // half the hit-box width/height
+const EDIT_RADIUS: f64 = 8.0;  // adjustment "edit settings" sliders, sits left of the eye
+const MASK_RADIUS: f64 = 8.0;  // adjustment "show mask" toggle, sits left of the sliders
+const EDIT_EYE_GAP: f64 = 6.0; // gap between adjacent row icons
 const CHEVRON_SIZE: f64 = 12.0;
 const FOLDER_W: f64 = 16.0;
 const FOLDER_H: f64 = 13.0;
@@ -121,9 +125,11 @@ pub(super) struct VisibleRow {
 
 // --- Click zone ---
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum HitZone {
+pub(super) enum HitZone {
     Handle,
     Eye,
+    Edit,    // adjustment layers only: the "edit settings" sliders left of the eye
+    Mask,    // adjustment layers only: the "show mask" toggle left of the sliders
     Chevron, // groups only
     Swatch,  // layers only
     Body,
@@ -157,6 +163,12 @@ pub(super) struct Ui {
     // Late-bound callback that reloads the blend-mode/opacity controls from the
     // current selection. Invoked whenever the selection changes.
     pub(super) blend_sync: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
+    // Id of the adjustment layer whose mask is toggled into view (mirrors the
+    // canvas state so the row's mask button can draw its on/off state).
+    pub(super) mask_view: Rc<RefCell<Option<String>>>,
+    // Icon currently under the pointer (row index + zone), for the hover
+    // highlight. Only the clickable per-row icons (eye / sliders / mask) set it.
+    pub(super) hover: Rc<RefCell<Option<(usize, HitZone)>>>,
 }
 
 impl Ui {
@@ -176,6 +188,8 @@ impl Ui {
             multi_selected: Rc::new(RefCell::new(HashSet::new())),
             active_group: Rc::new(RefCell::new(None)),
             blend_sync: Rc::new(RefCell::new(None)),
+            mask_view: Rc::new(RefCell::new(None)),
+            hover: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -1511,6 +1525,8 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
 
         let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
         let count = rows.len();
+        // No hover highlight mid-drag (rows are sliding around).
+        let hover = if drag.is_none() { *ui.hover.borrow() } else { None };
 
         // Span covers a group header plus its expanded children when one is being dragged.
         let drag_handle = drag.as_ref().and_then(|d| {
@@ -1553,7 +1569,10 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             };
             let is_component = row_is_component(&ui, row);
             let is_text = row_is_text(&ui, row);
-            draw_row(ctx, &palette, width, y, row, (row.depth + row.adjust_indent) as f64, is_active, is_multi, thumb, is_component, is_text);
+            let is_adjustment = row_is_adjustment(&ui, row);
+            let mask_active = is_adjustment && row_mask_active(&ui, row);
+            let hover_zone = hover.and_then(|(hr, z)| (hr == row_idx).then_some(z));
+            draw_row(ctx, &palette, width, y, row, (row.depth + row.adjust_indent) as f64, is_active, is_multi, thumb, is_component, is_text, is_adjustment, mask_active, hover_zone);
         }
 
         if let Some((from, span, _)) = drag_handle
@@ -1586,7 +1605,9 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                     let depth_f = ((row.depth + row.adjust_indent) as f64 + anim).max(0.0);
                     let is_component = row_is_component(&ui, row);
                     let is_text = row_is_text(&ui, row);
-                    draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text);
+                    let is_adjustment = row_is_adjustment(&ui, row);
+                    let mask_active = is_adjustment && row_mask_active(&ui, row);
+                    draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text, is_adjustment, mask_active, None);
                 }
             }
     });
@@ -1670,6 +1691,24 @@ fn row_is_text(ui: &Ui, row: &VisibleRow) -> bool {
     }
 }
 
+pub(super) fn row_is_adjustment(ui: &Ui, row: &VisibleRow) -> bool {
+    match &row.kind {
+        RowKind::Layer { flat_idx, .. } => ui
+            .state
+            .kind(*flat_idx)
+            .is_some_and(|k| matches!(k, oxiedraw_core::document::LayerKind::Adjustment(_))),
+        RowKind::Group { .. } => false,
+    }
+}
+
+// Whether this row's adjustment mask is currently toggled into canvas view.
+fn row_mask_active(ui: &Ui, row: &VisibleRow) -> bool {
+    match &row.kind {
+        RowKind::Layer { id, .. } => ui.mask_view.borrow().as_deref() == Some(id.as_str()),
+        RowKind::Group { .. } => false,
+    }
+}
+
 fn draw_row(
     ctx: &cairo::Context,
     palette: &Palette,
@@ -1682,6 +1721,9 @@ fn draw_row(
     thumbnail: Option<&cairo::ImageSurface>,
     is_component: bool,
     is_text: bool,
+    is_adjustment: bool,
+    mask_active: bool,
+    hover_zone: Option<HitZone>,
 ) {
     let indent = depth_f * INDENT_STEP;
     let left = LIST_PADDING;
@@ -1735,6 +1777,16 @@ fn draw_row(
             let eye_cx = handle_left - ITEM_INNER_PAD - EYE_RADIUS;
             let eye_cy = top + ITEM_HEIGHT / 2.0;
 
+            // Adjustment layers carry two icons left of the eye: the "edit
+            // settings" sliders (next to the eye) and the "show mask" toggle.
+            let sliders_cx = eye_cx - EYE_RADIUS - EDIT_EYE_GAP - EDIT_RADIUS;
+            let mask_cx = sliders_cx - EDIT_RADIUS - EDIT_EYE_GAP - MASK_RADIUS;
+            let controls_left = if is_adjustment {
+                mask_cx - MASK_RADIUS
+            } else {
+                eye_cx - EYE_RADIUS
+            };
+
             let badge_letter: Option<&str> = if is_component {
                 Some("C")
             } else if is_text {
@@ -1750,7 +1802,7 @@ fn draw_row(
             } else {
                 sx + SWATCH_SIZE + ITEM_INNER_PAD
             };
-            let text_max_w = eye_cx - EYE_RADIUS - ITEM_INNER_PAD - text_left;
+            let text_max_w = controls_left - ITEM_INNER_PAD - text_left;
 
             if let Some(letter) = badge_letter {
                 let badge_cy = top + ITEM_HEIGHT / 2.0;
@@ -1783,7 +1835,22 @@ fn draw_row(
                 ctx.restore().ok();
             }
 
+            if hover_zone == Some(HitZone::Eye) {
+                draw_icon_hover_bg(ctx, eye_cx, eye_cy, EYE_RADIUS, palette.fg);
+            }
             draw_eye(ctx, eye_cx, eye_cy, EYE_RADIUS, visible, icon_color, dim);
+            if is_adjustment {
+                if hover_zone == Some(HitZone::Edit) {
+                    draw_icon_hover_bg(ctx, sliders_cx, eye_cy, EDIT_RADIUS, palette.fg);
+                }
+                draw_sliders(ctx, sliders_cx, eye_cy, EDIT_RADIUS, icon_color, dim);
+                if hover_zone == Some(HitZone::Mask) {
+                    draw_icon_hover_bg(ctx, mask_cx, eye_cy, MASK_RADIUS, palette.fg);
+                }
+                // Toggle state: on = full icon, off = dimmed. Use icon_color so
+                // it stays visible against the accent background of an active row.
+                draw_mask(ctx, mask_cx, eye_cy, MASK_RADIUS, icon_color, dim || !mask_active);
+            }
             set_source(ctx, icon_color);
             if dim {
                 ctx.save().ok();
@@ -1829,6 +1896,9 @@ fn draw_row(
                 ctx.restore().ok();
             }
 
+            if hover_zone == Some(HitZone::Eye) {
+                draw_icon_hover_bg(ctx, eye_cx, eye_cy, EYE_RADIUS, palette.fg);
+            }
             draw_eye(ctx, eye_cx, eye_cy, EYE_RADIUS, visible, icon_color, dim);
             set_source(ctx, icon_color);
             if dim {
@@ -1916,6 +1986,55 @@ fn draw_eye(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, open: bool, color: R
         );
         ctx.stroke().ok();
     }
+    ctx.restore().ok();
+}
+
+// Subtle rounded background drawn behind a clickable row icon while it is
+// hovered. `color` is the foreground tint, applied at a low alpha.
+fn draw_icon_hover_bg(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb) {
+    ctx.arc(cx, cy, r + 4.0, 0.0, TAU);
+    ctx.set_source_rgba(color.0, color.1, color.2, 0.14);
+    ctx.fill().ok();
+}
+
+// Horizontal "sliders" icon (two tracks, each with an offset knob) marking an
+// adjustment layer's edit-settings button.
+fn draw_sliders(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim: bool) {
+    ctx.save().ok();
+    let alpha = if dim { 0.35 } else { 1.0 };
+    ctx.set_source_rgba(color.0, color.1, color.2, alpha);
+    ctx.set_line_width(1.4);
+    ctx.set_line_cap(cairo::LineCap::Round);
+
+    let left = cx - r;
+    let right = cx + r;
+    let knob = r * 0.34;
+    // Top track: knob sits left of centre. Bottom track: knob sits right.
+    for (ty, knob_x) in [(cy - r * 0.45, cx - r * 0.3), (cy + r * 0.45, cx + r * 0.3)] {
+        ctx.move_to(left, ty);
+        ctx.line_to(right, ty);
+        ctx.stroke().ok();
+        ctx.arc(knob_x, ty, knob, 0.0, TAU);
+        ctx.fill().ok();
+    }
+    ctx.restore().ok();
+}
+
+// "Show mask" toggle: a ring with a filled right half. Same glyph on or off -
+// only the alpha differs (full when on, dimmed when off), driven by `dim`.
+fn draw_mask(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim: bool) {
+    ctx.save().ok();
+    let alpha = if dim { 0.35 } else { 1.0 };
+    ctx.set_source_rgba(color.0, color.1, color.2, alpha);
+    let rr = r * 0.85;
+    // Outline ring.
+    ctx.set_line_width(1.4);
+    ctx.arc(cx, cy, rr, 0.0, TAU);
+    ctx.stroke().ok();
+    // Filled right half (top -> bottom along the right side).
+    ctx.arc(cx, cy, rr - 0.7, -TAU / 4.0, TAU / 4.0);
+    ctx.close_path();
+    ctx.fill().ok();
     ctx.restore().ok();
 }
 
@@ -2010,6 +2129,7 @@ fn hit_zone(
     widget_width: f64,
     depth: usize,
     is_group: bool,
+    has_edit: bool,
 ) -> HitZone {
     let indent = count_f64(depth) * INDENT_STEP;
     let content_left = LIST_PADDING + indent;
@@ -2028,6 +2148,19 @@ fn hit_zone(
         return HitZone::Eye;
     }
 
+    // Adjustment icons: edit-settings sliders (left of the eye), then the
+    // show-mask toggle (left of the sliders).
+    if has_edit {
+        let sliders_cx = eye_cx - EYE_RADIUS - EDIT_EYE_GAP - EDIT_RADIUS;
+        if (x - sliders_cx).abs() <= EDIT_RADIUS + 4.0 {
+            return HitZone::Edit;
+        }
+        let mask_cx = sliders_cx - EDIT_RADIUS - EDIT_EYE_GAP - MASK_RADIUS;
+        if (x - mask_cx).abs() <= MASK_RADIUS + 4.0 {
+            return HitZone::Mask;
+        }
+    }
+
     // Chevron or swatch (leftmost content).
     if is_group {
         let chevron_right = content_left + ITEM_INNER_PAD + CHEVRON_SIZE + 4.0;
@@ -2043,6 +2176,20 @@ fn hit_zone(
     }
 
     HitZone::Body
+}
+
+/// Make `flat_idx` the active layer and open the adjustment editor on it. The
+/// `layer-add-adjustment` action edits the active adjustment layer in place, so
+/// selecting first targets the right one regardless of prior selection.
+pub(super) fn open_adjustment_editor(ui: &Ui, area: &gtk::DrawingArea, flat_idx: usize) {
+    ui.multi_selected.borrow_mut().clear();
+    ui.state.select_index(flat_idx);
+    *ui.active_group.borrow_mut() = None;
+    area.queue_draw();
+    if let Some(gio_app) = gio::Application::default()
+        && let Ok(app) = gio_app.downcast::<gtk::Application>() {
+            app.activate_action("layer-add-adjustment", None);
+        }
 }
 
 fn install_list_input(
@@ -2070,7 +2217,8 @@ fn install_list_input(
             let width = f64::from(area_w.allocated_width());
             let y_in_row = y - slot_top(row_idx);
             let is_group = matches!(row.kind, RowKind::Group { .. });
-            let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group);
+            let has_edit = row_is_adjustment(&ui, row);
+            let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group, has_edit);
 
             *ui.drag.borrow_mut() = Some(Drag {
                 from_row: row_idx,
@@ -2282,6 +2430,34 @@ fn install_list_input(
                         }
                     }
                 }
+                HitZone::Edit => {
+                    if is_click
+                        && d.from_row < rows.len()
+                        && let RowKind::Layer { flat_idx, .. } = &rows[d.from_row].kind {
+                            open_adjustment_editor(&ui, &area_w, *flat_idx);
+                        }
+                }
+                HitZone::Mask => {
+                    if is_click
+                        && d.from_row < rows.len()
+                        && let RowKind::Layer { id, flat_idx, .. } = &rows[d.from_row].kind {
+                            let turn_on = ui.mask_view.borrow().as_deref() != Some(id.as_str());
+                            let new_view = turn_on.then(|| id.clone());
+                            // Editing the mask paints the active layer, so adopt
+                            // this one when turning the view on.
+                            if turn_on {
+                                ui.multi_selected.borrow_mut().clear();
+                                ui.state.select_index(*flat_idx);
+                                *ui.active_group.borrow_mut() = None;
+                                actions::refresh_action_sensitivity(&ui);
+                                ui.sync_blend_controls();
+                            }
+                            ui.mask_view.borrow_mut().clone_from(&new_view);
+                            canvas.borrow_mut().set_mask_view(new_view);
+                            area_w.queue_draw();
+                            redraw.request();
+                        }
+                }
                 HitZone::Chevron => {
                     if d.from_row < rows.len()
                         && let RowKind::Group { id, .. } = &rows[d.from_row].kind {
@@ -2413,9 +2589,8 @@ fn install_list_input(
                         actions::refresh_action_sensitivity(&ui);
                         ui.sync_blend_controls();
                         area_w.queue_draw();
-                        // Re-present the canvas so it switches into / out of the
-                        // adjustment mask view as the active layer changes.
-                        // Cheap when nothing changed: present() short-circuits.
+                        // Re-present in case the selection change affects the
+                        // canvas. Cheap when nothing changed: present() short-circuits.
                         redraw.request();
                     }
                 }
@@ -2481,25 +2656,45 @@ fn install_list_input(
             let width = f64::from(area_w.allocated_width());
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            let cursor = item_at(y, rows.len())
-                .is_some_and(|row_idx| {
-                    let row = &rows[row_idx];
-                    let y_in_row = y - slot_top(row_idx);
-                    let is_group = matches!(row.kind, RowKind::Group { .. });
-                    let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group);
-                    matches!(zone, HitZone::Handle | HitZone::Eye | HitZone::Chevron | HitZone::Swatch)
-                });
-            let c = if cursor {
-                gtk::gdk::Cursor::from_name("pointer", None)
-            } else {
-                None
-            };
+            let hit = item_at(y, rows.len()).map(|row_idx| {
+                let row = &rows[row_idx];
+                let y_in_row = y - slot_top(row_idx);
+                let is_group = matches!(row.kind, RowKind::Group { .. });
+                let has_edit = row_is_adjustment(&ui, row);
+                let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group, has_edit);
+                (row_idx, zone)
+            });
+            // The handle previews the drag (row-resize); the other clickable
+            // zones use the pointer hand; everything else keeps the default.
+            let cursor_name = hit.and_then(|(_, zone)| match zone {
+                HitZone::Handle => Some("row-resize"),
+                HitZone::Eye | HitZone::Edit | HitZone::Mask | HitZone::Chevron | HitZone::Swatch => {
+                    Some("pointer")
+                }
+                HitZone::Body => None,
+            });
+            // Only the interactive (non-drag) icons take a hover highlight.
+            let hover = hit.filter(|(_, zone)| {
+                matches!(zone, HitZone::Eye | HitZone::Edit | HitZone::Mask)
+            });
+            if *ui.hover.borrow() != hover {
+                *ui.hover.borrow_mut() = hover;
+                area_w.queue_draw();
+            }
+            let c = cursor_name.and_then(|name| gtk::gdk::Cursor::from_name(name, None));
             area_w.set_cursor(c.as_ref());
         });
     }
     {
         let area_w = area.clone();
-        motion.connect_leave(move |_| area_w.set_cursor(None));
+        let ui = ui.clone();
+        motion.connect_leave(move |_| {
+            if ui.hover.borrow().is_some() {
+                *ui.hover.borrow_mut() = None;
+                area_w.queue_draw();
+            }
+            area_w.set_cursor(None);
+        });
     }
     area.add_controller(motion);
 }
