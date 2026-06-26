@@ -49,10 +49,7 @@ impl SimpleComponent for AppModel {
 
             #[name = "toast_overlay"]
             adw::ToastOverlay {
-                #[name = "toast_layer"]
-                gtk::Overlay {
-                #[wrap(Some)]
-                set_child = &gtk::Box {
+                gtk::Box {
                     set_orientation: gtk::Orientation::Vertical,
 
                     append: &top_bar_widget,
@@ -104,7 +101,6 @@ impl SimpleComponent for AppModel {
                         },
                     },
                 },
-                },
             },
         }
     }
@@ -143,7 +139,7 @@ impl SimpleComponent for AppModel {
 
         let widgets = view_output!();
 
-        global.toaster.bind(widgets.toast_overlay.clone(), &widgets.toast_layer);
+        global.toaster.bind(widgets.toast_overlay.clone());
         widgets.tab_bar.set_view(Some(&widgets.tab_view));
 
         let manager = Rc::new(TabManager {

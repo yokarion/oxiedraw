@@ -1,23 +1,31 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxiedraw_core::renderer::MAX_LAYERS;
-use relm4::gtk;
-use relm4::gtk::gdk;
 use relm4::gtk::glib;
-use relm4::gtk::prelude::*;
+
+use crate::canvas_paintable::CanvasPaintable;
+
+/// Distance (px) the pill slides up as it fades in (and back down on the way out).
+const SLIDE_PX: f32 = 10.0;
+/// Fade-in / fade-out durations in milliseconds.
+const IN_MS: f32 = 180.0;
+const OUT_MS: f32 = 200.0;
+/// Animation tick interval. Only runs during the ~200ms fade phases - the
+/// multi-second hold in between schedules a single one-shot, so an idle toast
+/// costs no per-frame work.
+const TICK_MS: u64 = 16;
 
 /// Cheaply clonable handle for posting toast notifications.
 ///
-/// Transient info/error toasts are shown in a single persistent pill that lives
-/// as an overlay child of the canvas's `gtk::Overlay`. It is shown and hidden by
-/// animating its opacity (a CSS class), never by mapping/unmapping a widget.
-/// That matters because mapping a widget inside the canvas's surface mid-stroke
-/// resets a drawing tablet's implicit grab and aborts the stroke (a mouse's
-/// button grab survives it, so it looked tablet-only). Keeping the pill in the
-/// same surface - rather than a separate popover surface - also avoids forcing
-/// full compositor composition every frame, which made drawing lag.
+/// Transient info/error toasts are drawn as a pill *inside the active canvas's
+/// paintable* (`CanvasPaintable::set_toast_*`), not as a GTK widget. A widget
+/// mapping/unmapping inside the canvas surface mid-stroke resets a drawing
+/// tablet's implicit grab and aborts the stroke; a pill painted into the canvas
+/// content never touches the widget tree, so it can't. The slide/fade animates
+/// through the paintable's cheap invalidate path (the same one the marching ants
+/// use) - no canvas re-composite, no stutter.
 ///
 /// Persistent (`pending`) and action toasts still use the `adw::ToastOverlay`:
 /// they need a button or a live handle and only fire on deliberate, non-drawing
@@ -28,68 +36,56 @@ pub(crate) struct Toaster(Rc<RefCell<Inner>>);
 struct Inner {
     /// Native overlay, used only for `pending` / `action` toasts.
     overlay: Option<adw::ToastOverlay>,
-    /// Persistent transient-toast pill and its label (opacity-toggled).
-    pill: Option<gtk::Box>,
-    label: Option<gtk::Label>,
-    /// Auto-dismiss timer for the message currently on screen.
-    timer: Option<glib::SourceId>,
-    /// True while the pill is revealed.
-    showing: bool,
-    /// Flips each pulse so a fresh CSS class restarts the pop keyframe (re-adding
-    /// the same class in one frame would not re-trigger the animation).
-    pop_toggle: bool,
+    /// The active document's paintable; transient toasts are drawn into it.
+    /// Re-pointed on every tab switch (see `set_target`).
+    target: Option<CanvasPaintable>,
+    /// Frame ticker for the fade-in / fade-out phases.
+    tick: Option<glib::SourceId>,
+    /// One-shot timer for the on-screen hold between fade-in and fade-out.
+    hold: Option<glib::SourceId>,
+    /// True once the fade-in finished (pill fully on screen).
+    visible: bool,
 }
 
 impl Toaster {
-    /// Create an unbound toaster. Call [`bind`] once the widget tree exists.
+    /// Create an unbound toaster. Call [`bind`] / [`set_target`] once the widget
+    /// tree and a document exist.
     pub(crate) fn new() -> Self {
         Self(Rc::new(RefCell::new(Inner {
             overlay: None,
-            pill: None,
-            label: None,
-            timer: None,
-            showing: false,
-            pop_toggle: false,
+            target: None,
+            tick: None,
+            hold: None,
+            visible: false,
         })))
     }
 
-    /// Wire the toaster to the native overlay (for action/pending toasts) and
-    /// build the transient-toast pill as an overlay child of `host`.
-    pub(crate) fn bind(&self, overlay: adw::ToastOverlay, host: &gtk::Overlay) {
-        ensure_css();
+    /// Wire the native overlay used for action/pending toasts.
+    pub(crate) fn bind(&self, overlay: adw::ToastOverlay) {
+        self.0.borrow_mut().overlay = Some(overlay);
+    }
 
-        let label = gtk::Label::new(None);
-        label.set_wrap(true);
-        label.set_justify(gtk::Justification::Center);
-
-        let pill = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        pill.append(&label);
-        pill.add_css_class("oxie-toast");
-        pill.set_halign(gtk::Align::Center);
-        pill.set_valign(gtk::Align::End);
-        // Never a pointer/stylus/focus target: it must not steal events from the
-        // canvas, and being a persistent (always-mapped) widget it never breaks
-        // the active gesture.
-        pill.set_can_target(false);
-        pill.set_can_focus(false);
-        host.add_overlay(&pill);
-
-        {
-            let mut inner = self.0.borrow_mut();
-            inner.overlay = Some(overlay);
-            inner.pill = Some(pill);
-            inner.label = Some(label);
+    /// Point transient toasts at `paintable` (the now-active document). Clears
+    /// any in-flight toast on the previous canvas so it doesn't linger there.
+    pub(crate) fn set_target(&self, paintable: CanvasPaintable) {
+        self.cancel_timers();
+        let mut inner = self.0.borrow_mut();
+        if let Some(old) = inner.target.take() {
+            old.set_toast_message(None);
+            old.set_toast_anim(0.0, 0.0);
         }
+        inner.visible = false;
+        inner.target = Some(paintable);
     }
 
     /// Show a 3-second informational toast.
     pub(crate) fn info(&self, msg: &str) {
-        self.enqueue(msg, 3);
+        self.show(msg, 3);
     }
 
     /// Show a 5-second error toast.
     pub(crate) fn error(&self, msg: &str) {
-        self.enqueue(msg, 5);
+        self.show(msg, 5);
     }
 
     /// Show a persistent toast (no auto-dismiss) on the native overlay. Returns
@@ -127,113 +123,127 @@ impl Toaster {
         ));
     }
 
-    /// Show `msg` for `duration` seconds. If the pill is already on screen (a
-    /// different event), update the text and replay the scale pop; otherwise
-    /// play the entrance. Either way the auto-dismiss timer is reset.
-    fn enqueue(&self, msg: &str, duration: u32) {
-        let (pill, label, was_showing) = {
+    /// Show `msg` for `hold_secs` seconds in the active canvas's pill. If the
+    /// pill is already on screen, swap the text in place and just restart the
+    /// hold (no re-slide); otherwise play the fade/slide entrance.
+    fn show(&self, msg: &str, hold_secs: u64) {
+        let target = self.0.borrow().target.clone();
+        let Some(target) = target else {
+            // No active canvas yet (e.g. an error during startup): fall back to a
+            // native toast so the message isn't silently lost.
+            self.fallback(msg, hold_secs);
+            return;
+        };
+        target.set_toast_message(Some(msg));
+        // Stop any running fade so a re-show (including one arriving mid fade-out)
+        // doesn't fight the ticker. `visible` stays true through the fade-out, so
+        // a toast caught on its way out just snaps back to full and re-holds.
+        self.cancel_tick();
+        let was_visible = {
             let mut inner = self.0.borrow_mut();
-            let (Some(pill), Some(label)) = (inner.pill.clone(), inner.label.clone()) else {
-                return;
-            };
-            if let Some(id) = inner.timer.take() {
+            if let Some(id) = inner.hold.take() {
                 id.remove();
             }
-            let was = inner.showing;
-            inner.showing = true;
-            (pill, label, was)
+            inner.visible
         };
-        label.set_text(msg);
-        if was_showing {
-            self.pulse(&pill);
+        if was_visible {
+            target.set_toast_anim(1.0, 0.0);
+            self.start_hold(hold_secs);
         } else {
-            pill.add_css_class("revealed");
-        }
-        self.arm_dismiss(duration);
-    }
-
-    /// Replay the scale pop on the already-revealed pill. Alternating two
-    /// classes guarantees a fresh class application each time, which restarts
-    /// the keyframe (re-adding the same class in one frame would not).
-    fn pulse(&self, pill: &gtk::Box) {
-        let toggle = {
-            let mut inner = self.0.borrow_mut();
-            inner.pop_toggle = !inner.pop_toggle;
-            inner.pop_toggle
-        };
-        if toggle {
-            pill.remove_css_class("pop-b");
-            pill.add_css_class("pop-a");
-        } else {
-            pill.remove_css_class("pop-a");
-            pill.add_css_class("pop-b");
+            self.start_fade_in(hold_secs);
         }
     }
 
-    /// Arm the timer that fades the pill out after `duration` seconds.
-    fn arm_dismiss(&self, duration: u32) {
+    /// Drive the fade-in over `IN_MS`, then transition to the hold phase.
+    /// Callers (`show`) cancel any running tick first.
+    fn start_fade_in(&self, hold_secs: u64) {
+        let start = Instant::now();
         let this = self.clone();
-        let id = glib::timeout_add_local_once(Duration::from_secs(u64::from(duration)), move || {
-            let pill = {
-                let mut inner = this.0.borrow_mut();
-                inner.timer = None;
-                inner.showing = false;
-                inner.pill.clone()
+        let id = glib::timeout_add_local(Duration::from_millis(TICK_MS), move || {
+            let Some(target) = this.0.borrow().target.clone() else {
+                return glib::ControlFlow::Break;
             };
-            if let Some(pill) = pill {
-                pill.remove_css_class("revealed");
-                pill.remove_css_class("pop-a");
-                pill.remove_css_class("pop-b");
+            let p = (start.elapsed().as_secs_f32() * 1000.0 / IN_MS).min(1.0);
+            let eased = 1.0 - (1.0 - p).powi(3);
+            target.set_toast_anim(eased, (1.0 - eased) * SLIDE_PX);
+            if p >= 1.0 {
+                {
+                    let mut inner = this.0.borrow_mut();
+                    inner.tick = None;
+                    inner.visible = true;
+                }
+                this.start_hold(hold_secs);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
             }
         });
-        self.0.borrow_mut().timer = Some(id);
+        self.0.borrow_mut().tick = Some(id);
     }
-}
 
-/// Install the toast pill stylesheet once per display. Theme-adaptive via
-/// libadwaita named colours so it matches a native notification in light/dark.
-fn ensure_css() {
-    thread_local! {
-        static LOADED: Cell<bool> = const { Cell::new(false) };
+    /// Hold the pill fully visible for `hold_secs`, then fade out. No per-frame
+    /// work during the hold - a single one-shot timer.
+    fn start_hold(&self, hold_secs: u64) {
+        let this = self.clone();
+        let id = glib::timeout_add_local_once(Duration::from_secs(hold_secs), move || {
+            this.0.borrow_mut().hold = None;
+            this.start_fade_out();
+        });
+        self.0.borrow_mut().hold = Some(id);
     }
-    if LOADED.with(|l| l.replace(true)) {
-        return;
+
+    /// Drive the fade-out over `OUT_MS`, then clear the pill.
+    fn start_fade_out(&self) {
+        self.cancel_tick();
+        let start = Instant::now();
+        let this = self.clone();
+        let id = glib::timeout_add_local(Duration::from_millis(TICK_MS), move || {
+            let Some(target) = this.0.borrow().target.clone() else {
+                return glib::ControlFlow::Break;
+            };
+            let p = (start.elapsed().as_secs_f32() * 1000.0 / OUT_MS).min(1.0);
+            let eased = p * p;
+            target.set_toast_anim(1.0 - eased, eased * SLIDE_PX);
+            if p >= 1.0 {
+                {
+                    let mut inner = this.0.borrow_mut();
+                    inner.tick = None;
+                    inner.visible = false;
+                }
+                target.set_toast_message(None);
+                target.set_toast_anim(0.0, 0.0);
+                glib::ControlFlow::Break
+            } else {
+                glib::ControlFlow::Continue
+            }
+        });
+        self.0.borrow_mut().tick = Some(id);
     }
-    let css = "
-/* Panel (sidebar) colour, theme-adaptive, with a rounded-card shape. */
-.oxie-toast {
-    margin: 12px;
-    border-radius: 12px;
-    background-color: @sidebar_bg_color;
-    color: @sidebar_fg_color;
-    box-shadow: 0 1px 2px alpha(black, 0.12), 0 2px 8px alpha(black, 0.16);
-    opacity: 0;
-    transform: scale(0.9);
-    transition: opacity 200ms ease-in-out, transform 200ms ease-in-out;
-}
-.oxie-toast.revealed {
-    opacity: 1;
-    transform: scale(1);
-}
-.oxie-toast > label {
-    margin: 10px 16px;
-}
-@keyframes oxie-toast-pop {
-    0% { transform: scale(1); }
-    45% { transform: scale(0.9); }
-    100% { transform: scale(1); }
-}
-.oxie-toast.pop-a, .oxie-toast.pop-b {
-    animation: oxie-toast-pop 220ms ease-in-out;
-}
-";
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(css);
-    if let Some(display) = gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
+
+    fn cancel_tick(&self) {
+        if let Some(id) = self.0.borrow_mut().tick.take() {
+            id.remove();
+        }
+    }
+
+    fn cancel_timers(&self) {
+        let mut inner = self.0.borrow_mut();
+        if let Some(id) = inner.tick.take() {
+            id.remove();
+        }
+        if let Some(id) = inner.hold.take() {
+            id.remove();
+        }
+    }
+
+    /// Last-resort native toast when there's no active canvas to draw into.
+    fn fallback(&self, msg: &str, hold_secs: u64) {
+        let inner = self.0.borrow();
+        if let Some(overlay) = inner.overlay.as_ref() {
+            let t = adw::Toast::new(msg);
+            #[allow(clippy::cast_possible_truncation)]
+            t.set_timeout(hold_secs as u32);
+            overlay.add_toast(t);
+        }
     }
 }

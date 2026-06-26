@@ -102,6 +102,11 @@ impl TabManager {
         set_slot_child(&self.tool_options_slot, &session.tool_options);
         set_slot_child(&self.right_bar_slot, &session.right_bar);
         (session.reinstall_actions)();
+        // Transient toasts are drawn into the active document's canvas surface;
+        // re-point them so a toast lands on the tab the user is looking at.
+        self.global
+            .toaster
+            .set_target(session.viewport.paintable().clone());
 
         // Reflect the shared tool in this document's panels without the
         // destructive side effects of a full tool switch (no transform lift,

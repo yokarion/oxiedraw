@@ -274,6 +274,23 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
+    /// Rebuild the cached transient-toast pill texture for `msg` (or drop it
+    /// with `None`). The slide/fade is then driven per frame by [`set_toast_anim`].
+    /// Drawn into the canvas surface so it never breaks the tablet grab.
+    pub(crate) fn set_toast_message(&self, msg: Option<&str>) {
+        *self.imp().toast_cache.borrow_mut() = msg.and_then(render_toast_texture);
+    }
+
+    /// Set the toast's animation state: `alpha` in `0.0..=1.0` and a vertical
+    /// `offset` in pixels (positive = lower). Uses the cheap invalidate path -
+    /// the same one the marching ants animate through - so no canvas re-composite.
+    pub(crate) fn set_toast_anim(&self, alpha: f32, offset: f32) {
+        let imp = self.imp();
+        imp.toast_alpha.set(alpha);
+        imp.toast_offset.set(offset);
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
     /// Update the text-editing overlay. `box_rect`, `caret` and `selection`
     /// rects are all in canvas coordinates. Pass `active = false` to clear.
     pub(crate) fn set_text_edit(
@@ -728,22 +745,27 @@ fn draw_text_edit_overlay_cairo(
     }
 }
 
-/// Render the edit-mode label into a tight rounded-pill texture (dark fill,
-/// dim white text). Cached on the paintable and positioned per frame, so the
-/// hot snapshot path never re-shapes text or allocates a full-widget surface.
-/// Returns the texture plus its pixel `(width, height)`.
-fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f32)> {
+/// Render `text` into a tight rounded-pill `MemoryTexture` (filled background +
+/// single-line text), returning it with its pixel `(width, height)`. Shared by
+/// the edit-mode label and the transient toast; callers pick the font, padding
+/// and colors. Cached on the paintable and positioned per frame, so the hot
+/// snapshot path never re-shapes text or allocates a full-widget surface.
+fn render_pill_texture(
+    text: &str,
+    font_size: f64,
+    pad_h: f64,
+    pad_v: f64,
+    bg: (f64, f64, f64, f64),
+    fg: (f64, f64, f64, f64),
+) -> Option<(gdk::MemoryTexture, f32, f32)> {
     use gtk::cairo::{Context, Format, ImageSurface};
-
-    let pad_h = 8.0;
-    let pad_v = 4.0;
 
     // Measure on a throwaway 1x1 surface so we can size the real one tightly.
     let (pill_w, pill_h, text_h) = {
         let tmp = ImageSurface::create(Format::ARgb32, 1, 1).ok()?;
         let cr = Context::new(&tmp).ok()?;
-        cr.set_font_size(13.0);
-        let ext = cr.text_extents(label).ok()?;
+        cr.set_font_size(font_size);
+        let ext = cr.text_extents(text).ok()?;
         (
             ext.width() + pad_h * 2.0,
             ext.height() + pad_v * 2.0,
@@ -761,7 +783,7 @@ fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f3
     let mut surface = ImageSurface::create(Format::ARgb32, w, h).ok()?;
     {
         let cr = Context::new(&surface).ok()?;
-        cr.set_font_size(13.0);
+        cr.set_font_size(font_size);
         let r = pill_h / 2.0;
         cr.new_sub_path();
         cr.arc(r, r, r, PI, PI * 1.5);
@@ -769,11 +791,11 @@ fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f3
         cr.arc(pill_w - r, pill_h - r, r, 0.0, PI / 2.0);
         cr.arc(r, pill_h - r, r, PI / 2.0, PI);
         cr.close_path();
-        cr.set_source_rgba(0.08, 0.08, 0.10, 0.7);
+        cr.set_source_rgba(bg.0, bg.1, bg.2, bg.3);
         cr.fill().ok();
-        cr.set_source_rgba(1.0, 1.0, 1.0, 0.55);
+        cr.set_source_rgba(fg.0, fg.1, fg.2, fg.3);
         cr.move_to(pad_h, pad_v + text_h);
-        cr.show_text(label).ok();
+        cr.show_text(text).ok();
     }
     surface.flush();
 
@@ -790,6 +812,17 @@ fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f3
     );
     #[allow(clippy::cast_possible_truncation)]
     Some((texture, pill_w as f32, pill_h as f32))
+}
+
+/// Edit-mode label pill: small, dim white text on a faint dark fill.
+fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f32)> {
+    render_pill_texture(label, 13.0, 8.0, 4.0, (0.08, 0.08, 0.10, 0.7), (1.0, 1.0, 1.0, 0.55))
+}
+
+/// Transient toast pill: a notification - larger padding/font, near-opaque
+/// dark fill and bright text.
+fn render_toast_texture(msg: &str) -> Option<(gdk::MemoryTexture, f32, f32)> {
+    render_pill_texture(msg, 14.0, 16.0, 9.0, (0.10, 0.10, 0.12, 0.92), (1.0, 1.0, 1.0, 0.95))
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,6 +1268,12 @@ mod imp {
         /// Rebuilt only when the label changes, so the per-frame snapshot path
         /// never re-shapes the text or allocates a full-widget cairo surface.
         pub(super) edit_label_cache: RefCell<Option<(gdk::MemoryTexture, f32, f32)>>,
+        // transient toast pill (bottom-center): cached texture + animated alpha/offset.
+        // Texture rebuilt only when the message changes; alpha/offset are driven
+        // per frame via the cheap invalidate path (no canvas re-composite).
+        pub(super) toast_cache: RefCell<Option<(gdk::MemoryTexture, f32, f32)>>,
+        pub(super) toast_alpha: Cell<f32>,
+        pub(super) toast_offset: Cell<f32>,
         // text editing overlay (box outline + caret + selection, canvas coords)
         pub(super) text_edit_active: Cell<bool>,
         pub(super) text_edit_box: Cell<Option<TransformRect>>,
@@ -1291,6 +1330,9 @@ mod imp {
                 edit_bordered: Cell::new(false),
                 edit_accent: Cell::new((0.21, 0.52, 0.89)),
                 edit_label_cache: RefCell::new(None),
+                toast_cache: RefCell::new(None),
+                toast_alpha: Cell::new(0.0),
+                toast_offset: Cell::new(0.0),
                 text_edit_active: Cell::new(false),
                 text_edit_box: Cell::new(None),
                 text_caret: Cell::new(None),
@@ -1756,6 +1798,24 @@ mod imp {
                     let cr = gtk_snap.append_cairo(&widget_rect);
                     perf.render(&cr, self.gpu_timings.get());
                 }
+            }
+
+            // 10. Transient toast pill, bottom-center. Drawn last so it sits
+            //     above every overlay. Just a cached texture positioned + faded;
+            //     the slide/fade animates via the cheap invalidate path, never a
+            //     canvas re-composite, so it can't disturb an in-flight stroke.
+            #[allow(clippy::cast_possible_truncation)]
+            if self.toast_alpha.get() > 0.001
+                && let Some((texture, pill_w, pill_h)) = self.toast_cache.borrow().as_ref()
+            {
+                let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
+                let margin = 28.0_f32;
+                let x = ((width as f32 - *pill_w) / 2.0).round();
+                let y = (height as f32 - *pill_h - margin + self.toast_offset.get()).round();
+                let rect = graphene::Rect::new(x, y, *pill_w, *pill_h);
+                gtk_snap.push_opacity(f64::from(self.toast_alpha.get()));
+                gtk_snap.append_texture(texture, &rect);
+                gtk_snap.pop();
             }
         }
 
