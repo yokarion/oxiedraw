@@ -39,7 +39,7 @@ use super::dab::DabBuffers;
 use super::device;
 use super::dmabuf::DmabufImage;
 use super::erase::ErasePreview;
-use adjust_ops::GroupAccumulator;
+use adjust_ops::{GroupAccumulator, MaskEditPreview};
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
 use super::instance::{self, DebugMessenger};
@@ -169,6 +169,11 @@ pub struct VulkanRenderer {
     /// nesting level, used by the folder-scoped composite so an adjustment
     /// clips to its enclosing folder. Indexed by depth (0 = first folder).
     pub(super) group_accumulators: Vec<GroupAccumulator>,
+    /// Set only while building a live mask-edit preview: the adjustment slot
+    /// whose mask the in-flight stroke is painting. `apply_adjustment_to` runs
+    /// that slot's effect against the committed mask MERGED with the stroke, so
+    /// the canvas shows the effect updating live instead of the grayscale mask.
+    pub(super) mask_edit: Option<MaskEditPreview>,
     pub(super) transform_pipeline: ManuallyDrop<TransformPipeline>,
     /// Reusable resources for the live GPU transform preview, present only
     /// while the transform tool is dragging.
@@ -473,6 +478,7 @@ impl VulkanRenderer {
             blend_scratch: ManuallyDrop::new(blend_scratch),
             blend_scratch_dst_set,
             group_accumulators: Vec::new(),
+            mask_edit: None,
             blend_descriptor_pool,
             transform_pipeline: ManuallyDrop::new(transform_pipeline),
             transform_preview: None,

@@ -961,3 +961,80 @@ fn assert_mask_white(canvas: &mut Canvas, adj: usize) {
     assert_eq!(px(2, 8), (255, 255, 255, 255), "deleted region must be white");
     assert_eq!(px(12, 8), (255, 255, 255, 255), "kept region stays white");
 }
+
+/// Painting an adjustment layer's mask with the grayscale mask view OFF must
+/// preview the EFFECT (the adjusted backdrop), never the black/white mask. With
+/// a darkening effect over a red backdrop and the default white mask, stroking
+/// the mask should keep the canvas a darkened red - not flash the white mask.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn mask_edit_preview_shows_effect_not_mask() {
+    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
+    use oxiedraw_utils::geometry::Point;
+
+    let sample = |x: f32, y: f32, t: u64| InputSample {
+        position: Point::new(x, y),
+        pressure: 1.0,
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+        time_ms: t,
+    };
+
+    let size = Size::new(32, 32);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let _base = canvas
+        .add_layer_with_pixels("base", &solid(size, 0, 0, 255))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.5, // darken the red backdrop
+            }),
+        )
+        .unwrap();
+
+    // The committed (no-stroke) canvas is the darkened red the effect produces.
+    let committed = canvas.read_pixels().unwrap();
+    let center = ((16 * 32) + 16) * 4;
+    assert!(
+        committed[center + 2] < 220 && committed[center + 2] > committed[center] + 30,
+        "expected a darkened-red committed canvas, got B{} G{} R{}",
+        committed[center],
+        committed[center + 1],
+        committed[center + 2],
+    );
+
+    // Paint the adjustment's own mask (mask view left OFF). The default mask is
+    // white, so the white brush leaves it unchanged - the preview must equal the
+    // committed adjusted result, not the grayscale mask.
+    canvas.layers().set_active(Some(adj));
+    let brush = BrushEngine::new();
+    brush.size.set(8.0);
+    brush.opacity.set(1.0);
+    let white = Color::new(255, 255, 255);
+    canvas.begin_stroke(white, 1.0, false).unwrap();
+    canvas
+        .stamp(|t| brush.begin_stroke(sample(16.0, 16.0, 0), white, t))
+        .unwrap();
+    let preview = canvas.read_pixels().unwrap();
+
+    // Effect result, not the mask: still red-dominant and close to committed.
+    assert!(
+        preview[center + 2] > preview[center] + 30,
+        "mask leaked into the preview (gray, not red): B{} G{} R{}",
+        preview[center],
+        preview[center + 1],
+        preview[center + 2],
+    );
+    assert!(
+        near(preview[center + 2], committed[center + 2], 6),
+        "painted preview diverged from the committed effect: {} vs {}",
+        preview[center + 2],
+        committed[center + 2],
+    );
+}

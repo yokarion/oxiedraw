@@ -62,6 +62,16 @@ pub(super) enum PreviewTarget {
     Warp { set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
 }
 
+/// The in-flight mask stroke for a live mask-edit preview: which adjustment slot
+/// is being painted and the brush push (linear color + opacity) / erase flag the
+/// stroke is merged with.
+#[derive(Clone, Copy)]
+pub(in crate::renderer) struct MaskEditPreview {
+    pub(super) target_idx: usize,
+    pub(super) push: [f32; 4],
+    pub(super) erase: bool,
+}
+
 /// Map an adjustment effect to the destructive [`FilterSpec`] pass chain it
 /// reuses. `Stroke` has no `FilterSpec` equivalent (it is a separate SDF pass)
 /// and returns `None`.
@@ -130,6 +140,74 @@ impl VulkanRenderer {
         steps: &[CompositeStep],
     ) -> Result<(), RendererError> {
         let root = self.canvas_accumulator();
+        self.composite_steps_into(steps, root)
+    }
+
+    /// Live mask-edit preview: rebuild the whole canvas into the preview image
+    /// with the adjustment at `target_idx` gated by its committed mask merged
+    /// with the in-flight stroke, then present. Used while painting an
+    /// adjustment layer's mask with the grayscale mask view OFF, so the canvas
+    /// shows the effect updating live instead of the black/white mask.
+    pub fn render_mask_edit_preview_and_present(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<(), RendererError> {
+        self.build_mask_edit_preview(steps, target_idx, color_linear, opacity)?;
+        self.present_to_display(PresentSource::Preview)
+    }
+
+    /// As [`Self::render_mask_edit_preview_and_present`] but reads the preview
+    /// back to host memory (in-stroke export / readback) instead of presenting.
+    pub fn render_mask_edit_preview_and_read(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<Vec<u8>, RendererError> {
+        self.build_mask_edit_preview(steps, target_idx, color_linear, opacity)?;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes()
+    }
+
+    fn build_mask_edit_preview(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<(), RendererError> {
+        let push = [
+            color_linear[0],
+            color_linear[1],
+            color_linear[2],
+            opacity.clamp(0.0, 1.0),
+        ];
+        self.mask_edit = Some(MaskEditPreview {
+            target_idx,
+            push,
+            erase: self.stroke_erase,
+        });
+        let root = self.preview_accumulator();
+        let result = self.composite_steps_into(steps, root);
+        self.mask_edit = None;
+        result
+    }
+
+    /// Walk a bracketed composite step stream into `root`. Each `EnterGroup`
+    /// pushes a fresh transparent sub-accumulator; adjustments apply to the
+    /// top-of-stack accumulator, so they clip to their enclosing folder;
+    /// `ExitGroup` OVER-composites the finished folder onto its parent. A flat
+    /// step list (no groups) composites straight into `root`.
+    fn composite_steps_into(
+        &mut self,
+        steps: &[CompositeStep],
+        root: Accumulator,
+    ) -> Result<(), RendererError> {
         self.record_and_submit(|this| {
             this.cmd_clear_image(root.image, [0.0, 0.0, 0.0, 0.0]);
             Ok(())
@@ -1021,7 +1099,52 @@ impl VulkanRenderer {
     /// the layer's own grayscale mask. Each enabled effect: filter the
     /// accumulator -> mask-mix the result over the untouched accumulator by the
     /// mask -> copy back into the accumulator.
+    ///
+    /// While a mask-edit preview is building (`self.mask_edit` names this slot),
+    /// the gate is the committed mask MERGED with the in-flight stroke, so the
+    /// effect previews the mask the user is painting without ever showing the
+    /// grayscale mask itself.
     fn apply_adjustment_to(&mut self, acc: Accumulator, idx: usize) -> Result<(), RendererError> {
+        let (mask_view, mask_img) = match self.mask_edit {
+            Some(me) if me.target_idx == idx => self.stroked_mask(idx, me.push, me.erase)?,
+            _ => {
+                let slot = &self.layer_stack.slots[idx];
+                (slot.image.view, slot.image.handle)
+            }
+        };
+        self.apply_adjustment_with_mask(acc, idx, mask_view, mask_img)
+    }
+
+    /// Build the committed mask of slot `idx` merged with the in-flight stroke
+    /// into the erase-preview scratch, returning that scratch's (view, image).
+    /// Used by the mask-edit preview so the effect gates on the live mask.
+    fn stroked_mask(
+        &mut self,
+        idx: usize,
+        push: [f32; 4],
+        erase: bool,
+    ) -> Result<(vk::ImageView, vk::Image), RendererError> {
+        let mask_image = self.layer_stack.slots[idx].image.handle;
+        let scratch = self.erase_preview.scratch.handle;
+        let scratch_fb = self.erase_preview.framebuffer;
+        self.record_and_submit(|this| {
+            this.cmd_copy_image_full(mask_image, scratch);
+            this.cmd_composite_stroke(scratch_fb, push, erase);
+            this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        Ok((self.erase_preview.scratch.view, scratch))
+    }
+
+    /// As [`Self::apply_adjustment_to`] but with the gating mask supplied
+    /// explicitly (the committed slot image, or a stroke-merged scratch).
+    fn apply_adjustment_with_mask(
+        &mut self,
+        acc: Accumulator,
+        idx: usize,
+        mask_view: vk::ImageView,
+        mask_img: vk::Image,
+    ) -> Result<(), RendererError> {
         // Clone the (small, params-only) effect stack so we are not borrowing
         // the slot while mutating the renderer through the pass helpers.
         let Some(data): Option<AdjustmentData> = self.layer_stack.slots[idx].adjustment.clone()
@@ -1031,9 +1154,6 @@ impl VulkanRenderer {
         if data.is_noop() {
             return Ok(());
         }
-
-        let mask_view = self.layer_stack.slots[idx].image.view;
-        let mask_img = self.layer_stack.slots[idx].image.handle;
 
         for effect in &data.effects {
             if !effect.enabled {

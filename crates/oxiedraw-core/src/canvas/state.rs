@@ -647,7 +647,16 @@ impl Canvas {
             Some(ctx) => {
                 let linear = ctx.color.to_linear_rgb();
                 let visibilities = self.visibilities();
-                if self.effective_adjustment_above(ctx.layer_idx) {
+                if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_mask_edit_preview_and_read(
+                        &steps,
+                        ctx.layer_idx,
+                        linear,
+                        ctx.opacity,
+                    )
+                } else if self.effective_adjustment_above(ctx.layer_idx) {
                     let snapshot = self.layers.snapshot();
                     if let Some(steps) = self.folder_scoped_steps(&snapshot) {
                         self.renderer.render_preview_scoped_and_read(
@@ -836,11 +845,24 @@ impl Canvas {
                     Some(ctx) => {
                         let linear = ctx.color.to_linear_rgb();
                         let visibilities = self.visibilities();
+                        // Painting an adjustment layer's mask with the grayscale
+                        // mask view OFF: preview the effect gated by the live
+                        // (committed + in-flight) mask, never the mask itself.
+                        if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
+                            let snapshot = self.layers.snapshot();
+                            let steps = self.preview_steps(&snapshot);
+                            self.renderer.render_mask_edit_preview_and_present(
+                                &steps,
+                                ctx.layer_idx,
+                                linear,
+                                ctx.opacity,
+                            )?;
+                        }
                         // Live effect preview: when an effective adjustment sits
                         // above the painted layer, composite the in-flight stroke
                         // through the effect chain so the canvas shows the
                         // adjusted result while drawing.
-                        if self.effective_adjustment_above(ctx.layer_idx) {
+                        else if self.effective_adjustment_above(ctx.layer_idx) {
                             // Folder-scoped preview when a folder bounds an
                             // adjustment, so the live result clips like the
                             // commit will; otherwise the fast global path.
@@ -916,6 +938,23 @@ impl Canvas {
         matches!(self.layers.kind(idx), Some(LayerKind::Adjustment(_)))
     }
 
+    /// `true` when the in-flight stroke is painting an adjustment layer's mask
+    /// AND that layer's grayscale mask is NOT toggled into view. In that case
+    /// the canvas should preview the effect with the live mask, not show the
+    /// black/white mask. With the mask view ON, the user wants to see the mask
+    /// being painted, so this stays false (the normal stroked-target preview
+    /// renders the mask + the dab).
+    fn painting_hidden_adjustment_mask(&self, idx: usize) -> bool {
+        if !self.layer_is_adjustment(idx) {
+            return false;
+        }
+        let snapshot = self.layers.snapshot();
+        let Some(this_id) = snapshot.get(idx).map(|l| l.id.as_str()) else {
+            return false;
+        };
+        self.mask_view_id.as_deref() != Some(this_id)
+    }
+
     /// `true` when a visible adjustment layer with a non-empty effect stack sits
     /// *above* `target` (higher z-index). Only then does a stroke on `target`
     /// need the slow per-frame adjusted preview - the effect reprocesses the
@@ -969,7 +1008,8 @@ impl Canvas {
         // effective adjustment above this layer would alter the stroke's result
         // fall back to the slower stamp + present (the adjusted preview path).
         // Strokes no adjustment influences keep the fast path - no slowdown.
-        let needs_adjusted_preview = self.effective_adjustment_above(ctx.layer_idx);
+        let needs_adjusted_preview = self.effective_adjustment_above(ctx.layer_idx)
+            || self.painting_hidden_adjustment_mask(ctx.layer_idx);
         if self.renderer.filter_active()
             || self.renderer.fill_active()
             || self.renderer.shape_active()
