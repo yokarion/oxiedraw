@@ -818,10 +818,12 @@ impl Canvas {
             } else if self.renderer.transform_preview_active() {
                 let visibilities = self.visibilities();
                 // Run the adjustment chain (folder-scoped) over the transform
-                // preview when an effective adjustment sits above the target, so
-                // transforming a layer below an adjustment previews adjusted.
+                // preview whenever any effective adjustment is in play - above the
+                // target (the warped layer must preview adjusted) or below it (the
+                // fast path skips adjustment slots, so it would drop the effect on
+                // the static layers under the one being transformed).
                 let target = self.renderer.transform_preview_target();
-                if target.is_some_and(|t| self.effective_adjustment_above(t)) {
+                if target.is_some_and(|t| self.effective_adjustment_excluding(t)) {
                     let snapshot = self.layers.snapshot();
                     let steps = self.preview_steps(&snapshot);
                     self.renderer.render_transform_preview_scoped(&steps, &visibilities)?;
@@ -926,6 +928,25 @@ impl Canvas {
             .enumerate()
             .any(|(idx, l)| {
                 idx > target
+                    && l.visible
+                    && matches!(&l.kind, LayerKind::Adjustment(d) if !d.is_noop())
+            })
+    }
+
+    /// `true` when a visible effective adjustment layer other than `target`
+    /// exists anywhere in the stack. The transform preview's fast path skips
+    /// adjustment slots, so it needs the adjustment-aware (scoped) path when an
+    /// adjustment sits either above the transformed layer (the warp must preview
+    /// adjusted) or below it (the static layers under the adjustment must stay
+    /// adjusted). The target itself is excluded - its content is warped, not
+    /// applied as an effect.
+    fn effective_adjustment_excluding(&self, target: usize) -> bool {
+        self.layers
+            .snapshot()
+            .iter()
+            .enumerate()
+            .any(|(idx, l)| {
+                idx != target
                     && l.visible
                     && matches!(&l.kind, LayerKind::Adjustment(d) if !d.is_noop())
             })

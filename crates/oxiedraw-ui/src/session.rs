@@ -792,6 +792,24 @@ impl DocumentSession {
             Rc::new(move || prepare_transform_for_delete(&transform, || transform_cancel()))
         };
 
+        // Commit an in-progress transform before the layers panel reorders the
+        // stack: the transform holds a fixed layer index and has cleared the
+        // target's pixels into the live overlay, so a reorder underneath it would
+        // strand that content (the layer vanishes on apply) and corrupt the live
+        // preview. Applying first bakes the result at the current index, then the
+        // reorder proceeds on a stable stack.
+        let prepare_reorder: Rc<dyn Fn()> = {
+            let transform = transform.clone();
+            let transform_apply = Rc::clone(&transform_apply);
+            Rc::new(move || {
+                let in_progress =
+                    transform.original_layer_idx.get().is_some() || transform.rect.get().is_some();
+                if in_progress {
+                    transform_apply();
+                }
+            })
+        };
+
         // Callback for layers panel: if the Cursor tool is active when the
         // user clicks a layer row, automatically switch to Transform so they
         // can immediately drag the selected layer.
@@ -836,6 +854,7 @@ impl DocumentSession {
             &global.text_engine,
             &global.font_previews,
             &prepare_delete,
+            &prepare_reorder,
         );
 
         // -- Wire component enter/exit now the panel handles exist --------

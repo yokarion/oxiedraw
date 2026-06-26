@@ -810,6 +810,7 @@ pub(crate) fn build(
     on_edit_component: &Rc<dyn Fn(String)>,
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
+    prepare_reorder: &Rc<dyn Fn()>,
 ) -> (
     gtk::Box,
     Rc<dyn Fn()>,
@@ -852,6 +853,7 @@ pub(crate) fn build(
             history,
             on_edit_component,
             prepare_delete,
+            prepare_reorder,
         );
     let (components_page, refresh_components, component_begin_rename) = super::components::build(
         Rc::clone(components),
@@ -995,6 +997,7 @@ fn build_layers_page(
     history: &Rc<RefCell<HistoryStack>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
+    prepare_reorder: &Rc<dyn Fn()>,
 ) -> (
     gtk::Box,
     Rc<dyn Fn()>,
@@ -1030,6 +1033,7 @@ fn build_layers_page(
         select_layer_content,
         history,
         on_edit_component,
+        prepare_reorder,
     );
     actions::install_context_menu(&area, &ui, layer_clipboard);
 
@@ -2200,6 +2204,7 @@ fn install_list_input(
     select_layer_content: &Rc<dyn Fn(usize)>,
     history: &Rc<RefCell<HistoryStack>>,
     on_edit_component: &Rc<dyn Fn(String)>,
+    prepare_reorder: &Rc<dyn Fn()>,
 ) {
     let drag_gesture = gtk::GestureDrag::new();
     drag_gesture.set_button(gdk::BUTTON_PRIMARY);
@@ -2386,6 +2391,7 @@ fn install_list_input(
         let canvas = Rc::clone(&canvas);
         let select_layer_content = Rc::clone(select_layer_content);
         let history = Rc::clone(history);
+        let prepare_reorder = Rc::clone(prepare_reorder);
         drag_gesture.connect_drag_end(move |gesture, dx, dy| {
             let drag_state = ui.drag.borrow_mut().take();
             let Some(d) = drag_state else { return };
@@ -2470,6 +2476,9 @@ fn install_list_input(
                 }
                 HitZone::Handle => {
                     if d.from_row != d.current_row {
+                        // A reorder mutates the layer stack; commit any in-progress
+                        // transform first so it can't write onto a shifted index.
+                        prepare_reorder();
                         let dragged_row = rows.get(d.from_row);
                         let dragged_id = if let Some(r) = dragged_row { match &r.kind {
                             RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.clone(),

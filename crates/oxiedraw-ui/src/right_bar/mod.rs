@@ -46,6 +46,7 @@ pub(crate) fn build(
     text_engine: &Rc<RefCell<TextEngine>>,
     font_previews: &crate::font_previews::FontPreviews,
     prepare_delete: &Rc<dyn Fn() -> bool>,
+    prepare_reorder: &Rc<dyn Fn()>,
 ) -> (
     gtk::Widget,
     Rc<dyn Fn(Tool)>,
@@ -92,6 +93,7 @@ pub(crate) fn build(
         on_edit_component,
         component_exit,
         prepare_delete,
+        prepare_reorder,
     );
     normal_pane.set_end_child(Some(&layers_widget));
 
