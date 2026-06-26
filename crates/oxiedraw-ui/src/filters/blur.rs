@@ -5,8 +5,8 @@ use oxiedraw_core::filters::FilterSpec;
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 
-use super::{filter_type_row, open_adjustable, row_with_scale, FilterContext};
-use crate::widgets::slider;
+use super::{FilterContext, open_adjustable};
+use crate::widgets::{boxed_list, slider};
 
 pub(crate) fn show_blur(ctx: &FilterContext) {
     open_adjustable(
@@ -26,7 +26,10 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
                 }
             };
 
-            content.append(&filter_type_row("Type", &["Box Blur"]));
+            let list = boxed_list::list();
+
+            let type_combo = gtk::DropDown::from_strings(&["Box Blur"]);
+            list.append(&boxed_list::row("Type", &type_combo, &[]));
 
             // Lock links the two radii so they move together (default on).
             let locked = Rc::new(Cell::new(true));
@@ -47,33 +50,7 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
                 }
             });
 
-            // Keep the two scales in sync while locked, guarding against the
-            // re-entrant value-changed the programmatic set would trigger.
-            let syncing = Rc::new(Cell::new(false));
-            {
-                let other = v_scale.clone();
-                let locked = Rc::clone(&locked);
-                let syncing = Rc::clone(&syncing);
-                h_scale.connect_value_changed(move |s| {
-                    if locked.get() && !syncing.get() {
-                        syncing.set(true);
-                        other.set_value(s.value());
-                        syncing.set(false);
-                    }
-                });
-            }
-            {
-                let other = h_scale.clone();
-                let locked = Rc::clone(&locked);
-                let syncing = Rc::clone(&syncing);
-                v_scale.connect_value_changed(move |s| {
-                    if locked.get() && !syncing.get() {
-                        syncing.set(true);
-                        other.set_value(s.value());
-                        syncing.set(false);
-                    }
-                });
-            }
+            wire_radius_lock(&h_scale, &v_scale, &locked);
 
             let lock_btn = gtk::ToggleButton::builder()
                 .icon_name("changes-prevent-symbolic")
@@ -98,10 +75,45 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
                 });
             }
 
-            content.append(&row_with_scale("Horizontal", &h_scale, Some(&lock_btn)));
-            content.append(&row_with_scale("Vertical", &v_scale, None));
+            list.append(&boxed_list::row(
+                "Horizontal",
+                &h_scale,
+                &[lock_btn.upcast_ref()],
+            ));
+            list.append(&boxed_list::row("Vertical", &v_scale, &[]));
+            content.append(&list);
         },
     );
+}
+
+/// Keep the two scales in sync while locked, guarding against the re-entrant
+/// value-changed the programmatic set would trigger.
+fn wire_radius_lock(h_scale: &gtk::Scale, v_scale: &gtk::Scale, locked: &Rc<Cell<bool>>) {
+    let syncing = Rc::new(Cell::new(false));
+    {
+        let other = v_scale.clone();
+        let locked = Rc::clone(locked);
+        let syncing = Rc::clone(&syncing);
+        h_scale.connect_value_changed(move |s| {
+            if locked.get() && !syncing.get() {
+                syncing.set(true);
+                other.set_value(s.value());
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let other = h_scale.clone();
+        let locked = Rc::clone(locked);
+        let syncing = Rc::clone(&syncing);
+        v_scale.connect_value_changed(move |s| {
+            if locked.get() && !syncing.get() {
+                syncing.set(true);
+                other.set_value(s.value());
+                syncing.set(false);
+            }
+        });
+    }
 }
 
 fn update_blur(spec: &Rc<Cell<FilterSpec>>, f: impl FnOnce(&mut BlurFields)) {

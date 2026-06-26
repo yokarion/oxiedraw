@@ -1,5 +1,8 @@
 //! Adjustment-layer UI: create a non-destructive adjustment layer and edit its
-//! effect stack in a floating split-view window.
+//! effect stack in a floating sidebar + content window. The sidebar is the
+//! effect checklist; the content pane shows the selected effect's controls as a
+//! libadwaita boxed list (the Hue/Sat/Bright panel is the exception - it keeps
+//! the rainbow gradient sliders).
 //!
 //! Unlike the destructive filter popups, edits here write straight to the
 //! layer's stored effect stack via `Canvas::set_layer_effects`, which
@@ -7,11 +10,12 @@
 //! stack is snapshotted on open: Cancel restores it, Apply records one
 //! `EffectEdit` undo step.
 //!
-//! The working model always carries exactly three effects (Hue/Sat/Bright,
-//! Blur, Stroke) in that order; each sidebar checkbox drives its `enabled`
-//! flag, so disabled effects stay in the stack (and round-trip) but cost
-//! nothing at composite time.
+//! The working model always carries one of every effect (Hue/Sat/Bright, Blur,
+//! Sharpen, Invert, Stroke) in that order; each sidebar checkbox drives its
+//! `enabled` flag, so disabled effects stay in the stack (and round-trip) but
+//! cost nothing at composite time.
 
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -24,7 +28,8 @@ use relm4::gtk;
 
 use crate::canvas::RedrawHandle;
 use crate::toaster::Toaster;
-use crate::widgets::slider;
+use crate::widgets::gradient_slider::{self, hsl_to_rgb};
+use crate::widgets::{boxed_list, slider};
 
 /// Shared handles the adjustment actions need, built per invocation from the
 /// active document.
@@ -112,11 +117,14 @@ fn capture_layer(
     ))
 }
 
-/// Working copy of the three effects, behind a `RefCell` so each control's
-/// callback can mutate one field and push the whole stack to the canvas.
+/// Working copy of every effect, behind a `RefCell` so each control's callback
+/// can mutate one field and push the whole stack to the canvas. The field order
+/// here is the composite order (bottom to top).
 struct Working {
     hsb: Effect,
     blur: Effect,
+    sharpen: Effect,
+    invert: Effect,
     stroke: Effect,
 }
 
@@ -142,6 +150,11 @@ impl Working {
                 |k| matches!(k, EffectKind::Blur { .. }),
                 EffectKind::blur_default(),
             ),
+            sharpen: find(
+                |k| matches!(k, EffectKind::Sharpen { .. }),
+                EffectKind::sharpen_default(),
+            ),
+            invert: find(|k| matches!(k, EffectKind::Invert), EffectKind::Invert),
             stroke: find(
                 |k| matches!(k, EffectKind::Stroke { .. }),
                 EffectKind::stroke_default(),
@@ -151,7 +164,13 @@ impl Working {
 
     fn assemble(&self) -> AdjustmentData {
         AdjustmentData {
-            effects: vec![self.hsb.clone(), self.blur.clone(), self.stroke.clone()],
+            effects: vec![
+                self.hsb.clone(),
+                self.blur.clone(),
+                self.sharpen.clone(),
+                self.invert.clone(),
+                self.stroke.clone(),
+            ],
         }
     }
 }
@@ -203,7 +222,7 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         .modal(false)
         .title("Adjustment Effects")
         .default_width(640)
-        .default_height(420)
+        .default_height(460)
         .resizable(true)
         .build();
 
@@ -217,12 +236,12 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
     header.pack_start(&cancel_btn);
     header.pack_end(&apply_btn);
 
-    // Sidebar (checklist) | content stack.
+    // Sidebar (effect checklist) | content stack of boxed-list panels.
     let sidebar = gtk::ListBox::builder()
         .selection_mode(gtk::SelectionMode::Single)
-        .width_request(200)
+        .width_request(210)
         .build();
-    sidebar.add_css_class("navigation-sidebar");
+    sidebar.add_css_class("sidebar");
     let stack = gtk::Stack::builder()
         .hexpand(true)
         .vexpand(true)
@@ -231,6 +250,8 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
 
     add_effect_page(&sidebar, &stack, "hsb", &working.borrow().hsb);
     add_effect_page(&sidebar, &stack, "blur", &working.borrow().blur);
+    add_effect_page(&sidebar, &stack, "sharpen", &working.borrow().sharpen);
+    add_effect_page(&sidebar, &stack, "invert", &working.borrow().invert);
     add_effect_page(&sidebar, &stack, "stroke", &working.borrow().stroke);
     // Fill the pages + wire the checkboxes now that the rows exist.
     bind_pages(&sidebar, &stack, &working, &apply_live);
@@ -239,8 +260,7 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         let stack = stack.clone();
         sidebar.connect_row_selected(move |_, row| {
             if let Some(row) = row {
-                let name = row.widget_name();
-                stack.set_visible_child_name(&name);
+                stack.set_visible_child_name(&row.widget_name());
             }
         });
     }
@@ -248,12 +268,18 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         sidebar.select_row(Some(&first));
     }
 
+    let content_scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .vexpand(true)
+        .child(&stack)
+        .build();
+
     let split = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .build();
     split.append(&sidebar);
     split.append(&gtk::Separator::new(gtk::Orientation::Vertical));
-    split.append(&stack);
+    split.append(&content_scroll);
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
@@ -323,7 +349,13 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
     window.present();
 }
 
-/// Build one sidebar row (icon + title + enable checkbox) plus an empty content
+// ---------------------------------------------------------------------------
+// Sidebar rows + content panels. Each effect gets a sidebar row (enable
+// checkbox + icon + name) and a Stack page; the page holds its controls as a
+// boxed list, except Hue/Sat/Bright which uses the rainbow gradient sliders.
+// ---------------------------------------------------------------------------
+
+/// Build one sidebar row (enable checkbox + icon + title) plus an empty content
 /// page named `name`; the actual panel widgets are added by `bind_pages`.
 fn add_effect_page(sidebar: &gtk::ListBox, stack: &gtk::Stack, name: &str, effect: &Effect) {
     let row = gtk::ListBoxRow::new();
@@ -338,15 +370,12 @@ fn add_effect_page(sidebar: &gtk::ListBox, stack: &gtk::Stack, name: &str, effec
         .build();
     let check = gtk::CheckButton::builder().active(effect.enabled).build();
     check.set_widget_name(&format!("{name}-check"));
-    let icon = gtk::Image::from_icon_name(effect.kind.icon_name());
-    icon.add_css_class("adjustment-effect-icon");
     let label = gtk::Label::builder()
         .label(effect.kind.display_name())
         .xalign(0.0)
         .hexpand(true)
         .build();
     hbox.append(&check);
-    hbox.append(&icon);
     hbox.append(&label);
     row.set_child(Some(&hbox));
     sidebar.append(&row);
@@ -362,58 +391,55 @@ fn add_effect_page(sidebar: &gtk::ListBox, stack: &gtk::Stack, name: &str, effec
     stack.add_named(&page, Some(name));
 }
 
-/// Wire each row's checkbox to its effect's `enabled` flag and fill each
-/// content page with the effect's controls. Kept separate so the row widgets
-/// exist before their callbacks capture the working state.
+/// Wire each row's checkbox to its effect's `enabled` flag and fill each content
+/// page with the effect's controls. Kept separate so the row widgets exist
+/// before their callbacks capture the working state.
 fn bind_pages(
     sidebar: &gtk::ListBox,
     stack: &gtk::Stack,
     working: &Rc<RefCell<Working>>,
     apply_live: &Rc<dyn Fn()>,
 ) {
-    // Checkboxes.
-    for (name, set_enabled) in [
-        ("hsb", 0u8),
-        ("blur", 1u8),
-        ("stroke", 2u8),
-    ] {
-        if let Some(row) = find_row(sidebar, name) {
-            if let Some(check) = first_check(&row) {
-                let working = Rc::clone(working);
-                let apply_live = Rc::clone(apply_live);
-                check.connect_toggled(move |c| {
-                    let mut w = working.borrow_mut();
-                    let target = match set_enabled {
-                        0 => &mut w.hsb,
-                        1 => &mut w.blur,
-                        _ => &mut w.stroke,
-                    };
-                    target.enabled = c.is_active();
-                    drop(w);
-                    apply_live();
-                });
-            }
+    let selectors: [(&str, Select); 5] = [
+        ("hsb", |w| &mut w.hsb),
+        ("blur", |w| &mut w.blur),
+        ("sharpen", |w| &mut w.sharpen),
+        ("invert", |w| &mut w.invert),
+        ("stroke", |w| &mut w.stroke),
+    ];
+    for (name, select) in selectors {
+        if let Some(check) = find_row(sidebar, name).and_then(|r| first_check(&r)) {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            check.connect_toggled(move |c| {
+                select(&mut working.borrow_mut()).enabled = c.is_active();
+                apply_live();
+            });
         }
     }
 
-    if let Some(page) = stack
-        .child_by_name("hsb")
-        .and_then(|w| w.downcast::<gtk::Box>().ok())
-    {
+    if let Some(page) = page_box(stack, "hsb") {
         build_hsb_panel(&page, working, apply_live);
     }
-    if let Some(page) = stack
-        .child_by_name("blur")
-        .and_then(|w| w.downcast::<gtk::Box>().ok())
-    {
+    if let Some(page) = page_box(stack, "blur") {
         build_blur_panel(&page, working, apply_live);
     }
-    if let Some(page) = stack
-        .child_by_name("stroke")
-        .and_then(|w| w.downcast::<gtk::Box>().ok())
-    {
+    if let Some(page) = page_box(stack, "sharpen") {
+        build_sharpen_panel(&page, working, apply_live);
+    }
+    if let Some(page) = page_box(stack, "invert") {
+        build_invert_panel(&page);
+    }
+    if let Some(page) = page_box(stack, "stroke") {
         build_stroke_panel(&page, working, apply_live);
     }
+}
+
+/// Selects which effect in the working stack a checkbox/control mutates.
+type Select = fn(&mut Working) -> &mut Effect;
+
+fn page_box(stack: &gtk::Stack, name: &str) -> Option<gtk::Box> {
+    stack.child_by_name(name)?.downcast::<gtk::Box>().ok()
 }
 
 fn find_row(sidebar: &gtk::ListBox, name: &str) -> Option<gtk::ListBoxRow> {
@@ -439,28 +465,9 @@ fn first_check(row: &gtk::ListBoxRow) -> Option<gtk::CheckButton> {
     None
 }
 
-fn labeled(label: &str, control: &impl IsA<gtk::Widget>) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let lbl = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .width_request(96)
-        .build();
-    row.append(&lbl);
-    let w = control.as_ref();
-    w.set_hexpand(true);
-    row.append(w);
-    row
-}
-
+/// A section heading above a boxed list.
 fn section(title: &str) -> gtk::Label {
-    let lbl = gtk::Label::builder()
-        .label(title)
-        .xalign(0.0)
-        .build();
+    let lbl = gtk::Label::builder().label(title).xalign(0.0).build();
     lbl.add_css_class("heading");
     lbl
 }
@@ -475,49 +482,89 @@ fn build_hsb_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: 
         return;
     };
 
+    // The hue ramp shifts with the rotation value, so every slider shares this
+    // cell and the saturation bar is refreshed when hue moves.
+    let hue = Rc::new(Cell::new(f64::from(hue_degrees)));
+
+    let hue_slider = gradient_slider::build(
+        "_Hue",
+        (-180.0, 180.0),
+        1.0,
+        0,
+        f64::from(hue_degrees),
+        {
+            let hue = Rc::clone(&hue);
+            move |t| hsl_to_rgb(t * 360.0 + hue.get(), 1.0, 0.5)
+        },
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            let hue = Rc::clone(&hue);
+            move |v| {
+                hue.set(v);
+                set_hsb(&working, |k| {
+                    if let EffectKind::HueSatBright { hue_degrees, .. } = k {
+                        *hue_degrees = v as f32;
+                    }
+                });
+                apply_live();
+            }
+        },
+    );
+
+    let sat_slider = gradient_slider::build(
+        "_Saturation",
+        (0.0, 2.0),
+        0.01,
+        2,
+        f64::from(saturation),
+        {
+            let hue = Rc::clone(&hue);
+            move |t| hsl_to_rgb(hue.get(), t, 0.5)
+        },
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            move |v| {
+                set_hsb(&working, |k| {
+                    if let EffectKind::HueSatBright { saturation, .. } = k {
+                        *saturation = v as f32;
+                    }
+                });
+                apply_live();
+            }
+        },
+    );
+
+    let bright_slider = gradient_slider::build(
+        "_Brightness",
+        (0.0, 2.0),
+        0.01,
+        2,
+        f64::from(brightness),
+        |t| (t, t, t),
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            move |v| {
+                set_hsb(&working, |k| {
+                    if let EffectKind::HueSatBright { brightness, .. } = k {
+                        *brightness = v as f32;
+                    }
+                });
+                apply_live();
+            }
+        },
+    );
+
+    // Moving hue restyles the saturation ramp (it samples the current hue).
+    let sat_area = sat_slider.area();
+    hue_slider.connect_changed(move |_| sat_area.queue_draw());
+
     page.append(&section("Adjust"));
-
-    let hue = slider::build((-180.0, 180.0), 1.0, f64::from(hue_degrees), 220, |v| format!("{v:.0} deg"), {
-        let working = Rc::clone(working);
-        let apply_live = Rc::clone(apply_live);
-        move |v| {
-            set_hsb(&working, |k| {
-                if let EffectKind::HueSatBright { hue_degrees, .. } = k {
-                    *hue_degrees = v as f32;
-                }
-            });
-            apply_live();
-        }
-    });
-    page.append(&labeled("Hue", &hue));
-
-    let sat = slider::build((0.0, 2.0), 0.01, f64::from(saturation), 220, |v| format!("{v:.2}"), {
-        let working = Rc::clone(working);
-        let apply_live = Rc::clone(apply_live);
-        move |v| {
-            set_hsb(&working, |k| {
-                if let EffectKind::HueSatBright { saturation, .. } = k {
-                    *saturation = v as f32;
-                }
-            });
-            apply_live();
-        }
-    });
-    page.append(&labeled("Saturation", &sat));
-
-    let bright = slider::build((0.0, 2.0), 0.01, f64::from(brightness), 220, |v| format!("{v:.2}"), {
-        let working = Rc::clone(working);
-        let apply_live = Rc::clone(apply_live);
-        move |v| {
-            set_hsb(&working, |k| {
-                if let EffectKind::HueSatBright { brightness, .. } = k {
-                    *brightness = v as f32;
-                }
-            });
-            apply_live();
-        }
-    });
-    page.append(&labeled("Brightness", &bright));
+    page.append(&hue_slider.widget);
+    page.append(&sat_slider.widget);
+    page.append(&bright_slider.widget);
 }
 
 fn set_hsb(working: &Rc<RefCell<Working>>, f: impl FnOnce(&mut EffectKind)) {
@@ -525,21 +572,154 @@ fn set_hsb(working: &Rc<RefCell<Working>>, f: impl FnOnce(&mut EffectKind)) {
 }
 
 fn build_blur_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: &Rc<dyn Fn()>) {
-    let EffectKind::Blur { radius } = working.borrow().blur.kind else {
+    let EffectKind::Blur { radius_x, radius_y } = working.borrow().blur.kind else {
         return;
     };
-    page.append(&section("Blur"));
-    let r = slider::build((0.0, 50.0), 0.5, f64::from(radius), 220, |v| format!("{v:.1} px"), {
+
+    let list = boxed_list::list();
+
+    let type_combo = gtk::DropDown::from_strings(&["Box Blur"]);
+    list.append(&boxed_list::row("Type", &type_combo, &[]));
+
+    // Lock links the two radii so they move together (default on when equal).
+    let locked = Rc::new(Cell::new((radius_x - radius_y).abs() < f32::EPSILON));
+    let h_scale = slider::build((0.0, 100.0), 1.0, f64::from(radius_x), 200, fmt_px, {
         let working = Rc::clone(working);
         let apply_live = Rc::clone(apply_live);
         move |v| {
-            if let EffectKind::Blur { radius } = &mut working.borrow_mut().blur.kind {
-                *radius = v as f32;
-            }
+            set_blur(&working, |b| b.0 = v as f32);
             apply_live();
         }
     });
-    page.append(&labeled("Radius", &r));
+    let v_scale = slider::build((0.0, 100.0), 1.0, f64::from(radius_y), 200, fmt_px, {
+        let working = Rc::clone(working);
+        let apply_live = Rc::clone(apply_live);
+        move |v| {
+            set_blur(&working, |b| b.1 = v as f32);
+            apply_live();
+        }
+    });
+
+    wire_radius_lock(&h_scale, &v_scale, &locked);
+
+    let lock_btn = gtk::ToggleButton::builder()
+        .icon_name(if locked.get() {
+            "changes-prevent-symbolic"
+        } else {
+            "changes-allow-symbolic"
+        })
+        .active(locked.get())
+        .tooltip_text("Link horizontal and vertical blur")
+        .build();
+    lock_btn.add_css_class("flat");
+    {
+        let locked = Rc::clone(&locked);
+        let v_scale = v_scale.clone();
+        let h_scale = h_scale.clone();
+        lock_btn.connect_toggled(move |b| {
+            locked.set(b.is_active());
+            b.set_icon_name(if b.is_active() {
+                "changes-prevent-symbolic"
+            } else {
+                "changes-allow-symbolic"
+            });
+            if b.is_active() {
+                v_scale.set_value(h_scale.value());
+            }
+        });
+    }
+
+    list.append(&boxed_list::row(
+        "Horizontal",
+        &h_scale,
+        &[lock_btn.upcast_ref()],
+    ));
+    list.append(&boxed_list::row("Vertical", &v_scale, &[]));
+    page.append(&list);
+}
+
+/// Mutate the blur radii through a `(radius_x, radius_y)` view.
+fn set_blur(working: &Rc<RefCell<Working>>, f: impl FnOnce(&mut (f32, f32))) {
+    if let EffectKind::Blur { radius_x, radius_y } = &mut working.borrow_mut().blur.kind {
+        let mut pair = (*radius_x, *radius_y);
+        f(&mut pair);
+        *radius_x = pair.0;
+        *radius_y = pair.1;
+    }
+}
+
+/// Keep two scales in sync while locked, guarding the re-entrant value-changed
+/// the programmatic set would trigger.
+fn wire_radius_lock(h_scale: &gtk::Scale, v_scale: &gtk::Scale, locked: &Rc<Cell<bool>>) {
+    let syncing = Rc::new(Cell::new(false));
+    {
+        let other = v_scale.clone();
+        let locked = Rc::clone(locked);
+        let syncing = Rc::clone(&syncing);
+        h_scale.connect_value_changed(move |s| {
+            if locked.get() && !syncing.get() {
+                syncing.set(true);
+                other.set_value(s.value());
+                syncing.set(false);
+            }
+        });
+    }
+    {
+        let other = h_scale.clone();
+        let locked = Rc::clone(locked);
+        let syncing = Rc::clone(&syncing);
+        v_scale.connect_value_changed(move |s| {
+            if locked.get() && !syncing.get() {
+                syncing.set(true);
+                other.set_value(s.value());
+                syncing.set(false);
+            }
+        });
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn fmt_px(v: f64) -> String {
+    format!("{} px", v.round() as i64)
+}
+
+fn build_sharpen_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: &Rc<dyn Fn()>) {
+    let EffectKind::Sharpen { amount } = working.borrow().sharpen.kind else {
+        return;
+    };
+
+    let list = boxed_list::list();
+
+    let type_combo = gtk::DropDown::from_strings(&["Unsharp Mask"]);
+    list.append(&boxed_list::row("Type", &type_combo, &[]));
+
+    let strength = slider::build(
+        (0.0, 100.0),
+        0.05,
+        f64::from(amount),
+        200,
+        |v| format!("{v:.2}"),
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            move |v| {
+                if let EffectKind::Sharpen { amount } = &mut working.borrow_mut().sharpen.kind {
+                    *amount = v as f32;
+                }
+                apply_live();
+            }
+        },
+    );
+    list.append(&boxed_list::row("Strength", &strength, &[]));
+    page.append(&list);
+}
+
+fn build_invert_panel(page: &gtk::Box) {
+    let list = boxed_list::list();
+    list.append(&boxed_list::info_row(
+        "Inverts the colors of everything below. No options.",
+    ));
+    page.append(&list);
 }
 
 fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: &Rc<dyn Fn()>) {
@@ -556,6 +736,7 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
 
     // --- Color section ---
     page.append(&section("Color"));
+    let color_list = boxed_list::list();
 
     let color_dialog = gtk::ColorDialog::new();
     let color_btn = gtk::ColorDialogButton::new(Some(color_dialog));
@@ -565,6 +746,8 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
         f32::from(color.b) / 255.0,
         1.0,
     ));
+    color_btn.set_hexpand(false);
+    color_btn.set_halign(gtk::Align::End);
     {
         let working = Rc::clone(working);
         let apply_live = Rc::clone(apply_live);
@@ -580,30 +763,37 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
             apply_live();
         });
     }
-    page.append(&labeled("Color", &color_btn));
+    color_list.append(&boxed_list::row("Color", &color_btn, &[]));
 
-    let op = slider::build((0.0, 1.0), 0.01, f64::from(opacity), 220, |v| format!("{:.0}%", v * 100.0), {
-        let working = Rc::clone(working);
-        let apply_live = Rc::clone(apply_live);
-        move |v| {
-            if let EffectKind::Stroke { opacity, .. } = &mut working.borrow_mut().stroke.kind {
-                *opacity = v as f32;
+    let op = slider::build(
+        (0.0, 1.0),
+        0.01,
+        f64::from(opacity),
+        200,
+        |v| format!("{:.0}%", v * 100.0),
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            move |v| {
+                if let EffectKind::Stroke { opacity, .. } = &mut working.borrow_mut().stroke.kind {
+                    *opacity = v as f32;
+                }
+                apply_live();
             }
-            apply_live();
-        }
-    });
-    page.append(&labeled("Opacity", &op));
+        },
+    );
+    color_list.append(&boxed_list::row("Opacity", &op, &[]));
+    page.append(&color_list);
 
     // --- Stroke Design section ---
     page.append(&section("Stroke Design"));
+    let design_list = boxed_list::list();
 
     // Thickness: slider with +/- steppers for gradual control.
     let thickness_adj = gtk::Adjustment::new(f64::from(thickness), 0.0, 100.0, 1.0, 5.0, 0.0);
-    let thickness_scale =
-        gtk::Scale::new(gtk::Orientation::Horizontal, Some(&thickness_adj));
+    let thickness_scale = gtk::Scale::new(gtk::Orientation::Horizontal, Some(&thickness_adj));
     thickness_scale.set_draw_value(true);
     thickness_scale.set_value_pos(gtk::PositionType::Right);
-    thickness_scale.set_hexpand(true);
     {
         let working = Rc::clone(working);
         let apply_live = Rc::clone(apply_live);
@@ -616,6 +806,8 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
     }
     let minus = gtk::Button::from_icon_name("list-remove-symbolic");
     let plus = gtk::Button::from_icon_name("list-add-symbolic");
+    minus.add_css_class("flat");
+    plus.add_css_class("flat");
     {
         let adj = thickness_adj.clone();
         minus.connect_clicked(move |_| adj.set_value(adj.value() - 1.0));
@@ -624,44 +816,46 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
         let adj = thickness_adj.clone();
         plus.connect_clicked(move |_| adj.set_value(adj.value() + 1.0));
     }
-    let thickness_row = gtk::Box::builder()
+    let thickness_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
+        .spacing(4)
         .build();
-    let tl = gtk::Label::builder()
-        .label("Thickness")
-        .xalign(0.0)
-        .width_request(96)
-        .build();
-    thickness_row.append(&tl);
-    thickness_row.append(&minus);
-    thickness_row.append(&thickness_scale);
-    thickness_row.append(&plus);
-    page.append(&thickness_row);
+    thickness_box.append(&minus);
+    thickness_scale.set_hexpand(true);
+    thickness_box.append(&thickness_scale);
+    thickness_box.append(&plus);
+    design_list.append(&boxed_list::row("Thickness", &thickness_box, &[]));
 
     // Offset: -1 inside .. 0 center .. +1 outside.
-    let off = slider::build((-1.0, 1.0), 0.01, f64::from(offset), 220, |v| {
-        let where_ = if v < -0.33 {
-            "inside"
-        } else if v > 0.33 {
-            "outside"
-        } else {
-            "center"
-        };
-        format!("{v:.2} ({where_})")
-    }, {
-        let working = Rc::clone(working);
-        let apply_live = Rc::clone(apply_live);
-        move |v| {
-            if let EffectKind::Stroke { offset, .. } = &mut working.borrow_mut().stroke.kind {
-                *offset = v as f32;
+    let off = slider::build(
+        (-1.0, 1.0),
+        0.01,
+        f64::from(offset),
+        200,
+        |v| {
+            let where_ = if v < -0.33 {
+                "inside"
+            } else if v > 0.33 {
+                "outside"
+            } else {
+                "center"
+            };
+            format!("{v:.2} ({where_})")
+        },
+        {
+            let working = Rc::clone(working);
+            let apply_live = Rc::clone(apply_live);
+            move |v| {
+                if let EffectKind::Stroke { offset, .. } = &mut working.borrow_mut().stroke.kind {
+                    *offset = v as f32;
+                }
+                apply_live();
             }
-            apply_live();
-        }
-    });
-    page.append(&labeled("Offset", &off));
+        },
+    );
+    design_list.append(&boxed_list::row("Offset", &off, &[]));
 
-    // Softness dropdown.
+    // Softness.
     let labels: Vec<&str> = StrokeSoftness::ALL.iter().map(|s| s.label()).collect();
     let dropdown = gtk::DropDown::from_strings(&labels);
     dropdown.set_selected(softness.to_index());
@@ -676,5 +870,6 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
             apply_live();
         });
     }
-    page.append(&labeled("Softness", &dropdown));
+    design_list.append(&boxed_list::row("Softness", &dropdown, &[]));
+    page.append(&design_list);
 }

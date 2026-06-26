@@ -32,7 +32,6 @@ use relm4::gtk::prelude::*;
 
 use crate::canvas::RedrawHandle;
 use crate::toaster::Toaster;
-use crate::widgets::slider;
 
 /// Shared handles the filter actions need. Cloned into each menu action.
 #[derive(Clone)]
@@ -169,61 +168,4 @@ pub(super) fn open_adjustable(
     let dialog = dialog::build(&ctx.window, title, on_apply, on_cancel);
     populate(&dialog.content, &spec, ctx);
     dialog.window.present();
-}
-
-
-// ---------------------------------------------------------------------------
-// Shared widget helpers
-// ---------------------------------------------------------------------------
-
-pub(super) fn labeled_slider(
-    label: &str,
-    range: (f64, f64),
-    step: f64,
-    initial: f64,
-    on_change: impl Fn(f64) + 'static,
-) -> gtk::Box {
-    let fmt = move |v: f64| format!("{v:.2}");
-    let scale = slider::build(range, step, initial, 200, fmt, on_change);
-    row_with_scale(label, &scale, None)
-}
-
-pub(super) fn row_with_scale(
-    label: &str,
-    scale: &gtk::Scale,
-    suffix: Option<&gtk::ToggleButton>,
-) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let lbl = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .width_request(96)
-        .build();
-    row.append(&lbl);
-    scale.set_hexpand(true);
-    row.append(scale);
-    if let Some(s) = suffix {
-        row.append(s);
-    }
-    row
-}
-
-pub(super) fn filter_type_row(label: &str, options: &[&str]) -> gtk::Box {
-    let row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(8)
-        .build();
-    let lbl = gtk::Label::builder()
-        .label(label)
-        .xalign(0.0)
-        .width_request(96)
-        .build();
-    let dropdown = gtk::DropDown::from_strings(options);
-    dropdown.set_hexpand(true);
-    row.append(&lbl);
-    row.append(&dropdown);
-    row
 }

@@ -67,9 +67,21 @@ pub enum EffectKind {
         saturation: f32,
         brightness: f32,
     },
-    /// Gaussian-ish box blur with a single radius in pixels (applied on both
-    /// axes). Maps to the existing separable `filter_box_blur`.
-    Blur { radius: f32 },
+    /// Box blur with independent horizontal / vertical radii in pixels - the
+    /// same parameters as the destructive Blur filter. Maps to the separable
+    /// `filter_box_blur`. The legacy single-`radius` field deserializes into
+    /// `radius_x` (with `radius_y` defaulting to 0) so old projects still load.
+    Blur {
+        #[serde(alias = "radius")]
+        radius_x: f32,
+        #[serde(default)]
+        radius_y: f32,
+    },
+    /// Invert colors. No parameters. Maps to the destructive Invert filter.
+    Invert,
+    /// Unsharp-mask sharpen. `amount` of 0 leaves the backdrop unchanged.
+    /// Maps to the destructive Sharpen filter.
+    Sharpen { amount: f32 },
     /// Outline traced around the alpha edge of the backdrop, gated by the
     /// adjustment mask. `offset` slides the band from fully inside (-1.0)
     /// through centred (0.0) to fully outside (+1.0) the edge.
@@ -89,17 +101,9 @@ impl EffectKind {
         match self {
             Self::HueSatBright { .. } => "Hue/Saturation/Brightness",
             Self::Blur { .. } => "Blur",
+            Self::Invert => "Invert",
+            Self::Sharpen { .. } => "Sharpen",
             Self::Stroke { .. } => "Stroke",
-        }
-    }
-
-    /// Icon name for the sidebar's rounded-square chip.
-    #[must_use]
-    pub const fn icon_name(&self) -> &'static str {
-        match self {
-            Self::HueSatBright { .. } => "oxiedraw-filter-hsv-symbolic",
-            Self::Blur { .. } => "oxiedraw-filter-blur-symbolic",
-            Self::Stroke { .. } => "oxiedraw-filter-stroke-symbolic",
         }
     }
 
@@ -114,7 +118,15 @@ impl EffectKind {
 
     #[must_use]
     pub const fn blur_default() -> Self {
-        Self::Blur { radius: 4.0 }
+        Self::Blur {
+            radius_x: 4.0,
+            radius_y: 4.0,
+        }
+    }
+
+    #[must_use]
+    pub const fn sharpen_default() -> Self {
+        Self::Sharpen { amount: 3.0 }
     }
 
     #[must_use]
@@ -192,8 +204,13 @@ mod tests {
                 Effect {
                     id: "e000000000000001".into(),
                     enabled: false,
-                    kind: EffectKind::Blur { radius: 12.0 },
+                    kind: EffectKind::Blur {
+                        radius_x: 12.0,
+                        radius_y: 8.0,
+                    },
                 },
+                Effect::new(EffectKind::Invert),
+                Effect::new(EffectKind::sharpen_default()),
                 Effect::new(EffectKind::stroke_default()),
             ],
         };
@@ -209,6 +226,14 @@ mod tests {
         let json = r#"{"id":"e1","kind":{"Blur":{"radius":3.0}}}"#;
         let effect: Effect = serde_json::from_str(json).unwrap();
         assert!(effect.enabled);
+        // Legacy single `radius` maps onto the horizontal axis.
+        assert_eq!(
+            effect.kind,
+            EffectKind::Blur {
+                radius_x: 3.0,
+                radius_y: 0.0
+            }
+        );
     }
 
     #[test]

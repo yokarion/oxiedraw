@@ -76,10 +76,9 @@ fn effect_to_filter_spec(kind: EffectKind) -> Option<FilterSpec> {
             saturation,
             value: brightness,
         }),
-        EffectKind::Blur { radius } => Some(FilterSpec::BoxBlur {
-            radius_x: radius,
-            radius_y: radius,
-        }),
+        EffectKind::Blur { radius_x, radius_y } => Some(FilterSpec::BoxBlur { radius_x, radius_y }),
+        EffectKind::Invert => Some(FilterSpec::Invert),
+        EffectKind::Sharpen { amount } => Some(FilterSpec::Sharpen { amount }),
         EffectKind::Stroke { .. } => None,
     }
 }
@@ -505,9 +504,11 @@ impl VulkanRenderer {
                     continue;
                 }
                 match effect.kind {
-                    EffectKind::HueSatBright { .. } => n += 2, // filter + mask-mix
-                    EffectKind::Blur { .. } => n += 3,         // H + V + mask-mix
-                    EffectKind::Stroke { .. } => n += 1,       // stroke band pass
+                    // filter + mask-mix
+                    EffectKind::HueSatBright { .. } | EffectKind::Invert => n += 2,
+                    EffectKind::Blur { .. } => n += 3, // H + V + mask-mix
+                    EffectKind::Sharpen { .. } => n += 4, // blur H + V + sharpen + mask-mix
+                    EffectKind::Stroke { .. } => n += 1, // stroke band pass
                 }
             }
         }
@@ -793,9 +794,58 @@ impl VulkanRenderer {
                 );
                 Scratch::B
             }
-            // Adjustments only produce Hsv / BoxBlur here; anything else is a
-            // no-op pass-through.
-            _ => Scratch::A,
+            FilterSpec::Invert => {
+                let pipeline = self.filter_resources.invert;
+                let fb = self.filter_resources.framebuffer(Scratch::A);
+                let set = self.filter_resources.input_set(*cursor);
+                *cursor += 1;
+                self.filter_resources
+                    .write_input(&self.device, set, src_view, src_view, src_view);
+                self.cmd_filter_pass3(
+                    set, layout, pipeline, render_pass, fb, src_img, src_img, src_img, [0.0; 4],
+                );
+                Scratch::A
+            }
+            FilterSpec::Sharpen { amount } => {
+                // Blur the source (H then V) into B, then unsharp = src vs blurred.
+                let r = FilterSpec::SHARPEN_BLUR_RADIUS;
+                let blur = self.filter_resources.box_blur;
+                let fb_a = self.filter_resources.framebuffer(Scratch::A);
+                let set_h = self.filter_resources.input_set(*cursor);
+                *cursor += 1;
+                self.filter_resources
+                    .write_input(&self.device, set_h, src_view, src_view, src_view);
+                self.cmd_filter_pass3(
+                    set_h, layout, blur, render_pass, fb_a, src_img, src_img, src_img,
+                    [inv_w, 0.0, r, 0.0],
+                );
+
+                let a_view = self.filter_resources.scratch_view(Scratch::A);
+                let a_img = self.filter_resources.scratch_handle(Scratch::A);
+                let fb_b = self.filter_resources.framebuffer(Scratch::B);
+                let set_v = self.filter_resources.input_set(*cursor);
+                *cursor += 1;
+                self.filter_resources
+                    .write_input(&self.device, set_v, a_view, a_view, a_view);
+                self.cmd_filter_pass3(
+                    set_v, layout, blur, render_pass, fb_b, a_img, a_img, a_img,
+                    [0.0, inv_h, r, 0.0],
+                );
+
+                // Sharpen reads the source (binding 0) + blurred-in-B (binding 1).
+                let b_view = self.filter_resources.scratch_view(Scratch::B);
+                let b_img = self.filter_resources.scratch_handle(Scratch::B);
+                let sharpen = self.filter_resources.sharpen;
+                let set_s = self.filter_resources.input_set(*cursor);
+                *cursor += 1;
+                self.filter_resources
+                    .write_input(&self.device, set_s, src_view, b_view, b_view);
+                self.cmd_filter_pass3(
+                    set_s, layout, sharpen, render_pass, fb_a, src_img, b_img, b_img,
+                    [amount, 0.0, 0.0, 0.0],
+                );
+                Scratch::A
+            }
         }
     }
 
@@ -890,8 +940,11 @@ impl VulkanRenderer {
                 }
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let r = match effect.kind {
-                    EffectKind::HueSatBright { .. } => 0,
-                    EffectKind::Blur { radius } => radius.ceil().max(0.0) as u32,
+                    EffectKind::HueSatBright { .. } | EffectKind::Invert => 0,
+                    EffectKind::Blur { radius_x, radius_y } => {
+                        radius_x.max(radius_y).ceil().max(0.0) as u32
+                    }
+                    EffectKind::Sharpen { .. } => FilterSpec::SHARPEN_BLUR_RADIUS.ceil() as u32,
                     EffectKind::Stroke { thickness, .. } => thickness.ceil().max(0.0) as u32 + 1,
                 };
                 margin += r;
