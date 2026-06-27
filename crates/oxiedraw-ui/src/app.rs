@@ -276,6 +276,22 @@ fn register_window_actions(
         app.add_action(&action);
     }
 
+    // Swap which slot (primary/secondary) is the active drawing color.
+    {
+        use oxiedraw_core::color::ColorSlot;
+        let colors = global.colors.clone();
+        let action = gio::SimpleAction::new("swap-colors", None);
+        action.connect_activate(move |_, _| {
+            let next = match colors.selected.get() {
+                ColorSlot::Primary => ColorSlot::Secondary,
+                ColorSlot::Secondary => ColorSlot::Primary,
+            };
+            colors.selected.set(next);
+            colors.notify_changed();
+        });
+        app.add_action(&action);
+    }
+
     // Brush manager (global brush library).
     {
         let win = root.clone();

@@ -248,6 +248,14 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
         ],
     },
     ActionGroup {
+        label: "Color",
+        actions: &[ActionInfo {
+            id: "swap-colors",
+            label: "Swap Primary/Secondary Color",
+            default_accel: Some("x"),
+        }],
+    },
+    ActionGroup {
         label: "Layers",
         actions: &[
             ActionInfo {
