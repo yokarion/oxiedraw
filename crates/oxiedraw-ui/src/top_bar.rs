@@ -25,10 +25,7 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
 
     let menus: &[(&str, gio::MenuModel)] = &[
         ("File", build_file_menu().upcast()),
-        ("Edit", build_edit_menu().upcast()),
-        ("Select", build_select_menu().upcast()),
         ("View", build_view_menu().upcast()),
-        ("Image", build_image_menu().upcast()),
         ("Filters", build_filters_menu().upcast()),
     ];
 
@@ -118,12 +115,6 @@ fn build_file_menu() -> gio::Menu {
     s1.append_item(&item("Open...", "app.open", None));
     menu.append_section(None, &s1);
 
-    let s2 = gio::Menu::new();
-    let recent = gio::Menu::new();
-    let recent_item = gio::MenuItem::new_submenu(Some("Open Recent"), &recent);
-    s2.append_item(&recent_item);
-    menu.append_section(None, &s2);
-
     let s3 = gio::Menu::new();
     s3.append_item(&item("Save", "app.save", None));
     s3.append_item(&item("Save As...", "app.save-as", None));
@@ -135,31 +126,6 @@ fn build_file_menu() -> gio::Menu {
     s4.append_item(&item("Quit", "app.quit", None));
     menu.append_section(None, &s4);
 
-    menu
-}
-
-fn build_edit_menu() -> gio::Menu {
-    let menu = gio::Menu::new();
-
-    let s1 = gio::Menu::new();
-    s1.append_item(&item("Undo", "app.undo", None));
-    s1.append_item(&item("Redo", "app.redo", None));
-    menu.append_section(None, &s1);
-
-    let s2 = gio::Menu::new();
-    s2.append_item(&item("Cut", "app.cut", None));
-    s2.append_item(&item("Copy", "app.copy", None));
-    s2.append_item(&item("Paste", "app.paste", None));
-    menu.append_section(None, &s2);
-
-    menu
-}
-
-fn build_select_menu() -> gio::Menu {
-    let menu = gio::Menu::new();
-    let s1 = gio::Menu::new();
-    s1.append_item(&item("Deselect", "app.deselect-all", None));
-    menu.append_section(None, &s1);
     menu
 }
 
@@ -180,21 +146,6 @@ fn build_view_menu() -> gio::Menu {
     menu
 }
 
-fn build_image_menu() -> gio::Menu {
-    let menu = gio::Menu::new();
-
-    let s1 = gio::Menu::new();
-    s1.append_item(&item("Canvas Size...", "app.canvas-size", None));
-    s1.append_item(&item("Resize Canvas...", "app.resize-canvas", None));
-    menu.append_section(None, &s1);
-
-    let s2 = gio::Menu::new();
-    s2.append_item(&item("Flatten Image", "app.flatten-image", None));
-    menu.append_section(None, &s2);
-
-    menu
-}
-
 fn build_filters_menu() -> gio::Menu {
     let menu = gio::Menu::new();
 
@@ -207,14 +158,6 @@ fn build_filters_menu() -> gio::Menu {
     blur_sharpen.append_item(&item("Blur...", "app.filter-blur", None));
     blur_sharpen.append_item(&item("Sharpen...", "app.filter-sharpen", None));
     menu.append_submenu(Some("Blur/Sharpen"), &blur_sharpen);
-
-    let nondestructive = gio::Menu::new();
-    nondestructive.append_item(&item(
-        "New Adjustment Layer...",
-        "app.layer-add-adjustment",
-        None,
-    ));
-    menu.append_section(None, &nondestructive);
 
     menu
 }
