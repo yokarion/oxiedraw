@@ -521,6 +521,17 @@ fn build_fill_page(fill: &FillState) -> gtk::Box {
     );
     row.append(&slider);
 
+    // Sample the composite of all visible layers instead of just the
+    // active one when deciding which pixels to fill.
+    let all_layers = fill.sample_all_layers.clone();
+    let check = gtk::CheckButton::builder()
+        .label("Use all Layers")
+        .active(all_layers.get())
+        .valign(gtk::Align::Center)
+        .build();
+    check.connect_toggled(move |c| all_layers.set(c.is_active()));
+    row.append(&check);
+
     row
 }
 

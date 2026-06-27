@@ -968,7 +968,8 @@ impl PrimaryDragHandler {
             return;
         }
 
-        let (layer_idx, original, layer_id, selection_mask) = {
+        let sample_all_layers = self.fill.sample_all_layers.get();
+        let (layer_idx, original, fill_source, layer_id, selection_mask) = {
             let mut canvas = self.canvas.borrow_mut();
             let Some(idx) = canvas.layers().active() else {
                 return;
@@ -987,8 +988,22 @@ impl PrimaryDragHandler {
             } else {
                 None
             };
+            // When sampling all layers, the flood fill seeds/matches against
+            // the composited canvas; the fill still paints into the active
+            // layer, so we read that separately as the paint target.
+            let source = if sample_all_layers {
+                match canvas.read_pixels() {
+                    Ok(px) => Some(px),
+                    Err(e) => {
+                        tracing::error!(error = %e, "fill: read_pixels failed");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             match canvas.read_layer(idx) {
-                Ok(px) => (idx, px, id, mask),
+                Ok(px) => (idx, px, source, id, mask),
                 Err(e) => {
                     tracing::error!(error = %e, "fill: read_layer failed");
                     return;
@@ -1011,7 +1026,11 @@ impl PrimaryDragHandler {
         let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Option<FillResult>)>();
         let primary_color = primary;
         std::thread::spawn(move || {
-            let result = flood_fill(&original, w, h, sx, sy, tolerance, selection_mask.as_deref());
+            // Seed/match against the composite when sampling all layers,
+            // but always hand back the active-layer buffer as the paint
+            // target so the downstream commit writes the right layer.
+            let bfs_source = fill_source.as_deref().unwrap_or(&original);
+            let result = flood_fill(bfs_source, w, h, sx, sy, tolerance, selection_mask.as_deref());
             let _ = tx.send((original, result));
         });
 

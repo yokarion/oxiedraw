@@ -469,15 +469,21 @@ impl SelectionTool {
 /// across BGRA) between a candidate pixel and the seed pixel for the
 /// bucket flood-fill to include it. Stored as 0..=255 where 0 = exact
 /// match only and 255 = match anything within the connected region.
+///
+/// `sample_all_layers` makes the flood-fill seed/match against the
+/// composited image of every visible layer instead of just the active
+/// one; the fill itself is still painted into the active layer.
 #[derive(Debug, Clone)]
 pub struct FillState {
     pub tolerance: Rc<Cell<u8>>,
+    pub sample_all_layers: Rc<Cell<bool>>,
 }
 
 impl FillState {
     pub fn new() -> Self {
         Self {
             tolerance: Rc::new(Cell::new(16)),
+            sample_all_layers: Rc::new(Cell::new(false)),
         }
     }
 }
