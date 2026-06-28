@@ -11,67 +11,46 @@ use super::super::dmabuf::DmabufDescriptor;
 use super::{PresentSource, VulkanRenderer, full_image_barrier, full_subresource_range};
 
 impl VulkanRenderer {
-    /// Get a descriptor of the dmabuf display image (fd + DRM metadata).
+    /// Get a descriptor (fd + DRM metadata) of the display buffer most recently
+    /// written by [`Self::record_present_copy`] - the one GTK should import now.
     #[must_use]
     pub fn display_descriptor(&self) -> DmabufDescriptor {
-        self.display.descriptor()
+        self.display[self.display_cursor].descriptor()
     }
 
-    /// Copy `source` into the dmabuf display image and fence-wait so the
+    /// Copy `source` into the next display buffer and fence-wait so the
     /// display server can safely read it.
     pub fn present_to_display(&mut self, source: PresentSource) -> Result<(), RendererError> {
         let src_image = match source {
             PresentSource::Canvas => self.canvas.handle,
             PresentSource::Preview => self.preview.handle,
         };
-        let display_old_layout = self.display_old_layout();
         // Async: don't stall the input loop on the dmabuf copy. GTK syncs to our
         // GPU writes via dma-buf implicit sync, and same-queue order keeps the
         // next preview write after this copy.
         self.record_and_submit_async(|this| {
-            this.record_present_copy(src_image, display_old_layout);
+            this.record_present_copy(src_image);
             Ok(())
         })?;
-        self.display_initialised = true;
         Ok(())
-    }
-
-    /// The display image's layout coming into a present: GENERAL once it
-    /// has been written at least once, UNDEFINED on the very first copy.
-    pub(super) fn display_old_layout(&self) -> vk::ImageLayout {
-        if self.display_initialised {
-            vk::ImageLayout::GENERAL
-        } else {
-            vk::ImageLayout::UNDEFINED
-        }
     }
 
     /// Record the dmabuf-copy commands (display barriers + `src_image` ->
     /// display copy) into the current command buffer. Caller wraps this in
-    /// `record_and_submit` and sets `display_initialised` afterward. `src_image`
-    /// must be in GENERAL and is restored to GENERAL on return.
-    pub(super) fn record_present_copy(
-        &self,
-        src_image: vk::Image,
-        display_old_layout: vk::ImageLayout,
-    ) {
-        // Honor an active clip rect so only the dirty region is pushed to the
-        // display (the rest is already correct from the previous present).
-        let (clip_offset, clip_extent) = match self.clip {
-            Some(r) => (
-                vk::Offset3D {
-                    x: r.offset.x,
-                    y: r.offset.y,
-                    z: 0,
-                },
-                vk::Extent3D {
-                    width: r.extent.width,
-                    height: r.extent.height,
-                    depth: 1,
-                },
-            ),
-            None => (vk::Offset3D::default(), self.canvas.extent),
-        };
+    /// `record_and_submit`. `src_image` must be in GENERAL and is restored to
+    /// GENERAL on return.
+    ///
+    /// Advances `display_cursor` to a fresh buffer first, so GTK never samples
+    /// the buffer we write here. Because each buffer is independent, the copy is
+    /// always the *full* canvas (a clipped copy would leave the buffer's other
+    /// regions holding pixels from however many frames ago it was last written).
+    pub(super) fn record_present_copy(&mut self, src_image: vk::Image) {
+        self.display_cursor = (self.display_cursor + 1) % self.display.len();
+        let dst_image = self.display[self.display_cursor].image;
+        // Full-frame copy; old contents are discarded (UNDEFINED), not preserved.
+        let display_old_layout = vk::ImageLayout::UNDEFINED;
+        let (clip_offset, clip_extent) =
+            (vk::Offset3D::default(), self.canvas.extent);
         // No queue-family transfer to FOREIGN_EXT - we rely on implicit
         // dma-buf sync (kernel propagates the GPU fence).
         unsafe {
@@ -83,7 +62,7 @@ impl VulkanRenderer {
                 &[],
                 &[],
                 &[full_image_barrier(
-                    self.display.image,
+                    dst_image,
                     display_old_layout,
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 )],
@@ -116,7 +95,7 @@ impl VulkanRenderer {
                 self.command_buffer,
                 src_image,
                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                self.display.image,
+                dst_image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 &[copy],
             );
@@ -144,7 +123,7 @@ impl VulkanRenderer {
                     .new_layout(vk::ImageLayout::GENERAL)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .image(self.display.image)
+                    .image(dst_image)
                     .subresource_range(full_subresource_range())],
             );
         }

@@ -114,6 +114,69 @@ pub(crate) struct Viewport {
     /// the in-flight stroke is committed and recorded before history mutates,
     /// keeping the canvas and the undo stack in sync.
     flush_correction: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    render_pump: RenderPump,
+}
+
+/// Keeps GTK's frame clock continuously updating during an interactive drag, so
+/// the canvas renders at steady vsync regardless of input-event timing.
+///
+/// We only schedule a redraw when an input event arrives. A high-rate mouse
+/// (~160 Hz) delivers an event almost every frame, which keeps the frame clock
+/// "updating" and paced at vsync. A stylus delivers motion in jittery coalesced
+/// bursts, so between bursts the clock has nothing to do and stops; the next
+/// event restarts it, re-syncing with the compositor and costing a frame or two
+/// - visible as jitter on the pen but not the mouse. While armed, a frame-clock
+/// tick re-presents every frame, keeping the clock hot (what a continuous
+/// render loop does). It self-removes when no drag is active, so idle is free.
+#[derive(Clone)]
+pub(crate) struct RenderPump {
+    canvas: Rc<RefCell<Canvas>>,
+    paintable: CanvasPaintable,
+    picture: Rc<RefCell<Option<gtk::Picture>>>,
+    active: Rc<Cell<u32>>,
+    installed: Rc<Cell<bool>>,
+}
+
+impl RenderPump {
+    fn new(
+        canvas: Rc<RefCell<Canvas>>,
+        paintable: CanvasPaintable,
+        picture: Rc<RefCell<Option<gtk::Picture>>>,
+    ) -> Self {
+        Self {
+            canvas,
+            paintable,
+            picture,
+            active: Rc::new(Cell::new(0)),
+            installed: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Begin (or join) an interaction: ensure the per-frame present tick runs.
+    pub(crate) fn arm(&self) {
+        self.active.set(self.active.get() + 1);
+        if self.installed.replace(true) {
+            return;
+        }
+        let Some(area) = self.picture.borrow().clone() else {
+            self.installed.set(false);
+            return;
+        };
+        let me = self.clone();
+        area.add_tick_callback(move |area, _clock| {
+            if me.active.get() == 0 {
+                me.installed.set(false);
+                return gtk::glib::ControlFlow::Break;
+            }
+            present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
+            gtk::glib::ControlFlow::Continue
+        });
+    }
+
+    /// End one interaction; the tick stops once the last one ends.
+    pub(crate) fn disarm(&self) {
+        self.active.set(self.active.get().saturating_sub(1));
+    }
 }
 
 impl std::fmt::Debug for Viewport {
@@ -129,6 +192,9 @@ impl Viewport {
     pub(crate) fn new(canvas_size: Size, layers: LayerState) -> Self {
         let canvas = Canvas::new(canvas_size, layers).expect("Vulkan canvas init");
         let paintable = CanvasPaintable::new(canvas_size.width, canvas_size.height);
+        let canvas = Rc::new(RefCell::new(canvas));
+        let picture = Rc::new(RefCell::new(None));
+        let render_pump = RenderPump::new(Rc::clone(&canvas), paintable.clone(), Rc::clone(&picture));
         Self {
             pan: Rc::new(Cell::new(Point::ZERO)),
             pan_last_offset: Rc::new(Cell::new(Point::ZERO)),
@@ -138,13 +204,20 @@ impl Viewport {
             nav_zoom_start: Rc::new(Cell::new(1.0)),
             nav_anchor: Rc::new(Cell::new(Point::ZERO)),
             centered: Rc::new(Cell::new(false)),
-            canvas: Rc::new(RefCell::new(canvas)),
+            canvas,
             paintable,
             redraw: RedrawHandle::default(),
             canvas_size: Rc::new(Cell::new(canvas_size)),
-            picture: Rc::new(RefCell::new(None)),
+            picture,
             flush_correction: Rc::new(RefCell::new(None)),
+            render_pump,
         }
+    }
+
+    /// Handle to the render pump - armed/disarmed around interactive drags to
+    /// keep the frame clock at steady vsync. See [`RenderPump`].
+    pub(crate) fn render_pump(&self) -> RenderPump {
+        self.render_pump.clone()
     }
 
     /// Cloneable slot the brush handler installs its "finalize the in-flight
@@ -602,8 +675,10 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let nav_zoom_start = Rc::clone(&viewport.nav_zoom_start);
         let nav_anchor = Rc::clone(&viewport.nav_anchor);
         let zoom = Rc::clone(&viewport.zoom);
+        let pump = viewport.render_pump.clone();
         let area_c = area.clone();
         drag.connect_drag_begin(move |gesture, start_x, start_y| {
+            pump.arm();
             last.set(Point::ZERO);
             let ctrl_held = gesture
                 .current_event_state()
@@ -662,13 +737,17 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
                 pan.set(new_pan);
                 paintable.set_transform(new_pan.x, new_pan.y, zoom.get());
             }
+            // The render pump (armed at drag-begin) re-presents every frame, so
+            // just updating the transform here is enough - no per-event present.
         });
     }
     {
         let nav = Rc::clone(&viewport.nav);
+        let pump = viewport.render_pump.clone();
         let area_c = area.clone();
         drag.connect_drag_end(move |_, _, _| {
             nav.set(NavDrag::None);
+            pump.disarm();
             // Drop the grab / zoom cursor; the next motion event restores
             // the tool's normal cursor.
             area_c.set_cursor_from_name(None);
@@ -819,8 +898,17 @@ fn build_texture(
         .set_modifier(desc.modifier)
         .set_premultiplied(true)
         .set_n_planes(1);
+    // Only chain to the previous texture when it has the same dimensions.
+    // `set_update_texture` is a "successor of that memory" hint; after a canvas
+    // resize the previous texture is a different size, and feeding GTK a
+    // mismatched successor wedges its dmabuf-import reuse into a degraded
+    // per-frame path that paces at every-3rd-vsync (the post-resize 24ms cap).
     if let Some(prev) = previous {
-        builder = builder.set_update_texture(Some(prev));
+        if prev.width() == i32::try_from(desc.width).unwrap_or(-1)
+            && prev.height() == i32::try_from(desc.height).unwrap_or(-1)
+        {
+            builder = builder.set_update_texture(Some(prev));
+        }
     }
     // SAFETY: `dup` (and thus `raw`) is kept alive by the release
     // closure below until GTK drops the texture.

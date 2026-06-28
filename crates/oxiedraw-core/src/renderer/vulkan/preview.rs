@@ -27,20 +27,18 @@ impl VulkanRenderer {
         let visible_indices = self.visible_layer_indices(visibilities);
         self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
         let clip = self.take_preview_clip();
-        let display_old_layout = self.display_old_layout();
         let result = self.record_and_submit_async(|this| {
             this.cmd_frame_timing_begin();
             this.record_layered_preview(&visible_indices, target_idx, push, clip);
             this.cmd_frame_timing_mark(1);
             let preview_image = this.preview.handle;
-            this.record_present_copy(preview_image, display_old_layout);
+            this.record_present_copy(preview_image);
             this.cmd_frame_timing_mark(2);
             Ok(())
         });
         self.clip = None;
         result?;
         self.note_frame_timing();
-        self.display_initialised = true;
         Ok(())
     }
 
@@ -77,7 +75,6 @@ impl VulkanRenderer {
         let visible_indices = self.visible_layer_indices(visibilities);
         self.prepare_below_cache_if_needed(&visible_indices, target_idx)?;
         let clip = self.take_preview_clip();
-        let display_old_layout = self.display_old_layout();
         let result = self.record_and_submit_async(|this| {
             this.cmd_frame_timing_begin();
             if n > 0 {
@@ -94,14 +91,13 @@ impl VulkanRenderer {
             this.record_layered_preview(&visible_indices, target_idx, push, clip);
             this.cmd_frame_timing_mark(1);
             let preview_image = this.preview.handle;
-            this.record_present_copy(preview_image, display_old_layout);
+            this.record_present_copy(preview_image);
             this.cmd_frame_timing_mark(2);
             Ok(())
         });
         self.clip = None;
         result?;
         self.note_frame_timing();
-        self.display_initialised = true;
         Ok(())
     }
 

@@ -26,9 +26,11 @@ mod transform_preview;
 
 pub use shape_ops::ShapeKind;
 
+use std::cell::RefCell;
 use std::mem::ManuallyDrop;
+use std::rc::Rc;
 
-use ash::{Device, Entry, Instance, vk};
+use ash::{Device, Instance, vk};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use oxiedraw_utils::geometry::Size;
@@ -42,7 +44,7 @@ use super::erase::ErasePreview;
 use adjust_ops::{GroupAccumulator, MaskEditPreview};
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
-use super::instance::{self, DebugMessenger};
+use super::instance;
 use super::layers::{LayerBlendPipeline, LayerCompositePipeline, LayerStack};
 use transform_preview::TransformPreview;
 use super::mask::{DabPipelineSet, MaskPipelineSet};
@@ -52,6 +54,54 @@ use super::selection::SelectionResources;
 use super::shape_overlay::ShapeOverlayResources;
 use super::targets::ImageTarget;
 use super::transform::TransformPipeline;
+
+/// Process-wide Vulkan core (instance + logical device) shared by every
+/// `VulkanRenderer`.
+///
+/// A canvas resize replaces the renderer (`self.renderer = VulkanRenderer::new`).
+/// When `new` also built a fresh `VkInstance`/`VkDevice`, GTK saw a new DRM
+/// device fd on every resize and had to share the canvas dmabuf across two GPU
+/// contexts - the cross-context implicit sync stalled and jittered the present
+/// path, worst at a stylus's high event rate (mouse stayed under the budget).
+/// Creating instance + device once and reusing them keeps the fd stable, so a
+/// resize only rebuilds the size-dependent GPU resources on the same device.
+/// The app is single-threaded (GTK main thread), so a thread-local is enough
+/// and avoids Send/Sync bounds on the raw vk handles.
+struct SharedVk {
+    inst: instance::InstanceBundle,
+    dev: device::DeviceBundle,
+    max_image_dim: u32,
+}
+
+thread_local! {
+    static SHARED_VK: RefCell<Option<Rc<SharedVk>>> = const { RefCell::new(None) };
+}
+
+/// Get the shared Vulkan core, creating it on first use. The handles live for
+/// the process lifetime - intentionally never destroyed, since teardown would
+/// race GTK's still-imported dmabuf textures and only matters at exit anyway.
+fn shared_vk() -> Result<Rc<SharedVk>, RendererError> {
+    SHARED_VK.with(|cell| {
+        if let Some(s) = cell.borrow().as_ref() {
+            return Ok(Rc::clone(s));
+        }
+        let inst = instance::create()?;
+        let dev = device::create(&inst.instance)?;
+        let max_image_dim = unsafe {
+            inst.instance
+                .get_physical_device_properties(dev.physical)
+                .limits
+                .max_image_dimension2_d
+        };
+        let shared = Rc::new(SharedVk {
+            inst,
+            dev,
+            max_image_dim,
+        });
+        *cell.borrow_mut() = Some(Rc::clone(&shared));
+        Ok(shared)
+    })
+}
 
 /// Result of a `compute_selection_edges` + readback. Caller runs marching
 /// squares on these bytes; the buffer is `width x height` R8.
@@ -78,6 +128,14 @@ pub(super) const CANVAS_BYTES_PER_PIXEL: u64 = 4;
 /// Command buffers / fences kept in flight. The CPU may run up to this many
 /// submits ahead of the GPU before a `record_and_submit` has to wait.
 pub(super) const RING_FRAMES: usize = 3;
+
+/// Rotating display dmabuf images. The real stall fix is the synchronous present
+/// (`wait_last` before handing the fd to GTK); the rotation only avoids a
+/// write-while-GTK-reads hazard. Handing the compositor a *different* fd every
+/// frame made wlroots/Hyprland pace our window at every-3rd-vsync (24ms) after a
+/// resize, so we keep this small. 1 = a single stable buffer (like a normal
+/// app); the sync present + frame-clock pacing keep it correct.
+pub(super) const DISPLAY_BUFFERS: usize = 1;
 
 /// What source the dmabuf display image should mirror.
 #[derive(Debug, Clone, Copy)]
@@ -221,8 +279,11 @@ pub struct VulkanRenderer {
 
     /// Display-side dmabuf image. Per-frame `present_to_display` copies
     /// the chosen source (canvas or preview) into here.
-    pub(super) display: ManuallyDrop<DmabufImage>,
-    pub(super) display_initialised: bool,
+    /// Rotating pool of display dmabuf images (see [`DISPLAY_BUFFERS`]). Each
+    /// present advances `display_cursor` and writes that buffer; GTK reads the
+    /// one we just wrote while the next present targets a different buffer.
+    pub(super) display: Vec<DmabufImage>,
+    pub(super) display_cursor: usize,
 
     pub(super) command_pool: vk::CommandPool,
     /// Ring of command buffers + fences for frames-in-flight: `record_and_submit`
@@ -251,7 +312,7 @@ pub struct VulkanRenderer {
     pub(super) allocator: ManuallyDrop<Allocator>,
     pub(super) device: Device,
 
-    pub(super) debug: Option<DebugMessenger>,
+    #[allow(dead_code)]
     pub(super) instance: Instance,
     #[allow(dead_code)]
     pub(super) physical_device: vk::PhysicalDevice,
@@ -259,17 +320,17 @@ pub struct VulkanRenderer {
     /// `VkPhysicalDeviceLimits::maxImageDimension2D` - caps the transform
     /// render target size. Beyond this `vkCreateImage` fails.
     pub(super) max_image_dim: u32,
-    pub(super) _entry: Entry,
+    /// Keeps the shared instance/device alive for this renderer's lifetime.
+    _shared: Rc<SharedVk>,
 }
 
 impl VulkanRenderer {
     #[allow(clippy::too_many_lines)]
     pub fn new(canvas_size: Size) -> Result<Self, RendererError> {
-        let inst = instance::create()?;
-        let dev = device::create(&inst.instance)?;
-
-        let dev_props = unsafe { inst.instance.get_physical_device_properties(dev.physical) };
-        let max_image_dim = dev_props.limits.max_image_dimension2_d;
+        let shared = shared_vk()?;
+        let inst = &shared.inst;
+        let dev = &shared.dev;
+        let max_image_dim = shared.max_image_dim;
 
         let mut allocator = Allocator::new(&AllocatorCreateDesc {
             instance: inst.instance.clone(),
@@ -419,14 +480,18 @@ impl VulkanRenderer {
         )?;
         let transform_pipeline = TransformPipeline::new(&dev.device, canvas_target.render_pass)?;
         let layer_stack = LayerStack::new(&dev.device)?;
-        let display = DmabufImage::new(
-            &inst.instance,
-            dev.physical,
-            &dev.device,
-            &dev.external_memory_fd,
-            canvas_size.width,
-            canvas_size.height,
-        )?;
+        let display = (0..DISPLAY_BUFFERS)
+            .map(|_| {
+                DmabufImage::new(
+                    &inst.instance,
+                    dev.physical,
+                    &dev.device,
+                    &dev.external_memory_fd,
+                    canvas_size.width,
+                    canvas_size.height,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
@@ -500,8 +565,9 @@ impl VulkanRenderer {
             filter_active: false,
             filter_spec: crate::filters::FilterSpec::Invert,
             filter_affected: Vec::new(),
-            display: ManuallyDrop::new(display),
-            display_initialised: false,
+            display,
+            // First present rotates to 0, so buffer 0 is written first.
+            display_cursor: DISPLAY_BUFFERS - 1,
             command_pool,
             ring_cmds,
             ring_fences,
@@ -515,13 +581,12 @@ impl VulkanRenderer {
             queue: dev.queue,
             queue_family: dev.queue_family,
             allocator: ManuallyDrop::new(allocator),
-            device: dev.device,
-            debug: inst.debug,
-            instance: inst.instance,
+            device: dev.device.clone(),
+            instance: inst.instance.clone(),
             physical_device: dev.physical,
-            device_name: dev.device_name,
+            device_name: dev.device_name.clone(),
             max_image_dim,
-            _entry: inst.entry,
+            _shared: Rc::clone(&shared),
         };
 
         renderer.transition_to_resting()?;
@@ -1001,7 +1066,7 @@ impl VulkanRenderer {
     }
 
     /// Wait for the most recent submission to finish.
-    pub(super) fn wait_last(&self) -> Result<(), RendererError> {
+    pub fn wait_last(&self) -> Result<(), RendererError> {
         unsafe {
             self.device
                 .wait_for_fences(&[self.ring_fences[self.last_slot]], true, u64::MAX)?;
@@ -1126,7 +1191,9 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.dab_pipelines).destroy(&self.device);
             ManuallyDrop::take(&mut self.pattern_atlas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.dab_buffers).destroy(&self.device, &mut self.allocator);
-            ManuallyDrop::take(&mut self.display).destroy(&self.device);
+            for img in self.display.drain(..) {
+                img.destroy(&self.device);
+            }
             self.device
                 .destroy_framebuffer(self.preview_framebuffer, None);
             self.device
@@ -1140,11 +1207,8 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.stroke).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.canvas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::drop(&mut self.allocator);
-            self.device.destroy_device(None);
-            if let Some(d) = self.debug.take() {
-                d.loader.destroy_debug_utils_messenger(d.messenger, None);
-            }
-            self.instance.destroy_instance(None);
+            // Instance + device are process-shared (see `SharedVk`); they
+            // outlive this renderer and are intentionally not destroyed here.
         }
     }
 }

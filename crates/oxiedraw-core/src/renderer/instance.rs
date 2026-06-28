@@ -8,11 +8,18 @@ use super::RendererError;
 const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 pub(super) struct InstanceBundle {
+    /// Held only to keep the Vulkan loader alive for as long as the instance;
+    /// never read directly. Same for the debug messenger.
+    #[allow(dead_code)]
     pub entry: Entry,
     pub instance: Instance,
+    #[allow(dead_code)]
     pub debug: Option<DebugMessenger>,
 }
 
+/// Lives for the process; its handles are released by the driver at exit, so
+/// the fields are kept alive but never read back.
+#[allow(dead_code)]
 pub(super) struct DebugMessenger {
     pub loader: debug_utils::Instance,
     pub messenger: vk::DebugUtilsMessengerEXT,

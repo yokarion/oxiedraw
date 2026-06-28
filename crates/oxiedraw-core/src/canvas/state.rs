@@ -903,6 +903,16 @@ impl Canvas {
             }
             self.display_version = self.pixels_version;
             self.displayed_mask_idx = want_mask;
+            // Block until the present copy actually finishes on the GPU before we
+            // hand the dmabuf to GTK. The copy is async-submitted, so otherwise we
+            // give GTK a descriptor for a buffer whose write is still in flight;
+            // GTK's compositor read then stalls on the implicit dma-buf fence,
+            // which (on Wayland) withholds the frame callback AND the frame-clock-
+            // gated stylus events - freezing input for 100-300ms. Waiting here
+            // (a few tens of us) moves that sync onto our idle main thread, the
+            // GPU-renderer equivalent of what GSK_RENDERER=cairo does by reading
+            // the buffer back to the CPU.
+            self.renderer.wait_last()?;
         }
         Ok(self.renderer.display_descriptor())
     }
@@ -1958,6 +1968,83 @@ mod tests {
 
         // Far-from-stroke corner stays transparent.
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// A resize recreates the renderer; drawing must keep working afterward.
+    /// Guards the shared-device path: instance/device are created once and
+    /// reused, so the post-resize renderer paints correctly and the original
+    /// content survives the crop. Regression test for stylus-draw lag that
+    /// only appeared after an in-session canvas resize.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn draw_after_resize_paints() {
+        let mut canvas = Canvas::headless(Size::new(128, 64)).expect("canvas init");
+        let brush = BrushEngine::new();
+        brush.size.set(8.0);
+        brush.opacity.set(1.0);
+        let red = Color::new(255, 0, 0);
+
+        // Helper: paint a short horizontal red stroke centred on `cx`.
+        let stroke = |canvas: &mut Canvas, cx: f32| {
+            canvas.begin_stroke(red, 1.0, false).expect("begin_stroke");
+            let mut iter = (0_u32..5).map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let x = (i as f32).mul_add(6.0, cx - 12.0);
+                sample(x, 32.0, u64::from(i) * 10)
+            });
+            let first = iter.next().expect("non-empty");
+            canvas
+                .stamp(|t| brush.begin_stroke(first, red, t))
+                .expect("brush.begin");
+            for s in iter {
+                canvas.stamp(|t| brush.push_sample(s, t)).expect("brush.push");
+            }
+            canvas.stamp(|t| brush.end_stroke(t)).expect("brush.end");
+            canvas.commit_stroke().expect("commit");
+        };
+
+        // Count opaque-red pixels in a region (the default brush is soft /
+        // speed-dynamic, so assert on coverage rather than an exact pixel).
+        let red_count = |bytes: &[u8], stride: usize, x0: usize, x1: usize, y0: usize, y1: usize| {
+            let mut n = 0;
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let i = (y * stride + x) * 4;
+                    if bytes[i + 2] >= 0xF0 && bytes[i + 3] >= 0xF0 {
+                        n += 1;
+                    }
+                }
+            }
+            n
+        };
+
+        // Paint on the original canvas, then expand the width to 192.
+        stroke(&mut canvas, 32.0);
+        let new_size = canvas
+            .apply_crop(CropRect::new(0.0, 0.0, 192.0, 64.0))
+            .expect("apply_crop");
+        assert_eq!(new_size, Size::new(192, 64), "canvas should widen to 192");
+
+        // Draw again, in the newly-added region, on the recreated renderer.
+        stroke(&mut canvas, 160.0);
+
+        let bytes = canvas.read_pixels().expect("readback");
+        // The post-resize stroke painted on the recreated (shared-device) renderer.
+        assert!(
+            red_count(&bytes, 192, 144, 176, 24, 40) > 20,
+            "post-resize stroke did not paint",
+        );
+        // The first stroke survived the crop (content preserved at offset 0).
+        assert!(
+            red_count(&bytes, 192, 8, 56, 24, 40) > 20,
+            "pre-resize content lost after crop",
+        );
+        // Untouched area in the expanded region stays transparent.
+        assert_eq!(
+            red_count(&bytes, 192, 176, 192, 0, 16),
+            0,
+            "expanded area should be transparent",
+        );
     }
 
     /// The incremental (dab-region-clipped) preview must produce the same image

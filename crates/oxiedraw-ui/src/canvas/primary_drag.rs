@@ -25,7 +25,7 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::canvas_paintable::CanvasPaintable;
-use crate::settings::AppSettings;
+use crate::settings::{AppSettings, ShapeCorrectionSettings};
 
 use super::Viewport;
 use super::{
@@ -80,6 +80,11 @@ pub(super) struct PrimaryDragHandler {
     /// undo/redo finalize the corrected shape. `None` for a plain freehand
     /// stroke or once the correction has been committed.
     pending_correction: Rc<RefCell<Option<PendingCorrection>>>,
+    /// Shape-correction settings snapshotted at stroke start. Read on every
+    /// motion event by the idle-timer reset; loading them from disk per event
+    /// (a `read_to_string` + JSON parse) saturated the main thread at stylus
+    /// report rates and jittered the frame clock. They can't change mid-stroke.
+    stroke_shape_correction: RefCell<ShapeCorrectionSettings>,
     // -- crop ------------------------------------------------------------
     crop: CropState,
     crop_handle: Rc<Cell<CropHandle>>,
@@ -232,6 +237,9 @@ impl PrimaryDragHandler {
             src.remove();
         }
         *self.pending_correction.borrow_mut() = None;
+        // Snapshot shape-correction settings for the whole stroke so the
+        // per-event idle-timer reset doesn't hit disk on every motion event.
+        *self.stroke_shape_correction.borrow_mut() = AppSettings::load().shape_correction;
 
         let opacity = self.brush_engine.opacity.get();
         let buildup = self.brush_engine.active_brush().buildup;
@@ -300,12 +308,10 @@ impl PrimaryDragHandler {
         }
         // Build-up brushes composite each step into the layer so repeated
         // dabs accumulate opacity; other brushes just accrue in the stroke
-        // buffer. The present itself is coalesced to the next frame tick.
+        // buffer. The render pump (armed at drag-begin) presents every frame.
         if buildup && let Err(e) = canvas.flush_stroke() {
             tracing::error!(error = %e, "flush_stroke failed");
         }
-        drop(canvas);
-        self.request_present();
     }
 
     fn brush_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
@@ -337,29 +343,6 @@ impl PrimaryDragHandler {
         if buildup && let Err(e) = canvas.flush_stroke() {
             tracing::error!(error = %e, "flush_stroke failed");
         }
-        drop(canvas);
-        self.request_present();
-    }
-
-    /// Coalesce canvas presents to one per frame-clock tick. Pointer-rate
-    /// motion events (125-1000 Hz on a tablet) can fire several times per
-    /// displayed frame; presenting on each one re-composites the whole
-    /// canvas and re-imports the dmabuf for frames that are never shown.
-    /// That wasted GPU work is invisible when the GPU is idle but pushes us
-    /// past the vblank deadline under contention (e.g. an OBS PipeWire
-    /// capture forcing full compositor composition), halving the effective
-    /// frame rate. Instead, the hot paths stamp into the stroke buffer and
-    /// call this; the actual `present()` runs once on the next tick. Stamps
-    /// accumulate in the stroke buffer, so the single present shows every
-    /// dab from the burst.
-    /// Present the current state to the display. With frames-in-flight, the
-    /// present submit is async (non-blocking) and the command-buffer ring
-    /// throttles us by GPU readiness - the CPU runs at most `RING_FRAMES` ahead
-    /// before a slot-reuse wait. GTK coalesces the `queue_draw`s to one snapshot
-    /// per displayed frame, so presenting per input event just keeps the dmabuf
-    /// as fresh as possible (lowest latency) without blocking the input loop.
-    fn request_present(&self) {
-        present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
     }
 
     fn brush_end(&self) {
@@ -494,7 +477,7 @@ impl PrimaryDragHandler {
             src.remove();
         }
 
-        let sc = AppSettings::load().shape_correction;
+        let sc = self.stroke_shape_correction.borrow().clone();
         if !sc.enabled {
             return;
         }
@@ -508,7 +491,9 @@ impl PrimaryDragHandler {
         let paintable_t = self.paintable.clone();
         let area_t = self.area.clone();
         let brush_engine_t = self.brush_engine.clone();
-        let samples = self.stroke_points.borrow().clone();
+        // Share the sample buffer (cheap Rc clone) and read it when the timer
+        // actually fires, instead of deep-cloning the growing Vec every event.
+        let stroke_points = Rc::clone(&self.stroke_points);
         let color = self.pending_color.get();
         let opacity = self.pending_opacity.get();
         let erase = self.pending_erase.get();
@@ -526,6 +511,9 @@ impl PrimaryDragHandler {
                     return glib::ControlFlow::Break;
                 }
 
+                // Read the full stroke now that movement has paused (the timer
+                // only fires after `trigger_delay_ms` of no new samples).
+                let samples = stroke_points.borrow().clone();
                 let positions: Vec<Point> = samples.iter().map(|s| s.position).collect();
                 let Some(shape) = detect_shape(&positions) else {
                     return glib::ControlFlow::Break;
@@ -1761,6 +1749,7 @@ pub(super) fn install_primary_drag(
         pending_erase: Rc::new(Cell::new(false)),
         pending_timer: Rc::new(RefCell::new(None)),
         pending_correction: Rc::new(RefCell::new(None)),
+        stroke_shape_correction: RefCell::new(ShapeCorrectionSettings::default()),
         crop: crop.clone(),
         crop_handle: Rc::new(Cell::new(CropHandle::None)),
         crop_start: Rc::new(Cell::new(Point::ZERO)),
@@ -1790,9 +1779,15 @@ pub(super) fn install_primary_drag(
     let drag = gtk::GestureDrag::new();
     drag.set_button(BUTTON_PRIMARY);
 
+    // Keep the frame clock at steady vsync for the whole drag, so a jittery
+    // stylus event stream still renders smoothly. See `RenderPump`.
     {
         let h = Rc::clone(&handler);
-        drag.connect_drag_begin(move |g, x, y| h.on_begin(g, x, y));
+        let pump = viewport.render_pump();
+        drag.connect_drag_begin(move |g, x, y| {
+            pump.arm();
+            h.on_begin(g, x, y);
+        });
     }
     {
         let h = Rc::clone(&handler);
@@ -1800,7 +1795,11 @@ pub(super) fn install_primary_drag(
     }
     {
         let h = Rc::clone(&handler);
-        drag.connect_drag_end(move |_, _, _| h.on_end());
+        let pump = viewport.render_pump();
+        drag.connect_drag_end(move |_, _, _| {
+            h.on_end();
+            pump.disarm();
+        });
     }
 
     // Let undo/redo land an in-flight shape correction before they touch

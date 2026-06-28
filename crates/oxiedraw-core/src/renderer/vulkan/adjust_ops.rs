@@ -650,7 +650,6 @@ impl VulkanRenderer {
         let acc = self.preview_accumulator();
         let below_cached = self.preview_cache_valid;
         let visible_indices = visible_indices.to_vec();
-        let display_old_layout = self.display_old_layout();
         // Blocking: the per-frame effect chain rewrites the shared input-set
         // ring, so this frame's passes must finish before the next frame reuses
         // those sets. The work is one cheap (dirty-rect) submit.
@@ -690,13 +689,10 @@ impl VulkanRenderer {
             }
             // 4. Fold the dmabuf present copy into this same submit.
             if present {
-                this.record_present_copy(acc.image, display_old_layout);
+                this.record_present_copy(acc.image);
             }
             Ok(())
         });
-        if present {
-            self.display_initialised = true;
-        }
     }
 
     /// Record (no submit) a plain layer composite into `acc`.
