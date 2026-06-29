@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 
@@ -20,7 +20,11 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
     let mut document_bytes: Option<Vec<u8>> = None;
     let mut components_bytes: Option<Vec<u8>> = None;
     let mut fonts_bytes: Option<Vec<u8>> = None;
-    let mut layer_pngs: HashMap<String, Vec<u8>> = HashMap::new();
+    // Layer PNGs kept in archive order, which is the layer z-order the writer
+    // emits. We pair them to layer entries positionally rather than by id, so a
+    // file with duplicate layer ids (a known pre-fix corruption) keeps every
+    // layer's pixels instead of collapsing them in an id-keyed map.
+    let mut layer_pngs: Vec<(String, Vec<u8>)> = Vec::new();
     // Component layer PNGs keyed by "{component_id}/{layer_id}".
     let mut component_pngs: HashMap<String, Vec<u8>> = HashMap::new();
     // Embedded font files keyed by content hash.
@@ -46,7 +50,7 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
             .strip_prefix("layers/")
             .and_then(|s| s.strip_suffix(".png"))
         {
-            layer_pngs.insert(stem.to_string(), bytes);
+            layer_pngs.push((stem.to_string(), bytes));
         } else if let Some(rest) = entry_path
             .strip_prefix("components/")
             .and_then(|s| s.strip_suffix(".png"))
@@ -71,18 +75,47 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
         });
     }
 
-    let document: DocumentData = serde_json::from_slice(
+    let mut document: DocumentData = serde_json::from_slice(
         document_bytes
             .as_deref()
             .ok_or_else(|| ProjectError::MissingEntry("document.json".to_string()))?,
     )?;
 
-    let mut layer_pixels = HashMap::new();
+    // Seed the id counter past every id in the file before minting any new ones,
+    // so the dedup pass below (and any layer added this session) can't reuse a
+    // loaded id.
     for layer in &document.layers {
-        let png_bytes = layer_pngs
-            .get(&layer.id)
-            .ok_or_else(|| ProjectError::MissingEntry(format!("layers/{}.png", layer.id)))?;
+        crate::document::observe_layer_id(&layer.id);
+    }
+
+    // Pair each layer entry with its PNG positionally, since the writer emits one
+    // PNG per layer in z-order. This is the same as an id lookup for a healthy
+    // file but, unlike one, it survives duplicate ids without dropping pixels.
+    let positional = layer_pngs.len() == document.layers.len();
+    let by_id: HashMap<&str, &Vec<u8>> =
+        layer_pngs.iter().map(|(id, b)| (id.as_str(), b)).collect();
+
+    let mut layer_pixels = HashMap::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    for (idx, layer) in document.layers.iter_mut().enumerate() {
+        // Resolve pixels before any renumber: positional for a normal file, by
+        // original id only when the png count disagrees (older/odd file).
+        let png_bytes = if positional {
+            &layer_pngs[idx].1
+        } else {
+            *by_id
+                .get(layer.id.as_str())
+                .ok_or_else(|| ProjectError::MissingEntry(format!("layers/{}.png", layer.id)))?
+        };
         let pixels = decode_png(png_bytes, document.canvas_width, document.canvas_height)?;
+
+        // Duplicate id: hand this layer a fresh one so it gets its own texture
+        // instead of phantom-linking to the first layer that claimed the id. The
+        // first occurrence keeps its id, so any layer_tree reference stays valid.
+        if !seen_ids.insert(layer.id.clone()) {
+            layer.id = crate::document::generate_layer_id();
+            seen_ids.insert(layer.id.clone());
+        }
         layer_pixels.insert(layer.id.clone(), pixels);
     }
 
@@ -91,6 +124,9 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
         Some(bytes) => serde_json::from_slice(&bytes)?,
         None => Vec::new(),
     };
+    for comp in &components {
+        crate::components::observe_component_id(&comp.id);
+    }
     let mut component_pixels = HashMap::new();
     for comp in &components {
         for layer in &comp.layers {
@@ -315,6 +351,78 @@ mod tests {
             project.font_bytes.get("abc123").map(Vec::as_slice),
             Some(b"FONTDATA".as_slice())
         );
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A 1x1 RGBA PNG of a single solid color, for building test archives.
+    fn solid_png(rgba: [u8; 4]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut enc = png::Encoder::new(&mut out, 1, 1);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut w = enc.write_header().expect("png header");
+        w.write_image_data(&rgba).expect("png data");
+        drop(w);
+        out
+    }
+
+    /// A corrupt archive with two layers sharing one id (the pre-fix layer-id
+    /// collision) loads as two distinct layers, each keeping its own pixels by
+    /// archive position rather than one clobbering the other.
+    #[test]
+    fn duplicate_layer_ids_are_split_and_keep_pixels() {
+        use std::io::Cursor;
+
+        let red = solid_png([255, 0, 0, 255]);
+        let blue = solid_png([0, 0, 255, 255]);
+
+        let path = std::env::temp_dir().join("oxiedraw_dup_layer_ids.oxiedrawproj");
+        {
+            let file = std::fs::File::create(&path).expect("create");
+            let mut ar = tar::Builder::new(file);
+            let mut append = |name: &str, bytes: &[u8]| {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(bytes.len() as u64);
+                h.set_mode(0o644);
+                h.set_cksum();
+                ar.append_data(&mut h, name, Cursor::new(bytes.to_vec()))
+                    .expect("append");
+            };
+            append(
+                "manifest.json",
+                br#"{"schema_version":7,"app_version":"t","created_at":""}"#,
+            );
+            append(
+                "document.json",
+                br#"{"canvas_width":1,"canvas_height":1,"dpi":96.0,"active_layer":0,
+                     "layers":[
+                       {"id":"0000000000000004","name":"A","visible":true},
+                       {"id":"0000000000000004","name":"B","visible":true}
+                     ]}"#,
+            );
+            // Same filename twice, in layer order: red for A, blue for B.
+            append("layers/0000000000000004.png", &red);
+            append("layers/0000000000000004.png", &blue);
+            ar.finish().expect("finish");
+        }
+
+        let project = load(&path).expect("load");
+        let layers = &project.document.layers;
+        assert_eq!(layers.len(), 2);
+        assert_ne!(layers[0].id, layers[1].id, "duplicate ids must be split");
+
+        // decode_png returns BGRA, so red -> [0,0,255,255], blue -> [255,0,0,255].
+        assert_eq!(
+            project.layer_pixels.get(&layers[0].id).map(Vec::as_slice),
+            Some([0u8, 0, 255, 255].as_slice()),
+            "first layer keeps its own (red) pixels"
+        );
+        assert_eq!(
+            project.layer_pixels.get(&layers[1].id).map(Vec::as_slice),
+            Some([255u8, 0, 0, 255].as_slice()),
+            "second layer keeps its own (blue) pixels, not clobbered"
+        );
+
         std::fs::remove_file(&path).ok();
     }
 }

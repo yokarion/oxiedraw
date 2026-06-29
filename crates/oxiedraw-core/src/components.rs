@@ -31,6 +31,18 @@ fn generate_component_id() -> String {
     format!("c{n:015x}")
 }
 
+/// Advance the component-id counter past an externally supplied id (loaded from
+/// a project). Same reset-on-launch hazard as [`crate::document::observe_layer_id`]:
+/// without it a reopened document re-mints ids that collide with existing
+/// components, whose layer PNGs then overwrite each other in the archive.
+pub(crate) fn observe_component_id(id: &str) {
+    if let Some(hex) = id.strip_prefix('c')
+        && let Ok(n) = u64::from_str_radix(hex, 16)
+    {
+        crate::document::bump_counter_past(&COMPONENT_ID_COUNTER, n);
+    }
+}
+
 /// One raster layer inside a component, with its pixels held in CPU memory
 /// (BGRA8, `component.size`, row-major, premultiplied).
 #[derive(Debug, Clone, Serialize, Deserialize)]

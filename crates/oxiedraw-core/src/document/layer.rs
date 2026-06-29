@@ -13,6 +13,29 @@ pub(crate) fn generate_layer_id() -> String {
     format!("{n:016x}")
 }
 
+/// Advance the layer-id counter past an externally supplied id (e.g. one loaded
+/// from a project file). The counter is process-global and starts at 1 each
+/// launch, so without this a reopened document would mint ids that collide with
+/// its own existing layers - producing duplicate `layers/<id>.png` entries that
+/// clobber each other on the next save/load.
+pub(crate) fn observe_layer_id(id: &str) {
+    if let Ok(n) = u64::from_str_radix(id, 16) {
+        bump_counter_past(&LAYER_ID_COUNTER, n);
+    }
+}
+
+/// Raise `counter` to at least `value + 1` if it is currently lower.
+pub(crate) fn bump_counter_past(counter: &AtomicU64, value: u64) {
+    let target = value.saturating_add(1);
+    let mut current = counter.load(Ordering::Relaxed);
+    while current < target {
+        match counter.compare_exchange_weak(current, target, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 /// Where a component instance sits on the canvas. Centre-based with a
 /// rotation angle, mirroring [`TransformRect`] so the existing affine remap
 /// can render the master texture into the instance's layer slot.
@@ -210,6 +233,7 @@ impl Layer {
     }
 
     pub(crate) fn with_id(id: String, name: impl Into<String>, visible: bool) -> Self {
+        observe_layer_id(&id);
         Self {
             id,
             name: name.into(),
@@ -284,7 +308,22 @@ impl Layer {
 
 #[cfg(test)]
 mod tests {
-    use super::BlendMode;
+    use super::{generate_layer_id, observe_layer_id, BlendMode};
+
+    // After observing a loaded id, freshly generated ids must sort past it, so a
+    // reopened document can never re-mint an id that already exists in the file.
+    #[test]
+    fn observed_id_is_never_reissued() {
+        // A high sentinel keeps this robust against the process-global counter
+        // being advanced by other tests running in parallel.
+        let sentinel = "00000000ffff0000";
+        observe_layer_id(sentinel);
+        let next = generate_layer_id();
+        assert!(
+            next.as_str() > sentinel,
+            "generated id {next} must be past observed {sentinel}"
+        );
+    }
 
     // The dropdown index (to_index/from_index) round-trips for every mode and is
     // independent of the shader contract (to_gpu).

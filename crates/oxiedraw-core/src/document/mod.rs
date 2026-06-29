@@ -7,6 +7,7 @@ pub use grouping::{
     build_composite_steps, collect_leaf_ids, CompositeStep, LayerGroup, LayerTreeNode,
 };
 pub use layer::{BlendMode, ComponentInstance, Layer, LayerKind, Placement};
+pub(crate) use layer::{bump_counter_past, generate_layer_id, observe_layer_id};
 pub use properties::DocumentProperties;
 pub use state::LayerState;
 
