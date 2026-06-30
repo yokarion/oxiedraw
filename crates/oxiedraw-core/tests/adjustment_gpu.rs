@@ -550,6 +550,63 @@ fn stroke_colours_the_silhouette_edge() {
     assert!(corner_a < 16, "far corner should stay transparent, got A{corner_a}");
 }
 
+/// A thick centred stroke over a straight half-plane edge: exercises the
+/// jump-flood band at a radius where the old per-pixel disc scan was slowest.
+/// Backdrop: left half (x < 32) opaque white, right half transparent, so the
+/// silhouette edge is the vertical line x = 32. A centred thickness-16 stroke
+/// must paint a ~16px-wide red band straddling that line, leaving the deep
+/// interior white and the far exterior transparent.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn thick_stroke_band_spans_silhouette_edge() {
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+
+    let mut base = vec![0u8; (size.width * size.height) as usize * 4];
+    for y in 0..size.height {
+        for x in 0..size.width / 2 {
+            let i = ((y * size.width + x) * 4) as usize;
+            base[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+        }
+    }
+    canvas.add_layer_with_pixels("base", &base).unwrap();
+
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::Stroke {
+                color: Color { r: 255, g: 0, b: 0 },
+                opacity: 1.0,
+                thickness: 16.0,
+                offset: 0.0, // centred on the edge
+                softness: StrokeSoftness::Pixelated,
+            }),
+        )
+        .unwrap();
+
+    let out = canvas.read_pixels().unwrap();
+    let at = |x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2], out[i + 3])
+    };
+    let is_red = |(b, g, r, a): (u8, u8, u8, u8)| a > 150 && r > 150 && g < 100 && b < 100;
+
+    // Just inside (x=30) and just outside (x=34) the edge: inside the band.
+    assert!(is_red(at(30, 32)), "inside-edge pixel not in band: {:?}", at(30, 32));
+    assert!(is_red(at(34, 32)), "outside-edge pixel not in band: {:?}", at(34, 32));
+
+    // Deep interior stays white (no band reaches it).
+    let (b, g, r, a) = at(5, 32);
+    assert!(
+        a > 200 && r > 200 && g > 200 && b > 200,
+        "deep interior should stay white, got B{b} G{g} R{r} A{a}"
+    );
+    // Far exterior stays transparent.
+    let (_, _, _, far_a) = at(60, 32);
+    assert!(far_a < 16, "far exterior should stay transparent, got A{far_a}");
+}
+
 /// Build BGRA8 pixels: opaque red in the left half (`x < width/2`), transparent
 /// elsewhere. Used to tell folder-scoped from global adjustments.
 fn left_half_red(size: Size) -> Vec<u8> {

@@ -19,7 +19,7 @@ use ash::vk;
 use crate::filters::FilterSpec;
 
 use super::super::RendererError;
-use super::super::filters::Scratch;
+use super::super::filters::{JfaSlot, Scratch};
 use super::VulkanRenderer;
 
 impl VulkanRenderer {
@@ -389,53 +389,92 @@ impl VulkanRenderer {
         self.cmd_end_fullscreen_pass();
     }
 
-    /// Run the adjustment stroke pass: trace the backdrop's alpha edge (binding
-    /// 0) gated by the mask (binding 1) and write the premultiplied stroke band
-    /// into scratch A. Uses the wider 48-byte push layout. The result lives in
-    /// `Scratch::A`; the caller OVER-composites it onto the canvas.
-    pub(super) fn run_stroke_pass(
-        &mut self,
+    /// Record (no submit) the full jump-flood stroke band into `Scratch::A`:
+    /// seed the backdrop silhouette, flood the nearest-edge distance field with
+    /// halving step sizes, then resolve the coloured band. Descriptor sets are
+    /// taken from the input ring starting at `*cursor` (one per pass, advanced
+    /// past those used), so the chain can share a submission with other passes.
+    /// `push` is the 48-byte resolve push (color, params, texel); `thickness`
+    /// drives how many flood passes the band radius needs. The caller
+    /// OVER-composites `Scratch::A` onto the accumulator.
+    pub(super) fn cmd_stroke_band(
+        &self,
         backdrop_view: vk::ImageView,
         backdrop_img: vk::Image,
         mask_view: vk::ImageView,
         mask_img: vk::Image,
         push: [f32; 12],
-    ) -> Result<(), RendererError> {
-        let set = self.filter_resources.input_set(0);
+        thickness: f32,
+        cursor: &mut usize,
+    ) {
+        let texel = [push[8], push[9]];
+        let jfa_rp = self.filter_resources.jfa_render_pass;
+        let layout16 = self.filter_resources.pipeline_layout;
+
+        // Seed: classify the backdrop silhouette into coord A.
+        let seed_set = self.filter_resources.input_set(*cursor);
+        *cursor += 1;
         self.filter_resources
-            .write_input(&self.device, set, backdrop_view, mask_view, mask_view);
-        let layout = self.filter_resources.stroke_layout;
-        let pipeline = self.filter_resources.stroke;
+            .write_input(&self.device, seed_set, backdrop_view, backdrop_view, backdrop_view);
+        self.barrier(backdrop_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        let seed_fb = self.filter_resources.coord_framebuffer(JfaSlot::A);
+        let seed_pipe = self.filter_resources.jfa_seed;
+        self.cmd_fullscreen_draw(seed_set, layout16, seed_pipe, jfa_rp, seed_fb, &[
+            texel[0], texel[1], 0.0, 0.0,
+        ]);
+
+        // Flood: halving steps, ping-ponging the coord buffers.
+        let mut src = JfaSlot::A;
+        for step in jfa_step_sizes(thickness) {
+            let dst = src.other();
+            let set = self.filter_resources.input_set(*cursor);
+            *cursor += 1;
+            let src_view = self.filter_resources.coord_view(src);
+            let src_img = self.filter_resources.coord_handle(src);
+            self.filter_resources
+                .write_input(&self.device, set, src_view, src_view, src_view);
+            self.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            let dst_fb = self.filter_resources.coord_framebuffer(dst);
+            let flood_pipe = self.filter_resources.jfa_flood;
+            #[allow(clippy::cast_precision_loss)]
+            let step_f = step as f32;
+            self.cmd_fullscreen_draw(set, layout16, flood_pipe, jfa_rp, dst_fb, &[
+                texel[0], texel[1], step_f, 0.0,
+            ]);
+            src = dst;
+        }
+
+        // Resolve: colour the band from the converged field into Scratch::A.
+        let resolve_set = self.filter_resources.input_set(*cursor);
+        *cursor += 1;
+        let coord_view = self.filter_resources.coord_view(src);
+        let coord_img = self.filter_resources.coord_handle(src);
+        self.filter_resources
+            .write_input(&self.device, resolve_set, coord_view, backdrop_view, mask_view);
+        self.barrier(coord_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        self.barrier(backdrop_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        if mask_img != backdrop_img && mask_img != coord_img {
+            self.barrier(mask_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        }
+        let resolve_fb = self.filter_resources.framebuffer(Scratch::A);
+        let resolve_pipe = self.filter_resources.jfa_resolve;
+        let resolve_layout = self.filter_resources.stroke_layout;
         let render_pass = self.canvas_target.render_pass;
-        let framebuffer = self.filter_resources.framebuffer(Scratch::A);
-        // Blocking: rewrites the shared input_set(0) (see filter_pass3).
-        self.record_and_submit(|this| {
-            this.cmd_run_stroke_pass(
-                set, layout, pipeline, render_pass, framebuffer, backdrop_img, mask_img, push,
-            );
-            Ok(())
-        })
+        self.cmd_fullscreen_draw(resolve_set, resolve_layout, resolve_pipe, render_pass, resolve_fb, &push);
     }
 
-    /// Record (no submit) the stroke band pass into the current buffer. `set`
-    /// must already be written (backdrop on 0, mask on 1). Lets the batched
-    /// adjustment preview include a Stroke effect in its single submit.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) fn cmd_run_stroke_pass(
-        &mut self,
+    /// Begin a fullscreen pass, bind `set`, push `push` (its byte length, so a
+    /// 16- or 48-byte push both work), draw the fullscreen triangle, end. The
+    /// caller barriers the sources first.
+    fn cmd_fullscreen_draw(
+        &self,
         set: vk::DescriptorSet,
         layout: vk::PipelineLayout,
         pipeline: vk::Pipeline,
         render_pass: vk::RenderPass,
         framebuffer: vk::Framebuffer,
-        backdrop_img: vk::Image,
-        mask_img: vk::Image,
-        push: [f32; 12],
+        push: &[f32],
     ) {
-        self.barrier(backdrop_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-        if mask_img != backdrop_img {
-            self.barrier(mask_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-        }
         self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
         unsafe {
             self.device.cmd_bind_descriptor_sets(
@@ -447,7 +486,7 @@ impl VulkanRenderer {
                 &[],
             );
             let push_bytes =
-                std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), std::mem::size_of_val(&push));
+                std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), std::mem::size_of_val(push));
             self.device.cmd_push_constants(
                 self.command_buffer,
                 layout,
@@ -508,4 +547,29 @@ const fn color_layers() -> vk::ImageSubresourceLayers {
         base_array_layer: 0,
         layer_count: 1,
     }
+}
+
+/// Jump-flood step sizes for a stroke of `thickness` pixels: the smallest power
+/// of two covering the band radius, halving down to 1, plus one extra step-1
+/// pass (JFA+1) to clean up the rare propagation error. The number of passes is
+/// `O(log thickness)`, where the old disc scan was `O(thickness^2)` per pixel.
+fn jfa_step_sizes(thickness: f32) -> Vec<u32> {
+    // Seeds must reach the band's far edge (~thickness) plus an AA pixel.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let radius = (thickness.ceil() as u32).saturating_add(2).clamp(1, 64);
+    let mut start = 1u32;
+    while start < radius {
+        start <<= 1;
+    }
+    let mut steps = Vec::new();
+    let mut step = start;
+    loop {
+        steps.push(step);
+        if step == 1 {
+            break;
+        }
+        step >>= 1;
+    }
+    steps.push(1);
+    steps
 }

@@ -722,7 +722,9 @@ impl VulkanRenderer {
                     EffectKind::HueSatBright { .. } | EffectKind::Invert => n += 2,
                     EffectKind::Blur { .. } => n += 3, // H + V + mask-mix
                     EffectKind::Sharpen { .. } => n += 4, // blur H + V + sharpen + mask-mix
-                    EffectKind::Stroke { .. } => n += 1, // stroke band pass
+                    // The jump-flood band must flood full-canvas (no dab clip),
+                    // so a stroke drops the chain to the per-submit path.
+                    EffectKind::Stroke { .. } => return None,
                 }
             }
         }
@@ -887,7 +889,7 @@ impl VulkanRenderer {
     /// Record (no submit) a Stroke effect: render the band into scratch A then
     /// OVER-composite it onto `acc`, advancing `cursor`.
     fn cmd_apply_stroke(
-        &mut self,
+        &self,
         acc: Accumulator,
         kind: EffectKind,
         mask_view: ash::vk::ImageView,
@@ -926,17 +928,7 @@ impl VulkanRenderer {
             0.0,
         ];
 
-        let layout = self.filter_resources.stroke_layout;
-        let pipeline = self.filter_resources.stroke;
-        let render_pass = self.canvas_target.render_pass;
-        let fb_a = self.filter_resources.framebuffer(Scratch::A);
-        let set = self.filter_resources.input_set(*cursor);
-        *cursor += 1;
-        self.filter_resources
-            .write_input(&self.device, set, acc.view, mask_view, mask_view);
-        self.cmd_run_stroke_pass(
-            set, layout, pipeline, render_pass, fb_a, acc.image, mask_img, push,
-        );
+        self.cmd_stroke_band(acc.view, acc.image, mask_view, mask_img, push, thickness, cursor);
 
         let comp_set = self.filter_resources.composite_set(Scratch::A);
         let stroke_img = self.filter_resources.scratch_handle(Scratch::A);
@@ -1371,13 +1363,17 @@ impl VulkanRenderer {
             0.0,
         ];
 
-        self.run_stroke_pass(acc.view, acc.image, mask_view, mask_img, push)?;
-
-        // OVER-blend the finished stroke band onto the accumulator.
+        // Build the jump-flood band into Scratch::A and OVER-blend it onto the
+        // accumulator, all in one submit. The scoped/unbatched preview paths run
+        // this with `clip` unset, so the flood is full-canvas (correct distance
+        // propagation); a Stroke effect forces those paths via
+        // `batched_input_pass_count`.
         use crate::renderer::filters::Scratch;
         let set = self.filter_resources.composite_set(Scratch::A);
         let stroke_img = self.filter_resources.scratch_handle(Scratch::A);
         self.record_and_submit(|this| {
+            let mut cursor = 0usize;
+            this.cmd_stroke_band(acc.view, acc.image, mask_view, mask_img, push, thickness, &mut cursor);
             this.barrier(stroke_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
             this.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, 0, 1.0);
             Ok(())

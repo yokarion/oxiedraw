@@ -26,7 +26,10 @@ const INVERT_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_
 const BOX_BLUR_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_box_blur.frag.spv"));
 const SHARPEN_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_sharpen.frag.spv"));
-const STROKE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/adjust_stroke.frag.spv"));
+const JFA_SEED_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jfa_seed.frag.spv"));
+const JFA_FLOOD_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jfa_flood.frag.spv"));
+const JFA_RESOLVE_FRAG_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/jfa_resolve.frag.spv"));
 const MASK_MIX_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_mask_mix.frag.spv"));
 
@@ -36,7 +39,7 @@ pub(super) const FILTER_PUSH_BYTES: u32 = 16;
 /// adjustment preview can record into a single submit before falling back to
 /// the per-submit path.
 pub(super) const INPUT_RING: usize = 16;
-/// Stroke pass push: 3x vec4 (color, params, texel). See `adjust_stroke.frag`.
+/// Stroke resolve push: 3x vec4 (color, params, texel). See `jfa_resolve.frag`.
 pub(super) const STROKE_PUSH_BYTES: u32 = 48;
 
 /// Which scratch image currently holds a pass's output.
@@ -48,6 +51,22 @@ pub(super) enum Scratch {
 
 impl Scratch {
     /// The opposite slot - the natural destination when ping-ponging.
+    pub(super) const fn other(self) -> Self {
+        match self {
+            Self::A => Self::B,
+            Self::B => Self::A,
+        }
+    }
+}
+
+/// Which jump-flood coordinate buffer is the current source while ping-ponging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum JfaSlot {
+    A,
+    B,
+}
+
+impl JfaSlot {
     pub(super) const fn other(self) -> Self {
         match self {
             Self::A => Self::B,
@@ -83,11 +102,21 @@ pub(super) struct FilterResources {
     pub sharpen: vk::Pipeline,
     pub mask_mix: vk::Pipeline,
 
-    /// Adjustment-layer stroke pass. Reuses the 3-sampler `input_set` (backdrop
-    /// on binding 0, mask on binding 1) but needs a wider 48-byte push, so it
-    /// has its own pipeline layout.
+    /// Adjustment-layer stroke via jump flooding. `jfa_seed` and `jfa_flood`
+    /// render into the `coord_*` ping-pong buffers (16-bit float, RG = offset to
+    /// nearest inside pixel, BA = nearest outside) through `jfa_render_pass`;
+    /// `jfa_resolve` reads the converged field and writes the coloured band into
+    /// `Scratch::A` through the canvas render pass. Resolve needs the wider
+    /// 48-byte push, so it reuses `stroke_layout`.
     pub stroke_layout: vk::PipelineLayout,
-    pub stroke: vk::Pipeline,
+    pub jfa_seed: vk::Pipeline,
+    pub jfa_flood: vk::Pipeline,
+    pub jfa_resolve: vk::Pipeline,
+    pub jfa_render_pass: vk::RenderPass,
+    pub coord_a: Image,
+    pub coord_b: Image,
+    pub coord_fb_a: vk::Framebuffer,
+    pub coord_fb_b: vk::Framebuffer,
 
     /// Descriptor sets that bind each scratch image for the layer-composite
     /// pipeline, so a finished scratch image can be drawn into the preview.
@@ -153,9 +182,39 @@ impl FilterResources {
         let mask_mix =
             create_pipeline(device, pipeline_layout, canvas_render_pass, MASK_MIX_FRAG_SPV)?;
 
+        // Jump-flood resources. The coordinate buffers store signed pixel
+        // offsets, so they need a float format, not the 8-bit sRGB canvas one.
+        let coord_usage =
+            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED;
+        let coord_a = Image::new_2d(
+            device,
+            allocator,
+            "jfa-coord-a",
+            super::vulkan::JFA_FORMAT,
+            canvas_extent,
+            coord_usage,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let coord_b = Image::new_2d(
+            device,
+            allocator,
+            "jfa-coord-b",
+            super::vulkan::JFA_FORMAT,
+            canvas_extent,
+            coord_usage,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+        let jfa_render_pass = create_color_render_pass(device, super::vulkan::JFA_FORMAT)?;
+        let coord_fb_a = create_framebuffer(device, jfa_render_pass, canvas_extent, coord_a.view)?;
+        let coord_fb_b = create_framebuffer(device, jfa_render_pass, canvas_extent, coord_b.view)?;
+
+        let jfa_seed = create_pipeline(device, pipeline_layout, jfa_render_pass, JFA_SEED_FRAG_SPV)?;
+        let jfa_flood =
+            create_pipeline(device, pipeline_layout, jfa_render_pass, JFA_FLOOD_FRAG_SPV)?;
         let stroke_layout =
             create_pipeline_layout_sized(device, input_set_layout, STROKE_PUSH_BYTES)?;
-        let stroke = create_pipeline(device, stroke_layout, canvas_render_pass, STROKE_FRAG_SPV)?;
+        let jfa_resolve =
+            create_pipeline(device, stroke_layout, canvas_render_pass, JFA_RESOLVE_FRAG_SPV)?;
 
         let composite_pool = create_composite_pool(device)?;
         let composite_set_a = allocate_composite_set(
@@ -189,7 +248,14 @@ impl FilterResources {
             sharpen,
             mask_mix,
             stroke_layout,
-            stroke,
+            jfa_seed,
+            jfa_flood,
+            jfa_resolve,
+            jfa_render_pass,
+            coord_a,
+            coord_b,
+            coord_fb_a,
+            coord_fb_b,
             composite_pool,
             composite_set_a,
             composite_set_b,
@@ -286,7 +352,9 @@ impl FilterResources {
             device.destroy_pipeline(self.box_blur, None);
             device.destroy_pipeline(self.sharpen, None);
             device.destroy_pipeline(self.mask_mix, None);
-            device.destroy_pipeline(self.stroke, None);
+            device.destroy_pipeline(self.jfa_seed, None);
+            device.destroy_pipeline(self.jfa_flood, None);
+            device.destroy_pipeline(self.jfa_resolve, None);
             device.destroy_pipeline_layout(self.stroke_layout, None);
             device.destroy_pipeline_layout(self.pipeline_layout, None);
             device.destroy_descriptor_pool(self.composite_pool, None);
@@ -295,8 +363,37 @@ impl FilterResources {
             device.destroy_sampler(self.sampler, None);
             device.destroy_framebuffer(self.framebuffer_a, None);
             device.destroy_framebuffer(self.framebuffer_b, None);
+            device.destroy_framebuffer(self.coord_fb_a, None);
+            device.destroy_framebuffer(self.coord_fb_b, None);
+            device.destroy_render_pass(self.jfa_render_pass, None);
             self.scratch_a.destroy(device, allocator);
             self.scratch_b.destroy(device, allocator);
+            self.coord_a.destroy(device, allocator);
+            self.coord_b.destroy(device, allocator);
+        }
+    }
+
+    /// Image handle for a jump-flood coordinate slot (for barriers).
+    pub(super) const fn coord_handle(&self, which: JfaSlot) -> vk::Image {
+        match which {
+            JfaSlot::A => self.coord_a.handle,
+            JfaSlot::B => self.coord_b.handle,
+        }
+    }
+
+    /// Image view for a jump-flood coordinate slot (sampler source).
+    pub(super) const fn coord_view(&self, which: JfaSlot) -> vk::ImageView {
+        match which {
+            JfaSlot::A => self.coord_a.view,
+            JfaSlot::B => self.coord_b.view,
+        }
+    }
+
+    /// Framebuffer to render a jump-flood pass into a coordinate slot.
+    pub(super) const fn coord_framebuffer(&self, which: JfaSlot) -> vk::Framebuffer {
+        match which {
+            JfaSlot::A => self.coord_fb_a,
+            JfaSlot::B => self.coord_fb_b,
         }
     }
 }
@@ -467,6 +564,34 @@ fn create_sampler(device: &Device) -> Result<vk::Sampler, RendererError> {
         .min_lod(0.0)
         .max_lod(0.0);
     Ok(unsafe { device.create_sampler(&info, None)? })
+}
+
+/// A single-attachment render pass for `format`, resting in GENERAL like the
+/// rest of the renderer. Used for the jump-flood coordinate buffers, whose
+/// float format differs from the canvas render pass's.
+fn create_color_render_pass(
+    device: &Device,
+    format: vk::Format,
+) -> Result<vk::RenderPass, RendererError> {
+    let attachments = [vk::AttachmentDescription::default()
+        .format(format)
+        .samples(vk::SampleCountFlags::TYPE_1)
+        .load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .store_op(vk::AttachmentStoreOp::STORE)
+        .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+        .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+        .initial_layout(vk::ImageLayout::GENERAL)
+        .final_layout(vk::ImageLayout::GENERAL)];
+    let color_refs = [vk::AttachmentReference::default()
+        .attachment(0)
+        .layout(vk::ImageLayout::GENERAL)];
+    let subpasses = [vk::SubpassDescription::default()
+        .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+        .color_attachments(&color_refs)];
+    let info = vk::RenderPassCreateInfo::default()
+        .attachments(&attachments)
+        .subpasses(&subpasses);
+    Ok(unsafe { device.create_render_pass(&info, None)? })
 }
 
 fn create_framebuffer(

@@ -121,6 +121,10 @@ pub struct EdgesBuffer {
 pub const CANVAS_FORMAT: vk::Format = vk::Format::B8G8R8A8_SRGB;
 /// Stroke alpha-mask format. Single 8-bit channel, linear (no sRGB).
 pub const STROKE_FORMAT: vk::Format = vk::Format::R8_UNORM;
+/// Jump-flood coordinate-buffer format. Stores signed pixel offsets (two per
+/// pixel: nearest inside + nearest outside), so it needs float channels with
+/// range past the canvas, not the 8-bit sRGB canvas format.
+pub(crate) const JFA_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
 
 /// BGRA8 is 4 bytes per pixel. Used to size staging buffers and the
 /// readback `Vec<u8>` returned to callers.
@@ -679,6 +683,16 @@ impl VulkanRenderer {
                 ),
                 full_image_barrier(
                     this.filter_resources.scratch_b.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                ),
+                full_image_barrier(
+                    this.filter_resources.coord_a.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                ),
+                full_image_barrier(
+                    this.filter_resources.coord_b.handle,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::GENERAL,
                 ),
