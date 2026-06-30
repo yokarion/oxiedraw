@@ -53,6 +53,61 @@ struct Accumulator {
     framebuffer: vk::Framebuffer,
 }
 
+/// One open scope while walking a scoped preview: the accumulator children
+/// compose into, the descriptor set that samples it when it folds into its
+/// parent, and (for a freshly rebuilt static folder) the cache slot its result
+/// is copied to.
+struct ScopeFrame {
+    acc: Accumulator,
+    fold_set: vk::DescriptorSet,
+    cache_ordinal: Option<usize>,
+    used_depth: bool,
+}
+
+/// Pre-order folder metadata for a scoped step stream.
+#[derive(Clone, Copy)]
+struct GroupSpan {
+    /// Pre-order index of this folder among all folders (its cache key).
+    ordinal: usize,
+    /// Step index of the matching `ExitGroup`.
+    exit: usize,
+    /// Whether the stroke target layer composites inside this folder.
+    contains_target: bool,
+}
+
+/// Index each `EnterGroup` step to its [`GroupSpan`]. A folder "contains" the
+/// target when the target's `Layer` step falls between its `EnterGroup` and
+/// `ExitGroup`. Folders are numbered in pre-order so the numbering is stable for
+/// a fixed step stream (which holds for the duration of one stroke).
+fn scoped_group_spans(steps: &[CompositeStep], target_idx: usize) -> Vec<Option<GroupSpan>> {
+    let target_step = steps
+        .iter()
+        .position(|s| matches!(s, CompositeStep::Layer(i) if *i == target_idx));
+    let mut spans = vec![None; steps.len()];
+    let mut open: Vec<(usize, usize)> = Vec::new(); // (enter index, ordinal)
+    let mut next_ordinal = 0usize;
+    for (i, step) in steps.iter().enumerate() {
+        match step {
+            CompositeStep::EnterGroup => {
+                open.push((i, next_ordinal));
+                next_ordinal += 1;
+            }
+            CompositeStep::ExitGroup => {
+                if let Some((enter, ordinal)) = open.pop() {
+                    let contains_target = target_step.is_some_and(|t| t > enter && t < i);
+                    spans[enter] = Some(GroupSpan {
+                        ordinal,
+                        exit: i,
+                        contains_target,
+                    });
+                }
+            }
+            CompositeStep::Layer(_) => {}
+        }
+    }
+    spans
+}
+
 /// How the live in-flight content is merged into the target layer when building
 /// a folder-scoped preview: a brush stroke over the target, or a warped copy of
 /// the target (the transform tool's live preview).
@@ -99,6 +154,7 @@ impl VulkanRenderer {
     pub fn set_layer_adjustment(&mut self, idx: usize, data: Option<AdjustmentData>) {
         self.layer_stack.set_adjustment(idx, data);
         self.preview_cache_valid = false;
+        self.scoped_cache_valid = false;
     }
 
     /// `true` when at least one slot is an adjustment layer.
@@ -305,17 +361,28 @@ impl VulkanRenderer {
         target: PreviewTarget,
     ) -> Result<(), RendererError> {
         self.clip = None;
+        let spans = scoped_group_spans(steps, target_idx);
         let root = self.preview_accumulator();
         self.record_and_submit(|this| {
             this.cmd_clear_image(root.image, [0.0, 0.0, 0.0, 0.0]);
             Ok(())
         })?;
-        let mut stack: Vec<Accumulator> = vec![root];
+        let mut frames: Vec<ScopeFrame> = vec![ScopeFrame {
+            acc: root,
+            fold_set: vk::DescriptorSet::null(),
+            cache_ordinal: None,
+            used_depth: false,
+        }];
+        // `depth` counts only the rebuilt folders currently open (the ones that
+        // consume a working `group_accumulators` slot); cached folders are
+        // skipped whole and never take a slot.
         let mut depth = 0usize;
-        for step in steps {
-            match *step {
+        let mut built_cache = false;
+        let mut i = 0usize;
+        while i < steps.len() {
+            match steps[i] {
                 CompositeStep::Layer(idx) => {
-                    let acc = *stack.last().expect("non-empty accumulator stack");
+                    let acc = frames.last().expect("non-empty accumulator stack").acc;
                     if idx == target_idx {
                         self.record_and_submit(|this| {
                             this.cmd_compose_preview_target(acc, target_idx, target);
@@ -326,24 +393,70 @@ impl VulkanRenderer {
                     } else {
                         self.compose_layer_into(acc, idx)?;
                     }
+                    i += 1;
                 }
                 CompositeStep::EnterGroup => {
-                    let acc = self.ensure_group_accumulator(depth)?;
-                    self.record_and_submit(|this| {
-                        this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
-                        Ok(())
-                    })?;
-                    stack.push(acc);
-                    depth += 1;
+                    let span = spans[i].expect("EnterGroup has a matching span");
+                    // A folder without the stroke target is constant this stroke.
+                    // If it was cached on an earlier frame, blend the cache in and
+                    // jump past its (possibly effect-heavy) interior entirely.
+                    let cached = !span.contains_target
+                        && self.scoped_cache_valid
+                        && self.scoped_group_cache.len() > span.ordinal;
+                    if cached {
+                        let acc = self.scoped_group_cache_accumulator(span.ordinal);
+                        let fold_set = self.scoped_group_cache[span.ordinal].descriptor_set;
+                        frames.push(ScopeFrame {
+                            acc,
+                            fold_set,
+                            cache_ordinal: None,
+                            used_depth: false,
+                        });
+                        i = span.exit; // resume at the matching ExitGroup
+                    } else {
+                        let acc = self.ensure_group_accumulator(depth)?;
+                        self.record_and_submit(|this| {
+                            this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                            Ok(())
+                        })?;
+                        let fold_set = self.group_accumulators[depth].descriptor_set;
+                        // Persist this folder's result for reuse only if it is
+                        // static (does not contain the target).
+                        let cache_ordinal = (!span.contains_target).then_some(span.ordinal);
+                        frames.push(ScopeFrame {
+                            acc,
+                            fold_set,
+                            cache_ordinal,
+                            used_depth: true,
+                        });
+                        depth += 1;
+                        i += 1;
+                    }
                 }
                 CompositeStep::ExitGroup => {
-                    let group_acc = stack.pop().expect("ExitGroup without EnterGroup");
-                    depth -= 1;
-                    let parent = *stack.last().expect("folder nested above the canvas root");
-                    let src_set = self.group_accumulators[depth].descriptor_set;
+                    let frame = frames.pop().expect("ExitGroup without EnterGroup");
+                    if frame.used_depth {
+                        depth -= 1;
+                    }
+                    // Save a freshly built static folder so later frames skip it.
+                    if let Some(ord) = frame.cache_ordinal {
+                        let cache = self.ensure_scoped_group_cache(ord)?;
+                        let src = frame.acc.image;
+                        self.record_and_submit(|this| {
+                            this.cmd_copy_image_full(src, cache.image);
+                            Ok(())
+                        })?;
+                        built_cache = true;
+                    }
+                    let parent = frames
+                        .last()
+                        .expect("folder nested above the canvas root")
+                        .acc;
+                    let group_img = frame.acc.image;
+                    let src_set = frame.fold_set;
                     self.record_and_submit(|this| {
                         this.barrier(
-                            group_acc.image,
+                            group_img,
                             vk::ImageLayout::GENERAL,
                             vk::ImageLayout::GENERAL,
                         );
@@ -356,10 +469,33 @@ impl VulkanRenderer {
                         );
                         Ok(())
                     })?;
+                    i += 1;
                 }
             }
         }
+        if built_cache {
+            self.scoped_cache_valid = true;
+        }
         Ok(())
+    }
+
+    /// Lazily allocate the per-stroke static-folder cache up to `ordinal` and
+    /// return its accumulator. Mirrors [`Self::ensure_group_accumulator`].
+    fn ensure_scoped_group_cache(&mut self, ordinal: usize) -> Result<Accumulator, RendererError> {
+        while self.scoped_group_cache.len() <= ordinal {
+            let acc = self.create_group_accumulator()?;
+            self.scoped_group_cache.push(acc);
+        }
+        Ok(self.scoped_group_cache_accumulator(ordinal))
+    }
+
+    fn scoped_group_cache_accumulator(&self, ordinal: usize) -> Accumulator {
+        let ga = &self.scoped_group_cache[ordinal];
+        Accumulator {
+            image: ga.image.handle,
+            view: ga.image.view,
+            framebuffer: ga.framebuffer,
+        }
     }
 
     /// Record (no submit) the in-flight target content into `acc` per the

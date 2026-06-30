@@ -589,6 +589,16 @@ pub(super) fn tree_from_core(nodes: &[LayerTreeNode]) -> Vec<LayerNode> {
     nodes.iter().rev().map(node_from_core).collect()
 }
 
+// Groups only nest inside other groups, so a group anywhere in the tree implies
+// one at the top level; a top-level scan answers "has folders" for either tree.
+fn ui_tree_has_groups(nodes: &[LayerNode]) -> bool {
+    nodes.iter().any(|n| matches!(n, LayerNode::Group(_)))
+}
+
+fn core_tree_has_groups(nodes: &[LayerTreeNode]) -> bool {
+    nodes.iter().any(|n| matches!(n, LayerTreeNode::Group(_)))
+}
+
 // Push the current panel folder structure to the canvas (recomposites so
 // folder-scoped adjustments update). Call after any folder-structure change.
 pub(super) fn commit_groups(tree: &[LayerNode], canvas: &mut Canvas) {
@@ -1087,6 +1097,16 @@ fn build_layers_page(
         let canvas = Rc::clone(canvas);
         Rc::new(move || {
             let c = canvas.borrow();
+            // A freshly loaded document gets its folder tree set on the canvas
+            // after this panel was built, so the build-time seed saw an empty
+            // tree. Adopt the canvas tree here, before the commit below would
+            // push the panel's flat tree back over the saved folders.
+            {
+                let mut tree = ui.tree.borrow_mut();
+                if !ui_tree_has_groups(&tree) && core_tree_has_groups(c.layer_tree()) {
+                    *tree = tree_from_core(c.layer_tree());
+                }
+            }
             let snap = c.layers().snapshot();
             reconcile_tree(&mut ui.tree.borrow_mut(), &snap);
             sync_tree_order_from_canvas(&mut ui.tree.borrow_mut(), &c);

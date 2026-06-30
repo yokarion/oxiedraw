@@ -66,6 +66,7 @@ impl VulkanRenderer {
         // The shared below-stack cache may hold a prior stroke's target; force a
         // rebuild for this transform's below-stack on the first frame.
         self.preview_cache_valid = false;
+        self.scoped_cache_valid = false;
 
         let src_extent = vk::Extent2D {
             width: src_w,

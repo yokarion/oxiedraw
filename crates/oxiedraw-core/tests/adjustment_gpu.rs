@@ -1038,3 +1038,87 @@ fn mask_edit_preview_shows_effect_not_mask() {
         committed[center + 2],
     );
 }
+
+/// Live-stroke scoped preview for a target OUTSIDE a folder-bounded adjustment.
+/// Stack (bottom->top): blue C (root), folder { red-left B, brightness-0 adj },
+/// transparent target T (root, on top). While stroking T the folder's adjustment
+/// must blacken only the folder content; C below stays blue (the flat fast path
+/// used to bleed the effect onto everything below the adjustment). The second
+/// preview frame reuses the cached static folder and must match the first.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn live_scoped_preview_clips_folder_and_cache_matches() {
+    use oxiedraw_core::color::Color;
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let c = canvas
+        .add_layer_with_pixels("C-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let b = canvas
+        .add_layer_with_pixels("B-red", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+    let t = canvas
+        .add_layer_with_pixels("T", &vec![0u8; (size.width * size.height) as usize * 4])
+        .unwrap();
+
+    let snap = canvas.layers().snapshot();
+    let tree = vec![
+        LayerTreeNode::layer(snap[c].id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![
+                LayerTreeNode::layer(snap[b].id.clone()),
+                LayerTreeNode::layer(snap[adj].id.clone()),
+            ],
+        }),
+        LayerTreeNode::layer(snap[t].id.clone()),
+    ];
+    canvas.set_layer_tree(tree).unwrap();
+
+    canvas.layers().set_active(Some(t));
+    canvas
+        .begin_stroke(Color { r: 255, g: 255, b: 255 }, 1.0, false)
+        .unwrap();
+
+    let at = |out: &[u8], x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+
+    let frame1 = canvas.read_pixels().unwrap(); // builds the folder cache
+    let frame2 = canvas.read_pixels().unwrap(); // reuses the folder cache
+
+    // Left half: folder content (red B) blackened by the brightness-0 adjustment.
+    let (lb, lg, lr) = at(&frame1, 16, 32);
+    assert!(
+        lb <= 6 && lg <= 6 && lr <= 6,
+        "folder content should be blackened, got B{lb} G{lg} R{lr}"
+    );
+    // Right half: C (blue) below the folder must NOT be touched by the effect.
+    let (rb, rg, rr) = at(&frame1, 48, 32);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "adjustment bled onto the layer below its folder, got B{rb} G{rg} R{rr}"
+    );
+
+    // The cached second frame must be pixel-identical to the first.
+    assert!(
+        frame1 == frame2,
+        "cached scoped preview frame diverged from the first (uncached) frame"
+    );
+}

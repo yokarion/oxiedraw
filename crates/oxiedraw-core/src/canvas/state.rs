@@ -656,23 +656,22 @@ impl Canvas {
                         linear,
                         ctx.opacity,
                     )
+                } else if let Some(steps) = self.folder_scoped_steps(&self.layers.snapshot()) {
+                    // Folder-bounded adjustment: scope the effect to its folder
+                    // (the flat path below would apply it to the whole backdrop).
+                    self.renderer.render_preview_scoped_and_read(
+                        &steps,
+                        ctx.layer_idx,
+                        linear,
+                        ctx.opacity,
+                    )
                 } else if self.effective_adjustment_above(ctx.layer_idx) {
-                    let snapshot = self.layers.snapshot();
-                    if let Some(steps) = self.folder_scoped_steps(&snapshot) {
-                        self.renderer.render_preview_scoped_and_read(
-                            &steps,
-                            ctx.layer_idx,
-                            linear,
-                            ctx.opacity,
-                        )
-                    } else {
-                        self.renderer.render_preview_adjusted_and_read(
-                            &visibilities,
-                            ctx.layer_idx,
-                            linear,
-                            ctx.opacity,
-                        )
-                    }
+                    self.renderer.render_preview_adjusted_and_read(
+                        &visibilities,
+                        ctx.layer_idx,
+                        linear,
+                        ctx.opacity,
+                    )
                 } else {
                     self.renderer.render_preview_layered_and_read(
                         &visibilities,
@@ -858,30 +857,31 @@ impl Canvas {
                                 ctx.opacity,
                             )?;
                         }
-                        // Live effect preview: when an effective adjustment sits
-                        // above the painted layer, composite the in-flight stroke
-                        // through the effect chain so the canvas shows the
-                        // adjusted result while drawing.
+                        // Folder-bounded adjustment: the flat fast path can't clip
+                        // the effect to its folder (it would bleed onto every layer
+                        // below). The scoped path caches static folders per stroke,
+                        // so it stays cheap even when painting outside that folder.
+                        else if let Some(steps) =
+                            self.folder_scoped_steps(&self.layers.snapshot())
+                        {
+                            self.renderer.render_preview_scoped_and_present(
+                                &steps,
+                                ctx.layer_idx,
+                                linear,
+                                ctx.opacity,
+                            )?;
+                        }
+                        // Live effect preview: when an effective (non-folder)
+                        // adjustment sits above the painted layer, composite the
+                        // in-flight stroke through the effect chain so the canvas
+                        // shows the adjusted result while drawing.
                         else if self.effective_adjustment_above(ctx.layer_idx) {
-                            // Folder-scoped preview when a folder bounds an
-                            // adjustment, so the live result clips like the
-                            // commit will; otherwise the fast global path.
-                            let snapshot = self.layers.snapshot();
-                            if let Some(steps) = self.folder_scoped_steps(&snapshot) {
-                                self.renderer.render_preview_scoped_and_present(
-                                    &steps,
-                                    ctx.layer_idx,
-                                    linear,
-                                    ctx.opacity,
-                                )?;
-                            } else {
-                                self.renderer.render_preview_adjusted_and_present(
-                                    &visibilities,
-                                    ctx.layer_idx,
-                                    linear,
-                                    ctx.opacity,
-                                )?;
-                            }
+                            self.renderer.render_preview_adjusted_and_present(
+                                &visibilities,
+                                ctx.layer_idx,
+                                linear,
+                                ctx.opacity,
+                            )?;
                         } else {
                             self.renderer.render_preview_and_present(
                                 &visibilities,
@@ -1019,7 +1019,8 @@ impl Canvas {
         // fall back to the slower stamp + present (the adjusted preview path).
         // Strokes no adjustment influences keep the fast path - no slowdown.
         let needs_adjusted_preview = self.effective_adjustment_above(ctx.layer_idx)
-            || self.painting_hidden_adjustment_mask(ctx.layer_idx);
+            || self.painting_hidden_adjustment_mask(ctx.layer_idx)
+            || self.folder_scoped_steps(&self.layers.snapshot()).is_some();
         if self.renderer.filter_active()
             || self.renderer.fill_active()
             || self.renderer.shape_active()

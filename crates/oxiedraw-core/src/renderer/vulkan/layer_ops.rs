@@ -21,6 +21,7 @@ impl VulkanRenderer {
         self.layer_stack.set_blend(idx, mode, opacity);
         // The cached below-stack may include this layer; force a rebuild.
         self.preview_cache_valid = false;
+        self.scoped_cache_valid = false;
     }
 
     /// Append a new layer image and clear it to fully transparent.

@@ -227,6 +227,15 @@ pub struct VulkanRenderer {
     /// nesting level, used by the folder-scoped composite so an adjustment
     /// clips to its enclosing folder. Indexed by depth (0 = first folder).
     pub(super) group_accumulators: Vec<GroupAccumulator>,
+    /// Per-stroke cache of finished folder composites that do NOT contain the
+    /// stroke target, keyed by the folder's pre-order ordinal in the scoped step
+    /// stream. A folder's interior is isolated (it never reads the parent
+    /// backdrop), so when it doesn't contain the target its result is constant
+    /// for the whole stroke: built once, then re-blended each frame instead of
+    /// re-running its (often expensive) effect chain. Invalidated whenever
+    /// `preview_cache_valid` is.
+    pub(super) scoped_group_cache: Vec<GroupAccumulator>,
+    pub(super) scoped_cache_valid: bool,
     /// Set only while building a live mask-edit preview: the adjustment slot
     /// whose mask the in-flight stroke is painting. `apply_adjustment_to` runs
     /// that slot's effect against the committed mask MERGED with the stroke, so
@@ -543,6 +552,8 @@ impl VulkanRenderer {
             blend_scratch: ManuallyDrop::new(blend_scratch),
             blend_scratch_dst_set,
             group_accumulators: Vec::new(),
+            scoped_group_cache: Vec::new(),
+            scoped_cache_valid: false,
             mask_edit: None,
             blend_descriptor_pool,
             transform_pipeline: ManuallyDrop::new(transform_pipeline),
@@ -765,6 +776,7 @@ impl VulkanRenderer {
     /// mutation.
     pub fn invalidate_preview_cache(&mut self) {
         self.preview_cache_valid = false;
+        self.scoped_cache_valid = false;
         // The below-stack changed, so the next preview frame must rebuild the
         // whole canvas before incremental updates resume.
         self.preview_needs_full = true;
@@ -1177,6 +1189,9 @@ impl Drop for VulkanRenderer {
                 .destroy_descriptor_pool(self.blend_descriptor_pool, None);
             ManuallyDrop::take(&mut self.blend_scratch).destroy(&self.device, &mut self.allocator);
             for mut ga in self.group_accumulators.drain(..) {
+                ga.destroy(&self.device, &mut self.allocator);
+            }
+            for mut ga in self.scoped_group_cache.drain(..) {
                 ga.destroy(&self.device, &mut self.allocator);
             }
             ManuallyDrop::take(&mut self.layer_blend_pipeline).destroy(&self.device);
