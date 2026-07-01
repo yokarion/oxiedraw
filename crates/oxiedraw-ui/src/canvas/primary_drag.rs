@@ -645,7 +645,11 @@ impl PrimaryDragHandler {
         };
 
         self.crop.rect.set(new_rect);
-        self.crop.notify_rect_changed();
+        // NB: deliberately do NOT call notify_rect_changed() here. It syncs the
+        // numeric W/H spinner and label, and updating those widgets queues a
+        // resize that GTK4 propagates up to the canvas Picture, re-allocating it
+        // under the pen and cancelling the stylus grab mid-drag. The overlay
+        // still tracks live via set_crop below; crop_end() syncs the numbers.
         self.paintable.set_crop(new_rect, self.crop.overlay.get());
     }
 

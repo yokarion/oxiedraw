@@ -63,6 +63,13 @@ fn build_header(crop: &CropState) -> gtk::Box {
     let dim_label = gtk::Label::builder()
         .label("")
         .halign(gtk::Align::End)
+        .xalign(1.0)
+        // Fixed width: the dimensions update live during a crop drag, and a
+        // width change here would relayout up to the canvas Picture, cancelling
+        // the in-progress stylus grab. A fixed request keeps the size stable.
+        .width_chars(13)
+        .max_width_chars(13)
+        .ellipsize(gtk::pango::EllipsizeMode::End)
         .build();
     dim_label.add_css_class("dim-label");
     dim_label.inline_css("font-size: 12px; opacity: 0.6;");

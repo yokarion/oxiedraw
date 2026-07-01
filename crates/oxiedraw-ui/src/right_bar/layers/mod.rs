@@ -34,6 +34,9 @@ const PANEL_MARGIN: i32 = 8;
 const TAB_SPACING: i32 = 6;
 
 const LIST_PADDING: f64 = 8.0;
+// Gap between the row's right edge and the scrollbar. Kept small so rows run
+// close to the scrollbar; the left/top inset stays at LIST_PADDING.
+const LIST_PADDING_RIGHT: f64 = 0.8;
 const ITEM_HEIGHT: f64 = 44.0;
 const ITEM_GAP: f64 = 4.0;
 const ITEM_RADIUS: f64 = 6.0;
@@ -60,6 +63,10 @@ const SLOT_HEIGHT: f64 = ITEM_HEIGHT + ITEM_GAP;
 // at the very edge (px/sec). Speed ramps linearly across the zone.
 const AUTOSCROLL_EDGE: f64 = 56.0;
 const AUTOSCROLL_MAX_SPEED: f64 = 700.0;
+
+// Assumed minimum thumb size (px) when mapping a stylus drag onto the vertical
+// scrollbar, so the thumb keeps tracking the pen even on very long lists.
+const SCROLL_THUMB_MIN: f64 = 24.0;
 
 // --- Color types and fallbacks ---
 type Rgb = (f64, f64, f64);
@@ -193,6 +200,11 @@ pub(super) struct Ui {
     // Icon currently under the pointer (row index + zone), for the hover
     // highlight. Only the clickable per-row icons (eye / sliders / mask) set it.
     pub(super) hover: Rc<RefCell<Option<(usize, HitZone)>>>,
+    // Vertical scroll of the list. We scroll by a draw offset rather than a
+    // GtkScrolledWindow so autoscroll never re-allocates the drawing area (which
+    // would cancel an in-progress stylus reorder). `value` is the content pixel
+    // at the top of the viewport.
+    pub(super) vadj: gtk::Adjustment,
 }
 
 impl Ui {
@@ -214,7 +226,13 @@ impl Ui {
             blend_sync: Rc::new(RefCell::new(None)),
             mask_view: Rc::new(RefCell::new(None)),
             hover: Rc::new(RefCell::new(None)),
+            vadj: gtk::Adjustment::new(0.0, 0.0, 0.0, SLOT_HEIGHT, 0.0, 0.0),
         }
+    }
+
+    /// Content pixel currently at the top of the viewport.
+    fn scroll_offset(&self) -> f64 {
+        self.vadj.value()
     }
 
     /// Reload the blend-mode/opacity controls from the current selection.
@@ -1079,9 +1097,10 @@ fn build_layers_page(
         }
     }
 
-    let area = gtk::DrawingArea::builder().hexpand(true).build();
-    sync_height(&area, &ui);
+    let area = gtk::DrawingArea::builder().hexpand(true).vexpand(true).build();
     install_list_draw(&area, &ui);
+    sync_height(&area, &ui);
+
     install_list_input(
         &area,
         &ui,
@@ -1126,15 +1145,58 @@ fn build_layers_page(
     page.append(&build_layers_header(&ui, &area, canvas, redraw, toaster, history));
     page.append(&build_blend_controls(&ui, canvas, redraw, history));
 
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .hexpand(true)
-        .child(&area)
-        .build();
-    page.append(&scroll);
+    // List body: the drawing area plus our own vertical scrollbar. We manage the
+    // scroll offset ourselves (via `ui.vadj`) instead of a GtkScrolledWindow so
+    // that autoscroll during a reorder only redraws - it never re-allocates the
+    // drawing area, which would cancel an in-progress stylus grab.
+    let list_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    list_row.set_vexpand(true);
+    list_row.set_hexpand(true);
+    list_row.append(&area);
+    let scrollbar = gtk::Scrollbar::new(gtk::Orientation::Vertical, Some(&ui.vadj));
+    install_scrollbar_pen_drag(&scrollbar);
+    list_row.append(&scrollbar);
+    page.append(&list_row);
     page.append(&build_layers_footer());
+
+    // Redraw on any scroll (wheel, scrollbar drag, autoscroll).
+    {
+        let area = area.clone();
+        ui.vadj.connect_value_changed(move |_| area.queue_draw());
+    }
+    // Auto-hide the scrollbar when everything fits, mirroring the old
+    // ScrolledWindow's Automatic policy.
+    {
+        let scrollbar = scrollbar.clone();
+        let update = move |adj: &gtk::Adjustment| {
+            scrollbar.set_visible(adj.upper() > adj.page_size() + 0.5);
+        };
+        update(&ui.vadj);
+        ui.vadj.connect_changed(move |adj| update(adj));
+    }
+    // Viewport height changed: refresh the page size (and thus the scrollbar
+    // thumb / auto-hide). Done here, outside the draw callback, so toggling the
+    // scrollbar's visibility happens in a safe context.
+    {
+        let ui = ui.clone();
+        let area_w = area.clone();
+        area.connect_resize(move |_, _w, h| {
+            update_list_metrics(&ui, f64::from(h));
+            area_w.queue_draw();
+        });
+    }
+    // Mouse-wheel / touchpad scrolling over the list.
+    {
+        let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+        let ui = ui.clone();
+        wheel.connect_scroll(move |_, _dx, dy| {
+            let adj = &ui.vadj;
+            let max = (adj.upper() - adj.page_size()).max(0.0);
+            adj.set_value((adj.value() + dy * ITEM_HEIGHT).clamp(0.0, max));
+            glib::Propagation::Stop
+        });
+        area.add_controller(wheel);
+    }
 
     // Rebuild tree from canvas state, update height, and redraw. Called after
     // undo/redo so the panel stays in sync with mutations applied to the canvas.
@@ -1335,6 +1397,8 @@ fn build_blend_controls(
     opacity.set_hexpand(true);
     opacity.set_draw_value(false);
     opacity.set_tooltip_text(Some("Opacity of the selected layers"));
+    // Match the brush opacity slider so stylus drags actually move it.
+    crate::widgets::slider::install_pen_drag(&opacity);
 
     let opacity_row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1570,15 +1634,39 @@ const fn slot_top(index: usize) -> f64 {
     count_f64(index).mul_add(SLOT_HEIGHT, LIST_PADDING)
 }
 
+/// Total content height in pixels for `count` visible rows.
+fn list_content_height(count: usize) -> f64 {
+    let body =
+        count_f64(count).mul_add(ITEM_HEIGHT, count_f64(count.saturating_sub(1)) * ITEM_GAP);
+    LIST_PADDING.mul_add(2.0, body)
+}
+
+/// Keep the scroll adjustment in sync with the content and viewport size, then
+/// clamp the current offset. `viewport_h` of 0 (not yet allocated) leaves the
+/// page size alone - the draw callback sets it once a real height is known.
+fn update_list_metrics(ui: &Ui, viewport_h: f64) {
+    let snapshot = ui.state.snapshot();
+    let count = compute_visible_rows(&ui.tree.borrow(), &snapshot).len();
+    let total = list_content_height(count);
+    let adj = &ui.vadj;
+    if (adj.upper() - total).abs() > 0.5 {
+        adj.set_upper(total);
+    }
+    if viewport_h > 0.0 && (adj.page_size() - viewport_h).abs() > 0.5 {
+        adj.set_page_size(viewport_h);
+        adj.set_page_increment(viewport_h);
+    }
+    let max = (adj.upper() - adj.page_size()).max(0.0);
+    if adj.value() > max {
+        adj.set_value(max);
+    }
+}
+
 pub(super) fn sync_height(area: &gtk::DrawingArea, ui: &Ui) {
     let snapshot = ui.state.snapshot();
     reconcile_tree(&mut ui.tree.borrow_mut(), &snapshot);
-    let count = compute_visible_rows(&ui.tree.borrow(), &snapshot).len();
-    let body = count_f64(count)
-        .mul_add(ITEM_HEIGHT, count_f64(count.saturating_sub(1)) * ITEM_GAP);
-    let total = LIST_PADDING.mul_add(2.0, body);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    area.set_content_height(total.ceil() as i32);
+    update_list_metrics(ui, f64::from(area.height()));
+    area.queue_draw();
 }
 
 // --- Drawing ---
@@ -1593,6 +1681,11 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         let multi = ui.multi_selected.borrow();
         let thumbnails = ui.thumbnails.borrow();
         let width = f64::from(width_px);
+
+        // Manual scroll: translate the whole list up by the scroll offset. The
+        // adjustment metrics are maintained by sync_height (content) and the
+        // area's resize handler (viewport), never from inside draw.
+        ctx.translate(0.0, -ui.scroll_offset());
 
         let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
         let count = rows.len();
@@ -1798,7 +1891,7 @@ fn draw_row(
 ) {
     let indent = depth_f * INDENT_STEP;
     let left = LIST_PADDING;
-    let row_w = LIST_PADDING.mul_add(-2.0, width).max(0.0);
+    let row_w = (width - LIST_PADDING - LIST_PADDING_RIGHT).max(0.0);
     let right = left + row_w;
 
     let (visible, name) = match &row.kind {
@@ -2204,7 +2297,7 @@ fn hit_zone(
 ) -> HitZone {
     let indent = count_f64(depth) * INDENT_STEP;
     let content_left = LIST_PADDING + indent;
-    let row_w = LIST_PADDING.mul_add(-2.0, widget_width).max(0.0);
+    let row_w = (widget_width - LIST_PADDING - LIST_PADDING_RIGHT).max(0.0);
     let right = LIST_PADDING + row_w;
 
     // Handle (rightmost).
@@ -2263,6 +2356,69 @@ pub(super) fn open_adjustment_editor(ui: &Ui, area: &gtk::DrawingArea, flat_idx:
         }
 }
 
+/// Give a vertical scrollbar stylus pen-drag handling, so it can be dragged with
+/// a tablet pen (GTK4 drops continuous stylus drags on the built-in gesture). In
+/// GTK4 `GtkScrollbar` wraps an adjustment directly (it is not a `GtkRange`), so
+/// map the pen's Y position over the widget height onto the adjustment value.
+fn install_scrollbar_pen_drag(sb: &gtk::Scrollbar) {
+    let stylus = gtk::GestureStylus::new();
+    stylus.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let pressed = Rc::new(std::cell::Cell::new(false));
+
+    let set_from_y: Rc<dyn Fn(f64)> = {
+        let sb = sb.clone();
+        Rc::new(move |y: f64| {
+            let height = f64::from(sb.height());
+            let adj = sb.adjustment();
+            let lower = adj.lower();
+            let page = adj.page_size();
+            let span = adj.upper() - lower;
+            if height <= 0.0 || span <= page {
+                return;
+            }
+            // Center the thumb on the pen so it tracks 1:1: map over the travel
+            // the thumb actually has (height minus its own size), not the whole
+            // widget height.
+            let thumb = (page / span * height).clamp(SCROLL_THUMB_MIN, height);
+            let travel = (height - thumb).max(1.0);
+            let t = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
+            adj.set_value(lower + t * (span - page));
+        })
+    };
+
+    {
+        let pressed = Rc::clone(&pressed);
+        let set_from_y = Rc::clone(&set_from_y);
+        stylus.connect_down(move |_, _x, y| {
+            pressed.set(true);
+            set_from_y(y);
+        });
+    }
+    {
+        let pressed = Rc::clone(&pressed);
+        let set_from_y = Rc::clone(&set_from_y);
+        stylus.connect_motion(move |_, _x, y| {
+            if pressed.get() {
+                set_from_y(y);
+            }
+        });
+    }
+    {
+        let pressed = Rc::clone(&pressed);
+        stylus.connect_up(move |_, _, _| pressed.set(false));
+    }
+    sb.add_controller(stylus);
+}
+
+/// True when the controller's current event came from a tablet pen or eraser.
+/// Used to keep the mouse `GestureDrag` from also handling stylus events, which
+/// are routed through a dedicated `GestureStylus` instead.
+fn event_is_stylus(controller: &impl IsA<gtk::EventController>) -> bool {
+    controller
+        .current_event_device()
+        .is_some_and(|d| d.source() == gdk::InputSource::Pen)
+}
+
 fn install_list_input(
     area: &gtk::DrawingArea,
     ui: &Ui,
@@ -2273,14 +2429,20 @@ fn install_list_input(
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_reorder: &Rc<dyn Fn()>,
 ) {
-    let drag_gesture = gtk::GestureDrag::new();
-    drag_gesture.set_button(gdk::BUTTON_PRIMARY);
+    // Shared drag logic, driven by both the mouse (GestureDrag) and the stylus
+    // (GestureStylus). GestureDrag drops pen motion on GTK4, so the pen path is
+    // routed through a dedicated stylus gesture below; the closures here keep
+    // the two paths identical.
 
-    // --- drag_begin ---
-    {
+    // --- drag begin ---
+    let on_begin: Rc<dyn Fn(f64, f64)> = {
         let area_w = area.clone();
         let ui = ui.clone();
-        drag_gesture.connect_drag_begin(move |_gesture, x, y| {
+        Rc::new(move |x: f64, y: f64| {
+            // Guard against both gestures starting a drag for the same press.
+            if ui.drag.borrow().is_some() {
+                return;
+            }
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
             let Some(row_idx) = item_at(y, rows.len()) else { return };
@@ -2330,11 +2492,8 @@ fn install_list_input(
                     // Auto-scroll when the grabbed row nears a viewport edge. Speed
                     // ramps linearly from zero at the zone boundary to max at the edge.
                     let mut current_row = current_row;
-                    if let Some(scroll) = widget
-                        .ancestor(gtk::ScrolledWindow::static_type())
-                        .and_downcast::<gtk::ScrolledWindow>()
                     {
-                        let vadj = scroll.vadjustment();
+                        let vadj = tick_ui.vadj.clone();
                         let page = vadj.page_size();
                         let pointer_y =
                             tick_ui.drag.borrow().as_ref().map_or(0.0, |d| d.pointer_y);
@@ -2426,32 +2585,30 @@ fn install_list_input(
                 });
             }
             area_w.queue_draw();
-        });
-    }
+        })
+    };
 
-    // --- drag_update ---
-    {
+    // --- drag update (pointer_y is the absolute Y in the area) ---
+    let on_update: Rc<dyn Fn(f64)> = {
         let area_w = area.clone();
         let ui = ui.clone();
-        drag_gesture.connect_drag_update(move |gesture, _dx, dy| {
-            let Some((_sx, sy)) = gesture.start_point() else { return };
+        Rc::new(move |pointer_y: f64| {
             let mut drag_ref = ui.drag.borrow_mut();
             let Some(d) = drag_ref.as_mut() else { return };
             if d.zone != HitZone::Handle {
                 return;
             }
-            let pointer_y = sy + dy;
             d.pointer_y = pointer_y;
             let snapshot = ui.state.snapshot();
             let count = compute_visible_rows(&ui.tree.borrow(), &snapshot).len();
             d.current_row = insertion_index(pointer_y - d.grab_offset_y, count);
             drop(drag_ref);
             area_w.queue_draw();
-        });
-    }
+        })
+    };
 
-    // --- drag_end ---
-    {
+    // --- drag end ---
+    let on_end: Rc<dyn Fn(f64, f64, gdk::ModifierType)> = {
         let area_w = area.clone();
         let ui = ui.clone();
         let redraw = redraw.clone();
@@ -2459,15 +2616,12 @@ fn install_list_input(
         let select_layer_content = Rc::clone(select_layer_content);
         let history = Rc::clone(history);
         let prepare_reorder = Rc::clone(prepare_reorder);
-        drag_gesture.connect_drag_end(move |gesture, dx, dy| {
+        Rc::new(move |dx: f64, dy: f64, modifiers: gdk::ModifierType| {
             let drag_state = ui.drag.borrow_mut().take();
             let Some(d) = drag_state else { return };
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
 
-            let modifiers = gesture
-                .current_event()
-                .map_or(gdk::ModifierType::empty(), |ev| ev.modifier_state());
             let shift = modifiers.contains(gdk::ModifierType::SHIFT_MASK);
             let ctrl = modifiers.contains(gdk::ModifierType::CONTROL_MASK);
 
@@ -2671,10 +2825,116 @@ fn install_list_input(
                     }
                 }
             }
+        })
+    };
+
+    // A drag is owned by exactly one gesture for its whole lifetime. Without
+    // this, the mouse GestureDrag (which still tracks the pen via pointer
+    // emulation) fires a spurious drag_end when autoscroll scrolls the viewport
+    // and breaks the emulated grab - dropping the pen reorder. Owner: 0 none,
+    // 1 mouse, 2 pen.
+    let drag_owner = Rc::new(std::cell::Cell::new(0u8));
+
+    // Mouse drag; defers to the stylus gesture for pen input. Gesture Y is
+    // viewport-relative; add the scroll offset to reach content space.
+    let drag_gesture = gtk::GestureDrag::new();
+    drag_gesture.set_button(gdk::BUTTON_PRIMARY);
+    {
+        let on_begin = Rc::clone(&on_begin);
+        let drag_owner = Rc::clone(&drag_owner);
+        let ui = ui.clone();
+        drag_gesture.connect_drag_begin(move |g, x, y| {
+            if drag_owner.get() != 0 || event_is_stylus(g) {
+                return;
+            }
+            drag_owner.set(1);
+            on_begin(x, y + ui.scroll_offset());
         });
     }
-
+    {
+        let on_update = Rc::clone(&on_update);
+        let drag_owner = Rc::clone(&drag_owner);
+        let ui = ui.clone();
+        drag_gesture.connect_drag_update(move |g, _dx, dy| {
+            if drag_owner.get() != 1 {
+                return;
+            }
+            let Some((_sx, sy)) = g.start_point() else { return };
+            on_update(sy + dy + ui.scroll_offset());
+        });
+    }
+    {
+        let on_end = Rc::clone(&on_end);
+        let drag_owner = Rc::clone(&drag_owner);
+        drag_gesture.connect_drag_end(move |g, dx, dy| {
+            if drag_owner.get() != 1 {
+                return;
+            }
+            drag_owner.set(0);
+            let modifiers = g
+                .current_event()
+                .map_or(gdk::ModifierType::empty(), |ev| ev.modifier_state());
+            on_end(dx, dy, modifiers);
+        });
+    }
     area.add_controller(drag_gesture);
+
+    // Stylus drag - GestureDrag drops pen motion on GTK4, so drive the shared
+    // logic from a dedicated stylus gesture on the `area`. This works during
+    // autoscroll because we scroll by a draw offset (`ui.vadj`), which only
+    // redraws - the area is never re-allocated, so the pen grab survives.
+    // Coordinates arrive viewport-relative; add the scroll offset for content.
+    let stylus = gtk::GestureStylus::new();
+    {
+        // Viewport-space start point, for click-vs-drag distance at release.
+        let start = Rc::new(std::cell::Cell::new((0.0_f64, 0.0_f64)));
+        {
+            let drag_owner = Rc::clone(&drag_owner);
+            let start = Rc::clone(&start);
+            let on_begin = Rc::clone(&on_begin);
+            let ui = ui.clone();
+            stylus.connect_down(move |_, x, y| {
+                if drag_owner.get() != 0 {
+                    return;
+                }
+                drag_owner.set(2);
+                start.set((x, y));
+                on_begin(x, y + ui.scroll_offset());
+            });
+        }
+        {
+            let drag_owner = Rc::clone(&drag_owner);
+            let on_update = Rc::clone(&on_update);
+            let ui = ui.clone();
+            stylus.connect_motion(move |_, _x, y| {
+                if drag_owner.get() == 2 {
+                    on_update(y + ui.scroll_offset());
+                }
+            });
+        }
+        {
+            let drag_owner = Rc::clone(&drag_owner);
+            let start = Rc::clone(&start);
+            let on_end = Rc::clone(&on_end);
+            stylus.connect_up(move |g, x, y| {
+                if drag_owner.get() != 2 {
+                    return;
+                }
+                drag_owner.set(0);
+                let (sx, sy) = start.get();
+                let modifiers = g
+                    .current_event()
+                    .map_or(gdk::ModifierType::empty(), |ev| ev.modifier_state());
+                on_end(x - sx, y - sy, modifiers);
+            });
+        }
+        // Deliberately no `connect_cancel`: when autoscroll runs, GtkGestureStylus
+        // cancels its sequence, but it keeps delivering raw down/motion/up events
+        // for the pen that is still in contact. Aborting the drag on cancel would
+        // drop the layer mid-autoscroll; instead we keep the drag alive and let
+        // the real pen-up (which still fires) finish it.
+    }
+    area.add_controller(stylus);
 
     // Double-click to rename.
     let rename_click = gtk::GestureClick::new();
@@ -2690,9 +2950,10 @@ fn install_list_input(
                 return;
             }
             gesture.set_state(gtk::EventSequenceState::Claimed);
+            let cy = y + ui_c.scroll_offset();
             let snapshot = ui_c.state.snapshot();
             let rows = compute_visible_rows(&ui_c.tree.borrow(), &snapshot);
-            let Some(row_idx) = item_at(y, rows.len()) else { return };
+            let Some(row_idx) = item_at(cy, rows.len()) else { return };
             let row = &rows[row_idx];
             // Double-clicking a component layer opens the component for editing
             // instead of renaming the layer.
@@ -2713,7 +2974,7 @@ fn install_list_input(
                 is_layer,
                 &ui_c,
                 &canvas_c,
-                slot_top(row_idx),
+                slot_top(row_idx) - ui_c.scroll_offset(),
                 &history,
             );
         });
@@ -2730,11 +2991,12 @@ fn install_list_input(
             }
             #[allow(deprecated)]
             let width = f64::from(area_w.allocated_width());
+            let cy = y + ui.scroll_offset();
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            let hit = item_at(y, rows.len()).map(|row_idx| {
+            let hit = item_at(cy, rows.len()).map(|row_idx| {
                 let row = &rows[row_idx];
-                let y_in_row = y - slot_top(row_idx);
+                let y_in_row = cy - slot_top(row_idx);
                 let is_group = matches!(row.kind, RowKind::Group { .. });
                 let has_edit = row_is_adjustment(&ui, row);
                 let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group, has_edit);
@@ -2925,7 +3187,7 @@ pub(super) fn begin_rename_active(
     let current_name = match &rows[row_idx].kind {
         RowKind::Layer { name, .. } | RowKind::Group { name, .. } => name.clone(),
     };
-    show_rename_popover(area, target_id, current_name, is_layer, ui, canvas, slot_top(row_idx), history);
+    show_rename_popover(area, target_id, current_name, is_layer, ui, canvas, slot_top(row_idx) - ui.scroll_offset(), history);
 }
 
 pub(super) fn item_at(y: f64, count: usize) -> Option<usize> {

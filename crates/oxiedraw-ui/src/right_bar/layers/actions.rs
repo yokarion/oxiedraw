@@ -951,7 +951,8 @@ pub(super) fn install_context_menu(
 
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            let Some(row_idx) = item_at(y, rows.len()) else { return };
+            // Row hit-testing is in content space; the pointer Y is viewport.
+            let Some(row_idx) = item_at(y + ui.vadj.value(), rows.len()) else { return };
             let row = &rows[row_idx];
 
             // Make the clicked row the sole selection so menu actions target it.

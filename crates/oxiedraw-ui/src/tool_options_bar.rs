@@ -15,10 +15,19 @@ use crate::widgets::{slider, tool_chip};
 const HEIGHT: i32 = 40;
 const LABEL_MARGIN: i32 = 12;
 const ROW_SPACING: i32 = 8;
-const SIZE_RANGE: (f64, f64) = (1.0, 200.0);
-const SIZE_STEP: f64 = 1.0;
 const OPACITY_STEP: f64 = 0.01;
-const SIZE_SLIDER_WIDTH: i32 = 140;
+const SIZE_SLIDER_WIDTH: i32 = 260;
+
+/// Brush size segments as `(size_lo, size_hi, step, pos_width)`. Each segment
+/// covers a size range with its own increment and occupies `pos_width` of the
+/// slider trough, so fine sizes get more travel than coarse ones. `pos_width`
+/// values sum to 1.0.
+const SIZE_SEGMENTS: [(f64, f64, f64, f64); 3] = [
+    (1.0, 50.0, 1.0, 0.50),
+    (50.0, 200.0, 10.0, 0.30),
+    (200.0, 1000.0, 50.0, 0.20),
+];
+
 const OPACITY_SLIDER_WIDTH: i32 = 120;
 
 const STACK_BRUSH: &str = "brush";
@@ -171,21 +180,51 @@ fn apply_eraser_style(btn: &gtk::ToggleButton, active: bool) {
 
 fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
     let size = brush_engine.size.clone();
-    slider::build(
-        SIZE_RANGE,
-        SIZE_STEP,
+    slider::build_mapped(
         f64::from(brush_engine.size.get()),
         SIZE_SLIDER_WIDTH,
+        size_pos_to_value,
+        size_value_to_pos,
         |value| {
             #[allow(clippy::cast_possible_truncation)]
             let v = value.round() as i32;
-            format!("{v:>3}")
+            format!("{v:>4}")
         },
         move |value| {
             #[allow(clippy::cast_possible_truncation)]
             size.set(value as f32);
         },
     )
+}
+
+/// Maps a `[0, 1]` trough position to a brush size snapped to the piecewise
+/// step of the segment it falls in.
+fn size_pos_to_value(pos: f64) -> f64 {
+    let mut pos_lo = 0.0;
+    for (size_lo, size_hi, step, pos_width) in SIZE_SEGMENTS {
+        let pos_hi = pos_lo + pos_width;
+        if pos <= pos_hi || pos_width <= 0.0 {
+            let t = ((pos - pos_lo) / pos_width).clamp(0.0, 1.0);
+            let raw = size_lo + t * (size_hi - size_lo);
+            let snapped = size_lo + ((raw - size_lo) / step).round() * step;
+            return snapped.clamp(size_lo, size_hi);
+        }
+        pos_lo = pos_hi;
+    }
+    SIZE_SEGMENTS[SIZE_SEGMENTS.len() - 1].1
+}
+
+/// Places a brush size on the `[0, 1]` trough per the piecewise layout.
+fn size_value_to_pos(size: f64) -> f64 {
+    let mut pos_lo = 0.0;
+    for (size_lo, size_hi, _step, pos_width) in SIZE_SEGMENTS {
+        if size <= size_hi {
+            let t = ((size - size_lo) / (size_hi - size_lo)).clamp(0.0, 1.0);
+            return pos_lo + t * pos_width;
+        }
+        pos_lo += pos_width;
+    }
+    1.0
 }
 
 fn build_opacity_slider(brush_engine: &BrushEngine) -> gtk::Scale {
