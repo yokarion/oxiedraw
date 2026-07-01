@@ -75,6 +75,30 @@ fn new_group_id() -> String {
     format!("g{:016x}", GROUP_COUNTER.fetch_add(1, AOrdering::Relaxed))
 }
 
+// Advance the group-id counter past an id loaded from a project file. The
+// counter is process-global and resets to 1 each launch, so without this a
+// reopened document that adds a new folder would mint an id colliding with an
+// existing group - phantom-linking the two (shared expand/select state).
+fn observe_group_id(id: &str) {
+    if let Some(hex) = id.strip_prefix('g') {
+        if let Ok(n) = u64::from_str_radix(hex, 16) {
+            let target = n.saturating_add(1);
+            let mut current = GROUP_COUNTER.load(AOrdering::Relaxed);
+            while current < target {
+                match GROUP_COUNTER.compare_exchange_weak(
+                    current,
+                    target,
+                    AOrdering::Relaxed,
+                    AOrdering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct GroupData {
     pub(super) id: String,
@@ -572,21 +596,44 @@ fn tree_to_core(nodes: &[LayerNode]) -> Vec<LayerTreeNode> {
 fn node_from_core(node: &LayerTreeNode) -> LayerNode {
     match node {
         LayerTreeNode::Layer { id } => LayerNode::Layer(id.clone()),
-        LayerTreeNode::Group(g) => LayerNode::Group(GroupData {
-            id: g.id.clone(),
-            name: g.name.clone(),
-            expanded: g.expanded,
-            visible: true,
-            children: tree_from_core(&g.children),
-            masked_leaves: HashSet::new(),
-        }),
+        LayerTreeNode::Group(g) => {
+            observe_group_id(&g.id);
+            LayerNode::Group(GroupData {
+                id: g.id.clone(),
+                name: g.name.clone(),
+                expanded: g.expanded,
+                visible: true,
+                children: tree_from_core(&g.children),
+                masked_leaves: HashSet::new(),
+            })
+        }
     }
 }
 
 // Rebuild the panel tree (top-first) from the core folder tree (bottom-first),
 // used when a saved document is loaded.
 pub(super) fn tree_from_core(nodes: &[LayerTreeNode]) -> Vec<LayerNode> {
-    nodes.iter().rev().map(node_from_core).collect()
+    // node_from_core seeds GROUP_COUNTER past every loaded id, so replacements
+    // minted in the dedup pass below can't collide with a surviving group.
+    let mut tree: Vec<LayerNode> = nodes.iter().rev().map(node_from_core).collect();
+    dedup_group_ids(&mut tree, &mut HashSet::new());
+    tree
+}
+
+// Heal duplicate group ids from pre-fix corruption: two groups sharing an id
+// phantom-link (expanding or selecting one drives the other). The first keeps
+// its id; later duplicates get a fresh one. Persisted once the panel commits
+// its tree back to the canvas.
+fn dedup_group_ids(nodes: &mut [LayerNode], seen: &mut HashSet<String>) {
+    for node in nodes {
+        if let LayerNode::Group(g) = node {
+            if !seen.insert(g.id.clone()) {
+                g.id = new_group_id();
+                seen.insert(g.id.clone());
+            }
+            dedup_group_ids(&mut g.children, seen);
+        }
+    }
 }
 
 // Groups only nest inside other groups, so a group anywhere in the tree implies
@@ -2983,6 +3030,58 @@ mod tests {
             parent_id: parent_id.map(str::to_owned),
             idx_in_parent,
         }
+    }
+
+    fn core_group(id: &str, children: Vec<LayerTreeNode>) -> LayerTreeNode {
+        LayerTreeNode::Group(LayerGroup {
+            id: id.to_string(),
+            name: id.to_string(),
+            expanded: false,
+            children,
+        })
+    }
+
+    // Collect every group id in a UI tree, depth-first.
+    fn collect_group_ids(nodes: &[LayerNode], out: &mut Vec<String>) {
+        for node in nodes {
+            if let LayerNode::Group(g) = node {
+                out.push(g.id.clone());
+                collect_group_ids(&g.children, out);
+            }
+        }
+    }
+
+    // --- tree_from_core group-id healing ---
+    #[test]
+    fn tree_from_core_heals_duplicate_group_ids() {
+        // Two sibling groups share an id (the pre-fix corruption that
+        // phantom-links them); a third is unique.
+        let core = vec![
+            core_group("g0000000000000001", vec![]),
+            core_group("g0000000000000002", vec![]),
+            core_group("g0000000000000001", vec![]),
+        ];
+        let tree = tree_from_core(&core);
+
+        let mut ids = Vec::new();
+        collect_group_ids(&tree, &mut ids);
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(ids.len(), 3);
+        assert_eq!(unique.len(), 3, "group ids should be unique after load: {ids:?}");
+    }
+
+    #[test]
+    fn tree_from_core_heals_nested_duplicate_group_ids() {
+        let core = vec![core_group(
+            "g0000000000000001",
+            vec![core_group("g0000000000000001", vec![])],
+        )];
+        let tree = tree_from_core(&core);
+
+        let mut ids = Vec::new();
+        collect_group_ids(&tree, &mut ids);
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "nested group ids should be unique: {ids:?}");
     }
 
     // --- drag_span ---

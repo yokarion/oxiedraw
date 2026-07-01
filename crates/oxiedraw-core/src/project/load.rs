@@ -86,6 +86,11 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
     // loaded id.
     for layer in &document.layers {
         crate::document::observe_layer_id(&layer.id);
+        if let crate::document::LayerKind::Adjustment(adjustment) = &layer.kind {
+            for effect in &adjustment.effects {
+                crate::effects::observe_effect_id(&effect.id);
+            }
+        }
     }
 
     // Pair each layer entry with its PNG positionally, since the writer emits one

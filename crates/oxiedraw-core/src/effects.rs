@@ -22,6 +22,18 @@ pub fn generate_effect_id() -> String {
     format!("e{n:015x}")
 }
 
+/// Advance the effect-id counter past an id loaded from a project file. The
+/// counter is process-global and resets to 1 each launch, so without this a
+/// reopened document that adds an adjustment layer would re-mint ids that
+/// collide with effects already in the file.
+pub fn observe_effect_id(id: &str) {
+    if let Some(hex) = id.strip_prefix('e') {
+        if let Ok(n) = u64::from_str_radix(hex, 16) {
+            crate::document::bump_counter_past(&EFFECT_ID_COUNTER, n);
+        }
+    }
+}
+
 /// How a stroke's edge is resolved against the alpha-distance field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum StrokeSoftness {
@@ -193,6 +205,16 @@ mod tests {
         let a = generate_effect_id();
         let b = generate_effect_id();
         assert_ne!(a, b);
+    }
+
+    // Seeding past a loaded id means the next minted id can't collide with it.
+    #[test]
+    fn observe_effect_id_seeds_past_loaded_id() {
+        let value = |s: &str| u64::from_str_radix(s.strip_prefix('e').unwrap(), 16).unwrap();
+        let loaded = "e0000000000ffff";
+        observe_effect_id(loaded);
+        let next = generate_effect_id();
+        assert!(value(&next) > value(loaded), "minted {next} should exceed {loaded}");
     }
 
     // The whole stack must survive a JSON round-trip - it rides document.json.
