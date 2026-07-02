@@ -1,6 +1,10 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
+
+use crate::color::{Color, ColorState};
+
 // ---------------------------------------------------------------------------
 // Crop types
 // ---------------------------------------------------------------------------
@@ -578,6 +582,248 @@ impl ShapeTool {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gradient tool
+// ---------------------------------------------------------------------------
+
+/// Number of texels in the baked gradient LUT. 256 gives one entry per
+/// 8-bit level; the GPU sampler interpolates linearly between them.
+pub const GRADIENT_LUT_SIZE: usize = 256;
+
+/// Geometry of the gradient ramp along the drag axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GradientType {
+    #[default]
+    Linear,
+    Radial,
+    Square,
+}
+
+impl GradientType {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::Linear => "Linear",
+            Self::Radial => "Radial",
+            Self::Square => "Square",
+        }
+    }
+
+    /// Map to the renderer's primitive enum.
+    #[must_use]
+    pub const fn to_renderer_kind(self) -> crate::renderer::GradientKind {
+        use crate::renderer::GradientKind;
+        match self {
+            Self::Linear => GradientKind::Linear,
+            Self::Radial => GradientKind::Radial,
+            Self::Square => GradientKind::Square,
+        }
+    }
+}
+
+/// One gradient stop: a colour + opacity anchored at `position` (0..=1)
+/// along the ramp. Serialised into the project as the document default.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GradientStop {
+    /// Position along the ramp in `0.0..=1.0`.
+    pub position: f32,
+    /// Stop opacity in `0.0..=1.0`.
+    pub opacity: f32,
+    pub color: Color,
+}
+
+/// An ordered set of gradient stops (at least two). Interpolation between
+/// stops happens in sRGB channel space so the on-canvas result matches the
+/// preview bar in the panel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GradientSettings {
+    pub stops: Vec<GradientStop>,
+}
+
+impl GradientSettings {
+    /// Sort stops ascending by position. Called after any edit that could
+    /// reorder them (drag past a neighbour, insert).
+    fn sort(&mut self) {
+        self.stops
+            .sort_by(|a, b| a.position.partial_cmp(&b.position).unwrap_or(std::cmp::Ordering::Equal));
+    }
+
+    /// Interpolated `(color, opacity)` at `t` in sRGB channel space.
+    /// Positions outside the stop range clamp to the nearest end stop.
+    #[must_use]
+    pub fn sample_srgb(&self, t: f32) -> (Color, f32) {
+        let stops = &self.stops;
+        if stops.is_empty() {
+            return (Color::BLACK, 1.0);
+        }
+        let first = stops[0];
+        if t <= first.position {
+            return (first.color, first.opacity);
+        }
+        let last = stops[stops.len() - 1];
+        if t >= last.position {
+            return (last.color, last.opacity);
+        }
+        for pair in stops.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            if t >= a.position && t <= b.position {
+                let span = (b.position - a.position).max(f32::EPSILON);
+                let f = ((t - a.position) / span).clamp(0.0, 1.0);
+                let lerp_u8 = |x: u8, y: u8| {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    let v = (f32::from(x) + (f32::from(y) - f32::from(x)) * f).round() as u8;
+                    v
+                };
+                let color = Color::new(
+                    lerp_u8(a.color.r, b.color.r),
+                    lerp_u8(a.color.g, b.color.g),
+                    lerp_u8(a.color.b, b.color.b),
+                );
+                let opacity = a.opacity + (b.opacity - a.opacity) * f;
+                return (color, opacity);
+            }
+        }
+        (last.color, last.opacity)
+    }
+
+    /// Bake the ramp into a premultiplied **linear** RGBA LUT for the GPU
+    /// (`GRADIENT_LUT_SIZE` texels, 4 floats each). Colours are sRGB-lerped
+    /// then converted to linear so the canvas result matches the UI preview.
+    #[must_use]
+    pub fn bake_lut(&self) -> Vec<f32> {
+        let mut out = vec![0.0_f32; GRADIENT_LUT_SIZE * 4];
+        for i in 0..GRADIENT_LUT_SIZE {
+            #[allow(clippy::cast_precision_loss)]
+            let t = i as f32 / (GRADIENT_LUT_SIZE - 1) as f32;
+            let (color, opacity) = self.sample_srgb(t);
+            let lin = color.to_linear_rgb();
+            let a = opacity.clamp(0.0, 1.0);
+            out[i * 4] = lin[0] * a;
+            out[i * 4 + 1] = lin[1] * a;
+            out[i * 4 + 2] = lin[2] * a;
+            out[i * 4 + 3] = a;
+        }
+        out
+    }
+
+    /// Insert a stop at `t`, interpolating its colour + opacity from the
+    /// current ramp. Returns the index of the new stop after re-sorting.
+    pub fn insert_stop(&mut self, t: f32) -> usize {
+        let t = t.clamp(0.0, 1.0);
+        let (color, opacity) = self.sample_srgb(t);
+        self.stops.push(GradientStop { position: t, opacity, color });
+        self.sort();
+        self.stops
+            .iter()
+            .position(|s| (s.position - t).abs() < f32::EPSILON && s.color == color)
+            .unwrap_or(0)
+    }
+
+    /// Move the stop at `idx` to `position`, re-sorting. Returns the stop's
+    /// new index so a drag can keep tracking it after a reorder.
+    pub fn move_stop(&mut self, idx: usize, position: f32) -> usize {
+        if idx >= self.stops.len() {
+            return idx;
+        }
+        let mut stop = self.stops.remove(idx);
+        stop.position = position.clamp(0.0, 1.0);
+        let pos = self.stops.partition_point(|s| s.position <= stop.position);
+        self.stops.insert(pos, stop);
+        pos
+    }
+
+    /// Remove the stop at `idx`. No-op if it would drop below two stops.
+    pub fn remove_stop(&mut self, idx: usize) -> bool {
+        if self.stops.len() <= 2 || idx >= self.stops.len() {
+            return false;
+        }
+        self.stops.remove(idx);
+        true
+    }
+}
+
+/// Live state for the Gradient tool.
+///
+/// `settings` is `None` until the user edits a stop; while `None` the ramp is
+/// derived from the primary/secondary colours (see [`Self::resolve`]). Once
+/// concrete it is what gets persisted to the project as the document default.
+pub struct GradientState {
+    pub settings: Rc<RefCell<Option<GradientSettings>>>,
+    pub gradient_type: Rc<Cell<GradientType>>,
+    /// Index of the stop currently bound to the colour picker + panel fields.
+    pub selected_stop: Rc<Cell<usize>>,
+    changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+}
+
+impl std::fmt::Debug for GradientState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GradientState")
+            .field("gradient_type", &self.gradient_type.get())
+            .field("selected_stop", &self.selected_stop.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Clone for GradientState {
+    fn clone(&self) -> Self {
+        Self {
+            settings: Rc::clone(&self.settings),
+            gradient_type: Rc::clone(&self.gradient_type),
+            selected_stop: Rc::clone(&self.selected_stop),
+            changed: Rc::clone(&self.changed),
+        }
+    }
+}
+
+impl GradientState {
+    pub fn new() -> Self {
+        Self {
+            settings: Rc::new(RefCell::new(None)),
+            gradient_type: Rc::new(Cell::new(GradientType::default())),
+            selected_stop: Rc::new(Cell::new(0)),
+            changed: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    /// Effective ramp: stored settings if present, else a two-stop ramp
+    /// seeded from the primary (0%) and secondary (100%) colours.
+    #[must_use]
+    pub fn resolve(&self, colors: &ColorState) -> GradientSettings {
+        if let Some(s) = self.settings.borrow().as_ref() {
+            return s.clone();
+        }
+        GradientSettings {
+            stops: vec![
+                GradientStop { position: 0.0, opacity: 1.0, color: colors.primary.get() },
+                GradientStop { position: 1.0, opacity: 1.0, color: colors.secondary.get() },
+            ],
+        }
+    }
+
+    /// Promote `None` settings to a concrete ramp (seeded from the colours)
+    /// so subsequent edits persist. Returns nothing; edit via `settings`.
+    pub fn ensure_owned(&self, colors: &ColorState) {
+        if self.settings.borrow().is_none() {
+            *self.settings.borrow_mut() = Some(self.resolve(colors));
+        }
+    }
+
+    pub fn notify_changed(&self) {
+        for cb in self.changed.borrow().iter() {
+            cb();
+        }
+    }
+
+    pub fn connect_changed(&self, cb: Box<dyn Fn()>) {
+        self.changed.borrow_mut().push(cb);
+    }
+}
+
+impl Default for GradientState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Tool {
     Cursor,
@@ -647,5 +893,72 @@ impl ToolState {
 impl Default for ToolState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod gradient_tests {
+    use super::*;
+
+    fn two_stop() -> GradientSettings {
+        GradientSettings {
+            stops: vec![
+                GradientStop { position: 0.0, opacity: 1.0, color: Color::BLACK },
+                GradientStop { position: 1.0, opacity: 1.0, color: Color::WHITE },
+            ],
+        }
+    }
+
+    #[test]
+    fn sample_clamps_and_interpolates() {
+        let g = two_stop();
+        assert_eq!(g.sample_srgb(-0.5).0, Color::BLACK);
+        assert_eq!(g.sample_srgb(1.5).0, Color::WHITE);
+        let (mid, _) = g.sample_srgb(0.5);
+        assert_eq!(mid, Color::new(128, 128, 128));
+    }
+
+    #[test]
+    fn lut_endpoints_are_premultiplied() {
+        let mut g = two_stop();
+        g.stops[1].opacity = 0.0; // white, fully transparent
+        let lut = g.bake_lut();
+        assert_eq!(lut.len(), GRADIENT_LUT_SIZE * 4);
+        // First texel: opaque black -> all zero rgb, alpha 1.
+        assert!((lut[3] - 1.0).abs() < 1e-4);
+        // Last texel: transparent white -> premultiplied rgb collapses to 0.
+        let last = (GRADIENT_LUT_SIZE - 1) * 4;
+        assert!(lut[last] < 1e-4 && lut[last + 3] < 1e-4);
+    }
+
+    #[test]
+    fn insert_keeps_sorted_and_returns_index() {
+        let mut g = two_stop();
+        let idx = g.insert_stop(0.5);
+        assert_eq!(g.stops.len(), 3);
+        assert_eq!(idx, 1);
+        assert!(g.stops[0].position <= g.stops[1].position);
+        assert!(g.stops[1].position <= g.stops[2].position);
+    }
+
+    #[test]
+    fn remove_respects_two_stop_minimum() {
+        let mut g = two_stop();
+        assert!(!g.remove_stop(0));
+        g.insert_stop(0.5);
+        assert!(g.remove_stop(1));
+        assert_eq!(g.stops.len(), 2);
+    }
+
+    #[test]
+    fn resolve_defaults_to_primary_secondary() {
+        let colors = ColorState::new();
+        colors.primary.set(Color::new(10, 20, 30));
+        colors.secondary.set(Color::new(40, 50, 60));
+        let g = GradientState::new();
+        let r = g.resolve(&colors);
+        assert_eq!(r.stops.len(), 2);
+        assert_eq!(r.stops[0].color, Color::new(10, 20, 30));
+        assert_eq!(r.stops[1].color, Color::new(40, 50, 60));
     }
 }

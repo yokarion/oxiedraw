@@ -13,6 +13,7 @@
 mod adjust_ops;
 mod fill_ops;
 mod filter_ops;
+mod gradient_ops;
 mod io;
 mod layer_ops;
 mod pattern_ops;
@@ -24,6 +25,7 @@ mod stroke;
 mod transform_ops;
 mod transform_preview;
 
+pub use gradient_ops::GradientKind;
 pub use shape_ops::ShapeKind;
 
 use std::cell::RefCell;
@@ -51,6 +53,7 @@ use super::mask::{DabPipelineSet, MaskPipelineSet};
 use super::pattern_atlas::PatternAtlas;
 use super::resources::{Buffer, Image};
 use super::selection::SelectionResources;
+use super::gradient_overlay::GradientOverlayResources;
 use super::shape_overlay::ShapeOverlayResources;
 use super::targets::ImageTarget;
 use super::transform::TransformPipeline;
@@ -280,6 +283,16 @@ pub struct VulkanRenderer {
     pub(super) shape_rect: [f32; 4],
     pub(super) shape_extra: [f32; 4],
 
+    pub(super) gradient_overlay: ManuallyDrop<GradientOverlayResources>,
+    /// True while a gradient drag is in flight. Gates the preview path so
+    /// the ramp is composited at `gradient_layer_idx`'s z-order each frame.
+    pub(super) gradient_active: bool,
+    pub(super) gradient_layer_idx: usize,
+    /// Push-constant buffers for the gradient overlay: endpoints (x0,y0,x1,y1)
+    /// and extra (kind/sel_active/_/_).
+    pub(super) gradient_endpoints: [f32; 4],
+    pub(super) gradient_extra: [f32; 4],
+
     pub(super) filter_resources: ManuallyDrop<FilterResources>,
     /// True while a filter popup is open. Gates the preview path so the
     /// affected layers are composited through the filter pipeline.
@@ -447,6 +460,12 @@ impl VulkanRenderer {
             canvas_target.render_pass,
             selection.mask.view,
         )?;
+        let gradient_overlay = GradientOverlayResources::new(
+            &dev.device,
+            &mut allocator,
+            canvas_target.render_pass,
+            selection.mask.view,
+        )?;
         let composite_pipeline = CompositePipeline::new(
             &dev.device,
             canvas_target.render_pass,
@@ -576,6 +595,11 @@ impl VulkanRenderer {
             shape_color_premul: [0.0; 4],
             shape_rect: [0.0; 4],
             shape_extra: [0.0; 4],
+            gradient_overlay: ManuallyDrop::new(gradient_overlay),
+            gradient_active: false,
+            gradient_layer_idx: 0,
+            gradient_endpoints: [0.0; 4],
+            gradient_extra: [0.0; 4],
             filter_resources: ManuallyDrop::new(filter_resources),
             filter_active: false,
             filter_spec: crate::filters::FilterSpec::Invert,
@@ -673,6 +697,11 @@ impl VulkanRenderer {
                 ),
                 full_image_barrier(
                     this.fill_overlay.mask.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                ),
+                full_image_barrier(
+                    this.gradient_overlay.lut.handle,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::GENERAL,
                 ),
@@ -1212,6 +1241,8 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.layer_composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.filter_resources)
+                .destroy(&self.device, &mut self.allocator);
+            ManuallyDrop::take(&mut self.gradient_overlay)
                 .destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.shape_overlay).destroy(&self.device);
             ManuallyDrop::take(&mut self.fill_overlay).destroy(&self.device, &mut self.allocator);

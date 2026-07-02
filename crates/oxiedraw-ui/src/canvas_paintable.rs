@@ -13,7 +13,7 @@ use std::f64::consts::PI;
 
 use oxiedraw_core::brush_engine::BrushCursor;
 use oxiedraw_core::color::Color;
-use oxiedraw_core::tools::{CropOverlay, CropRect, PendingMarquee, TransformRect};
+use oxiedraw_core::tools::{CropOverlay, CropRect, GradientSettings, PendingMarquee, TransformRect};
 use oxiedraw_utils::geometry::Point;
 
 use crate::perf_graph::PerfGraph;
@@ -42,6 +42,14 @@ const PICKER_MAG_SCALE: f32 = 12.0;
 pub(crate) struct ColorPickerOverlay {
     pub(crate) cursor: Point,
     pub(crate) color: Option<Color>,
+}
+
+/// Gradient-tool cursor: a crosshair plus a small swatch of the current ramp
+/// (over a checkerboard so transparency shows) drawn at the pointer.
+#[derive(Clone)]
+pub(crate) struct GradientCursorOverlay {
+    pub(crate) cursor: Point,
+    pub(crate) settings: GradientSettings,
 }
 
 glib::wrapper! {
@@ -229,6 +237,12 @@ impl CanvasPaintable {
     /// hide (e.g. when switching away from the picker or leaving the canvas).
     pub(crate) fn set_color_picker(&self, overlay: Option<ColorPickerOverlay>) {
         self.imp().color_picker.set(overlay);
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
+    /// Update the gradient-tool cursor overlay. Pass `None` to hide it.
+    pub(crate) fn set_gradient_cursor(&self, overlay: Option<GradientCursorOverlay>) {
+        *self.imp().gradient_cursor.borrow_mut() = overlay;
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
@@ -1209,11 +1223,94 @@ fn draw_eyedropper_cairo(cr: &gtk::cairo::Context, tip: Point, color: Option<Col
     cr.restore().ok();
 }
 
+/// Crosshair at the pointer plus a ramp swatch to its lower right. Widget-space.
+fn draw_gradient_cursor_cairo(cr: &gtk::cairo::Context, overlay: &GradientCursorOverlay) {
+    let cx = f64::from(overlay.cursor.x);
+    let cy = f64::from(overlay.cursor.y);
+
+    // Crosshair with a small centre gap, dark halo under a white core.
+    let arm = 10.0;
+    let gap = 3.0;
+    let draw_cross = |cr: &gtk::cairo::Context| {
+        cr.move_to(cx - arm, cy);
+        cr.line_to(cx - gap, cy);
+        cr.move_to(cx + gap, cy);
+        cr.line_to(cx + arm, cy);
+        cr.move_to(cx, cy - arm);
+        cr.line_to(cx, cy - gap);
+        cr.move_to(cx, cy + gap);
+        cr.line_to(cx, cy + arm);
+    };
+    cr.set_line_width(3.0);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.55);
+    draw_cross(cr);
+    cr.stroke().ok();
+    cr.set_line_width(1.0);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    draw_cross(cr);
+    cr.stroke().ok();
+
+    // Ramp swatch, offset down-right of the pointer.
+    let sw_w = 46.0;
+    let sw_h = 22.0;
+    let sw_x = cx + 12.0;
+    let sw_y = cy + 12.0;
+
+    // Checkerboard so transparent stops read as transparency.
+    let cell = 5.0;
+    cr.rectangle(sw_x, sw_y, sw_w, sw_h);
+    cr.set_source_rgb(0.6, 0.6, 0.6);
+    cr.fill().ok();
+    cr.save().ok();
+    cr.rectangle(sw_x, sw_y, sw_w, sw_h);
+    cr.clip();
+    let cols = (sw_w / cell).ceil() as i32;
+    let rows = (sw_h / cell).ceil() as i32;
+    cr.set_source_rgb(0.85, 0.85, 0.85);
+    for row in 0..rows {
+        for col in 0..cols {
+            if (row + col) % 2 == 0 {
+                cr.rectangle(
+                    sw_x + f64::from(col) * cell,
+                    sw_y + f64::from(row) * cell,
+                    cell,
+                    cell,
+                );
+                cr.fill().ok();
+            }
+        }
+    }
+
+    // Ramp: vertical strips sampling the settings across the swatch.
+    let strips = sw_w.ceil() as i32;
+    for i in 0..strips {
+        let t = f64::from(i) / f64::from(strips - 1).max(1.0);
+        #[allow(clippy::cast_possible_truncation)]
+        let (color, opacity) = overlay.settings.sample_srgb(t as f32);
+        cr.rectangle(sw_x + f64::from(i), sw_y, 1.0 + 1.0, sw_h);
+        cr.set_source_rgba(
+            f64::from(color.r) / 255.0,
+            f64::from(color.g) / 255.0,
+            f64::from(color.b) / 255.0,
+            f64::from(opacity),
+        );
+        cr.fill().ok();
+    }
+    cr.restore().ok();
+
+    // Border around the swatch.
+    cr.rectangle(sw_x, sw_y, sw_w, sw_h);
+    cr.set_source_rgba(0.0, 0.0, 0.0, 0.6);
+    cr.set_line_width(1.0);
+    cr.stroke().ok();
+}
+
 mod imp {
     use super::{
-        BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect, PendingMarquee,
-        Point, RefCell, TransformRect, draw_brush_cursor_cairo, draw_color_picker_cairo,
-        draw_crop_overlay_cairo, draw_pixel_grid_cairo, draw_selection_overlay_cairo,
+        BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
+        GradientCursorOverlay, PendingMarquee, Point, RefCell, TransformRect,
+        draw_brush_cursor_cairo, draw_color_picker_cairo, draw_crop_overlay_cairo,
+        draw_gradient_cursor_cairo, draw_pixel_grid_cairo, draw_selection_overlay_cairo,
         draw_text_edit_overlay_cairo, draw_transform_overlay_cairo, gdk, glib, graphene, gsk, gtk,
     };
     use gtk::prelude::*;
@@ -1260,6 +1357,8 @@ mod imp {
         pub(super) brush_cursor_anchor: Cell<Point>,
         // color-picker loupe + eyedropper
         pub(super) color_picker: Cell<Option<ColorPickerOverlay>>,
+        // gradient-tool crosshair + ramp swatch cursor
+        pub(super) gradient_cursor: RefCell<Option<GradientCursorOverlay>>,
         // edit-mode chrome (main canvas vs component): dim label + accent border
         pub(super) edit_label: RefCell<String>,
         pub(super) edit_bordered: Cell<bool>,
@@ -1324,6 +1423,7 @@ mod imp {
                 grid_enabled: Cell::new(true),
                 grid_threshold: Cell::new(8.0),
                 brush_cursor: RefCell::new(None),
+                gradient_cursor: RefCell::new(None),
                 brush_cursor_anchor: Cell::new(Point::ZERO),
                 color_picker: Cell::new(None),
                 edit_label: RefCell::new("Main canvas".to_string()),
@@ -1787,6 +1887,16 @@ mod imp {
                     canvas_w,
                     canvas_h,
                 );
+            }
+
+            // 8b. Gradient-tool cursor: crosshair + ramp swatch at the pointer.
+            {
+                let gradient_cursor = self.gradient_cursor.borrow();
+                if let Some(overlay) = gradient_cursor.as_ref() {
+                    let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
+                    let cr = gtk_snap.append_cairo(&widget_rect);
+                    draw_gradient_cursor_cairo(&cr, overlay);
+                }
             }
 
             // 9. Performance overlay (F3): records this frame's interval and

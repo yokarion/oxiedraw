@@ -15,9 +15,9 @@ use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::shape_correction::{CorrectedShape, corrected_samples, detect_shape};
 use oxiedraw_core::text::{ResizeMode, TextBox};
 use oxiedraw_core::tools::{
-    CropHandle, CropRect, CropState, FillState, FillTool, PendingMarquee, SelectionMode,
-    SelectionState, SelectionTool, ShapeState, ShapeTool, Tool, ToolState, TransformFilter,
-    TransformHandle, TransformState,
+    CropHandle, CropRect, CropState, FillState, FillTool, GradientState, PendingMarquee,
+    SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, Tool, ToolState,
+    TransformFilter, TransformHandle, TransformState,
 };
 use oxiedraw_utils::geometry::{Point, Size, TransformRect, morph_path};
 use relm4::gtk;
@@ -113,6 +113,15 @@ pub(super) struct PrimaryDragHandler {
     shape_cur_rect: Rc<Cell<Option<(f32, f32, f32, f32)>>>,
     /// Layer pixels + id captured at shape_begin for the history patch.
     shape_pending: Rc<RefCell<Option<ShapePending>>>,
+    // -- gradient ---------------------------------------------------------
+    gradient: GradientState,
+    /// Canvas-space point where the gradient drag started.
+    gradient_drag_start: Rc<Cell<Point>>,
+    /// Current endpoints `(x0, y0, x1, y1)` in canvas pixels, updated every
+    /// drag move so `gradient_end` can commit them.
+    gradient_cur_endpoints: Rc<Cell<Option<[f32; 4]>>>,
+    /// Layer pixels + id captured at gradient_begin for the history patch.
+    gradient_pending: Rc<RefCell<Option<GradientPending>>>,
     // -- text -------------------------------------------------------------
     /// Canvas-space point where a text drag/click started.
     text_drag_start: Rc<Cell<Point>>,
@@ -137,6 +146,15 @@ pub(super) struct PrimaryDragHandler {
 /// the pristine pixels (for the undo before-state). Selection clipping
 /// happens on the GPU via the bound selection mask sampler.
 struct ShapePending {
+    idx: usize,
+    id: String,
+    before: Vec<u8>,
+}
+
+/// State captured when a gradient drag begins: the target layer, its id,
+/// and its pristine pixels for the undo before-state. Selection clipping is
+/// sampled on the GPU from the bound selection mask.
+struct GradientPending {
     idx: usize,
     id: String,
     before: Vec<u8>,
@@ -192,14 +210,12 @@ impl PrimaryDragHandler {
                 self.fill_begin(x, y);
                 gesture.set_state(gtk::EventSequenceState::Denied);
             }
+            Tool::Fill(FillTool::Gradient) => self.gradient_begin(x, y),
             Tool::Shapes(kind) => self.shape_begin(kind, x, y),
             Tool::ColorPicker => self.color_pick_begin(x, y),
             Tool::Text => self.text_begin(x, y),
             Tool::Cursor => {
                 (self.cursor_activates_transform)();
-                gesture.set_state(gtk::EventSequenceState::Denied);
-            }
-            _ => {
                 gesture.set_state(gtk::EventSequenceState::Denied);
             }
         }
@@ -212,6 +228,7 @@ impl PrimaryDragHandler {
             Tool::Transform => self.transform_update(gesture, dx, dy),
             Tool::Selection(s) => self.selection_update(gesture, s, dx, dy),
             Tool::Shapes(kind) => self.shape_update(gesture, kind, dx, dy),
+            Tool::Fill(FillTool::Gradient) => self.gradient_update(gesture, dx, dy),
             Tool::ColorPicker => self.color_pick_update(),
             Tool::Text => self.text_update(gesture, dx, dy),
             _ => {}
@@ -224,6 +241,7 @@ impl PrimaryDragHandler {
             Tool::Crop => self.crop_end(),
             Tool::Selection(s) => self.selection_end(s),
             Tool::Shapes(kind) => self.shape_end(kind),
+            Tool::Fill(FillTool::Gradient) => self.gradient_end(),
             Tool::Text => self.text_end(),
             _ => {}
         }
@@ -1241,6 +1259,114 @@ impl PrimaryDragHandler {
         present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
     }
 
+    // -- gradient ----------------------------------------------------------
+
+    fn gradient_begin(&self, x: f64, y: f64) {
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        self.gradient_drag_start.set(canvas_pos);
+        self.gradient_cur_endpoints.set(None);
+
+        // Capture the target layer's pristine pixels for the undo patch. The
+        // selection clip is sampled directly by the shader from the GPU mask.
+        let pending = {
+            let mut canvas = self.canvas.borrow_mut();
+            let Some(idx) = canvas.layers().active() else {
+                *self.gradient_pending.borrow_mut() = None;
+                return;
+            };
+            let id = canvas.layers().snapshot()
+                .get(idx).map(|l| l.id.clone()).unwrap_or_default();
+            match canvas.read_layer(idx) {
+                Ok(before) => Some(GradientPending { idx, id, before }),
+                Err(e) => {
+                    tracing::error!(error = %e, "gradient: read_layer failed");
+                    None
+                }
+            }
+        };
+        *self.gradient_pending.borrow_mut() = pending;
+
+        // Arm the GPU overlay and upload the baked ramp LUT once.
+        if let Some(p) = self.gradient_pending.borrow().as_ref() {
+            let lut = self.gradient.resolve(&self.colors).bake_lut();
+            let mut canvas = self.canvas.borrow_mut();
+            canvas.begin_gradient_overlay(p.idx);
+            if let Err(e) = canvas.set_gradient_lut(&lut) {
+                tracing::error!(error = %e, "gradient: set_gradient_lut failed");
+            }
+        }
+    }
+
+    fn gradient_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
+        let Some((sx, sy)) = gesture.start_point() else {
+            return;
+        };
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let start = self.gradient_drag_start.get();
+        let endpoints = [start.x, start.y, cur.x, cur.y];
+        self.gradient_cur_endpoints.set(Some(endpoints));
+
+        let kind = self.gradient.gradient_type.get().to_renderer_kind();
+        let mut canvas = self.canvas.borrow_mut();
+        canvas.set_gradient_preview_params(kind, endpoints);
+        present_into_paintable(&mut canvas, &self.paintable, &self.area);
+    }
+
+    fn gradient_end(&self) {
+        let Some(endpoints) = self.gradient_cur_endpoints.take() else {
+            self.canvas.borrow_mut().cancel_gradient_overlay();
+            self.gradient_pending.borrow_mut().take();
+            present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+            return;
+        };
+        let Some(pending) = self.gradient_pending.borrow_mut().take() else {
+            self.canvas.borrow_mut().cancel_gradient_overlay();
+            return;
+        };
+
+        // Ignore a click / zero-length drag.
+        let dx = endpoints[2] - endpoints[0];
+        let dy = endpoints[3] - endpoints[1];
+        if dx * dx + dy * dy < 1.0 {
+            self.canvas.borrow_mut().cancel_gradient_overlay();
+            present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+            return;
+        }
+
+        let kind = self.gradient.gradient_type.get().to_renderer_kind();
+        let cs = {
+            let mut canvas = self.canvas.borrow_mut();
+            if let Err(e) = canvas.commit_gradient(pending.idx, kind, endpoints) {
+                tracing::error!(error = %e, "gradient: commit_gradient failed");
+                canvas.cancel_gradient_overlay();
+                drop(canvas);
+                present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+                return;
+            }
+            canvas.size()
+        };
+
+        // History: tight diff of before vs after layer pixels.
+        let after = match self.canvas.borrow_mut().read_layer(pending.idx) {
+            Ok(px) => px,
+            Err(e) => {
+                tracing::error!(error = %e, "gradient: read_layer after commit failed");
+                present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+                return;
+            }
+        };
+        if let Some(patch) =
+            LayerPatch::from_full_diff(&pending.before, &after, cs.width, cs.height)
+        {
+            self.history.borrow_mut().record(HistoryAction::Gradient {
+                layer_id: pending.id,
+                patch,
+            });
+        }
+
+        present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+    }
+
     /// Selection-tool click with no drag: clear any existing selection.
     /// Photoshop parity - a single click in the marquee/lasso tool means
     /// "I'm not picking anything, drop the current selection".
@@ -1731,6 +1857,7 @@ pub(super) fn install_primary_drag(
     selection: &SelectionState,
     fill: &FillState,
     shape: &ShapeState,
+    gradient: &GradientState,
     history: &Rc<RefCell<HistoryStack>>,
     toaster: &crate::toaster::Toaster,
     text_edit: &crate::text_edit::TextEdit,
@@ -1771,6 +1898,10 @@ pub(super) fn install_primary_drag(
         shape_drag_start: Rc::new(Cell::new(Point::ZERO)),
         shape_cur_rect: Rc::new(Cell::new(None)),
         shape_pending: Rc::new(RefCell::new(None)),
+        gradient: gradient.clone(),
+        gradient_drag_start: Rc::new(Cell::new(Point::ZERO)),
+        gradient_cur_endpoints: Rc::new(Cell::new(None)),
+        gradient_pending: Rc::new(RefCell::new(None)),
         text_drag_start: Rc::new(Cell::new(Point::ZERO)),
         text_cur_rect: Rc::new(Cell::new(None)),
         text_editing_gesture: Rc::new(Cell::new(false)),

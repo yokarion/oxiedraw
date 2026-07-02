@@ -9,7 +9,8 @@ use crate::document::{
 use crate::effects::AdjustmentData;
 use crate::filters::FilterSpec;
 use crate::renderer::{
-    DmabufDescriptor, EdgesBuffer, RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
+    DmabufDescriptor, EdgesBuffer, GradientKind, RendererError, SelectionBlendMode, ShapeKind,
+    VulkanRenderer,
 };
 use crate::selection::SelectionShape;
 use crate::tools::{CropRect, SelectionMode};
@@ -823,6 +824,10 @@ impl Canvas {
                 let visibilities = self.visibilities();
                 self.renderer.render_shape_preview(&visibilities)?;
                 self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.gradient_active() {
+                let visibilities = self.visibilities();
+                self.renderer.render_gradient_preview(&visibilities)?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.transform_preview_active() {
                 let visibilities = self.visibilities();
                 // Run the adjustment chain (folder-scoped) over the transform
@@ -1024,6 +1029,7 @@ impl Canvas {
         if self.renderer.filter_active()
             || self.renderer.fill_active()
             || self.renderer.shape_active()
+            || self.renderer.gradient_active()
             || needs_adjusted_preview
         {
             self.stamp(paint)?;
@@ -1330,6 +1336,57 @@ impl Canvas {
     /// Cancel an in-flight shape overlay without committing.
     pub fn cancel_shape_overlay(&mut self) {
         self.renderer.clear_shape_overlay();
+        self.bump_version();
+    }
+
+    // ----------------------------------------------------------------
+    // Gradient tool GPU overlay
+    // ----------------------------------------------------------------
+
+    /// Arm the GPU gradient overlay for a drag on `layer_idx`. Upload the
+    /// LUT once with `set_gradient_lut`, then push endpoints per drag move.
+    pub fn begin_gradient_overlay(&mut self, layer_idx: usize) {
+        self.renderer.begin_gradient_overlay(layer_idx);
+        self.bump_version();
+    }
+
+    /// Upload the baked ramp LUT (premultiplied linear RGBA, one entry per
+    /// `GRADIENT_LUT_SIZE` step).
+    pub fn set_gradient_lut(&mut self, lut: &[f32]) -> Result<(), RendererError> {
+        self.renderer.set_gradient_lut(lut)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Update the in-flight gradient's geometry. `endpoints` is
+    /// `(x0, y0, x1, y1)` in canvas pixels.
+    pub fn set_gradient_preview_params(&mut self, kind: GradientKind, endpoints: [f32; 4]) {
+        self.renderer.set_gradient_preview_params(kind, endpoints);
+        self.bump_version();
+    }
+
+    /// Whether a gradient overlay is currently active.
+    #[must_use]
+    pub const fn gradient_overlay_active(&self) -> bool {
+        self.renderer.gradient_active()
+    }
+
+    /// Commit the gradient into the target layer (GPU OVER blend), clear
+    /// the overlay, and recomposite the canvas.
+    pub fn commit_gradient(
+        &mut self,
+        layer_idx: usize,
+        kind: GradientKind,
+        endpoints: [f32; 4],
+    ) -> Result<(), RendererError> {
+        self.renderer.commit_gradient(layer_idx, kind, endpoints)?;
+        self.normalize_adjustment_slot(layer_idx)?;
+        self.recomposite_canvas()
+    }
+
+    /// Cancel an in-flight gradient overlay without committing.
+    pub fn cancel_gradient_overlay(&mut self) {
+        self.renderer.clear_gradient_overlay();
         self.bump_version();
     }
 

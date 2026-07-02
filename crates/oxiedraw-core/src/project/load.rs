@@ -285,6 +285,7 @@ mod tests {
                 active_layer: None,
                 layers: Vec::new(),
                 layer_tree: Vec::new(),
+                gradient: None,
             },
             layer_pixels: HashMap::new(),
             components: vec![ComponentData {

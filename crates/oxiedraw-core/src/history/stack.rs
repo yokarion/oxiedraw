@@ -170,6 +170,7 @@ fn apply_direction(
         HistoryAction::Stroke { layer_id, patch }
         | HistoryAction::Fill { layer_id, patch }
         | HistoryAction::Shape { layer_id, patch }
+        | HistoryAction::Gradient { layer_id, patch }
         | HistoryAction::Clear { layer_id, patch }
         | HistoryAction::Transform { layer_id, patch }
         | HistoryAction::Filter { layer_id, patch } => {

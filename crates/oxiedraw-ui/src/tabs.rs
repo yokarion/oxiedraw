@@ -246,6 +246,13 @@ impl TabManager {
                 return;
             }
         }
+        // Restore the document's default gradient stops (if the file has any).
+        session
+            .gradient
+            .settings
+            .borrow_mut()
+            .clone_from(&project.document.gradient);
+
         // Restore the per-document component library.
         *session.components.borrow_mut() = project::load::build_components(&project);
         (session.refresh_components)();

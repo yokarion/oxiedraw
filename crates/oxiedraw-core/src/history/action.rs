@@ -59,6 +59,12 @@ pub enum HistoryAction {
         layer_id: String,
         patch: LayerPatch,
     },
+    /// Gradient-tool commit on a single layer. Patch carries the before+after
+    /// BGRA8 of the changed region.
+    Gradient {
+        layer_id: String,
+        patch: LayerPatch,
+    },
     /// Clear-layer or selection-clear pixel write.
     Clear {
         layer_id: String,
@@ -274,6 +280,7 @@ impl HistoryAction {
             Self::Stroke { .. } => "Brush stroke",
             Self::Fill { .. } => "Bucket fill",
             Self::Shape { .. } => "Shape",
+            Self::Gradient { .. } => "Gradient",
             Self::Clear { .. } => "Clear layer",
             Self::Transform { .. } => "Transform",
             Self::TextEdit { .. } => "Edit text",

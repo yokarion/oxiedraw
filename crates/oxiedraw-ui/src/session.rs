@@ -26,8 +26,8 @@ use oxiedraw_core::history::{
 };
 use oxiedraw_core::renderer::RendererError;
 use oxiedraw_core::tools::{
-    CropRect, CropState, FillState, SelectionState, ShapeState, Tool, ToolState, TransformFilter,
-    TransformRect, TransformState,
+    CropRect, CropState, FillState, GradientState, SelectionState, ShapeState, Tool, ToolState,
+    TransformFilter, TransformRect, TransformState,
 };
 use oxiedraw_utils::geometry::Size;
 use relm4::gtk;
@@ -151,6 +151,7 @@ pub(crate) struct DocumentSession {
     pub(crate) selection: SelectionState,
     pub(crate) fill: FillState,
     pub(crate) shape: ShapeState,
+    pub(crate) gradient: GradientState,
     pub(crate) viewport: Viewport,
     pub(crate) doc_props: DocumentProperties,
     pub(crate) layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>>,
@@ -224,6 +225,7 @@ impl DocumentSession {
         let selection = SelectionState::new();
         let fill = FillState::new();
         let shape = ShapeState::new();
+        let gradient = GradientState::new();
         let doc_props = document.properties.clone();
         let viewport = Viewport::new(init_size, document.layers.clone());
         let layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>> =
@@ -730,6 +732,7 @@ impl DocumentSession {
             Rc::clone(&transform_cancel),
             &fill,
             &shape,
+            &gradient,
             &text_edit_slot,
             global.default_brush_name.clone(),
             global.toaster.clone(),
@@ -843,6 +846,7 @@ impl DocumentSession {
             &viewport.redraw_handle(),
             &crop,
             &global.tools,
+            &gradient,
             &global.clipboard,
             &global.toaster,
             &select_layer_content,
@@ -972,6 +976,7 @@ impl DocumentSession {
             &selection,
             &fill,
             &shape,
+            &gradient,
             &history,
             &global.toaster,
             &text_edit,
@@ -1086,6 +1091,7 @@ impl DocumentSession {
             selection,
             fill,
             shape,
+            gradient,
             viewport,
             doc_props,
             layer_extensions,
@@ -1803,6 +1809,9 @@ fn build_apply_tool(
         if t != Tool::ColorPicker {
             paintable.set_color_picker(None);
         }
+        // The gradient ramp cursor is transient; drop it on any tool switch
+        // (the next pointer motion re-arms it when the Gradient tool is active).
+        paintable.set_gradient_cursor(None);
         if t == Tool::Crop && crop_for_tool.rect.get().is_none() {
             let cs = canvas_for_tool.borrow().size();
             #[allow(clippy::cast_precision_loss)]

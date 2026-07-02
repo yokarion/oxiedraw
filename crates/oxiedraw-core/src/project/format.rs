@@ -18,8 +18,11 @@ use crate::text::fonts::FontMeta;
 /// `layers/<id>.png`, so no new archive entries are needed.
 /// v7 adds the layer folder tree (`layer_tree`), so adjustment layers can be
 /// scoped to their enclosing folder. Absent in pre-v7 files (loads as flat).
-pub const SCHEMA_VERSION: u32 = 7;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7];
+/// v8 adds the document's default gradient stops (`gradient`), the persisted
+/// setting for the Gradient tool. Absent in pre-v8 files (tool falls back to
+/// primary/secondary colours).
+pub const SCHEMA_VERSION: u32 = 8;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -90,6 +93,10 @@ pub struct DocumentData {
     /// absent (pre-v7) = flat, no folders.
     #[serde(default)]
     pub layer_tree: Vec<LayerTreeNode>,
+    /// Document default gradient stops for the Gradient tool. Absent (pre-v8)
+    /// or `None` = derive the ramp from the primary/secondary colours.
+    #[serde(default)]
+    pub gradient: Option<crate::tools::GradientSettings>,
 }
 
 /// The complete in-memory representation of an `.oxiedrawproj` archive.

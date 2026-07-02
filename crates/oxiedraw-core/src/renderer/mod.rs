@@ -122,6 +122,7 @@ mod erase;
 mod error;
 mod fill_overlay;
 mod filters;
+mod gradient_overlay;
 mod instance;
 mod layers;
 mod mask;
@@ -139,4 +140,7 @@ pub use dab::{DabFamily, DabInstance};
 pub use error::RendererError;
 pub use layers::MAX_LAYERS;
 pub use selection::SelectionBlendMode;
-pub use vulkan::{CANVAS_FORMAT, EdgesBuffer, PresentSource, STROKE_FORMAT, ShapeKind, VulkanRenderer};
+pub use vulkan::{
+    CANVAS_FORMAT, EdgesBuffer, GradientKind, PresentSource, STROKE_FORMAT, ShapeKind,
+    VulkanRenderer,
+};

@@ -98,6 +98,7 @@ mod tests {
             &props,
             &crate::components::ComponentLibrary::new(),
             &registry,
+            None,
             &path,
         )
         .expect("save");
@@ -139,7 +140,7 @@ mod tests {
         };
         let path = std::env::temp_dir().join("oxiedraw_round_trip.oxiedrawproj");
 
-        save::save(&mut canvas, &props, &crate::components::ComponentLibrary::new(), &crate::text::fonts::FontRegistry::new(), &path)
+        save::save(&mut canvas, &props, &crate::components::ComponentLibrary::new(), &crate::text::fonts::FontRegistry::new(), None, &path)
             .expect("save");
         let project = load::load(&path).expect("load");
 
@@ -196,6 +197,7 @@ mod tests {
             &props,
             &crate::components::ComponentLibrary::new(),
             &crate::text::fonts::FontRegistry::new(),
+            None,
             &path,
         )
         .expect("save");
@@ -241,7 +243,7 @@ mod tests {
         };
         let path = std::env::temp_dir().join("oxiedraw_size_mismatch.oxiedrawproj");
 
-        save::save(&mut canvas_a, &props, &crate::components::ComponentLibrary::new(), &crate::text::fonts::FontRegistry::new(), &path)
+        save::save(&mut canvas_a, &props, &crate::components::ComponentLibrary::new(), &crate::text::fonts::FontRegistry::new(), None, &path)
             .expect("save");
         let project = load::load(&path).expect("load");
 

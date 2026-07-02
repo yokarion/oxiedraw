@@ -1,6 +1,7 @@
 mod color_picker;
 mod components;
 mod crop_properties;
+mod gradient_properties;
 mod layers;
 mod text_properties;
 
@@ -13,7 +14,7 @@ use oxiedraw_core::components::ComponentLibrary;
 use oxiedraw_core::document::LayerState;
 use oxiedraw_core::history::HistoryStack;
 use oxiedraw_core::text::fonts::TextEngine;
-use oxiedraw_core::tools::{CropState, Tool, ToolState};
+use oxiedraw_core::tools::{CropState, FillTool, GradientState, Tool, ToolState};
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 
@@ -35,6 +36,7 @@ pub(crate) fn build(
     redraw: &RedrawHandle,
     crop: &CropState,
     tools: &ToolState,
+    gradient: &GradientState,
     layer_clipboard: &Rc<RefCell<Option<crate::clipboard::LayerClipboard>>>,
     toaster: &crate::toaster::Toaster,
     select_layer_content: &Rc<dyn Fn(usize)>,
@@ -67,7 +69,15 @@ pub(crate) fn build(
         .shrink_end_child(false)
         .wide_handle(true)
         .build();
-    normal_pane.set_start_child(Some(&color_picker::build(colors)));
+    // Colour picker with the gradient panel revealed on top of it while the
+    // Gradient tool is active.
+    let (gradient_panel, set_gradient_active) = gradient_properties::build(gradient, &colors);
+    let picker_column = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .build();
+    picker_column.append(&gradient_panel);
+    picker_column.append(&color_picker::build(colors));
+    normal_pane.set_start_child(Some(&picker_column));
 
     // "Editing text" properties panel (hidden until a text box is edited).
     let (text_panel, refresh_text_panel) =
@@ -149,6 +159,7 @@ pub(crate) fn build(
                 STACK_NORMAL
             };
             stack.set_visible_child_name(page);
+            set_gradient_active(t == Tool::Fill(FillTool::Gradient));
         })
     };
 

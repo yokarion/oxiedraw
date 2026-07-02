@@ -98,7 +98,9 @@ fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path:
             let families = used_text_families(&canvas.borrow());
             session.global.text_engine.borrow().embed_used_fonts(&families)
         };
-        match project::save::snapshot(&mut canvas.borrow_mut(), &props, &components, &fonts) {
+        let gradient = session.gradient.settings.borrow().clone();
+        match project::save::snapshot(&mut canvas.borrow_mut(), &props, &components, &fonts, gradient)
+        {
             Ok(s) => s,
             Err(e) => {
                 show_error(window, "Save Failed", &e.to_string());

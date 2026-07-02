@@ -20,7 +20,8 @@ use oxiedraw_core::color::ColorState;
 use oxiedraw_core::document::LayerState;
 use oxiedraw_core::renderer::DmabufDescriptor;
 use oxiedraw_core::tools::{
-    CropRect, CropState, FillState, SelectionState, ShapeState, Tool, ToolState, TransformState,
+    CropRect, CropState, FillState, FillTool, GradientState, SelectionState, ShapeState, Tool,
+    ToolState, TransformState,
 };
 use oxiedraw_utils::geometry::{Point, Size};
 
@@ -31,7 +32,7 @@ use relm4::gtk::prelude::*;
 
 use oxiedraw_core::color::Color;
 
-use crate::canvas_paintable::{CanvasPaintable, ColorPickerOverlay};
+use crate::canvas_paintable::{CanvasPaintable, ColorPickerOverlay, GradientCursorOverlay};
 
 pub(super) const BUTTON_PRIMARY: u32 = 1;
 const BUTTON_MIDDLE: u32 = 2;
@@ -392,6 +393,7 @@ pub(crate) fn wire(
     selection: &SelectionState,
     fill: &FillState,
     shape: &ShapeState,
+    gradient: &GradientState,
     history: &Rc<RefCell<oxiedraw_core::history::HistoryStack>>,
     toaster: &crate::toaster::Toaster,
     text_edit: &crate::text_edit::TextEdit,
@@ -416,7 +418,7 @@ pub(crate) fn wire(
     }
 
     install_motion(
-        picture, viewport, brush_engine, colors, tools, crop, transform, text_edit,
+        picture, viewport, brush_engine, colors, tools, crop, transform, gradient, text_edit,
     );
     install_pan(picture, viewport);
     install_zoom(picture, viewport);
@@ -431,6 +433,7 @@ pub(crate) fn wire(
         selection,
         fill,
         shape,
+        gradient,
         history,
         toaster,
         text_edit,
@@ -447,6 +450,7 @@ fn install_motion(
     tools: &ToolState,
     crop: &CropState,
     transform: &TransformState,
+    gradient: &GradientState,
     text_edit: &crate::text_edit::TextEdit,
 ) {
     let motion = gtk::EventControllerMotion::new();
@@ -459,6 +463,7 @@ fn install_motion(
     let tools_c = tools.clone();
     let crop = crop.clone();
     let transform = transform.clone();
+    let gradient = gradient.clone();
     let brush_engine = brush_engine.clone();
     let colors = colors.clone();
     let area_c = area.clone();
@@ -483,7 +488,13 @@ fn install_motion(
         if nav.get() != NavDrag::None {
             paintable.set_brush_cursor(None, Point::ZERO);
             paintable.set_color_picker(None);
+            paintable.set_gradient_cursor(None);
             return;
+        }
+
+        // Only the Gradient tool draws the ramp cursor; clear it otherwise.
+        if !matches!(tools_c.active.get(), Tool::Fill(FillTool::Gradient)) {
+            paintable.set_gradient_cursor(None);
         }
 
         match tools_c.active.get() {
@@ -569,6 +580,18 @@ fn install_motion(
                 paintable.set_brush_cursor(None, Point::ZERO);
                 paintable.set_color_picker(None);
             }
+            Tool::Fill(FillTool::Gradient) => {
+                // Hide the OS pointer; the drawn crosshair + ramp swatch is
+                // the cursor (mirrors the color-picker eyedropper).
+                area_c.set_cursor_from_name(Some("none"));
+                paintable.set_brush_cursor(None, Point::ZERO);
+                paintable.set_color_picker(None);
+                #[allow(clippy::cast_possible_truncation)]
+                paintable.set_gradient_cursor(Some(GradientCursorOverlay {
+                    cursor: Point::new(x as f32, y as f32),
+                    settings: gradient.resolve(&colors),
+                }));
+            }
             _ => {
                 area_c.set_cursor_from_name(None);
                 paintable.set_brush_cursor(None, Point::ZERO);
@@ -584,6 +607,7 @@ fn install_motion(
         motion.connect_leave(move |_| {
             paintable.set_brush_cursor(None, Point::ZERO);
             paintable.set_color_picker(None);
+            paintable.set_gradient_cursor(None);
         });
     }
 

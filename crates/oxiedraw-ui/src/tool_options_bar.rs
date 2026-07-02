@@ -3,7 +3,8 @@ use std::rc::Rc;
 
 use oxiedraw_core::brush_engine::BrushEngine;
 use oxiedraw_core::tools::{
-    CropState, FillState, FillTool, ShapeState, Tool, ToolState, TransformFilter, TransformState,
+    CropState, FillState, FillTool, GradientState, GradientType, ShapeState, Tool, ToolState,
+    TransformFilter, TransformState,
 };
 use relm4::RelmWidgetExt;
 use relm4::gtk;
@@ -35,6 +36,7 @@ const STACK_CROP: &str = "crop";
 const STACK_TRANSFORM: &str = "transform";
 const STACK_FILL: &str = "fill";
 const STACK_SHAPE: &str = "shape";
+const STACK_GRADIENT: &str = "gradient";
 const STACK_TEXT: &str = "text";
 const STACK_NONE: &str = "none";
 
@@ -54,6 +56,7 @@ pub(crate) fn build(
     on_transform_cancel: Rc<dyn Fn()>,
     fill: &FillState,
     shape: &ShapeState,
+    gradient: &GradientState,
     text_edit: &Rc<std::cell::RefCell<Option<crate::text_edit::TextEdit>>>,
     default_brush_name: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     toaster: crate::toaster::Toaster,
@@ -91,6 +94,7 @@ pub(crate) fn build(
     );
     stack.add_named(&build_fill_page(fill), Some(STACK_FILL));
     stack.add_named(&build_shape_page(shape), Some(STACK_SHAPE));
+    stack.add_named(&build_gradient_page(gradient), Some(STACK_GRADIENT));
     stack.add_named(&build_text_page(text_edit), Some(STACK_TEXT));
     stack.add_named(
         &gtk::Box::new(gtk::Orientation::Horizontal, 0),
@@ -112,12 +116,10 @@ const fn stack_name_for(tool: Tool) -> &'static str {
         Tool::Crop => STACK_CROP,
         Tool::Transform => STACK_TRANSFORM,
         Tool::Fill(FillTool::Bucket) => STACK_FILL,
+        Tool::Fill(FillTool::Gradient) => STACK_GRADIENT,
         Tool::Shapes(_) => STACK_SHAPE,
         Tool::Text => STACK_TEXT,
-        Tool::Cursor
-        | Tool::Selection(_)
-        | Tool::ColorPicker
-        | Tool::Fill(FillTool::Gradient) => STACK_NONE,
+        Tool::Cursor | Tool::Selection(_) | Tool::ColorPicker => STACK_NONE,
     }
 }
 
@@ -650,6 +652,46 @@ fn build_shape_page(shape: &ShapeState) -> gtk::Box {
 
     row.append(&small_label("Edges"));
     row.append(&build_filter_dropdown(shape.filter.clone()));
+
+    row
+}
+
+// ---------------------------------------------------------------------------
+// Gradient page
+// ---------------------------------------------------------------------------
+
+const GRADIENT_TYPES: [GradientType; 3] =
+    [GradientType::Linear, GradientType::Radial, GradientType::Square];
+
+fn build_gradient_page(gradient: &GradientState) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(ROW_SPACING)
+        .margin_start(6)
+        .margin_end(LABEL_MARGIN)
+        .valign(gtk::Align::Center)
+        .build();
+
+    row.append(&small_label("Type"));
+
+    let names: Vec<&str> = GRADIENT_TYPES.iter().map(|t| t.display_name()).collect();
+    let dropdown = gtk::DropDown::from_strings(&names);
+    let initial = GRADIENT_TYPES
+        .iter()
+        .position(|&t| t == gradient.gradient_type.get())
+        .unwrap_or(0);
+    #[allow(clippy::cast_possible_truncation)]
+    dropdown.set_selected(initial as u32);
+    {
+        let gradient = gradient.clone();
+        dropdown.connect_selected_notify(move |d| {
+            let idx = d.selected() as usize;
+            if let Some(&t) = GRADIENT_TYPES.get(idx) {
+                gradient.gradient_type.set(t);
+            }
+        });
+    }
+    row.append(&dropdown);
 
     row
 }
