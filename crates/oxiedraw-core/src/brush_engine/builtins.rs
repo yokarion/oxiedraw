@@ -20,14 +20,16 @@ const PLACEHOLDER_ID: BrushPresetId = BrushPresetId(0);
 /// `(filename, factory)` pairs. Filename is stable across releases so
 /// `seed_missing` can detect "this builtin is gone" via filesystem
 /// existence checks.
-fn builtins() -> [(&'static str, Factory); 6] {
+fn builtins() -> [(&'static str, Factory); 8] {
     [
         ("default_round.oxiebrush", BrushPreset::default_round),
         ("ink_pen.oxiebrush", BrushPreset::ink_pen),
         ("pixel.oxiebrush", BrushPreset::pixel),
         ("scatter_dot.oxiebrush", BrushPreset::scatter_dot),
         ("speed_brush.oxiebrush", BrushPreset::speed_brush),
-        ("chalk.oxiebrush", BrushPreset::debug_chalk),
+        ("chalk.oxiebrush", BrushPreset::chalk),
+        ("comics_halftone.oxiebrush", BrushPreset::comics),
+        ("real_brush.oxiebrush", BrushPreset::real_brush),
     ]
 }
 
@@ -50,14 +52,22 @@ pub fn seed_missing(dir: &Path) -> Result<usize, BrushError> {
     for (name, factory) in builtins() {
         let path = dir.join(name);
         let needs_write = if path.exists() {
-            let embedded_has_icon = factory(PLACEHOLDER_ID).icon.is_some();
-            if embedded_has_icon {
-                match format::load(&path) {
-                    Ok(pkg) => pkg.icon.is_none(),
-                    Err(_) => false, // unreadable file -> leave alone
+            match format::load(&path) {
+                // Refresh outdated builtins so newer definitions (soft
+                // Default Round, the global-texture brushes, tuned spacing)
+                // reach installs seeded by an older build. Keyed on schema
+                // *or* the builtin-definition revision so content tweaks
+                // don't need a schema bump.
+                Ok(pkg)
+                    if pkg.manifest.schema_version < format::SCHEMA_VERSION
+                        || pkg.manifest.builtin_revision < format::BUILTIN_REVISION =>
+                {
+                    true
                 }
-            } else {
-                false
+                // Backfill a missing icon when the embedded factory now
+                // ships one (migrates iconless stage-5 archives).
+                Ok(pkg) => factory(PLACEHOLDER_ID).icon.is_some() && pkg.icon.is_none(),
+                Err(_) => false, // unreadable file -> leave alone
             }
         } else {
             true

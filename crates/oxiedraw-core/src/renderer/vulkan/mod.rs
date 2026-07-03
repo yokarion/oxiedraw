@@ -216,6 +216,13 @@ pub struct VulkanRenderer {
     pub(super) pattern_atlas: ManuallyDrop<PatternAtlas>,
     pub(super) dab_pipelines: ManuallyDrop<DabPipelineSet>,
     pub(super) mask_pipelines: ManuallyDrop<MaskPipelineSet>,
+    /// Build-up variant: OVER-blend coverage so a build-up stroke
+    /// accumulates in the stroke buffer and caps at the stroke opacity on
+    /// the single final composite. Selected when `stroke_buildup` is set.
+    pub(super) mask_pipelines_buildup: ManuallyDrop<MaskPipelineSet>,
+    /// Whether the in-flight stroke uses build-up (OVER) mask blending.
+    /// Set at stroke start; defaults to false (MAX blend).
+    pub(super) stroke_buildup: bool,
     /// Cache mapping pattern data identity (raw `*const PatternData`)
     /// to its atlas slot. Lets `upload_pattern` no-op on re-uploads of
     /// the same `Rc<PatternData>`.
@@ -448,6 +455,11 @@ impl VulkanRenderer {
             stroke_target.render_pass,
             pattern_atlas.descriptor_set_layout(),
         )?;
+        let mask_pipelines_buildup = MaskPipelineSet::new_buildup(
+            &dev.device,
+            stroke_target.render_pass,
+            pattern_atlas.descriptor_set_layout(),
+        )?;
         let selection = SelectionResources::new(&dev.device, &mut allocator, extent)?;
         let fill_overlay = FillOverlayResources::new(
             &dev.device,
@@ -568,6 +580,8 @@ impl VulkanRenderer {
             pattern_atlas: ManuallyDrop::new(pattern_atlas),
             dab_pipelines: ManuallyDrop::new(dab_pipelines),
             mask_pipelines: ManuallyDrop::new(mask_pipelines),
+            mask_pipelines_buildup: ManuallyDrop::new(mask_pipelines_buildup),
+            stroke_buildup: false,
             pattern_cache: std::collections::HashMap::new(),
             composite_pipeline: ManuallyDrop::new(composite_pipeline),
             layer_composite_pipeline: ManuallyDrop::new(layer_composite_pipeline),
@@ -1248,6 +1262,7 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.fill_overlay).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.selection).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.mask_pipelines).destroy(&self.device);
+            ManuallyDrop::take(&mut self.mask_pipelines_buildup).destroy(&self.device);
             ManuallyDrop::take(&mut self.dab_pipelines).destroy(&self.device);
             ManuallyDrop::take(&mut self.pattern_atlas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.dab_buffers).destroy(&self.device, &mut self.allocator);
@@ -1377,6 +1392,10 @@ mod tests {
             flow: 1.0,
             color_premul,
             texture_uv: [0.0, 0.0, 1.0, 1.0],
+            hardness: 1.0,
+            tip: 0.0,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
         }
     }
 

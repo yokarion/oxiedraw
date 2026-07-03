@@ -9,7 +9,8 @@ layout(location = 3) in float a_rotation;    // radians (unused by soft-round)
 layout(location = 4) in float a_aspect;      // 1.0 = round (unused by soft-round)
 layout(location = 5) in float a_flow;        // coverage multiplier, 0..1
 layout(location = 6) in vec4 a_color;        // premultiplied linear RGBA
-layout(location = 7) in vec4 a_texture_uv;   // (u0,v0,u1,v1) unused until textured family
+layout(location = 7) in vec4 a_texture_uv;   // (u0,v0,u1,v1) unused by soft-round
+layout(location = 8) in float a_hardness;    // edge falloff, 1.0 = crisp
 
 layout(push_constant) uniform Push {
     vec2 inv_size;  // 2.0 / canvas_size
@@ -20,6 +21,7 @@ layout(location = 0) out vec2 v_local;
 layout(location = 1) out float v_radius;
 layout(location = 2) out vec4 v_color;
 layout(location = 3) out float v_flow;
+layout(location = 4) out float v_hardness;
 
 void main() {
     vec2 local = a_quad * a_radius;
@@ -34,4 +36,5 @@ void main() {
     v_radius = a_radius;
     v_color = a_color;
     v_flow = a_flow;
+    v_hardness = a_hardness;
 }

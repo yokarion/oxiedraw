@@ -51,7 +51,10 @@ pub fn load(path: &Path) -> Result<BrushPackage, BrushError> {
     if manifest.kind != KIND {
         return Err(BrushError::NotABrush(manifest.kind));
     }
-    if manifest.schema_version != SCHEMA_VERSION {
+    // Older archives load fine: new `brush.json` fields are
+    // `#[serde(default)]`. Only reject archives from a *newer* schema we
+    // can't understand.
+    if manifest.schema_version > SCHEMA_VERSION {
         return Err(BrushError::UnsupportedSchema {
             found: manifest.schema_version,
             expected: SCHEMA_VERSION,
@@ -112,6 +115,10 @@ impl BrushPackage {
             stabilizer: self.document.stabilizer,
             speed_smoothing: self.document.speed_smoothing,
             buildup: self.document.buildup,
+            hardness: self.document.hardness,
+            tip: self.document.tip,
+            texture_scale: self.document.texture_scale,
+            texture_strength: self.document.texture_strength,
             dynamics: self.document.dynamics,
             icon: self.icon,
             preview: self.preview,

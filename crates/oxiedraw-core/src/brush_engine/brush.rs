@@ -33,8 +33,24 @@ pub struct Dab {
     /// Per-dab tint. Carries premultiplied colour for stage-3 hue/sat/val
     /// jitter; today every dab in a stroke shares the stroke colour.
     pub color: Color,
-    /// `(u0, v0, u1, v1)` into the pattern atlas. Unused until stage 4.
+    /// `(u0, v0, u1, v1)` into the pattern atlas. Unused by the
+    /// global-texture path (which samples in canvas space instead).
     pub texture_uv: [f32; 4],
+    /// Edge falloff, `0..=1`. `1.0` is a crisp anti-aliased edge; lower
+    /// values start the fade closer to the centre for a soft/airbrush
+    /// look. Used by soft-round and the procedural textured tip.
+    pub hardness: f32,
+    /// Procedural tip shape for the textured family: `0.0` round,
+    /// `1.0` square. Ignored by soft-round / pixel.
+    pub tip: f32,
+    /// Global-grain tile size in canvas pixels. The textured shader
+    /// samples the pattern at `canvas_position / texture_scale`, so the
+    /// grain is anchored in canvas space and continuous across the whole
+    /// stroke. `0.0` disables the grain (plain tip).
+    pub texture_scale: f32,
+    /// How strongly the global grain modulates coverage, `0..=1`.
+    /// `0.0` = tip only, `1.0` = grain fully gates the tip.
+    pub texture_strength: f32,
 }
 
 impl Dab {
@@ -49,6 +65,10 @@ impl Dab {
             flow: 1.0,
             color,
             texture_uv: [0.0, 0.0, 1.0, 1.0],
+            hardness: 1.0,
+            tip: 0.0,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
         }
     }
 }

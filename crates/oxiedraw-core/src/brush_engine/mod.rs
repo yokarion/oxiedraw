@@ -15,7 +15,7 @@ pub use cursor::{BrushCursor, compute_brush_cursor};
 pub use dynamics::{Curve, DynSource, Dynamics, Mapping, SpawnInput, evaluate, make_spawn_input};
 pub use input::InputSample;
 pub use pattern::PatternData;
-pub use preset::{BrushFamily, BrushPreset};
+pub use preset::{BrushFamily, BrushPreset, TipShape};
 pub use registry::BrushRegistry;
 pub use stamp::start_stroke;
 
@@ -98,7 +98,9 @@ impl BrushEngine {
         engine.add_brush(BrushPreset::pixel(placeholder));
         engine.add_brush(BrushPreset::scatter_dot(placeholder));
         engine.add_brush(BrushPreset::speed_brush(placeholder));
-        engine.add_brush(BrushPreset::debug_chalk(placeholder));
+        engine.add_brush(BrushPreset::chalk(placeholder));
+        engine.add_brush(BrushPreset::comics(placeholder));
+        engine.add_brush(BrushPreset::real_brush(placeholder));
         engine.active.set(default_id);
         let default_preset_size = engine
             .brushes

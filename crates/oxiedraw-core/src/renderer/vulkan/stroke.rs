@@ -39,6 +39,23 @@ impl VulkanRenderer {
         self.stroke_erase = erase;
     }
 
+    /// Set whether the in-flight stroke accumulates coverage (build-up,
+    /// OVER blend) instead of saturating (MAX). Call at the start of a
+    /// stroke. Reset to false by `begin_stroke` for ordinary brushes.
+    pub fn set_stroke_buildup(&mut self, buildup: bool) {
+        self.stroke_buildup = buildup;
+    }
+
+    /// The mask pipeline set the current stroke stamps with: OVER-blend
+    /// for build-up, MAX-blend otherwise.
+    pub(super) fn active_mask_pipelines(&self) -> &super::super::mask::MaskPipelineSet {
+        if self.stroke_buildup {
+            &self.mask_pipelines_buildup
+        } else {
+            &self.mask_pipelines
+        }
+    }
+
     /// The tight integer AABB `(x, y, w, h)` of everything stamped since
     /// the last reset, clamped to the canvas. `None` if nothing was
     /// stamped or the rect is empty after clamping.
@@ -96,7 +113,7 @@ impl VulkanRenderer {
         }
         self.accumulate_dirty(dabs);
         let n = self.dab_buffers.upload_instances(dabs)?;
-        let pipe = self.mask_pipelines.get(family);
+        let pipe = self.active_mask_pipelines().get(family);
         let pipeline = pipe.pipeline;
         let layout = pipe.layout;
         let render_pass = self.stroke_target.render_pass;

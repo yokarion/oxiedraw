@@ -6,7 +6,9 @@ mod types;
 pub use error::BrushError;
 pub use load::load;
 pub use save::save;
-pub use types::{BrushDocument, BrushManifest, BrushPackage, FamilyDoc, SCHEMA_VERSION};
+pub use types::{
+    BUILTIN_REVISION, BrushDocument, BrushManifest, BrushPackage, FamilyDoc, SCHEMA_VERSION,
+};
 
 #[cfg(test)]
 mod tests {
@@ -38,6 +40,10 @@ mod tests {
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 1.0,
+            tip: super::super::preset::TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,
@@ -94,6 +100,10 @@ mod tests {
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 1.0,
+            tip: super::super::preset::TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,

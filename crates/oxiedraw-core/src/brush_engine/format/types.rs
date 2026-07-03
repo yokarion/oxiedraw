@@ -3,12 +3,22 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::super::dynamics::Dynamics;
+use super::super::preset::TipShape;
 
-pub const SCHEMA_VERSION: u32 = 1;
+/// Bumped to 2 when the global-texture brush fields (hardness, tip,
+/// texture scale/strength) landed. New fields are `#[serde(default)]`, so
+/// the loader still accepts older archives - see `load::load`.
+pub const SCHEMA_VERSION: u32 = 2;
 pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Manifest discriminator distinguishing brushes from other future TAR
 /// archive types so the loader can reject the wrong file early.
 pub(super) const KIND: &str = "brush";
+
+/// Monotonic revision of the built-in brush *definitions*. Bump this
+/// whenever a builtin factory changes in a way that should reach existing
+/// installs (tuned spacing, new grain, etc.) without a schema change.
+/// `seed_missing` re-writes any builtin whose on-disk revision is older.
+pub const BUILTIN_REVISION: u32 = 6;
 
 /// `manifest.json` - fast metadata read for the brush picker so we can
 /// list brushes without fully deserialising `brush.json`.
@@ -18,6 +28,10 @@ pub struct BrushManifest {
     pub app_version: String,
     pub kind: String,
     pub name: String,
+    /// Built-in definition revision this archive was written from. `0`
+    /// for user brushes and pre-revision builtins (via serde default).
+    #[serde(default)]
+    pub builtin_revision: u32,
 }
 
 /// Family discriminator in `brush.json`. `Textured` carries the
@@ -41,7 +55,21 @@ pub struct BrushDocument {
     pub speed_smoothing: f32,
     #[serde(default)]
     pub buildup: bool,
+    /// Edge falloff. Defaults to `1.0` (crisp) so pre-schema-2 archives
+    /// keep their original hard edge.
+    #[serde(default = "default_hardness")]
+    pub hardness: f32,
+    #[serde(default)]
+    pub tip: TipShape,
+    #[serde(default)]
+    pub texture_scale: f32,
+    #[serde(default)]
+    pub texture_strength: f32,
     pub dynamics: Dynamics,
+}
+
+fn default_hardness() -> f32 {
+    1.0
 }
 
 /// Decoded archive contents. Patterns are RGBA8 (premultiplied) with

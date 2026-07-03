@@ -10,14 +10,18 @@ use super::resources::Buffer;
 /// One brush dab on the GPU.
 ///
 /// Layout (offsets in bytes):
-/// - `center`       0   vec2
-/// - `radius`       8   f32
-/// - `rotation`    12   f32 (radians; soft-round/pixel ignore)
-/// - `aspect`      16   f32 (1.0 = round)
-/// - `flow`        20   f32 (coverage multiplier, 0..=1)
-/// - `color_premul` 24  vec4 (premultiplied linear RGBA)
-/// - `texture_uv`  40   vec4 (u0,v0,u1,v1; ignored until Textured family)
-/// Total stride = 56, all components 4-byte aligned.
+/// - `center`           0   vec2
+/// - `radius`           8   f32
+/// - `rotation`        12   f32 (radians; soft-round/pixel ignore)
+/// - `aspect`          16   f32 (1.0 = round)
+/// - `flow`            20   f32 (coverage multiplier, 0..=1)
+/// - `color_premul`    24   vec4 (premultiplied linear RGBA)
+/// - `texture_uv`      40   vec4 (u0,v0,u1,v1; unused by global-texture path)
+/// - `hardness`        56   f32 (edge falloff; 1.0 = crisp)
+/// - `tip`             60   f32 (textured tip: 0 round, 1 square)
+/// - `texture_scale`   64   f32 (global grain tile size in canvas px)
+/// - `texture_strength` 68  f32 (grain modulation 0..=1)
+/// Total stride = 72, all components 4-byte aligned.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DabInstance {
@@ -28,13 +32,17 @@ pub struct DabInstance {
     pub flow: f32,
     pub color_premul: [f32; 4],
     pub texture_uv: [f32; 4],
+    pub hardness: f32,
+    pub tip: f32,
+    pub texture_scale: f32,
+    pub texture_strength: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<DabInstance>() == DAB_INSTANCE_STRIDE as usize);
 
-pub(super) const DAB_INSTANCE_STRIDE: u32 = 56;
+pub(super) const DAB_INSTANCE_STRIDE: u32 = 72;
 
-/// Maximum dabs uploadable in a single call. ~3.5 MB at 56 bytes each.
+/// Maximum dabs uploadable in a single call. ~4.7 MB at 72 bytes each.
 pub(super) const MAX_INSTANCES: u32 = 64 * 1024;
 
 const QUAD_VERTS: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
@@ -119,6 +127,10 @@ impl DabInstance {
             flow: dab.flow,
             color_premul: [r, g, b, 1.0],
             texture_uv: dab.texture_uv,
+            hardness: dab.hardness,
+            tip: dab.tip,
+            texture_scale: dab.texture_scale,
+            texture_strength: dab.texture_strength,
         }
     }
 }
@@ -347,6 +359,26 @@ pub(super) fn build_dab_instanced_pipeline(
             .binding(1)
             .format(vk::Format::R32G32B32A32_SFLOAT)
             .offset(40), // texture_uv
+        vk::VertexInputAttributeDescription::default()
+            .location(8)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(56), // hardness
+        vk::VertexInputAttributeDescription::default()
+            .location(9)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(60), // tip
+        vk::VertexInputAttributeDescription::default()
+            .location(10)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(64), // texture_scale
+        vk::VertexInputAttributeDescription::default()
+            .location(11)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(68), // texture_strength
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)

@@ -20,19 +20,50 @@ pub(super) struct MaskPipeline {
     pub pipeline: vk::Pipeline,
 }
 
+/// Saturating coverage blend: `dst = max(dst, src)`. Overlapping dabs in
+/// one stroke settle to the highest coverage rather than accumulating -
+/// the default (non-build-up) behaviour.
+fn max_blend() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE)
+        .color_blend_op(vk::BlendOp::MAX)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+        .alpha_blend_op(vk::BlendOp::MAX)
+}
+
+/// Accumulating coverage blend: `dst = src + dst*(1 - src)` (alpha OVER on
+/// the coverage channel). Overlapping dabs build up toward full coverage
+/// (clamped by R8_UNORM), so build-up strokes darken where they overlap
+/// while the single final composite still caps at the stroke opacity.
+fn over_blend() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::ONE)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_COLOR)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ONE)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .alpha_blend_op(vk::BlendOp::ADD)
+}
+
 impl MaskPipeline {
     /// Soft-round coverage mask (anti-aliased edge).
     pub(super) fn new_round(
         device: &Device,
         render_pass: vk::RenderPass,
+        blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
-        Self::build(device, render_pass, &[], DAB_VERT_SPV, MASK_FRAG_SPV)
+        Self::build(device, render_pass, &[], DAB_VERT_SPV, MASK_FRAG_SPV, blend)
     }
 
     /// Pixel-art coverage mask (hard edge, integer-snapped centre).
     pub(super) fn new_pixel(
         device: &Device,
         render_pass: vk::RenderPass,
+        blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
         Self::build(
             device,
@@ -40,6 +71,7 @@ impl MaskPipeline {
             &[],
             DAB_PIXEL_VERT_SPV,
             MASK_PIXEL_FRAG_SPV,
+            blend,
         )
     }
 
@@ -48,6 +80,7 @@ impl MaskPipeline {
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
+        blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
         Self::build(
             device,
@@ -55,6 +88,7 @@ impl MaskPipeline {
             &[atlas_set_layout],
             DAB_TEXTURED_VERT_SPV,
             MASK_TEXTURED_FRAG_SPV,
+            blend,
         )
     }
 
@@ -64,6 +98,7 @@ impl MaskPipeline {
         set_layouts: &[vk::DescriptorSetLayout],
         vert_spv: &[u8],
         frag_spv: &[u8],
+        blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
         let layout = dab::create_pipeline_layout(device, set_layouts)?;
         let pipeline = dab::build_dab_instanced_pipeline(
@@ -72,16 +107,7 @@ impl MaskPipeline {
             render_pass,
             vert_spv,
             frag_spv,
-            // Saturating blend: dst = max(dst, src). Factors are unused
-            // by MAX, but Vulkan still requires sane values.
-            vk::PipelineColorBlendAttachmentState::default()
-                .blend_enable(true)
-                .src_color_blend_factor(vk::BlendFactor::ONE)
-                .dst_color_blend_factor(vk::BlendFactor::ONE)
-                .color_blend_op(vk::BlendOp::MAX)
-                .src_alpha_blend_factor(vk::BlendFactor::ONE)
-                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
-                .alpha_blend_op(vk::BlendOp::MAX),
+            blend,
             // R8_UNORM has only the R channel - write to it only.
             vk::ColorComponentFlags::R,
         )?;
@@ -105,14 +131,34 @@ pub(super) struct MaskPipelineSet {
 }
 
 impl MaskPipelineSet {
+    /// The default (non-build-up) mask set: MAX-blend coverage.
     pub(super) fn new(
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RendererError> {
-        let round = MaskPipeline::new_round(device, render_pass)?;
-        let pixel = MaskPipeline::new_pixel(device, render_pass)?;
-        let textured = MaskPipeline::new_textured(device, render_pass, atlas_set_layout)?;
+        Self::with_blend(device, render_pass, atlas_set_layout, max_blend())
+    }
+
+    /// The build-up mask set: OVER-blend coverage so overlapping dabs
+    /// accumulate in the stroke buffer instead of saturating.
+    pub(super) fn new_buildup(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        atlas_set_layout: vk::DescriptorSetLayout,
+    ) -> Result<Self, RendererError> {
+        Self::with_blend(device, render_pass, atlas_set_layout, over_blend())
+    }
+
+    fn with_blend(
+        device: &Device,
+        render_pass: vk::RenderPass,
+        atlas_set_layout: vk::DescriptorSetLayout,
+        blend: vk::PipelineColorBlendAttachmentState,
+    ) -> Result<Self, RendererError> {
+        let round = MaskPipeline::new_round(device, render_pass, blend)?;
+        let pixel = MaskPipeline::new_pixel(device, render_pass, blend)?;
+        let textured = MaskPipeline::new_textured(device, render_pass, atlas_set_layout, blend)?;
         // Index order must match `DabFamily::kind_index`.
         Ok(Self {
             pipelines: [round, pixel, textured],

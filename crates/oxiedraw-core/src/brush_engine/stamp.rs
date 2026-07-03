@@ -22,7 +22,37 @@ pub fn start_stroke(preset: &BrushPreset, ctx: StrokeContext) -> Box<dyn StrokeR
         preset.stabilizer,
         preset.speed_smoothing,
         preset.dynamics.clone(),
+        DabStyle::from_preset(preset),
     ))
+}
+
+/// Per-stroke tip + grain settings copied onto every dab so the GPU
+/// shaders can shape the footprint and modulate it with the global
+/// canvas-space texture. Constant across a stroke.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct DabStyle {
+    hardness: f32,
+    tip: f32,
+    texture_scale: f32,
+    texture_strength: f32,
+}
+
+impl DabStyle {
+    fn from_preset(preset: &BrushPreset) -> Self {
+        Self {
+            hardness: preset.hardness,
+            tip: preset.tip.as_gpu(),
+            texture_scale: preset.texture_scale,
+            texture_strength: preset.texture_strength,
+        }
+    }
+
+    fn apply(self, dab: &mut Dab) {
+        dab.hardness = self.hardness;
+        dab.tip = self.tip;
+        dab.texture_scale = self.texture_scale;
+        dab.texture_strength = self.texture_strength;
+    }
 }
 
 /// Streams input through a uniform Catmull-Rom spline so the painted
@@ -38,6 +68,7 @@ pub(super) struct PresetStrokeRenderer {
     /// EMA smoothing factor for the speed signal (0.0..=1.0 from preset).
     speed_smoothing: f32,
     dynamics: Dynamics,
+    style: DabStyle,
     history: VecDeque<InputSample>,
     dabs: Vec<Dab>,
     total_distance: f32,
@@ -59,6 +90,7 @@ impl PresetStrokeRenderer {
         stabilizer: f32,
         speed_smoothing: f32,
         dynamics: Dynamics,
+        style: DabStyle,
     ) -> Self {
         // Seed the per-stroke RNG so scatter / random dynamics are
         // deterministic per stroke (handy for tests) but distinct
@@ -76,6 +108,7 @@ impl PresetStrokeRenderer {
             stabilizer: stabilizer.clamp(0.0, 0.95),
             speed_smoothing: speed_smoothing.clamp(0.0, 1.0),
             dynamics,
+            style,
             history: VecDeque::with_capacity(4),
             dabs: Vec::new(),
             total_distance: 0.0,
@@ -142,6 +175,7 @@ impl PresetStrokeRenderer {
         tilt_y: f32,
     ) -> Dab {
         let mut dab = Dab::round(pos, self.ctx.size * 0.5, self.ctx.color);
+        self.style.apply(&mut dab);
         // Pixel family deliberately skips dynamics - the curves don't
         // line up with the integer grid. Empty `Dynamics` also skips
         // for the cheap path.
@@ -208,9 +242,12 @@ impl PresetStrokeRenderer {
         };
 
         let spacing_ratio = self.resolve_spacing_ratio(&p2, speed_px_ms, direction);
-        // step = diameter * spacing_ratio. Floored at 1 px so a zero
-        // ratio means "draw every pixel" rather than divide-by-zero.
-        let step = (self.ctx.size * spacing_ratio).max(MIN_DAB_RADIUS * 2.0);
+        // Spacing tracks the pressure-scaled dab size, not the base size,
+        // so a low-pressure (small) dab still overlaps its neighbour rather
+        // than leaving isolated dark centres (very visible at large sizes).
+        // Floored at 1 px to avoid divide-by-zero.
+        let effective_size = self.effective_diameter(&p1, &p2, speed_px_ms, direction);
+        let step = (effective_size * spacing_ratio).max(MIN_DAB_RADIUS * 2.0);
 
         self.dabs.clear();
 
@@ -261,11 +298,41 @@ impl PresetStrokeRenderer {
         target.paint_dabs(&self.dabs);
     }
 
-    /// Compute the spacing ratio for the upcoming segment. With no
-    /// active spacing dynamics this is the preset's static ratio; with
-    /// a mapping it's evaluated against the same `SpawnInput` the dab
-    /// dynamics will see, then floored so the renderer never has to
-    /// stamp millions of dabs per segment.
+    /// Smallest dab diameter the size dynamics produce across the segment
+    /// (evaluated at both endpoints; pressure interpolates monotonically).
+    /// Spacing scales by this so even the smallest dab overlaps. Falls back
+    /// to the base size when no size mapping is active.
+    fn effective_diameter(
+        &self,
+        p1: &InputSample,
+        p2: &InputSample,
+        speed_px_ms: f32,
+        direction_rad: f32,
+    ) -> f32 {
+        let Some(mapping) = &self.dynamics.size else {
+            return self.ctx.size;
+        };
+        let diameter_at = |p: &InputSample| {
+            let input = make_spawn_input(
+                p.pressure,
+                speed_px_ms,
+                direction_rad,
+                self.total_distance,
+                self.ctx.size,
+                0.0,
+                p.rotation,
+                p.tilt_x,
+                p.tilt_y,
+            );
+            self.ctx.size * mapping.apply(&input)
+        };
+        diameter_at(p1).min(diameter_at(p2)).max(MIN_DAB_RADIUS * 2.0)
+    }
+
+    /// Compute the spacing ratio for the upcoming segment. With no active
+    /// spacing dynamics this is the preset's static ratio; with a mapping
+    /// it's evaluated against the same `SpawnInput` the dab dynamics will
+    /// see, then floored so the renderer never stamps millions of dabs.
     fn resolve_spacing_ratio(
         &self,
         p2: &InputSample,
@@ -420,7 +487,26 @@ fn emit_segment_dabs_preview(
         );
         mapping.apply(&probe)
     });
-    let step = (base_size * effective_spacing).max(MIN_DAB_RADIUS * 2.0);
+    // Mirror the live path: spacing tracks the smallest pressure-scaled
+    // dab size across the segment so ramping pressure doesn't gap.
+    let effective_size = renderer.dynamics.size.as_ref().map_or(base_size, |mapping| {
+        let diameter_at = |p: &InputSample| {
+            let probe = make_spawn_input(
+                p.pressure,
+                speed_px_ms,
+                direction,
+                renderer.total_distance,
+                base_size,
+                0.0,
+                p.rotation,
+                p.tilt_x,
+                p.tilt_y,
+            );
+            base_size * mapping.apply(&probe)
+        };
+        diameter_at(&p1).min(diameter_at(&p2))
+    });
+    let step = (effective_size * effective_spacing).max(MIN_DAB_RADIUS * 2.0);
 
     // Preview is read-only - walk distances locally; no state advance.
     let mut s = step - renderer.dist_since_last_dab;
@@ -429,6 +515,7 @@ fn emit_segment_dabs_preview(
         let pos = catmull_rom(p0.position, p1.position, p2.position, p3.position, t);
         let pressure = (p2.pressure - p1.pressure).mul_add(t, p1.pressure);
         let mut dab = Dab::round(pos, base_size * 0.5, color);
+        renderer.style.apply(&mut dab);
         if !matches!(renderer.family, BrushFamily::Pixel) && renderer.dynamics.any_active() {
             // Use a stable per-position pseudo-random so the preview
             // tail doesn't visually jitter between frames.

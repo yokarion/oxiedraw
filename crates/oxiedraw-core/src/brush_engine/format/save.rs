@@ -7,7 +7,9 @@ use tar::{Builder, Header};
 use super::super::pattern::PatternData;
 use super::super::preset::{BrushFamily, BrushPreset};
 use super::error::BrushError;
-use super::types::{APP_VERSION, BrushDocument, BrushManifest, FamilyDoc, KIND, SCHEMA_VERSION};
+use super::types::{
+    APP_VERSION, BUILTIN_REVISION, BrushDocument, BrushManifest, FamilyDoc, KIND, SCHEMA_VERSION,
+};
 
 /// Write `preset` to an `.oxiebrush` archive at `path`.
 pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
@@ -19,6 +21,7 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
         app_version: APP_VERSION.to_string(),
         kind: KIND.to_string(),
         name: preset.name.clone(),
+        builtin_revision: BUILTIN_REVISION,
     };
     append_json(&mut archive, "manifest.json", &manifest)?;
 
@@ -44,6 +47,10 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
         stabilizer: preset.stabilizer,
         speed_smoothing: preset.speed_smoothing,
         buildup: preset.buildup,
+        hardness: preset.hardness,
+        tip: preset.tip,
+        texture_scale: preset.texture_scale,
+        texture_strength: preset.texture_strength,
         dynamics: preset.dynamics.clone(),
     };
     append_json(&mut archive, "brush.json", &document)?;

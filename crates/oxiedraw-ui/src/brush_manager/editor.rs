@@ -172,6 +172,20 @@ pub(super) fn build(
     let (speed_smoothing_row, speed_smoothing_scale) =
         build_scale_row("Speed smoothing", 0.0, 1.0, 0.01);
     props_group.add(&speed_smoothing_row);
+    let (hardness_row, hardness_scale) = build_scale_row("Hardness", 0.0, 1.0, 0.01);
+    hardness_row.set_subtitle("Edge softness - 1.0 crisp, low is a soft airbrush edge");
+    props_group.add(&hardness_row);
+    // Textured-only: size of the global canvas-anchored pattern (px per
+    // tile) and how strongly it gates coverage. Hidden for other families.
+    let (pattern_size_row, pattern_size_scale) =
+        build_scale_row("Pattern size", 16.0, 1024.0, 1.0);
+    pattern_size_row.set_subtitle("Grain tile size in canvas pixels");
+    pattern_size_row.set_visible(false);
+    props_group.add(&pattern_size_row);
+    let (pattern_strength_row, pattern_strength_scale) =
+        build_scale_row("Pattern strength", 0.0, 1.0, 0.01);
+    pattern_strength_row.set_visible(false);
+    props_group.add(&pattern_strength_row);
     let buildup_row = adw::SwitchRow::new();
     buildup_row.set_title("Build up opacity");
     buildup_row.set_subtitle("Paint over the same spot during one drag to stack opacity");
@@ -212,6 +226,11 @@ pub(super) fn build(
         let schedule_save = schedule_save.clone();
         let pattern_row = pattern_row.clone();
         let pattern_thumb = pattern_thumb.clone();
+        let pattern_size_row = pattern_size_row.clone();
+        let pattern_strength_row = pattern_strength_row.clone();
+        let pattern_size_scale = pattern_size_scale.clone();
+        let pattern_strength_scale = pattern_strength_scale.clone();
+        let loading_for_family = loading.clone();
         family_dropdown.connect_selected_notify(move |d| {
             if loading.get() {
                 return;
@@ -226,14 +245,30 @@ pub(super) fn build(
                 _ => match &brush.family {
                     BrushFamily::Textured(rc) => BrushFamily::Textured(rc.clone()),
                     // First-time switch to Textured: seed with the
-                    // synthesised chalk pattern so the brush stays
-                    // visually meaningful until the user picks one.
-                    _ => BrushFamily::Textured(Rc::new(PatternData::debug_chalk(128))),
+                    // synthesised chalk grain so the brush stays visually
+                    // meaningful until the user picks a pattern.
+                    _ => BrushFamily::Textured(Rc::new(PatternData::chalk_grain(512))),
                 },
             };
+            // A textured brush with no pattern size shows no grain, so give
+            // fresh conversions sensible defaults.
+            if matches!(brush.family, BrushFamily::Textured(_)) && brush.texture_scale <= 0.0 {
+                brush.texture_scale = 200.0;
+                brush.texture_strength = 0.85;
+                loading_for_family.set(true);
+                pattern_size_scale.set_value(f64::from(brush.texture_scale));
+                pattern_strength_scale.set_value(f64::from(brush.texture_strength));
+                loading_for_family.set(false);
+            }
             let updated_family = brush.family.clone();
             drop(brushes);
-            apply_pattern_visibility(&pattern_row, &pattern_thumb, &updated_family);
+            apply_pattern_visibility(
+                &pattern_row,
+                &pattern_thumb,
+                &pattern_size_row,
+                &pattern_strength_row,
+                &updated_family,
+            );
             schedule_save();
         });
     }
@@ -319,6 +354,30 @@ pub(super) fn build(
         &loading,
         &schedule_save,
         |b, v| b.speed_smoothing = v as f32,
+    );
+    wire_scale_to_field(
+        &hardness_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &schedule_save,
+        |b, v| b.hardness = v as f32,
+    );
+    wire_scale_to_field(
+        &pattern_size_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &schedule_save,
+        |b, v| b.texture_scale = v as f32,
+    );
+    wire_scale_to_field(
+        &pattern_strength_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &schedule_save,
+        |b, v| b.texture_strength = v as f32,
     );
     {
         let brush_engine = brush_engine.clone();
@@ -428,6 +487,11 @@ pub(super) fn build(
         let spacing_scale = spacing_scale.clone();
         let stabilizer_scale = stabilizer_scale.clone();
         let speed_smoothing_scale = speed_smoothing_scale.clone();
+        let hardness_scale = hardness_scale.clone();
+        let pattern_size_row = pattern_size_row.clone();
+        let pattern_strength_row = pattern_strength_row.clone();
+        let pattern_size_scale = pattern_size_scale.clone();
+        let pattern_strength_scale = pattern_strength_scale.clone();
         let buildup_row = buildup_row.clone();
         let delete_btn = delete_btn.clone();
         let choose_btn = choose_btn.clone();
@@ -452,6 +516,9 @@ pub(super) fn build(
             spacing_scale.set_sensitive(enabled);
             stabilizer_scale.set_sensitive(enabled);
             speed_smoothing_scale.set_sensitive(enabled);
+            hardness_scale.set_sensitive(enabled);
+            pattern_size_scale.set_sensitive(enabled);
+            pattern_strength_scale.set_sensitive(enabled);
             buildup_row.set_sensitive(enabled);
             size_dyn.row.set_sensitive(enabled);
             flow_dyn.row.set_sensitive(enabled);
@@ -463,12 +530,21 @@ pub(super) fn build(
                 name_entry.set_text(&p.name);
                 picker::apply_icon_to_image(&icon_image, p, FALLBACK_ICON);
                 family_dropdown.set_selected(family_to_dropdown_index(&p.family));
-                apply_pattern_visibility(&pattern_row, &pattern_thumb, &p.family);
+                apply_pattern_visibility(
+                    &pattern_row,
+                    &pattern_thumb,
+                    &pattern_size_row,
+                    &pattern_strength_row,
+                    &p.family,
+                );
                 size_scale.set_value(f64::from(p.default_size));
                 opacity_scale.set_value(f64::from(p.default_opacity));
                 spacing_scale.set_value(f64::from(p.spacing_ratio));
                 stabilizer_scale.set_value(f64::from(p.stabilizer));
                 speed_smoothing_scale.set_value(f64::from(p.speed_smoothing));
+                hardness_scale.set_value(f64::from(p.hardness));
+                pattern_size_scale.set_value(f64::from(p.texture_scale.max(16.0)));
+                pattern_strength_scale.set_value(f64::from(p.texture_strength));
                 buildup_row.set_active(p.buildup);
                 size_dyn.apply(p.dynamics.size.as_ref());
                 flow_dyn.apply(p.dynamics.flow.as_ref());
@@ -481,12 +557,17 @@ pub(super) fn build(
                 icon_image.set_icon_name(Some(FALLBACK_ICON));
                 family_dropdown.set_selected(0);
                 pattern_row.set_visible(false);
+                pattern_size_row.set_visible(false);
+                pattern_strength_row.set_visible(false);
                 pattern_thumb.set_icon_name(Some("image-x-generic-symbolic"));
                 size_scale.set_value(0.0);
                 opacity_scale.set_value(0.0);
                 spacing_scale.set_value(0.0);
                 stabilizer_scale.set_value(0.0);
                 speed_smoothing_scale.set_value(0.0);
+                hardness_scale.set_value(1.0);
+                pattern_size_scale.set_value(200.0);
+                pattern_strength_scale.set_value(0.0);
                 buildup_row.set_active(false);
                 size_dyn.apply(None);
                 flow_dyn.apply(None);
@@ -551,6 +632,9 @@ pub(super) fn build(
         &spacing_scale,
         &stabilizer_scale,
         &speed_smoothing_scale,
+        &hardness_scale,
+        &pattern_size_scale,
+        &pattern_strength_scale,
         &size_dyn,
         &flow_dyn,
         &rotation_dyn,
@@ -581,16 +665,16 @@ fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
 fn apply_pattern_visibility(
     row: &adw::ActionRow,
     thumb: &gtk::Image,
+    size_row: &adw::ActionRow,
+    strength_row: &adw::ActionRow,
     family: &BrushFamily,
 ) {
-    match family {
-        BrushFamily::Textured(rc) => {
-            row.set_visible(true);
-            apply_pattern_thumb(thumb, rc);
-        }
-        _ => {
-            row.set_visible(false);
-        }
+    let textured = matches!(family, BrushFamily::Textured(_));
+    row.set_visible(textured);
+    size_row.set_visible(textured);
+    strength_row.set_visible(textured);
+    if let BrushFamily::Textured(rc) = family {
+        apply_pattern_thumb(thumb, rc);
     }
 }
 
@@ -1016,6 +1100,9 @@ fn install_live_preview(
     spacing_scale: &gtk::Scale,
     stabilizer_scale: &gtk::Scale,
     speed_smoothing_scale: &gtk::Scale,
+    hardness_scale: &gtk::Scale,
+    pattern_size_scale: &gtk::Scale,
+    pattern_strength_scale: &gtk::Scale,
     size_dyn: &DynamicsRowHandles,
     flow_dyn: &DynamicsRowHandles,
     rotation_dyn: &DynamicsRowHandles,
@@ -1038,6 +1125,9 @@ fn install_live_preview(
     attach_scale(spacing_scale);
     attach_scale(stabilizer_scale);
     attach_scale(speed_smoothing_scale);
+    attach_scale(hardness_scale);
+    attach_scale(pattern_size_scale);
+    attach_scale(pattern_strength_scale);
 
     for handles in [size_dyn, flow_dyn, rotation_dyn, scatter_dyn, spacing_dyn] {
         let l = loading.clone();

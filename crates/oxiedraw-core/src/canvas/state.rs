@@ -174,6 +174,9 @@ impl Canvas {
         };
 
         self.renderer.set_stroke_erase(erase);
+        // Default to MAX-blend; a build-up brush opts in via
+        // `set_stroke_buildup(true)` right after this call.
+        self.renderer.set_stroke_buildup(false);
         self.renderer.clear_stroke()?;
         // New stroke target / fresh layer state: the cached below-stack
         // composite must be rebuilt on the first preview of this stroke.
@@ -188,6 +191,14 @@ impl Canvas {
         });
         self.bump_version();
         Ok(())
+    }
+
+    /// Opt the in-flight stroke into build-up (accumulating OVER-blend in
+    /// the stroke buffer). Call right after `begin_stroke`. The stroke then
+    /// builds up where it overlaps itself and caps at the stroke opacity on
+    /// the single commit composite - no per-event flushing needed.
+    pub fn set_stroke_buildup(&mut self, buildup: bool) {
+        self.renderer.set_stroke_buildup(buildup);
     }
 
     /// Run `paint` with a [`PaintTarget`] that stamps dabs into the
@@ -227,28 +238,9 @@ impl Canvas {
         Ok(())
     }
 
-    /// Build-up step: composite the current stroke buffer into the
-    /// captured layer at the captured (color, opacity), clear the
-    /// stroke buffer, and recomposite the canvas - WITHOUT taking the
-    /// stroke context. Subsequent `stamp` / `commit_stroke` calls keep
-    /// working as if the stroke hadn't ended.
-    pub fn flush_stroke(&mut self) -> Result<(), RendererError> {
-        let Some(ctx) = self.current_stroke else {
-            return Ok(());
-        };
-        let linear = ctx.color.to_linear_rgb();
-        let visibilities = self.visibilities();
-        self.renderer
-            .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
-        self.rescope_composite()?;
-        self.renderer.invalidate_preview_cache();
-        self.bump_version();
-        Ok(())
-    }
-
     /// Re-run the composite with folder scoping when a folder bounds an
     /// adjustment. No-op (cheap check) otherwise. Used after composite paths
-    /// that build the canvas flat (the stroke commit/flush).
+    /// that build the canvas flat (the stroke commit).
     fn rescope_composite(&mut self) -> Result<(), RendererError> {
         let snapshot = self.layers.snapshot();
         if let Some(steps) = self.folder_scoped_steps(&snapshot) {

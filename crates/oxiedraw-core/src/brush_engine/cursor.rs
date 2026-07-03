@@ -14,7 +14,7 @@ use oxiedraw_utils::geometry::Point;
 
 use super::dynamics::{SpawnInput, evaluate};
 use super::pattern::PatternData;
-use super::{BrushFamily, BrushPreset, Dab, StrokeContext};
+use super::{BrushFamily, BrushPreset, Dab, StrokeContext, TipShape};
 
 /// Lower bound on dab radius. Mirrors `stamp::MIN_DAB_RADIUS` - kept in
 /// sync by convention; both are 0.5 px because below that the renderer
@@ -80,7 +80,23 @@ pub fn compute_brush_cursor(
             let expanded = expand_outward(&outline, dab.center, scatter_max);
             vec![snap_to_pixel_grid(&expanded)]
         }
-        BrushFamily::Textured(pattern) => textured_outline(pattern, &dab, scatter_max),
+        BrushFamily::Textured(pattern) => {
+            // Global-grain brushes (texture_scale > 0) paint a procedural
+            // tip modulated by a canvas-anchored pattern, so the footprint
+            // is the tip - not the pattern's alpha contour. Tracing the
+            // (512px, noisy) grain per pointer-move would peg the CPU, and
+            // the grain isn't the outline anyway. Legacy stamped-pattern
+            // brushes (scale 0) still trace the mask.
+            if preset.texture_scale > 0.0 {
+                let outline = match preset.tip {
+                    TipShape::Round => ellipse_outline(&dab),
+                    TipShape::Square => rect_outline(&dab),
+                };
+                vec![expand_outward(&outline, dab.center, scatter_max)]
+            } else {
+                textured_outline(pattern, &dab, scatter_max)
+            }
+        }
     };
 
     BrushCursor { strokes }
@@ -126,6 +142,24 @@ fn ellipse_outline(dab: &Dab) -> Vec<Point> {
         points.push(Point::new(x, y));
     }
     points
+}
+
+/// Outline of a square tip: a rotated rectangle with half-extents
+/// `radius` x `radius * aspect`, matching the chebyshev footprint the
+/// textured shader paints for `TipShape::Square`.
+fn rect_outline(dab: &Dab) -> Vec<Point> {
+    let rx = dab.radius.max(MIN_DAB_RADIUS);
+    let ry = (dab.radius * dab.aspect).max(MIN_DAB_RADIUS);
+    let (sin_r, cos_r) = dab.rotation.sin_cos();
+    let corners = [(-rx, -ry), (rx, -ry), (rx, ry), (-rx, ry), (-rx, -ry)];
+    corners
+        .iter()
+        .map(|&(lx, ly)| {
+            let x = lx.mul_add(cos_r, -(ly * sin_r)) + dab.center.x;
+            let y = lx.mul_add(sin_r, ly * cos_r) + dab.center.y;
+            Point::new(x, y)
+        })
+        .collect()
 }
 
 /// Dilate `outline` outward along the centroid-radial direction by
@@ -365,6 +399,10 @@ mod tests {
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 1.0,
+            tip: crate::brush_engine::TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -654,6 +692,10 @@ mod tests {
             flow: 1.0,
             color: Color::BLACK,
             texture_uv: [0.0, 0.0, 1.0, 1.0],
+            hardness: 1.0,
+            tip: 0.0,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
         };
         let outline = ellipse_outline(&dab);
         let (mut xmin, mut xmax, mut ymin, mut ymax) =

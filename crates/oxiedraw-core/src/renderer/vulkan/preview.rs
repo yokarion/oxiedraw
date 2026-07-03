@@ -61,7 +61,7 @@ impl VulkanRenderer {
             self.accumulate_dirty(instances);
             self.dab_buffers.upload_instances(instances)?
         };
-        let mask_pipe = self.mask_pipelines.get(family);
+        let mask_pipe = self.active_mask_pipelines().get(family);
         let pipeline = mask_pipe.pipeline;
         let layout = mask_pipe.layout;
         let stroke_rp = self.stroke_target.render_pass;

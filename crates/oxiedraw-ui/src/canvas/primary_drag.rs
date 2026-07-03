@@ -291,27 +291,16 @@ impl PrimaryDragHandler {
 
         let mut canvas = self.canvas.borrow_mut();
 
-        // History capture. Build-up brushes flush into the layer on every
-        // move, so snapshot the pristine full layer now. Other brushes
-        // leave the layer untouched until commit, so we defer to pen-up and
-        // read only the (bounded) dirty region there - no full readback.
+        // History capture. Every brush (build-up included) now leaves the
+        // layer untouched until commit - build-up accumulates in the stroke
+        // buffer via OVER-blend, not per-event flushes - so we defer to
+        // pen-up and read only the (bounded) dirty region there.
         *self.pending_capture.borrow_mut() = canvas.layers().active().and_then(|idx| {
             let id = canvas.layers().snapshot().get(idx).map(|l| l.id.clone())?;
-            let before_full = if buildup {
-                match canvas.read_layer(idx) {
-                    Ok(before) => Some(before),
-                    Err(e) => {
-                        tracing::warn!(error = %e, "history: before-snapshot read failed");
-                        return None;
-                    }
-                }
-            } else {
-                None
-            };
             Some(PendingStroke {
                 idx,
                 id,
-                before_full,
+                before_full: None,
             })
         });
 
@@ -319,16 +308,14 @@ impl PrimaryDragHandler {
             tracing::error!(error = %e, "canvas.begin_stroke failed");
             return;
         }
+        // Build-up accumulates coverage in the stroke buffer (OVER-blend) so
+        // overlapping dabs darken, capped at the stroke opacity by the single
+        // commit composite. The render pump presents the live buffer.
+        canvas.set_stroke_buildup(buildup);
         if let Err(e) = canvas.stamp(|target| {
             self.brush_engine.begin_stroke(sample, color, target);
         }) {
             tracing::error!(error = %e, "stamp begin_stroke failed");
-        }
-        // Build-up brushes composite each step into the layer so repeated
-        // dabs accumulate opacity; other brushes just accrue in the stroke
-        // buffer. The render pump (armed at drag-begin) presents every frame.
-        if buildup && let Err(e) = canvas.flush_stroke() {
-            tracing::error!(error = %e, "flush_stroke failed");
         }
     }
 
@@ -351,15 +338,11 @@ impl PrimaryDragHandler {
         // Reset the 2 s idle timer - it fires only when movement stops.
         self.reset_idle_timer();
 
-        let buildup = self.brush_engine.active_brush().buildup;
         let mut canvas = self.canvas.borrow_mut();
         if let Err(e) = canvas.stamp(|target| {
             self.brush_engine.push_sample(sample, target);
         }) {
             tracing::error!(error = %e, "stamp push_sample failed");
-        }
-        if buildup && let Err(e) = canvas.flush_stroke() {
-            tracing::error!(error = %e, "flush_stroke failed");
         }
     }
 
@@ -499,8 +482,9 @@ impl PrimaryDragHandler {
         if !sc.enabled {
             return;
         }
-        // Build-up mode flushes each stamp into the layer as it happens,
-        // so shape correction can't unwind the stroke - skip the timer.
+        // Shape correction is not offered for build-up brushes - their
+        // overlap-accumulating look is the whole point, so snapping the
+        // path to a clean shape would misrepresent the stroke.
         if self.brush_engine.active_brush().buildup {
             return;
         }

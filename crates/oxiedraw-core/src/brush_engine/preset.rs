@@ -1,9 +1,31 @@
 use std::path::PathBuf;
 use std::rc::Rc;
 
+use serde::{Deserialize, Serialize};
+
 use super::BrushPresetId;
 use super::dynamics::{Curve, DynSource, Dynamics, Mapping};
 use super::pattern::PatternData;
+
+/// Procedural footprint shape for the textured family. The grain texture
+/// is masked by this tip so a stroke keeps a defined edge instead of a
+/// hard-cut window of texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TipShape {
+    #[default]
+    Round,
+    Square,
+}
+
+impl TipShape {
+    /// Encoding passed to the GPU: `0.0` round, `1.0` square.
+    pub const fn as_gpu(self) -> f32 {
+        match self {
+            Self::Round => 0.0,
+            Self::Square => 1.0,
+        }
+    }
+}
 
 // Built-in brush icons live in `data/icons/builtin-brush-icons/` at the
 // repo root. `include_bytes!` compiles them straight into the binary so
@@ -33,6 +55,19 @@ const ICON_CHALK: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/icons/builtin-brush-icons/chalk.png"
 ));
+const ICON_COMICS: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/icons/builtin-brush-icons/comics.png"
+));
+const ICON_REAL_BRUSH: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/icons/builtin-brush-icons/real_brush.png"
+));
+
+/// Side length of the synthesised grain tiles. Matches the pattern atlas
+/// slice dimension so the upload resize is an identity - no resampling
+/// artefacts on the crisp halftone dots.
+const GRAIN_DIM: u32 = 512;
 
 /// GPU pipeline family a preset stamps with.
 #[derive(Debug, Clone)]
@@ -83,6 +118,20 @@ pub struct BrushPreset {
     /// over the same spot during a single stroke accumulates opacity
     /// instead of saturating at the brush's MAX-blended dab.
     pub buildup: bool,
+    /// Edge falloff, `0..=1`. `1.0` gives a crisp anti-aliased edge;
+    /// lower values fade from nearer the centre for a soft/airbrush look.
+    /// Applies to the soft-round tip and the procedural textured tip.
+    pub hardness: f32,
+    /// Footprint shape for the textured family. Ignored otherwise.
+    pub tip: TipShape,
+    /// Global grain tile size in canvas pixels. The textured shader
+    /// samples the pattern at `canvas_position / texture_scale`, anchoring
+    /// the grain in canvas space so it stays continuous across the whole
+    /// stroke. `0.0` disables the grain. This is the "pattern scale"
+    /// knob for the global-texture brushes.
+    pub texture_scale: f32,
+    /// How strongly the global grain gates coverage, `0..=1`.
+    pub texture_strength: f32,
     pub dynamics: Dynamics,
     /// Optional custom icon shown in the brush picker. Raw PNG bytes,
     /// decoded lazily by the UI. `None` -> picker uses a generic placeholder.
@@ -102,7 +151,8 @@ pub struct BrushPreset {
 }
 
 impl BrushPreset {
-    /// Soft round brush, identical to the old `DefaultBrush`.
+    /// Soft round brush - a gentle airbrush-like circle whose alpha
+    /// falls off almost from the centre.
     pub fn default_round(id: BrushPresetId) -> Self {
         Self {
             id,
@@ -110,13 +160,25 @@ impl BrushPreset {
             family: BrushFamily::SoftRound,
             default_size: 80.0,
             default_opacity: 1.0,
-            spacing_ratio: 0.1,
+            // Tight spacing so the very soft dabs merge into an even stroke
+            // instead of scalloping (a wider spacing shows the soft edge of
+            // each dab as ripples along the line).
+            spacing_ratio: 0.025,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
-            // Linear pressure -> radius, matching the legacy behaviour.
+            // Very soft: fade begins near the centre for the airbrush look.
+            hardness: 0.02,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
+            // Pressure drives both size AND opacity. Tying flow to pressure
+            // stops low-pressure (small) dabs from punching full-opacity
+            // specks through the faint falloff of the larger dabs via the
+            // MAX blend - they fade in with pressure instead.
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
+                flow: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
             },
             icon: Some(ICON_DEFAULT_ROUND.to_vec()),
@@ -137,6 +199,11 @@ impl BrushPreset {
             stabilizer: 0.65,
             speed_smoothing: 0.0,
             buildup: false,
+            // Crisp edge - the ink pen stays sharp.
+            hardness: 1.0,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -160,6 +227,10 @@ impl BrushPreset {
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 1.0,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics::default(),
             icon: Some(ICON_PIXEL.to_vec()),
             preview: None,
@@ -181,6 +252,10 @@ impl BrushPreset {
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 1.0,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 scatter: Some(Mapping {
@@ -197,26 +272,106 @@ impl BrushPreset {
         }
     }
 
-    /// Textured demo - soft-edged "chalk" stamp synthesised in code
-    /// (see `PatternData::debug_chalk`). Validates the pattern atlas
-    /// upload + textured pipelines without needing an asset on disk.
-    pub fn debug_chalk(id: BrushPresetId) -> Self {
-        let pattern = Rc::new(PatternData::debug_chalk(128));
+    /// Chalk - a square-ish tip dragged over a global chalk-grit grain.
+    /// The grain is anchored in canvas space, so the stroke shows one
+    /// continuous, non-repeating chalky texture instead of stamped bumps.
+    pub fn chalk(id: BrushPresetId) -> Self {
+        let pattern = Rc::new(PatternData::chalk_grain(GRAIN_DIM));
         Self {
             id,
             name: "Chalk".into(),
             family: BrushFamily::Textured(pattern),
             default_size: 140.0,
             default_opacity: 1.0,
-            spacing_ratio: 0.1,
+            spacing_ratio: 0.08,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
+            hardness: 0.72,
+            tip: TipShape::Square,
+            texture_scale: 200.0,
+            texture_strength: 0.85,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
             },
             icon: Some(ICON_CHALK.to_vec()),
+            preview: None,
+            source_path: None,
+        }
+    }
+
+    /// Comics - a soft round footprint filled with a global halftone dot
+    /// grid, the screentone look. Dots are canvas-anchored so the grid is
+    /// consistent across the whole stroke.
+    pub fn comics(id: BrushPresetId) -> Self {
+        let pattern = Rc::new(PatternData::halftone(GRAIN_DIM));
+        Self {
+            id,
+            name: "Comics Halftone".into(),
+            family: BrushFamily::Textured(pattern),
+            default_size: 130.0,
+            default_opacity: 1.0,
+            spacing_ratio: 0.08,
+            stabilizer: 0.0,
+            speed_smoothing: 0.0,
+            buildup: false,
+            hardness: 0.6,
+            tip: TipShape::Round,
+            texture_scale: 160.0,
+            texture_strength: 1.0,
+            dynamics: Dynamics {
+                size: Some(Mapping::pressure_linear()),
+                ..Dynamics::default()
+            },
+            icon: Some(ICON_COMICS.to_vec()),
+            preview: None,
+            source_path: None,
+        }
+    }
+
+    /// Real Brush - a nearly crisp-edged round brush whose deposit is
+    /// driven by pressure and builds up where it passes over the same
+    /// area, capped near 90%, like an ink/watercolour brush. A very subtle
+    /// low-frequency wash adds life without graininess.
+    pub fn real_brush(id: BrushPresetId) -> Self {
+        let pattern = Rc::new(PatternData::soft_wash(GRAIN_DIM));
+        Self {
+            id,
+            name: "Real Brush".into(),
+            family: BrushFamily::Textured(pattern),
+            default_size: 90.0,
+            // Hard per-stroke opacity ceiling: build-up accumulates in the
+            // stroke buffer and composites once at this value, so one stroke
+            // can't exceed 90% however much it overlaps itself.
+            default_opacity: 0.9,
+            spacing_ratio: 0.04,
+            stabilizer: 0.2,
+            speed_smoothing: 0.0,
+            // Build-up: passing over the same area accumulates opacity like
+            // ink/watercolour.
+            buildup: true,
+            // Only ~1% soft: essentially a crisp edge.
+            hardness: 0.99,
+            tip: TipShape::Round,
+            // Large, very subtle wash - a whisper of variation, not grain.
+            texture_scale: 320.0,
+            texture_strength: 0.15,
+            // Pressure drives the per-dab deposit rate. Values are small
+            // because dabs OVER-accumulate in the stroke buffer (~25 overlap
+            // each point per pass), so a light touch stays faint and a firm
+            // one fills toward the opacity cap; going over an area again
+            // builds it up further, up to the 90% ceiling.
+            dynamics: Dynamics {
+                flow: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::linear(),
+                    range: (0.006, 0.15),
+                    invert: false,
+                }),
+                ..Dynamics::default()
+            },
+            icon: Some(ICON_REAL_BRUSH.to_vec()),
             preview: None,
             source_path: None,
         }
@@ -236,6 +391,10 @@ impl BrushPreset {
             stabilizer: 0.0,
             speed_smoothing: 0.5,
             buildup: false,
+            hardness: 1.0,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,
