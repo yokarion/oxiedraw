@@ -93,7 +93,7 @@ impl GlobalState {
         }
     }
 
-    /// Seed + load the on-disk brush library (the splash's "Loading basics"
+    /// Seed + load the on-disk brush library (the splash's "Loading brushes"
     /// step). Brushes live under $XDG_CONFIG_HOME/oxiedraw/brushes; built-in
     /// `.oxiebrush` archives are seeded on first launch, then everything in the
     /// directory is loaded (overriding the hard-coded builtins).

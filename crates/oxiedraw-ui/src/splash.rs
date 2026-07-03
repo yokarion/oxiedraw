@@ -1,8 +1,10 @@
 //! Startup splash window with staged loading progress.
 //!
 //! Shown immediately at launch while the slow startup work (brush library,
-//! the system font database) runs in stages on a glib timeout so each step can
-//! report progress instead of freezing on a blank window. The window is a
+//! the system font database) runs in stages driven off the splash's frame clock
+//! so each step can report progress instead of freezing on a blank window. The
+//! font files are parsed in parallel on a background thread; the loader polls
+//! for the result each frame. The window is a
 //! rounded, undecorated card showing the banner art, an accent progress bar,
 //! and three corner overlays: the current step (bottom-left), the logo plus
 //! version (top-right), and the banner artist credit (bottom-right). When the
@@ -10,9 +12,13 @@
 //! document and reveals the main window) and closes itself.
 
 use std::cell::RefCell;
-use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
+
+use oxiedraw_core::text::fonts::FaceInfo;
 
 use adw::prelude::*;
 use relm4::gtk;
@@ -34,12 +40,6 @@ const SPLASH_HEIGHT: i32 = 360; // 16:9
 /// the progress bar can repaint. Larger batches keep total load time close to a
 /// plain blocking scan; the short tick interval still leaves room to paint.
 const FONT_TICK_BUDGET: Duration = Duration::from_millis(10);
-
-/// Minimum time the "Loading fonts (i/N)" stage stays up. On a warm cache the
-/// previews render in a fraction of a second, too fast to read the count, so
-/// rendering is paced across at least this long. A genuinely slow machine just
-/// takes however long it needs.
-const MIN_FONT_DISPLAY: f64 = 1.4;
 
 /// Show the splash and start the staged loader. `finish` is invoked on the main
 /// thread once loading completes (it builds the first document and reveals the
@@ -137,18 +137,23 @@ fn build_card(
 // Staged loader
 // ---------------------------------------------------------------------------
 
-/// Progress band boundaries on the bar. Loading the font files is folded into
-/// the "Loading basics" step; rendering the previews is the slow, clearly
-/// counted "Loading fonts" step.
+/// Progress band boundaries on the bar. Two labelled steps: brushes, then a
+/// single "Loading fonts" step that spans parsing the font files (in parallel,
+/// off-thread) and then rendering the per-family previews.
 const BRUSHES_END: f64 = 0.05;
-const FILES_END: f64 = 0.40;
+const PARSE_END: f64 = 0.45;
 const PREVIEWS_END: f64 = 0.92;
 
 enum Phase {
-    AnnounceBasics,
+    AnnounceBrushes,
     LoadBrushes,
     ScanFonts,
-    LoadFontFiles { files: Rc<Vec<PathBuf>>, index: usize },
+    AwaitFonts {
+        rx: Receiver<Vec<FaceInfo>>,
+        parsed: Arc<AtomicUsize>,
+        total: usize,
+        start: Instant,
+    },
     ScanPreviews,
     RenderPreviews {
         families: Rc<Vec<String>>,
@@ -177,6 +182,8 @@ struct Loader {
     progress: gtk::ProgressBar,
     phase: Phase,
     finish: Option<Box<dyn FnOnce()>>,
+    /// When the staged loader began, for the total-startup timing log.
+    launch: Instant,
 }
 
 fn start_loader(
@@ -192,8 +199,9 @@ fn start_loader(
         window,
         step,
         progress,
-        phase: Phase::AnnounceBasics,
+        phase: Phase::AnnounceBrushes,
         finish: Some(finish),
+        launch: Instant::now(),
     }));
 
     // Drive the loader from the splash window's frame clock: a tick callback
@@ -202,46 +210,70 @@ fn start_loader(
     driver.add_tick_callback(move |_widget, _clock| {
         let mut l = loader.borrow_mut();
         match std::mem::replace(&mut l.phase, Phase::Closing) {
-            Phase::AnnounceBasics => {
-                l.step.set_label("Loading basics");
+            Phase::AnnounceBrushes => {
+                // Label the brush step one frame ahead so it paints before
+                // load_brushes() blocks the next tick.
+                l.step.set_label("Loading brushes");
                 l.progress.set_fraction(0.01);
                 l.phase = Phase::LoadBrushes;
                 glib::ControlFlow::Continue
             }
             Phase::LoadBrushes => {
+                let t = Instant::now();
                 l.global.load_brushes();
+                tracing::info!(elapsed_ms = t.elapsed().as_millis(), "startup: brushes loaded");
                 l.progress.set_fraction(BRUSHES_END);
+                l.step.set_label("Finding fonts");
                 l.phase = Phase::ScanFonts;
                 glib::ControlFlow::Continue
             }
             Phase::ScanFonts => {
-                let files = Rc::new(oxiedraw_core::text::fonts::system_font_files());
-                l.phase = Phase::LoadFontFiles { files, index: 0 };
+                let t = Instant::now();
+                let files = oxiedraw_core::text::fonts::system_font_files();
+                let total = files.len();
+                tracing::info!(
+                    files = total,
+                    elapsed_ms = t.elapsed().as_millis(),
+                    "startup: scanned system font files"
+                );
+                // Parse the font files in parallel off the UI thread; the splash
+                // keeps animating and polls `parsed` for a running count.
+                let parsed = Arc::new(AtomicUsize::new(0));
+                let rx = oxiedraw_core::text::fonts::spawn_font_load(files, parsed.clone());
+                l.step.set_label("Loading fonts");
+                l.phase = Phase::AwaitFonts { rx, parsed, total, start: Instant::now() };
                 glib::ControlFlow::Continue
             }
-            Phase::LoadFontFiles { files, mut index } => {
-                let total = files.len();
-                let tick = Instant::now();
-                {
-                    let mut engine = l.global.text_engine.borrow_mut();
-                    while index < total && tick.elapsed() < FONT_TICK_BUDGET {
-                        engine.load_font_path(&files[index]);
-                        index += 1;
+            Phase::AwaitFonts { rx, parsed, total, start } => {
+                let done = parsed.load(Ordering::Relaxed).min(total);
+                l.progress.set_fraction(ratio(BRUSHES_END, PARSE_END, done, total));
+                match rx.try_recv() {
+                    Ok(faces) => {
+                        l.global.text_engine.borrow_mut().add_faces(faces);
+                        tracing::info!(
+                            files = total,
+                            elapsed_ms = start.elapsed().as_millis(),
+                            "startup: parsed font files"
+                        );
+                        l.progress.set_fraction(PARSE_END);
+                        l.phase = Phase::ScanPreviews;
+                    }
+                    Err(TryRecvError::Empty) => {
+                        l.phase = Phase::AwaitFonts { rx, parsed, total, start };
+                    }
+                    // The worker dropped without a result (shouldn't happen); the
+                    // font list is simply whatever landed, so press on.
+                    Err(TryRecvError::Disconnected) => {
+                        tracing::warn!("startup: font parse worker disconnected");
+                        l.phase = Phase::ScanPreviews;
                     }
                 }
-                let frac = ratio(BRUSHES_END, FILES_END, index, total);
-                l.progress.set_fraction(frac);
-                l.phase = if index >= total {
-                    Phase::ScanPreviews
-                } else {
-                    Phase::LoadFontFiles { files, index }
-                };
                 glib::ControlFlow::Continue
             }
             Phase::ScanPreviews => {
                 let families = Rc::new(l.global.text_engine.borrow().available_families());
                 l.step.set_label(&format!("Loading fonts (0/{})", families.len()));
-                l.progress.set_fraction(FILES_END);
+                l.progress.set_fraction(PARSE_END);
                 l.phase = Phase::RenderPreviews {
                     families,
                     index: 0,
@@ -252,27 +284,27 @@ fn start_loader(
             Phase::RenderPreviews { families, mut index, start } => {
                 let total = families.len();
                 let color = crate::font_previews::theme_text_color();
-                // Pace rendering so the count is legible: only render up to the
-                // share of fonts the elapsed time has "earned" within the
-                // minimum display window (a slow machine simply lags behind it).
-                #[allow(clippy::cast_precision_loss, clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-                let target = (((start.elapsed().as_secs_f64() / MIN_FONT_DISPLAY) * total as f64)
-                    .ceil() as usize)
-                    .min(total);
+                // Render as many as fit the frame budget, then yield so the bar
+                // repaints. No artificial pacing - previews are fast enough now
+                // that startup shouldn't wait on a legible count.
                 let tick = Instant::now();
                 {
                     let mut engine = l.global.text_engine.borrow_mut();
-                    while index < target && tick.elapsed() < FONT_TICK_BUDGET {
+                    while index < total && tick.elapsed() < FONT_TICK_BUDGET {
                         l.global
                             .font_previews
                             .render_one(&mut engine, &families[index], color);
                         index += 1;
                     }
                 }
-                l.progress.set_fraction(ratio(FILES_END, PREVIEWS_END, index, total));
+                l.progress.set_fraction(ratio(PARSE_END, PREVIEWS_END, index, total));
                 l.step.set_label(&format!("Loading fonts ({index}/{total})"));
-                let done = index >= total && start.elapsed().as_secs_f64() >= MIN_FONT_DISPLAY;
-                l.phase = if done {
+                l.phase = if index >= total {
+                    tracing::info!(
+                        families = total,
+                        elapsed_ms = start.elapsed().as_millis(),
+                        "startup: rendered font previews"
+                    );
                     Phase::AnnounceStartup
                 } else {
                     Phase::RenderPreviews { families, index, start }
@@ -288,9 +320,15 @@ fn start_loader(
             Phase::Startup => {
                 // Fonts + previews are ready: build the first document and reveal
                 // the main window.
+                let t = Instant::now();
                 if let Some(finish) = l.finish.take() {
                     finish();
                 }
+                tracing::info!(
+                    elapsed_ms = t.elapsed().as_millis(),
+                    total_ms = l.launch.elapsed().as_millis(),
+                    "startup: first document ready"
+                );
                 l.progress.set_fraction(1.0);
                 // Brief beat at 100% before handing off to the main window.
                 let window = l.window.clone();

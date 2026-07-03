@@ -10,9 +10,16 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver};
 
 use cosmic_text::{FontSystem, SwashCache, fontdb};
 use serde::{Deserialize, Serialize};
+
+/// One parsed font face record, re-exported so callers outside this crate can
+/// name the result of [`spawn_font_load`] without depending on `fontdb`.
+pub use fontdb::FaceInfo;
 
 /// Content hash of font-file bytes as a 16-hex string. Used to dedup embedded
 /// fonts and to name their files inside the project archive.
@@ -145,10 +152,10 @@ impl TextEngine {
         }
     }
 
-    /// Create an engine with an empty font database. Fonts are loaded
-    /// afterwards file-by-file via [`Self::load_font_path`] (with the list from
-    /// [`system_font_files`]) so startup can show progress instead of blocking
-    /// on a full system scan.
+    /// Create an engine with an empty font database. The system fonts are
+    /// parsed afterwards off-thread via [`spawn_font_load`] (over the list from
+    /// [`system_font_files`]) and merged in with [`Self::add_faces`], so startup
+    /// can show progress instead of blocking on a full system scan.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -161,6 +168,17 @@ impl TextEngine {
     /// data are ignored - one bad file shouldn't abort startup.
     pub fn load_font_path(&mut self, path: &Path) {
         let _ = self.font_system.db_mut().load_font_file(path);
+    }
+
+    /// Insert already-parsed font faces into the database. Used to merge the
+    /// results of a parallel background parse (see [`spawn_font_load`]) into the
+    /// shared engine on the main thread; each face only references its file
+    /// path, so this is a cheap set of inserts (no re-reading of the fonts).
+    pub fn add_faces(&mut self, faces: Vec<fontdb::FaceInfo>) {
+        let db = self.font_system.db_mut();
+        for face in faces {
+            db.push_face_info(face);
+        }
     }
 
     /// All distinct font family names in the database, sorted.
@@ -322,6 +340,58 @@ fn system_font_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Parse the given font files into face records off the main thread, split
+/// across all available CPUs. `parsed` is bumped once per file so the caller can
+/// show a running count while the UI stays live; the merged faces arrive on the
+/// returned channel when every worker finishes. Feed the result to
+/// [`TextEngine::add_faces`].
+///
+/// Parsing the files is by far the slowest part of startup (a system with a few
+/// thousand fonts spends seconds here); doing it serially on the UI thread froze
+/// the splash, so it runs in parallel in the background instead.
+#[must_use]
+pub fn spawn_font_load(files: Vec<PathBuf>, parsed: Arc<AtomicUsize>) -> Receiver<Vec<fontdb::FaceInfo>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(parse_faces_parallel(&files, &parsed));
+    });
+    rx
+}
+
+/// Parse every file's faces across a scoped thread pool. Each worker builds its
+/// own throwaway `Database` (they can't share one) and hands back the parsed
+/// `FaceInfo`s, which only hold the file path - cheap to move and merge.
+fn parse_faces_parallel(files: &[PathBuf], parsed: &AtomicUsize) -> Vec<fontdb::FaceInfo> {
+    if files.is_empty() {
+        return Vec::new();
+    }
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(files.len());
+    let chunk_size = files.len().div_ceil(workers);
+
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = files
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    let mut db = fontdb::Database::new();
+                    for path in chunk {
+                        let _ = db.load_font_file(path);
+                        parsed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    db.faces().cloned().collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    })
+}
+
 /// Enumerate candidate font files under the standard system font directories,
 /// recursively. Returned as a list so a caller can load them one at a time and
 /// report a running count to the user.
@@ -381,6 +451,29 @@ fn is_font_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The parallel background parse must yield the same font families as loading
+    // the same files serially into an engine. Skips on machines with no fonts.
+    #[test]
+    fn parallel_load_matches_serial_families() {
+        let files = system_font_files();
+        if files.is_empty() {
+            return;
+        }
+
+        let mut serial = TextEngine::empty();
+        for path in &files {
+            serial.load_font_path(path);
+        }
+
+        let parsed = Arc::new(AtomicUsize::new(0));
+        let faces = parse_faces_parallel(&files, &parsed);
+        assert_eq!(parsed.load(Ordering::Relaxed), files.len());
+        let mut parallel = TextEngine::empty();
+        parallel.add_faces(faces);
+
+        assert_eq!(parallel.available_families(), serial.available_families());
+    }
 
     #[test]
     fn hash_is_deterministic_and_content_addressed() {
