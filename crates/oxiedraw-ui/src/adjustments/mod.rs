@@ -41,6 +41,10 @@ pub(crate) struct AdjustmentContext {
     pub history: Rc<RefCell<HistoryStack>>,
     pub toaster: Toaster,
     pub refresh_layers: Rc<dyn Fn()>,
+    /// Create an adjustment layer next to the current selection (respecting
+    /// groups) and return its index; refreshes the panel. Provided by the layer
+    /// panel, which owns the selection/tree state placement needs.
+    pub create_layer: Rc<dyn Fn() -> Option<usize>>,
 }
 
 /// Menu/button entry point: if the active layer is already an adjustment layer,
@@ -58,64 +62,19 @@ pub(crate) fn add_or_edit(ctx: &AdjustmentContext) {
         return;
     }
 
-    let new_idx = {
-        let mut c = ctx.canvas.borrow_mut();
-        c.add_adjustment_layer("Adjustment")
-    };
-    match new_idx {
-        Ok(idx) => {
-            // Record the layer creation so it can be undone in one step.
-            if let Some((id, name, visible, kind, blend, opacity, pixels)) =
-                capture_layer(&ctx.canvas, idx)
-            {
-                ctx.history.borrow_mut().record(HistoryAction::LayerAdd {
-                    idx,
-                    id,
-                    name,
-                    visible,
-                    layer_kind: kind,
-                    blend,
-                    opacity,
-                    pixels,
-                });
-            }
-            (ctx.refresh_layers)();
+    // The layer panel owns the selection + folder tree, so it does the create +
+    // placement (above the selected layer/group) and records the undo step.
+    match (ctx.create_layer)() {
+        Some(idx) => {
             ctx.redraw.request();
             open_editor(ctx, idx);
         }
-        Err(e) => {
-            tracing::error!(error = %e, "add adjustment layer failed");
+        None => {
             ctx.toaster.info("Could not add adjustment layer");
         }
     }
 }
 
-fn capture_layer(
-    canvas: &Rc<RefCell<Canvas>>,
-    idx: usize,
-) -> Option<(
-    String,
-    String,
-    bool,
-    oxiedraw_core::document::LayerKind,
-    oxiedraw_core::document::BlendMode,
-    f32,
-    Vec<u8>,
-)> {
-    let mut c = canvas.borrow_mut();
-    let layer = c.layers().snapshot().get(idx)?.clone();
-    let (blend, opacity) = c.layers().blend(idx).unwrap_or_default();
-    let pixels = c.read_layer(idx).ok()?;
-    Some((
-        layer.id,
-        layer.name,
-        layer.visible,
-        layer.kind,
-        blend,
-        opacity,
-        pixels,
-    ))
-}
 
 /// Working copy of every effect, behind a `RefCell` so each control's callback
 /// can mutate one field and push the whole stack to the canvas. The field order

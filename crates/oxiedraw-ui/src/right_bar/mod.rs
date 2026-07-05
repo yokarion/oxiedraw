@@ -59,6 +59,7 @@ pub(crate) fn build(
     Rc<dyn Fn(Option<String>)>,
     Rc<dyn Fn()>,
     Rc<dyn Fn()>,
+    Rc<dyn Fn() -> Option<usize>>,
 ) {
     // Normal panel: [editing-text panel] + color picker + layer list.
     let normal_pane = gtk::Paned::builder()
@@ -91,6 +92,7 @@ pub(crate) fn build(
         refresh_components,
         set_component_edit,
         begin_rename,
+        create_adjustment,
     ) = layers::build(
         layers,
         canvas,
@@ -175,5 +177,6 @@ pub(crate) fn build(
         set_component_edit,
         begin_rename,
         refresh_text_panel,
+        create_adjustment,
     )
 }

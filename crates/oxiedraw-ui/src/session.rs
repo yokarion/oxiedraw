@@ -175,6 +175,10 @@ pub(crate) struct DocumentSession {
     pub(crate) transform_cancel: Rc<dyn Fn()>,
     pub(crate) crop_apply: Rc<dyn Fn()>,
     pub(crate) refresh_layers: Rc<dyn Fn()>,
+    /// Create an adjustment layer next to the current selection (like the layer
+    /// panel's + button) and return its index. Backs the `layer-add-adjustment`
+    /// action so the adjustment editor can open on the new layer.
+    pub(crate) create_adjustment_layer: Rc<dyn Fn() -> Option<usize>>,
     /// Rename the active layer/group, or the selected component when that tab is
     /// showing. Backs the `app.rename` action (F2).
     pub(crate) begin_rename: Rc<dyn Fn()>,
@@ -839,6 +843,7 @@ impl DocumentSession {
             set_component_edit,
             begin_rename,
             refresh_text_panel,
+            create_adjustment_layer,
         ) = crate::right_bar::build(
             global.colors.clone(),
             &document.layers,
@@ -1105,6 +1110,7 @@ impl DocumentSession {
             transform_cancel,
             crop_apply,
             refresh_layers,
+            create_adjustment_layer,
             begin_rename,
             selected_layer_ids,
             set_right_panel_tool,

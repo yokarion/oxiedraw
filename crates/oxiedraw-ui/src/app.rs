@@ -319,6 +319,7 @@ fn register_window_actions(
                 history: Rc::clone(&s.history),
                 toaster: toaster.clone(),
                 refresh_layers: Rc::clone(&s.refresh_layers),
+                create_layer: Rc::clone(&s.create_adjustment_layer),
             };
             crate::adjustments::add_or_edit(&ctx);
         });

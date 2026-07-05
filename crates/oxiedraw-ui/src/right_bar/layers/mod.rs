@@ -679,6 +679,138 @@ pub(super) fn commit_groups_quiet(tree: &[LayerNode], canvas: &mut Canvas) {
     canvas.set_layer_tree_quiet(tree_to_core(tree));
 }
 
+// --- New-layer placement ---------------------------------------------------
+
+/// Which kind of layer the add buttons create. Both land relative to the
+/// current selection; only the core call and default name differ.
+#[derive(Clone, Copy)]
+pub(super) enum NewLayerKind {
+    Raster,
+    Adjustment,
+}
+
+/// Where a freshly added layer should slot into the tree, captured from the
+/// selection before the add (creating a layer moves the active selection onto
+/// the new layer, so the old selection has to be read first).
+enum InsertAnchor {
+    // Nothing selected: the new layer goes on top of everything (tree root).
+    Top,
+    // Directly above the selected node, at its level. `parent_id` is the
+    // enclosing group (None = tree root), `idx` the node's slot in that parent.
+    Above { parent_id: Option<String>, idx: usize },
+}
+
+// Read the current primary selection (a group takes precedence over a layer,
+// mirroring their mutual exclusivity) into an anchor for the next add.
+fn capture_insert_anchor(ui: &Ui) -> InsertAnchor {
+    let tree = ui.tree.borrow();
+    if let Some(gid) = ui.active_group.borrow().as_ref()
+        && let Some((parent_id, idx)) =
+            find_first_insertion_position(&tree, std::slice::from_ref(gid))
+    {
+        return InsertAnchor::Above { parent_id, idx };
+    }
+    if let Some(id) = ui.active_id()
+        && let Some((parent_id, idx)) =
+            find_first_insertion_position(&tree, std::slice::from_ref(&id))
+    {
+        return InsertAnchor::Above { parent_id, idx };
+    }
+    InsertAnchor::Top
+}
+
+// Slot `node` into the tree at `anchor`. Inserting at the anchor's own index
+// puts the new node just above it (index 0 is the topmost row).
+fn insert_node_at_anchor(tree: &mut Vec<LayerNode>, node: LayerNode, anchor: &InsertAnchor) {
+    match anchor {
+        InsertAnchor::Top => tree.insert(0, node),
+        InsertAnchor::Above { parent_id: None, idx } => {
+            let pos = (*idx).min(tree.len());
+            tree.insert(pos, node);
+        }
+        InsertAnchor::Above { parent_id: Some(pid), idx } => {
+            insert_at_in_group(tree, node, pid, *idx);
+        }
+    }
+}
+
+// Build the undo record for the layer at `idx` (already created on the canvas).
+fn capture_layer_add(canvas: &Rc<RefCell<Canvas>>, idx: usize) -> Option<HistoryAction> {
+    let mut c = canvas.borrow_mut();
+    let layer = c.layers().snapshot().get(idx)?.clone();
+    let (blend, opacity) = c.layers().blend(idx).unwrap_or_default();
+    let pixels = c.read_layer(idx).ok()?;
+    Some(HistoryAction::LayerAdd {
+        idx,
+        id: layer.id,
+        name: layer.name,
+        visible: layer.visible,
+        layer_kind: layer.kind,
+        blend,
+        opacity,
+        pixels,
+    })
+}
+
+/// Create a layer and drop it just above the current selection instead of on
+/// top of the whole stack. Respects groups: a selected layer inside a folder
+/// spawns inside that folder above it; a selected folder spawns above the whole
+/// folder. Records the add for undo and leaves the new layer selected. Returns
+/// its final index. View refresh (redraw / height) is the caller's job.
+pub(super) fn create_layer_at_selection(
+    ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
+    history: &Rc<RefCell<HistoryStack>>,
+    kind: NewLayerKind,
+) -> Result<usize, oxiedraw_core::renderer::RendererError> {
+    let anchor = capture_insert_anchor(ui);
+
+    let name = match kind {
+        NewLayerKind::Raster => format!("Layer {}", ui.state.len() + 1),
+        NewLayerKind::Adjustment => "Adjustment".to_string(),
+    };
+    let top_idx = {
+        let mut c = canvas.borrow_mut();
+        match kind {
+            NewLayerKind::Raster => c.add_layer(name)?,
+            NewLayerKind::Adjustment => c.add_adjustment_layer(name)?,
+        }
+    };
+    let new_id = canvas
+        .borrow()
+        .layers()
+        .snapshot()
+        .get(top_idx)
+        .map(|l| l.id.clone())
+        .unwrap_or_default();
+
+    insert_node_at_anchor(
+        &mut ui.tree.borrow_mut(),
+        LayerNode::Layer(new_id.clone()),
+        &anchor,
+    );
+    *ui.active_group.borrow_mut() = None;
+
+    // Push the new order to the canvas so z-order matches the tree, then mirror
+    // the folder structure (folder-scoped adjustments recomposite off it).
+    sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
+    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+
+    let final_idx = canvas
+        .borrow()
+        .layers()
+        .snapshot()
+        .iter()
+        .position(|l| l.id == new_id)
+        .unwrap_or(top_idx);
+    if let Some(action) = capture_layer_add(canvas, final_idx) {
+        history.borrow_mut().record(action);
+    }
+    ui.state.set_active(Some(final_idx));
+
+    Ok(final_idx)
+}
+
 // Wraps the listed nodes in a new group at the topmost position any of them held.
 pub(super) fn group_nodes(
     tree: &mut Vec<LayerNode>,
@@ -894,6 +1026,7 @@ pub(crate) fn build(
     Rc<dyn Fn()>,
     Rc<dyn Fn(Option<String>)>,
     Rc<dyn Fn()>,
+    Rc<dyn Fn() -> Option<usize>>,
 ) {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -917,8 +1050,14 @@ pub(crate) fn build(
         .hexpand(true)
         .build();
 
-    let (layers_page, refresh_layers, selected_ids, reinstall_actions, layer_begin_rename) =
-        build_layers_page(
+    let (
+        layers_page,
+        refresh_layers,
+        selected_ids,
+        reinstall_actions,
+        layer_begin_rename,
+        create_adjustment,
+    ) = build_layers_page(
             layers,
             canvas,
             redraw,
@@ -987,6 +1126,7 @@ pub(crate) fn build(
         refresh_components,
         set_editing,
         begin_rename,
+        create_adjustment,
     )
 }
 
@@ -1079,6 +1219,7 @@ fn build_layers_page(
     Rc<dyn Fn() -> Vec<String>>,
     Rc<dyn Fn()>,
     Rc<dyn Fn()>,
+    Rc<dyn Fn() -> Option<usize>>,
 ) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1243,7 +1384,29 @@ fn build_layers_page(
         Rc::new(move || begin_rename_active(&area, &ui, &canvas, &history)) as Rc<dyn Fn()>
     };
 
-    (page, refresh, selected_ids, reinstall_actions, begin_rename)
+    // Adjustment layers are created from an app-global action outside the panel;
+    // this lets it slot the new layer next to the selection (like the + button)
+    // and returns the layer's index so the caller can open its editor.
+    let create_adjustment = {
+        let ui = ui.clone();
+        let canvas = Rc::clone(canvas);
+        let history = Rc::clone(history);
+        let refresh = Rc::clone(&refresh);
+        Rc::new(move || {
+            match create_layer_at_selection(&ui, &canvas, &history, NewLayerKind::Adjustment) {
+                Ok(idx) => {
+                    refresh();
+                    Some(idx)
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "add adjustment layer failed");
+                    None
+                }
+            }
+        }) as Rc<dyn Fn() -> Option<usize>>
+    };
+
+    (page, refresh, selected_ids, reinstall_actions, begin_rename, create_adjustment)
 }
 
 // Returns `"Label (Ctrl+G)"`, or just `label` when the action has no binding.
@@ -1295,30 +1458,9 @@ fn build_layers_header(
         let toaster = toaster.clone();
         let history = Rc::clone(history);
         add_btn.connect_clicked(move |_| {
-            let next_n = ui.state.len() + 1;
-            let name = format!("Layer {next_n}");
-            let add_result = canvas.borrow_mut().add_layer(name.clone());
-            match add_result {
-                Ok(idx) => {
-                    let (new_id, new_pixels) = {
-                        let mut c = canvas.borrow_mut();
-                        let id = c.layers().snapshot()
-                            .get(idx).map(|l| l.id.clone()).unwrap_or_default();
-                        let pixels = c.read_layer(idx).unwrap_or_default();
-                        (id, pixels)
-                    };
-                    history.borrow_mut().record(HistoryAction::LayerAdd {
-                        idx,
-                        id: new_id,
-                        name,
-                        visible: true,
-                        layer_kind: oxiedraw_core::document::LayerKind::Raster,
-                        blend: oxiedraw_core::document::BlendMode::Normal,
-                        opacity: 1.0,
-                        pixels: new_pixels,
-                    });
+            match create_layer_at_selection(&ui, &canvas, &history, NewLayerKind::Raster) {
+                Ok(_) => {
                     sync_height(&area, &ui);
-                    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
                     ui.sync_blend_controls();
                     area.queue_draw();
                     redraw.request();
