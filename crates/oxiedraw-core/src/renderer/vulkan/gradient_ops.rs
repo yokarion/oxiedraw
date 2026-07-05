@@ -7,7 +7,9 @@ use ash::vk;
 
 use super::super::RendererError;
 use super::super::gradient_overlay::{GRADIENT_PUSH_BYTES, LUT_WIDTH};
+use super::adjust_ops::PreviewTarget;
 use super::VulkanRenderer;
+use crate::document::CompositeStep;
 
 /// Gradient ramp geometry. Must stay in lockstep with the `KIND_*`
 /// constants in `gradient.frag` and the `GradientType` enum.
@@ -89,6 +91,13 @@ impl VulkanRenderer {
         self.gradient_active
     }
 
+    /// The layer the in-flight gradient will land on. Lets the display path pick
+    /// the folder-scoped preview when an adjustment must clip around it.
+    #[must_use]
+    pub const fn gradient_target(&self) -> usize {
+        self.gradient_layer_idx
+    }
+
     /// Render the preview image: visible layers composited up to the target
     /// layer, the gradient spliced in, then the layers above. Mirrors
     /// `render_shape_preview`.
@@ -109,21 +118,50 @@ impl VulkanRenderer {
             this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
             for &idx in &visible_indices {
                 if overlay_at == Some(idx) {
-                    let scratch = this.erase_preview.scratch.handle;
-                    let scratch_fb = this.erase_preview.framebuffer;
-                    let layer_image = this.layer_stack.slots[idx].image.handle;
-                    this.cmd_copy_image_full(layer_image, scratch);
-                    this.record_gradient_pass_into(scratch_fb, endpoints, extra);
-                    this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-                    let (mode, opacity) = this.layer_stack.blend(idx);
-                    let set = this.erase_preview.composite_set;
-                    this.cmd_compose_layer_blended(preview_img, preview_fb, set, mode, opacity);
+                    this.compose_gradient_target_into(preview_img, preview_fb, idx, endpoints, extra);
                 } else {
                     this.preview_compose_layer(preview_img, preview_fb, idx);
                 }
             }
             Ok(())
         })
+    }
+
+    /// Folder-scoped gradient preview: walk the composite tree so a
+    /// folder-bounded adjustment above (or below) the gradient's target layer
+    /// clips exactly as the committed recomposite will. Mirrors
+    /// [`Self::render_transform_preview_scoped`]; the flat
+    /// [`Self::render_gradient_preview`] is used when no adjustment is in play.
+    pub fn render_gradient_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+    ) -> Result<(), RendererError> {
+        let endpoints = self.gradient_endpoints;
+        let extra = self.gradient_extra;
+        self.build_preview_scoped(steps, target_idx, PreviewTarget::Gradient { endpoints, extra })
+    }
+
+    /// Copy the target layer into scratch, splice the ramp on top (OVER), then
+    /// blend the result over `acc` at the layer's own mode + opacity. Shared by
+    /// the flat and folder-scoped gradient previews.
+    pub(super) fn compose_gradient_target_into(
+        &self,
+        acc_img: vk::Image,
+        acc_fb: vk::Framebuffer,
+        target_idx: usize,
+        endpoints: [f32; 4],
+        extra: [f32; 4],
+    ) {
+        let scratch = self.erase_preview.scratch.handle;
+        let scratch_fb = self.erase_preview.framebuffer;
+        let layer_image = self.layer_stack.slots[target_idx].image.handle;
+        self.cmd_copy_image_full(layer_image, scratch);
+        self.record_gradient_pass_into(scratch_fb, endpoints, extra);
+        self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        let (mode, opacity) = self.layer_stack.blend(target_idx);
+        let set = self.erase_preview.composite_set;
+        self.cmd_compose_layer_blended(acc_img, acc_fb, set, mode, opacity);
     }
 
     /// Final commit: render the gradient directly into the layer's
@@ -158,7 +196,7 @@ impl VulkanRenderer {
     /// Begin a fullscreen pass against `framebuffer`, bind the gradient
     /// pipeline + descriptor set, push endpoints + extra, draw.
     fn record_gradient_pass_into(
-        &mut self,
+        &self,
         framebuffer: vk::Framebuffer,
         endpoints: [f32; 4],
         extra: [f32; 4],

@@ -818,7 +818,18 @@ impl Canvas {
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.gradient_active() {
                 let visibilities = self.visibilities();
-                self.renderer.render_gradient_preview(&visibilities)?;
+                // Folder-bounded adjustment around the gradient's target: the flat
+                // preview skips adjustment slots and folder scope, so it would show
+                // the ramp unadjusted (bright) until commit. Route through the
+                // scoped walk so the live preview clips like the committed result.
+                let target = self.renderer.gradient_target();
+                if self.effective_adjustment_excluding(target) {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_gradient_preview_scoped(&steps, target)?;
+                } else {
+                    self.renderer.render_gradient_preview(&visibilities)?;
+                }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.transform_preview_active() {
                 let visibilities = self.visibilities();

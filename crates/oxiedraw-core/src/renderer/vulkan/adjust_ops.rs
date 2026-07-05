@@ -109,12 +109,13 @@ fn scoped_group_spans(steps: &[CompositeStep], target_idx: usize) -> Vec<Option<
 }
 
 /// How the live in-flight content is merged into the target layer when building
-/// a folder-scoped preview: a brush stroke over the target, or a warped copy of
-/// the target (the transform tool's live preview).
+/// a folder-scoped preview: a brush stroke over the target, a warped copy of the
+/// target (the transform tool), or the gradient ramp spliced over the target.
 #[derive(Clone, Copy)]
 pub(super) enum PreviewTarget {
     Stroke { push: [f32; 4], erase: bool },
     Warp { set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
+    Gradient { endpoints: [f32; 4], extra: [f32; 4] },
 }
 
 /// The in-flight mask stroke for a live mask-edit preview: which adjustment slot
@@ -520,6 +521,15 @@ impl VulkanRenderer {
                 if visible {
                     self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
                 }
+            }
+            PreviewTarget::Gradient { endpoints, extra } => {
+                self.compose_gradient_target_into(
+                    acc.image,
+                    acc.framebuffer,
+                    target_idx,
+                    endpoints,
+                    extra,
+                );
             }
         }
     }
