@@ -85,7 +85,48 @@ fn used_text_families(canvas: &oxiedraw_core::canvas::Canvas) -> std::collection
     families
 }
 
+/// How a write behaves: toasts, backups, and how the saved state updates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveKind {
+    /// Ctrl+S / Save As: toasts, backups, records the path.
+    Manual,
+    /// Autosave to the document's file: silent, no backups, marks it saved.
+    Autosave,
+    /// Autosave of an untitled document to its recovery copy: silent, no
+    /// backups, and leaves it marked unsaved (it still has no file).
+    Recovery,
+}
+
 fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path: &Path) {
+    let backups = crate::settings::AppSettings::load().save.effective_backup_count();
+    write_project(
+        session,
+        window,
+        path.to_path_buf(),
+        SaveKind::Manual,
+        backups,
+        Rc::new(|| {}),
+    );
+}
+
+/// Snapshot the canvas and write it to `path` on a worker thread. `on_done`
+/// runs on the main thread once the write settles (success or not), letting
+/// autosave chain the next document.
+fn write_project(
+    session: &Rc<DocumentSession>,
+    window: &adw::ApplicationWindow,
+    path: PathBuf,
+    kind: SaveKind,
+    backup_count: usize,
+    on_done: Rc<dyn Fn()>,
+) {
+    // Can't serialize mid component-edit (wrong layers on the canvas), and only
+    // one write at a time.
+    if session.is_editing_component() || session.global.save_in_progress.get() {
+        on_done();
+        return;
+    }
+
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();
@@ -103,27 +144,36 @@ fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path:
         {
             Ok(s) => s,
             Err(e) => {
-                show_error(window, "Save Failed", &e.to_string());
+                if kind == SaveKind::Manual {
+                    show_error(window, "Save Failed", &e.to_string());
+                } else {
+                    tracing::warn!(err = %e, "autosave snapshot failed");
+                }
+                on_done();
                 return;
             }
         }
     };
 
     session.global.save_in_progress.set(true);
-    let pending = session.global.toaster.pending("Saving project...");
+    let pending = if kind == SaveKind::Manual {
+        session.global.toaster.pending("Saving project...")
+    } else {
+        None
+    };
 
     // Phase 2 (worker thread): PNG-encode + write the TAR archive.
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
-    let path_for_worker = path.to_path_buf();
+    let path_for_worker = path.clone();
     std::thread::spawn(move || {
-        let result = project::save::write_snapshot(&snapshot, &path_for_worker).map_err(|e| e.to_string());
+        let result = project::save::write_snapshot(&snapshot, &path_for_worker, backup_count)
+            .map_err(|e| e.to_string());
         let _ = tx.send(result);
     });
 
     // Poll for completion on the main thread (no async runtime in this app).
     let session = Rc::clone(session);
     let window = window.clone();
-    let path = path.to_path_buf();
     glib::timeout_add_local(Duration::from_millis(50), move || {
         let outcome = match rx.try_recv() {
             Ok(result) => result,
@@ -137,8 +187,8 @@ fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path:
         if let Some(t) = pending.as_ref() {
             t.dismiss();
         }
-        match outcome {
-            Ok(()) => {
+        match (outcome, kind) {
+            (Ok(()), SaveKind::Manual) => {
                 tracing::info!(path = %path.display(), "project saved");
                 *session.file_path.borrow_mut() = Some(path.clone());
                 if let Some(stem) = path.file_stem() {
@@ -146,6 +196,8 @@ fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path:
                 }
                 session.mark_saved();
                 session.refresh_tab_title();
+                // The document now lives in a real file; drop any recovery copy.
+                session.clear_recovery();
 
                 let win = window.clone();
                 let saved_path = path.clone();
@@ -156,10 +208,108 @@ fn do_save(session: &Rc<DocumentSession>, window: &adw::ApplicationWindow, path:
                         open_containing_folder(&win, &saved_path);
                     });
             }
-            Err(e) => show_error(&window, "Save Failed", &e),
+            (Ok(()), SaveKind::Autosave) => {
+                tracing::debug!(path = %path.display(), "autosaved project");
+                session.mark_saved();
+                session.refresh_tab_title();
+            }
+            (Ok(()), SaveKind::Recovery) => {
+                tracing::debug!(path = %path.display(), "wrote recovery autosave");
+            }
+            (Err(e), SaveKind::Manual) => show_error(&window, "Save Failed", &e),
+            (Err(e), _) => tracing::warn!(err = %e, "autosave failed"),
         }
+        on_done();
         glib::ControlFlow::Break
     });
+}
+
+/// Autosave every open document with unsaved changes. Saved docs go back to
+/// their file; untitled docs go to a recovery copy. Writes run one at a time,
+/// chained through each write's completion callback.
+pub(crate) fn autosave_all(
+    sessions: Vec<Rc<DocumentSession>>,
+    window: adw::ApplicationWindow,
+) {
+    let mut queue: Vec<(Rc<DocumentSession>, PathBuf, SaveKind)> = Vec::new();
+    for session in sessions {
+        let has_path = session.file_path.borrow().is_some();
+        match autosave_action(
+            session.is_editing_component(),
+            has_path,
+            session.is_dirty(),
+            session.change_counter(),
+            session.last_autosave_len.get(),
+        ) {
+            AutosaveAction::None => {}
+            AutosaveAction::ToPath => {
+                let path = session.file_path.borrow().clone().expect("path checked above");
+                queue.push((session, path, SaveKind::Autosave));
+            }
+            AutosaveAction::ToRecovery => {
+                if let Some(path) = session.ensure_recovery_path() {
+                    session.last_autosave_len.set(Some(session.change_counter()));
+                    queue.push((session, path, SaveKind::Recovery));
+                }
+            }
+        }
+    }
+    process_autosave_queue(Rc::new(queue), 0, window);
+}
+
+/// What an autosave pass should do with a single document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AutosaveAction {
+    /// Leave it alone (unchanged, mid-component-edit, or an empty untitled doc).
+    None,
+    /// Save silently to the document's own file.
+    ToPath,
+    /// Save silently to a recovery copy (the document has no file yet).
+    ToRecovery,
+}
+
+/// Decide how to autosave one document. Split out from [`autosave_all`] so the
+/// rules are testable without a live session: never mid component edit, saved
+/// docs only when dirty, untitled docs only once they have content and changed
+/// since the last recovery write.
+fn autosave_action(
+    editing_component: bool,
+    has_path: bool,
+    is_dirty: bool,
+    change_counter: usize,
+    last_autosave_len: Option<usize>,
+) -> AutosaveAction {
+    if editing_component {
+        return AutosaveAction::None;
+    }
+    if has_path {
+        if is_dirty {
+            AutosaveAction::ToPath
+        } else {
+            AutosaveAction::None
+        }
+    } else if change_counter > 0 && last_autosave_len != Some(change_counter) {
+        AutosaveAction::ToRecovery
+    } else {
+        AutosaveAction::None
+    }
+}
+
+fn process_autosave_queue(
+    queue: Rc<Vec<(Rc<DocumentSession>, PathBuf, SaveKind)>>,
+    index: usize,
+    window: adw::ApplicationWindow,
+) {
+    let Some((session, path, kind)) = queue.get(index).cloned() else {
+        return;
+    };
+    let next: Rc<dyn Fn()> = {
+        let queue = Rc::clone(&queue);
+        let window = window.clone();
+        Rc::new(move || process_autosave_queue(Rc::clone(&queue), index + 1, window.clone()))
+    };
+    // Autosave never rotates the numbered backups (those are for manual saves).
+    write_project(&session, &window, path, kind, 0, next);
 }
 
 /// Reveal a saved file in the system file manager.
@@ -213,4 +363,63 @@ pub(crate) fn show_error(window: &adw::ApplicationWindow, heading: &str, body: &
         .build();
     dialog.set_buttons(&["OK"]);
     dialog.choose(Some(window), None::<&gio::Cancellable>, |_| {});
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AutosaveAction, autosave_action};
+
+    // Never autosave while editing a component, whatever else is true.
+    #[test]
+    fn skips_while_editing_a_component() {
+        assert_eq!(
+            autosave_action(true, true, true, 5, None),
+            AutosaveAction::None
+        );
+        assert_eq!(
+            autosave_action(true, false, true, 5, Some(1)),
+            AutosaveAction::None
+        );
+    }
+
+    #[test]
+    fn saved_document_writes_back_only_when_dirty() {
+        assert_eq!(
+            autosave_action(false, true, true, 9, None),
+            AutosaveAction::ToPath
+        );
+        assert_eq!(
+            autosave_action(false, true, false, 9, None),
+            AutosaveAction::None,
+            "a clean document has nothing to autosave"
+        );
+    }
+
+    #[test]
+    fn untitled_document_goes_to_recovery_once_it_has_content() {
+        // Fresh empty untitled doc (no edits yet) - nothing worth recovering.
+        assert_eq!(
+            autosave_action(false, false, true, 0, None),
+            AutosaveAction::None
+        );
+        // After the first edit, write a recovery copy.
+        assert_eq!(
+            autosave_action(false, false, true, 1, None),
+            AutosaveAction::ToRecovery
+        );
+    }
+
+    #[test]
+    fn untitled_document_is_not_rewritten_when_unchanged() {
+        // Already recovered at change-counter 4, still at 4 - skip.
+        assert_eq!(
+            autosave_action(false, false, true, 4, Some(4)),
+            AutosaveAction::None
+        );
+        // Edited again (counter moved to 5) - recover the new state.
+        assert_eq!(
+            autosave_action(false, false, true, 5, Some(4)),
+            AutosaveAction::ToRecovery
+        );
+    }
 }

@@ -70,6 +70,16 @@ pub(crate) struct GlobalState {
     /// Name of the brush that will be active on startup. Shared between
     /// the brush picker and manager so star-click in either updates both.
     pub(crate) default_brush_name: Rc<RefCell<Option<String>>>,
+    /// Live autosave toggle + interval, read by the autosave timer and updated
+    /// from the preferences window so changes take effect immediately.
+    pub(crate) autosave: AutosaveConfig,
+}
+
+/// Live autosave configuration shared between the timer and the preferences UI.
+#[derive(Clone)]
+pub(crate) struct AutosaveConfig {
+    pub(crate) enabled: Rc<Cell<bool>>,
+    pub(crate) interval_secs: Rc<Cell<u32>>,
 }
 
 impl GlobalState {
@@ -90,6 +100,10 @@ impl GlobalState {
             font_previews: crate::font_previews::FontPreviews::new(),
             save_in_progress: Rc::new(Cell::new(false)),
             default_brush_name: Rc::new(RefCell::new(settings.default_brush_name)),
+            autosave: AutosaveConfig {
+                enabled: Rc::new(Cell::new(settings.save.autosave_enabled)),
+                interval_secs: Rc::new(Cell::new(settings.save.autosave_interval_secs)),
+            },
         }
     }
 
@@ -201,6 +215,13 @@ pub(crate) struct DocumentSession {
     pub(crate) saved_marker: Rc<Cell<usize>>,
     pub(crate) title: Rc<RefCell<String>>,
     pub(crate) tab_page: Rc<RefCell<Option<adw::TabPage>>>,
+    /// Autosave recovery copy for a document with no file path yet. Assigned on
+    /// first recovery autosave (see [`Self::ensure_recovery_path`]) and removed
+    /// once the document is saved to a real file or its tab closes.
+    pub(crate) recovery_file: RefCell<Option<PathBuf>>,
+    /// `history.undo_len()` at the last autosave, so recovery autosave skips
+    /// re-writing an unchanged untitled document.
+    pub(crate) last_autosave_len: Cell<Option<usize>>,
     /// Liveness token: the dirty-title timer holds a weak ref and stops once the
     /// session is dropped (tab closed).
     _alive: Rc<()>,
@@ -1123,6 +1144,8 @@ impl DocumentSession {
             saved_marker,
             title,
             tab_page,
+            recovery_file: RefCell::new(None),
+            last_autosave_len: Cell::new(None),
             _alive: alive,
         })
     }
@@ -1135,6 +1158,42 @@ impl DocumentSession {
 
     pub(crate) fn mark_saved(&self) {
         self.saved_marker.set(self.history.borrow().undo_len());
+    }
+
+    /// Current undo depth; autosave compares it to spot untitled-doc changes.
+    pub(crate) fn change_counter(&self) -> usize {
+        self.history.borrow().undo_len()
+    }
+
+    /// This document's recovery-copy path, assigned (and the recovery dir
+    /// created) on first use. `None` if the dir can't be created.
+    pub(crate) fn ensure_recovery_path(&self) -> Option<PathBuf> {
+        if let Some(p) = self.recovery_file.borrow().as_ref() {
+            return Some(p.clone());
+        }
+        let dir = crate::settings::recovery_dir();
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::warn!(err = %e, "failed to create recovery directory");
+            return None;
+        }
+        // Stable per-session name so each autosave overwrites the same file.
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!(
+            "recovery-{}-{n}.oxiedrawproj",
+            std::process::id()
+        ));
+        *self.recovery_file.borrow_mut() = Some(path.clone());
+        Some(path)
+    }
+
+    /// Delete this document's recovery copy, if any. Called once the document is
+    /// saved to a real file or its tab is closed.
+    pub(crate) fn clear_recovery(&self) {
+        if let Some(path) = self.recovery_file.borrow_mut().take() {
+            let _ = std::fs::remove_file(path);
+        }
+        self.last_autosave_len.set(None);
     }
 
     /// Title with a leading `*` when the document has unsaved changes.

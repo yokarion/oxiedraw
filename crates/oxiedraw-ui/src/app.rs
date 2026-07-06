@@ -154,6 +154,7 @@ impl SimpleComponent for AppModel {
             root: root.clone(),
             history_capacity,
             untitled_counter: Cell::new(0),
+            last_autosave: Cell::new(std::time::Instant::now()),
         });
 
         // Publish the window-level tool setter now that the manager exists.
@@ -165,6 +166,7 @@ impl SimpleComponent for AppModel {
 
         manager.connect_tab_signals();
         manager.register_actions(&app_handle());
+        manager.start_autosave_timer();
 
         register_window_actions(&manager, &root, &global, &apply_decorations);
 
@@ -256,9 +258,15 @@ fn register_window_actions(
         let win = root.clone();
         let apply_dec = Rc::clone(apply_decorations);
         let apply_pv = Rc::clone(&apply_pixel_view);
+        let autosave = global.autosave.clone();
         let action = gio::SimpleAction::new("preferences", None);
         action.connect_activate(move |_, _| {
-            preferences_window::show(&win, Rc::clone(&apply_dec), Rc::clone(&apply_pv));
+            preferences_window::show(
+                &win,
+                Rc::clone(&apply_dec),
+                Rc::clone(&apply_pv),
+                autosave.clone(),
+            );
         });
         app.add_action(&action);
     }

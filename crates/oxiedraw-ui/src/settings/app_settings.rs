@@ -20,10 +20,55 @@ pub(crate) struct AppSettings {
     pub(crate) pixel_view: PixelViewSettings,
     #[serde(default)]
     pub(crate) history: HistorySettings,
+    #[serde(default)]
+    pub(crate) save: SaveSettings,
     /// Name of the brush that should be active on startup. Falls back to
     /// "Ink Pen" -> "Default Round" -> first brush if not found.
     #[serde(default)]
     pub(crate) default_brush_name: Option<String>,
+}
+
+/// Project saving: rolling numbered backups and background autosave.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SaveSettings {
+    /// Keep the last N project versions next to the file as `<name>-1 ... -N`
+    /// (`-N` newest), rotated on every manual save.
+    #[serde(default = "default_true")]
+    pub(crate) backups_enabled: bool,
+    /// How many numbered backups to keep (`-1 ... -N`). Default 3.
+    #[serde(default = "default_backup_count")]
+    pub(crate) backup_count: usize,
+    /// Autosave the open documents in the background. Default on.
+    #[serde(default = "default_true")]
+    pub(crate) autosave_enabled: bool,
+    /// Seconds between autosaves. Default 300 (5 minutes).
+    #[serde(default = "default_autosave_interval")]
+    pub(crate) autosave_interval_secs: u32,
+}
+
+fn default_backup_count() -> usize {
+    3
+}
+fn default_autosave_interval() -> u32 {
+    300
+}
+
+impl Default for SaveSettings {
+    fn default() -> Self {
+        Self {
+            backups_enabled: true,
+            backup_count: default_backup_count(),
+            autosave_enabled: true,
+            autosave_interval_secs: default_autosave_interval(),
+        }
+    }
+}
+
+impl SaveSettings {
+    /// Backups to keep on a manual save: 0 when disabled (which skips rotation).
+    pub(crate) fn effective_backup_count(&self) -> usize {
+        if self.backups_enabled { self.backup_count } else { 0 }
+    }
 }
 
 /// Undo/redo behaviour.
@@ -138,6 +183,7 @@ impl Default for AppSettings {
             export: ExportSettings::default(),
             pixel_view: PixelViewSettings::default(),
             history: HistorySettings::default(),
+            save: SaveSettings::default(),
             default_brush_name: Some("Ink Pen".to_string()),
         }
     }
@@ -159,6 +205,34 @@ pub(crate) fn config_dir() -> PathBuf {
 
 pub(crate) fn config_path() -> PathBuf {
     config_dir().join("settings.json")
+}
+
+/// Per-user data directory (`$XDG_DATA_HOME`/`~/.local/share`, `%LOCALAPPDATA%`
+/// on Windows). Holds bulkier artifacts like autosave recovery copies.
+pub(crate) fn data_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var("LOCALAPPDATA")
+        .or_else(|_| std::env::var("APPDATA"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var("XDG_DATA_HOME").map_or_else(
+        |_| {
+            std::env::var("HOME").map_or_else(
+                |_| PathBuf::from("."),
+                |h| PathBuf::from(h).join(".local/share"),
+            )
+        },
+        PathBuf::from,
+    );
+
+    base.join("oxiedraw")
+}
+
+/// Where autosave keeps recovery copies of documents with no file yet.
+pub(crate) fn recovery_dir() -> PathBuf {
+    data_dir().join("recovery")
 }
 
 impl AppSettings {
@@ -191,5 +265,82 @@ impl AppSettings {
             }
             Err(e) => tracing::warn!(err = %e, "failed to serialize settings"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_settings_defaults() {
+        let s = SaveSettings::default();
+        assert!(s.backups_enabled);
+        assert_eq!(s.backup_count, 3);
+        assert!(s.autosave_enabled);
+        assert_eq!(s.autosave_interval_secs, 300);
+    }
+
+    #[test]
+    fn effective_backup_count_reflects_toggle() {
+        let mut s = SaveSettings::default();
+        assert_eq!(s.effective_backup_count(), 3);
+        s.backups_enabled = false;
+        assert_eq!(s.effective_backup_count(), 0, "disabled backups skip rotation");
+        s.backups_enabled = true;
+        s.backup_count = 7;
+        assert_eq!(s.effective_backup_count(), 7);
+    }
+
+    #[test]
+    fn save_settings_survive_a_json_round_trip() {
+        let s = SaveSettings {
+            backups_enabled: false,
+            backup_count: 9,
+            autosave_enabled: false,
+            autosave_interval_secs: 30,
+        };
+        let json = serde_json::to_string(&s).expect("test json");
+        let back: SaveSettings = serde_json::from_str(&json).expect("test json");
+        assert_eq!(back.backups_enabled, s.backups_enabled);
+        assert_eq!(back.backup_count, s.backup_count);
+        assert_eq!(back.autosave_enabled, s.autosave_enabled);
+        assert_eq!(back.autosave_interval_secs, s.autosave_interval_secs);
+    }
+
+    // Old settings.json files predate the `save` block; they must load with the
+    // backup/autosave defaults rather than failing to parse.
+    #[test]
+    fn app_settings_without_save_block_uses_defaults() {
+        let legacy = r#"{
+            "version": "0.0.1",
+            "keybinds": {},
+            "appearance": { "show_window_decorations": true }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("legacy settings parse");
+        assert!(parsed.save.autosave_enabled);
+        assert_eq!(parsed.save.backup_count, 3);
+        assert_eq!(parsed.save.autosave_interval_secs, 300);
+    }
+
+    // Individually missing save fields fall back to their own defaults.
+    #[test]
+    fn partial_save_block_fills_missing_fields() {
+        let partial = r#"{
+            "version": "0.0.1",
+            "keybinds": {},
+            "appearance": { "show_window_decorations": true },
+            "save": { "autosave_interval_secs": 600 }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(partial).expect("parse");
+        assert_eq!(parsed.save.autosave_interval_secs, 600, "explicit value kept");
+        assert!(parsed.save.backups_enabled, "missing field -> default");
+        assert_eq!(parsed.save.backup_count, 3);
+    }
+
+    #[test]
+    fn recovery_dir_sits_under_the_data_dir() {
+        assert!(recovery_dir().starts_with(data_dir()));
+        assert!(recovery_dir().ends_with("recovery"));
     }
 }

@@ -6,6 +6,7 @@ mod appearance;
 mod canvas;
 mod general;
 mod keybinds;
+mod project;
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -15,6 +16,7 @@ use adw::prelude::*;
 use gtk::{self, gdk, gio, glib};
 
 use crate::actions::apply_all_accels;
+use crate::session::AutosaveConfig;
 use crate::settings::{AppSettings, PixelViewSettings};
 
 use self::appearance::build_appearance_page;
@@ -24,6 +26,7 @@ use self::keybinds::{
     RowHandles, build_accel_string, build_keybinds_page, count_modified, is_modifier_key,
     refresh_row,
 };
+use self::project::build_project_page;
 
 // Entry point
 
@@ -31,6 +34,7 @@ pub(crate) fn show(
     parent: &adw::ApplicationWindow,
     apply_decorations: Rc<dyn Fn(bool)>,
     apply_pixel_view: Rc<dyn Fn(&PixelViewSettings)>,
+    autosave: AutosaveConfig,
 ) {
     let settings: Rc<RefCell<AppSettings>> = Rc::new(RefCell::new(AppSettings::load()));
     let recording_id: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
@@ -56,6 +60,7 @@ pub(crate) fn show(
         Rc::clone(&settings),
         apply_decorations,
     ));
+    win.add(&build_project_page(Rc::clone(&settings), autosave));
     win.add(&build_keybinds_page(
         Rc::clone(&settings),
         Rc::clone(&recording_id),

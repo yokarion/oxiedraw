@@ -8,6 +8,7 @@
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::gio;
@@ -32,6 +33,8 @@ pub(crate) struct TabManager {
     pub(crate) root: adw::ApplicationWindow,
     pub(crate) history_capacity: usize,
     pub(crate) untitled_counter: Cell<u32>,
+    /// When the last autosave ran; the tick measures the interval against it.
+    pub(crate) last_autosave: Cell<Instant>,
 }
 
 impl TabManager {
@@ -207,12 +210,44 @@ impl TabManager {
     /// `page-detached` handler: drop the session and close the window if the
     /// last tab is gone.
     pub(crate) fn on_page_detached(self: &Rc<Self>, page: &adw::TabPage) {
+        if let Some(session) = self.session_for_page(page) {
+            // A closed tab no longer needs its autosave recovery copy.
+            session.clear_recovery();
+        }
         self.sessions
             .borrow_mut()
             .retain(|s| s.tab_page.borrow().as_ref() != Some(page));
         if self.sessions.borrow().is_empty() {
             self.root.close();
         }
+    }
+
+    /// Tick that autosaves the open documents once the configured interval has
+    /// elapsed. Reads enabled/interval live, so preferences changes apply at
+    /// once.
+    pub(crate) fn start_autosave_timer(self: &Rc<Self>) {
+        // The finest interval offered is 10s, so a 5s tick is granular enough.
+        const TICK: Duration = Duration::from_secs(5);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(TICK, move || {
+            let Some(manager) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            let cfg = &manager.global.autosave;
+            if !cfg.enabled.get() {
+                // Keep the clock from firing a burst the moment autosave is re-enabled.
+                manager.last_autosave.set(Instant::now());
+                return glib::ControlFlow::Continue;
+            }
+            let interval = u64::from(cfg.interval_secs.get().max(1));
+            if manager.last_autosave.get().elapsed().as_secs() < interval {
+                return glib::ControlFlow::Continue;
+            }
+            manager.last_autosave.set(Instant::now());
+            let sessions = manager.sessions.borrow().clone();
+            crate::project_io::autosave_all(sessions, manager.root.clone());
+            glib::ControlFlow::Continue
+        });
     }
 
     /// Open a loaded project in a fresh tab.

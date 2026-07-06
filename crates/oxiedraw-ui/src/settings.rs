@@ -14,7 +14,9 @@
 mod app_settings;
 pub(crate) mod keybinds;
 
-pub(crate) use app_settings::{APP_VERSION, AppSettings, PixelViewSettings, ShapeCorrectionSettings};
+pub(crate) use app_settings::{
+    APP_VERSION, AppSettings, PixelViewSettings, ShapeCorrectionSettings, recovery_dir,
+};
 // HistorySettings is reachable via AppSettings::history; export when a preferences page needs it.
 #[allow(unused_imports)]
 pub(crate) use app_settings::HistorySettings;

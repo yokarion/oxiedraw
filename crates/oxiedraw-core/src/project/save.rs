@@ -129,23 +129,23 @@ pub fn snapshot(
     })
 }
 
-/// Encode and write a [`ProjectSnapshot`] to an `.oxiedrawproj` archive. Pure
-/// data in, file out - safe to call from a worker thread.
-///
-/// The archive is built into a sibling temp file, flushed to disk, then
-/// atomically renamed over `path`. A failed or interrupted write leaves the
-/// previous project file untouched instead of truncating it in place.
-pub fn write_snapshot(snapshot: &ProjectSnapshot, path: &Path) -> Result<(), ProjectError> {
+/// Write a [`ProjectSnapshot`] to `path` as an `.oxiedrawproj` archive. Safe to
+/// call off the main thread. Builds into a temp sibling and atomically renames
+/// over `path`, so a failed write never truncates the old file. `backup_count`
+/// > 0 first rotates the previous file into `<path>-1`..`-N` (`-N` newest); 0
+/// overwrites without backups.
+pub fn write_snapshot(
+    snapshot: &ProjectSnapshot,
+    path: &Path,
+    backup_count: usize,
+) -> Result<(), ProjectError> {
     let tmp_path = temp_path_for(path);
 
-    // Build into the temp file in its own scope, so any failure returns before
-    // we touch the real project file.
+    // Fsync the temp file before it is renamed into place.
     let build = (|| -> Result<(), ProjectError> {
         let file = std::fs::File::create(&tmp_path)?;
         let mut archive = Builder::new(file);
         build_archive(&mut archive, snapshot)?;
-        // finish() writes the end-of-archive marker; into_inner() hands the File
-        // back so we can fsync before the rename makes the new file visible.
         archive.finish()?;
         archive.into_inner()?.sync_all()?;
         Ok(())
@@ -156,13 +156,46 @@ pub fn write_snapshot(snapshot: &ProjectSnapshot, path: &Path) -> Result<(), Pro
         return Err(e);
     }
 
-    // Atomic on the same filesystem: a reader sees either the old file or the
-    // new one, never the half-written archive.
+    // A rotation hiccup must not abort the save, so log rather than propagate.
+    if backup_count > 0
+        && path.exists()
+        && let Err(e) = rotate_backups(path, backup_count)
+    {
+        tracing::warn!(path = %path.display(), err = %e, "backup rotation failed");
+    }
+
     if let Err(e) = std::fs::rename(&tmp_path, path) {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.into());
     }
     Ok(())
+}
+
+/// The path of numbered backup `slot` for `main` (e.g. `foo.oxiedrawproj-2`).
+fn backup_path(main: &Path, slot: usize) -> std::path::PathBuf {
+    let mut name = main.file_name().unwrap_or_default().to_os_string();
+    name.push(format!("-{slot}"));
+    main.with_file_name(name)
+}
+
+/// Roll `main` into the newest backup slot (`-count`): drop the oldest, shift
+/// the rest down, move `main` up. Slots above `count` (from a since-lowered
+/// setting) are pruned.
+fn rotate_backups(main: &Path, count: usize) -> std::io::Result<()> {
+    let mut slot = count + 1;
+    while backup_path(main, slot).exists() {
+        let _ = std::fs::remove_file(backup_path(main, slot));
+        slot += 1;
+    }
+    let _ = std::fs::remove_file(backup_path(main, 1));
+    // -2 -> -1, -3 -> -2, ...
+    for slot in 1..count {
+        let from = backup_path(main, slot + 1);
+        if from.exists() {
+            std::fs::rename(&from, backup_path(main, slot))?;
+        }
+    }
+    std::fs::rename(main, backup_path(main, count))
 }
 
 /// Write every archive entry (manifest, document, layers, components, fonts)
@@ -206,9 +239,8 @@ fn build_archive<W: Write>(
     Ok(())
 }
 
-/// A sibling temp path in the same directory as `path`, so the later rename
-/// stays on one filesystem and is atomic. The pid keeps a second writer from
-/// clobbering an in-flight temp file.
+/// Sibling temp path next to `path` (same filesystem, so the rename is atomic).
+/// The pid avoids two writers sharing one temp file.
 fn temp_path_for(path: &Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_os_string();
     name.push(format!(".{}.part", std::process::id()));
@@ -225,7 +257,7 @@ pub fn save(
     path: &Path,
 ) -> Result<(), ProjectError> {
     let snap = snapshot(canvas, props, components, fonts, gradient)?;
-    write_snapshot(&snap, path)
+    write_snapshot(&snap, path, 0)
 }
 
 fn append_json<W, T>(archive: &mut Builder<W>, name: &str, value: &T) -> Result<(), ProjectError>
@@ -303,24 +335,40 @@ const fn unix_days_to_ymd(days: u64) -> (u64, u64, u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::project::format::DocumentData;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU32, Ordering};
 
-    /// A snapshot whose single layer carries a wrong-sized pixel buffer, so
-    /// `encode_png` fails partway through the archive build - the exact shape of
-    /// the failure that once truncated projects to a headerless stub.
+    use super::*;
+    use crate::document::{BlendMode, LayerKind};
+    use crate::project::format::{DocumentData, LayerEntry};
+    use crate::project::load;
+
+    // -- Fixtures --------------------------------------------------------------
+
+    /// Unique per-call temp path so parallel tests never collide.
+    fn unique_main(tag: &str) -> PathBuf {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "oxiedraw_test_{}_{n}_{tag}.oxiedrawproj",
+            std::process::id()
+        ))
+    }
+
+    /// Remove the main file, its temp sibling, and every numbered backup.
+    fn cleanup(main: &Path) {
+        std::fs::remove_file(main).ok();
+        std::fs::remove_file(temp_path_for(main)).ok();
+        for slot in 1..=12 {
+            std::fs::remove_file(backup_path(main, slot)).ok();
+        }
+    }
+
+    /// A snapshot with a wrong-sized layer buffer, so PNG encoding fails partway
+    /// through the build (the failure mode that once truncated saved files).
     fn failing_snapshot() -> ProjectSnapshot {
-        let doc = DocumentData {
-            canvas_width: 4,
-            canvas_height: 4,
-            dpi: 96.0,
-            active_layer: Some(0),
-            layers: Vec::new(),
-            layer_tree: Vec::new(),
-            gradient: None,
-        };
         ProjectSnapshot {
-            doc,
+            doc: doc_meta(4, 4, &[]),
             canvas_width: 4,
             canvas_height: 4,
             // A 4x4 layer needs 64 bytes; hand it 3 so PNG encoding rejects it.
@@ -332,25 +380,265 @@ mod tests {
         }
     }
 
+    fn doc_meta(width: u32, height: u32, ids: &[&str]) -> DocumentData {
+        DocumentData {
+            canvas_width: width,
+            canvas_height: height,
+            dpi: 96.0,
+            active_layer: (!ids.is_empty()).then_some(0),
+            layers: ids
+                .iter()
+                .map(|id| LayerEntry {
+                    id: (*id).to_string(),
+                    name: format!("layer {id}"),
+                    visible: true,
+                    kind: LayerKind::default(),
+                    blend: BlendMode::default(),
+                    opacity: 1.0,
+                })
+                .collect(),
+            layer_tree: Vec::new(),
+            gradient: None,
+        }
+    }
+
+    /// A valid, encodable snapshot: each id gets a `width x height` layer filled
+    /// with a distinct byte so a round-trip can prove pixels land in the right
+    /// layer.
+    fn valid_snapshot(width: u32, height: u32, ids: &[&str]) -> ProjectSnapshot {
+        let px_len = (width * height * 4) as usize;
+        let layers = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| ((*id).to_string(), vec![fill_byte(i); px_len]))
+            .collect();
+        ProjectSnapshot {
+            doc: doc_meta(width, height, ids),
+            canvas_width: width,
+            canvas_height: height,
+            layers,
+            components: Vec::new(),
+            component_layers: Vec::new(),
+            fonts: Vec::new(),
+            font_bytes: Vec::new(),
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn fill_byte(layer_index: usize) -> u8 {
+        (10 + layer_index * 7) as u8
+    }
+
+    // -- backup_path / temp_path_for ------------------------------------------
+
+    #[test]
+    fn backup_path_appends_numeric_suffix() {
+        let main = Path::new("/tmp/art.oxiedrawproj");
+        assert_eq!(backup_path(main, 1), Path::new("/tmp/art.oxiedrawproj-1"));
+        assert_eq!(backup_path(main, 3), Path::new("/tmp/art.oxiedrawproj-3"));
+    }
+
+    #[test]
+    fn temp_path_is_a_sibling_with_part_suffix() {
+        let main = Path::new("/tmp/sub/art.oxiedrawproj");
+        let tmp = temp_path_for(main);
+        assert_eq!(tmp.parent(), main.parent(), "temp must sit next to the file");
+        assert!(
+            tmp.file_name().expect("test io").to_string_lossy().ends_with(".part"),
+            "temp name must end in .part"
+        );
+    }
+
+    // -- rotate_backups edge cases --------------------------------------------
+
+    #[test]
+    fn rotate_backups_with_no_existing_backups_parks_main_at_top() {
+        let main = unique_main("rot_none");
+        std::fs::write(&main, b"MAIN").expect("test io");
+
+        rotate_backups(&main, 3).expect("rotate");
+
+        assert!(!main.exists());
+        assert!(!backup_path(&main, 1).exists());
+        assert!(!backup_path(&main, 2).exists());
+        assert_eq!(std::fs::read(backup_path(&main, 3)).expect("test io"), b"MAIN");
+        cleanup(&main);
+    }
+
+    #[test]
+    fn rotate_backups_count_one_keeps_only_newest() {
+        let main = unique_main("rot_one");
+        std::fs::write(&main, b"MAIN").expect("test io");
+        std::fs::write(backup_path(&main, 1), b"OLD").expect("test io");
+
+        rotate_backups(&main, 1).expect("rotate");
+
+        assert!(!main.exists());
+        assert_eq!(std::fs::read(backup_path(&main, 1)).expect("test io"), b"MAIN");
+        assert!(!backup_path(&main, 2).exists());
+        cleanup(&main);
+    }
+
+    // A full set: oldest drops, the rest shift down, main takes the newest slot.
+    #[test]
+    fn rotate_backups_shifts_and_caps() {
+        let main = unique_main("rot_full");
+        std::fs::write(&main, b"MAIN").expect("test io");
+        std::fs::write(backup_path(&main, 1), b"OLD1").expect("test io");
+        std::fs::write(backup_path(&main, 2), b"MID2").expect("test io");
+        std::fs::write(backup_path(&main, 3), b"NEW3").expect("test io");
+
+        rotate_backups(&main, 3).expect("rotate");
+
+        assert!(!main.exists(), "main must move into the newest backup slot");
+        assert_eq!(std::fs::read(backup_path(&main, 1)).expect("test io"), b"MID2");
+        assert_eq!(std::fs::read(backup_path(&main, 2)).expect("test io"), b"NEW3");
+        assert_eq!(std::fs::read(backup_path(&main, 3)).expect("test io"), b"MAIN");
+        cleanup(&main);
+    }
+
+    // Lowering the backup count removes the now-stale higher-numbered backups.
+    #[test]
+    fn rotate_backups_prunes_stale_slots() {
+        let main = unique_main("rot_prune");
+        std::fs::write(&main, b"MAIN").expect("test io");
+        for slot in 1..=5 {
+            std::fs::write(backup_path(&main, slot), b"x").expect("test io");
+        }
+
+        rotate_backups(&main, 2).expect("rotate");
+
+        assert!(backup_path(&main, 1).exists());
+        assert!(backup_path(&main, 2).exists());
+        for slot in 3..=5 {
+            assert!(!backup_path(&main, slot).exists(), "slot {slot} must be pruned");
+        }
+        cleanup(&main);
+    }
+
+    // -- write_snapshot: archive validity + atomicity -------------------------
+
+    #[test]
+    fn write_produces_a_loadable_archive() {
+        let main = unique_main("loadable");
+        write_snapshot(&valid_snapshot(4, 4, &["a1", "b2"]), &main, 3).expect("write");
+
+        let project = load::load(&main).expect("archive must load");
+        assert_eq!(project.document.layers.len(), 2);
+        assert_eq!(project.manifest.schema_version, SCHEMA_VERSION);
+        assert!(!temp_path_for(&main).exists(), "temp must be gone after success");
+        cleanup(&main);
+    }
+
+    #[test]
+    fn roundtrip_preserves_each_layers_pixels() {
+        let main = unique_main("pixels");
+        let ids = ["l0", "l1", "l2"];
+        write_snapshot(&valid_snapshot(3, 2, &ids), &main, 0).expect("write");
+
+        let project = load::load(&main).expect("load");
+        let px_len = 3 * 2 * 4;
+        for (i, id) in ids.iter().enumerate() {
+            let pixels = project.layer_pixels.get(*id).expect("layer pixels present");
+            assert_eq!(pixels.as_slice(), vec![fill_byte(i); px_len].as_slice());
+        }
+        cleanup(&main);
+    }
+
+    #[test]
+    fn first_save_creates_no_backup_files() {
+        let main = unique_main("first");
+        write_snapshot(&valid_snapshot(2, 2, &["x"]), &main, 3).expect("write");
+
+        assert!(main.exists());
+        for slot in 1..=3 {
+            assert!(!backup_path(&main, slot).exists(), "no backup on first save");
+        }
+        cleanup(&main);
+    }
+
+    #[test]
+    fn second_save_moves_previous_main_into_newest_backup() {
+        let main = unique_main("second");
+        write_snapshot(&valid_snapshot(2, 2, &["v0"]), &main, 3).expect("first write");
+        write_snapshot(&valid_snapshot(2, 2, &["v1"]), &main, 3).expect("second write");
+
+        // Newest backup is the previous main - it must load and contain v0.
+        let backup = load::load(&backup_path(&main, 3)).expect("newest backup loads");
+        assert_eq!(backup.document.layers[0].id, "v0");
+        let current = load::load(&main).expect("current loads");
+        assert_eq!(current.document.layers[0].id, "v1");
+        cleanup(&main);
+    }
+
+    // Backups grow from the top slot downward and never exceed `count`; every
+    // surviving backup is a real, loadable archive.
+    #[test]
+    fn repeated_saves_grow_then_cap_at_count() {
+        let main = unique_main("grow");
+        let count = 3;
+        for i in 0..6 {
+            let id = format!("gen{i}");
+            write_snapshot(&valid_snapshot(2, 2, &[&id]), &main, count).expect("write");
+        }
+
+        // Exactly `count` backups, in the top slots, all loadable.
+        for slot in 1..=count {
+            assert!(backup_path(&main, slot).exists(), "slot {slot} present");
+            load::load(&backup_path(&main, slot)).expect("backup loads");
+        }
+        assert!(!backup_path(&main, count + 1).exists(), "must cap at count");
+
+        // Newest backup (-3) holds the generation just before the current file.
+        let newest = load::load(&backup_path(&main, count)).expect("newest loads");
+        assert_eq!(newest.document.layers[0].id, "gen4");
+        let current = load::load(&main).expect("current loads");
+        assert_eq!(current.document.layers[0].id, "gen5");
+        cleanup(&main);
+    }
+
+    #[test]
+    fn backup_count_zero_never_creates_backups() {
+        let main = unique_main("zero");
+        write_snapshot(&valid_snapshot(2, 2, &["a"]), &main, 0).expect("first");
+        write_snapshot(&valid_snapshot(2, 2, &["b"]), &main, 0).expect("second");
+
+        assert!(main.exists());
+        assert!(!backup_path(&main, 1).exists(), "count 0 makes no backups");
+        load::load(&main).expect("main still valid");
+        cleanup(&main);
+    }
+
     // A failed write must leave the previous project file byte-for-byte intact
     // and must not leave a temp file behind.
     #[test]
     fn failed_write_preserves_existing_file() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("oxiedraw_atomic_{}.oxiedrawproj", std::process::id()));
+        let main = unique_main("fail_main");
         let original = b"PREVIOUS GOOD PROJECT".to_vec();
-        std::fs::write(&path, &original).expect("seed existing file");
+        std::fs::write(&main, &original).expect("test io");
 
-        let err = write_snapshot(&failing_snapshot(), &path);
+        let err = write_snapshot(&failing_snapshot(), &main, 3);
         assert!(err.is_err(), "encoding a bad layer must fail the write");
 
-        let after = std::fs::read(&path).expect("original file must still exist");
-        assert_eq!(after, original, "a failed save must not touch the old file");
-        assert!(
-            !temp_path_for(&path).exists(),
-            "the temp file must be cleaned up after a failed write"
-        );
+        assert_eq!(std::fs::read(&main).expect("test io"), original, "old file untouched");
+        assert!(!temp_path_for(&main).exists(), "temp cleaned up");
+        cleanup(&main);
+    }
 
-        std::fs::remove_file(&path).ok();
+    // A failed write happens before rotation, so existing backups are untouched
+    // too - a bad save must not disturb the backup history.
+    #[test]
+    fn failed_write_does_not_rotate_backups() {
+        let main = unique_main("fail_backups");
+        std::fs::write(&main, b"MAIN").expect("test io");
+        std::fs::write(backup_path(&main, 3), b"NEWEST").expect("test io");
+
+        let err = write_snapshot(&failing_snapshot(), &main, 3);
+        assert!(err.is_err());
+
+        assert_eq!(std::fs::read(&main).expect("test io"), b"MAIN", "main untouched");
+        assert_eq!(std::fs::read(backup_path(&main, 3)).expect("test io"), b"NEWEST");
+        assert!(!backup_path(&main, 2).exists(), "no rotation on failure");
+        cleanup(&main);
     }
 }
