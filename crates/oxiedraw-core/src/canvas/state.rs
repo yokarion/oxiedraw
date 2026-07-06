@@ -806,7 +806,21 @@ impl Canvas {
         if dirty {
             if self.renderer.filter_active() {
                 let visibilities = self.visibilities();
-                self.renderer.render_filter_preview(&visibilities)?;
+                // Folder-bounded / global adjustment around a single filtered
+                // layer: the flat preview ignores adjustment slots and folder
+                // scope, so the adjustment would bleed onto the whole canvas
+                // (unclipped) until the filter is applied. Route through the
+                // scoped walk so the live preview clips like the committed result.
+                match self.renderer.filter_single_target() {
+                    Some(target) if self.effective_adjustment_excluding(target) => {
+                        let snapshot = self.layers.snapshot();
+                        let steps = self.preview_steps(&snapshot);
+                        self.renderer.render_filter_preview_scoped(&steps, target)?;
+                    }
+                    _ => {
+                        self.renderer.render_filter_preview(&visibilities)?;
+                    }
+                }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.fill_active() {
                 let visibilities = self.visibilities();
@@ -1434,8 +1448,17 @@ impl Canvas {
     /// Render the armed filter preview and read it back as BGRA8. Intended
     /// for tests/diagnostics; the live path presents straight to the display.
     pub fn read_filter_preview(&mut self) -> Result<Vec<u8>, RendererError> {
-        let vis = self.visibilities();
-        self.renderer.read_filter_preview(&vis)
+        match self.renderer.filter_single_target() {
+            Some(target) if self.effective_adjustment_excluding(target) => {
+                let snapshot = self.layers.snapshot();
+                let steps = self.preview_steps(&snapshot);
+                self.renderer.read_filter_preview_scoped(&steps, target)
+            }
+            _ => {
+                let vis = self.visibilities();
+                self.renderer.read_filter_preview(&vis)
+            }
+        }
     }
 
     /// Cancel an in-flight filter preview. Layer images were never modified,

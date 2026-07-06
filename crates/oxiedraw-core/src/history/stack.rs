@@ -509,6 +509,14 @@ fn apply_direction(
             }
             Ok(())
         }
+        HistoryAction::LayerTreeEdit { before, after } => {
+            let tree = match direction {
+                Direction::Forward => after,
+                Direction::Backward => before,
+            };
+            canvas.set_layer_tree(tree.clone())?;
+            Ok(())
+        }
         HistoryAction::Batch { actions, .. } => match direction {
             Direction::Forward => {
                 for a in actions {

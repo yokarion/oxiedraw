@@ -131,29 +131,65 @@ pub fn snapshot(
 
 /// Encode and write a [`ProjectSnapshot`] to an `.oxiedrawproj` archive. Pure
 /// data in, file out - safe to call from a worker thread.
+///
+/// The archive is built into a sibling temp file, flushed to disk, then
+/// atomically renamed over `path`. A failed or interrupted write leaves the
+/// previous project file untouched instead of truncating it in place.
 pub fn write_snapshot(snapshot: &ProjectSnapshot, path: &Path) -> Result<(), ProjectError> {
-    let file = std::fs::File::create(path)?;
-    let mut archive = Builder::new(file);
+    let tmp_path = temp_path_for(path);
 
+    // Build into the temp file in its own scope, so any failure returns before
+    // we touch the real project file.
+    let build = (|| -> Result<(), ProjectError> {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut archive = Builder::new(file);
+        build_archive(&mut archive, snapshot)?;
+        // finish() writes the end-of-archive marker; into_inner() hands the File
+        // back so we can fsync before the rename makes the new file visible.
+        archive.finish()?;
+        archive.into_inner()?.sync_all()?;
+        Ok(())
+    })();
+
+    if let Err(e) = build {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
+    }
+
+    // Atomic on the same filesystem: a reader sees either the old file or the
+    // new one, never the half-written archive.
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    Ok(())
+}
+
+/// Write every archive entry (manifest, document, layers, components, fonts)
+/// into `archive`. The first failing entry aborts the whole build.
+fn build_archive<W: Write>(
+    archive: &mut Builder<W>,
+    snapshot: &ProjectSnapshot,
+) -> Result<(), ProjectError> {
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         app_version: APP_VERSION.to_string(),
         created_at: utc_timestamp_now(),
     };
-    append_json(&mut archive, "manifest.json", &manifest)?;
-    append_json(&mut archive, "document.json", &snapshot.doc)?;
+    append_json(archive, "manifest.json", &manifest)?;
+    append_json(archive, "document.json", &snapshot.doc)?;
 
     for (id, pixels) in &snapshot.layers {
         let png_bytes = encode_png(pixels, snapshot.canvas_width, snapshot.canvas_height)?;
-        append_bytes(&mut archive, &format!("layers/{id}.png"), &png_bytes)?;
+        append_bytes(archive, &format!("layers/{id}.png"), &png_bytes)?;
     }
 
     if !snapshot.components.is_empty() {
-        append_json(&mut archive, "components.json", &snapshot.components)?;
+        append_json(archive, "components.json", &snapshot.components)?;
         for (comp_id, layer_id, w, h, pixels) in &snapshot.component_layers {
             let png_bytes = encode_png(pixels, *w, *h)?;
             append_bytes(
-                &mut archive,
+                archive,
                 &format!("components/{comp_id}/layers/{layer_id}.png"),
                 &png_bytes,
             )?;
@@ -161,14 +197,22 @@ pub fn write_snapshot(snapshot: &ProjectSnapshot, path: &Path) -> Result<(), Pro
     }
 
     if !snapshot.fonts.is_empty() {
-        append_json(&mut archive, "fonts.json", &snapshot.fonts)?;
+        append_json(archive, "fonts.json", &snapshot.fonts)?;
         for (hash, bytes) in &snapshot.font_bytes {
-            append_bytes(&mut archive, &format!("fonts/{hash}"), bytes)?;
+            append_bytes(archive, &format!("fonts/{hash}"), bytes)?;
         }
     }
 
-    archive.finish()?;
     Ok(())
+}
+
+/// A sibling temp path in the same directory as `path`, so the later rename
+/// stays on one filesystem and is atomic. The pid keeps a second writer from
+/// clobbering an in-flight temp file.
+fn temp_path_for(path: &Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{}.part", std::process::id()));
+    path.with_file_name(name)
 }
 
 /// Convenience: snapshot then write synchronously, on the calling thread.
@@ -255,4 +299,58 @@ const fn unix_days_to_ymd(days: u64) -> (u64, u64, u64) {
     let month = j + 2 - 12 * l;
     let year = 100 * (n - 49) + i + l;
     (year, month, day)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::format::DocumentData;
+
+    /// A snapshot whose single layer carries a wrong-sized pixel buffer, so
+    /// `encode_png` fails partway through the archive build - the exact shape of
+    /// the failure that once truncated projects to a headerless stub.
+    fn failing_snapshot() -> ProjectSnapshot {
+        let doc = DocumentData {
+            canvas_width: 4,
+            canvas_height: 4,
+            dpi: 96.0,
+            active_layer: Some(0),
+            layers: Vec::new(),
+            layer_tree: Vec::new(),
+            gradient: None,
+        };
+        ProjectSnapshot {
+            doc,
+            canvas_width: 4,
+            canvas_height: 4,
+            // A 4x4 layer needs 64 bytes; hand it 3 so PNG encoding rejects it.
+            layers: vec![("0000000000000004".to_string(), vec![0u8; 3])],
+            components: Vec::new(),
+            component_layers: Vec::new(),
+            fonts: Vec::new(),
+            font_bytes: Vec::new(),
+        }
+    }
+
+    // A failed write must leave the previous project file byte-for-byte intact
+    // and must not leave a temp file behind.
+    #[test]
+    fn failed_write_preserves_existing_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("oxiedraw_atomic_{}.oxiedrawproj", std::process::id()));
+        let original = b"PREVIOUS GOOD PROJECT".to_vec();
+        std::fs::write(&path, &original).expect("seed existing file");
+
+        let err = write_snapshot(&failing_snapshot(), &path);
+        assert!(err.is_err(), "encoding a bad layer must fail the write");
+
+        let after = std::fs::read(&path).expect("original file must still exist");
+        assert_eq!(after, original, "a failed save must not touch the old file");
+        assert!(
+            !temp_path_for(&path).exists(),
+            "the temp file must be cleaned up after a failed write"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
 }

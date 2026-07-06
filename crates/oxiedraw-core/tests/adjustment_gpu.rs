@@ -1179,3 +1179,75 @@ fn live_scoped_preview_clips_folder_and_cache_matches() {
         "cached scoped preview frame diverged from the first (uncached) frame"
     );
 }
+
+/// A live FILTER preview on a layer OUTSIDE a folder-bounded adjustment must
+/// keep the adjustment clipped to its folder. Stack (bottom->top): blue C
+/// (root, the filtered target), folder { red-left B, brightness-0 adj }. The
+/// flat filter preview ignored adjustment slots and folder scope, so the
+/// brightness-0 adjustment bled onto everything below it (blackening C) until
+/// the filter was applied. With scoped routing, C stays blue (identity HSV) and
+/// only the folder content B is blackened.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn filter_preview_respects_folder_scope() {
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+    use oxiedraw_core::filters::FilterSpec;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let c = canvas
+        .add_layer_with_pixels("C-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let b = canvas
+        .add_layer_with_pixels("B-red", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let snap = canvas.layers().snapshot();
+    let tree = vec![
+        LayerTreeNode::layer(snap[c].id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![
+                LayerTreeNode::layer(snap[b].id.clone()),
+                LayerTreeNode::layer(snap[adj].id.clone()),
+            ],
+        }),
+    ];
+    canvas.set_layer_tree(tree).unwrap();
+
+    // Arm an identity HSV filter on C (below/outside the adjustment's folder).
+    canvas.begin_filter(&[c], FilterSpec::hsv_identity());
+    let frame = canvas.read_filter_preview().unwrap();
+
+    let at = |out: &[u8], x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+
+    // Left half: folder content (red B) blackened by the brightness-0 adjustment.
+    let (lb, lg, lr) = at(&frame, 16, 32);
+    assert!(
+        lb <= 6 && lg <= 6 && lr <= 6,
+        "folder content should be blackened, got B{lb} G{lg} R{lr}"
+    );
+    // Right half: C (blue), the filtered target below the folder, must keep its
+    // color - the adjustment must NOT bleed onto it.
+    let (rb, rg, rr) = at(&frame, 48, 32);
+    assert!(
+        rb > 200 && rg <= 12 && rr <= 12,
+        "adjustment bled onto the filtered layer below its folder, got B{rb} G{rg} R{rr}"
+    );
+}

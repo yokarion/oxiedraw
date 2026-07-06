@@ -23,7 +23,8 @@ use crate::toaster::Toaster;
 use super::{
     GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
     find_group_position, group_leaf_ids, group_nodes, insert_at_in_group, item_at, mirror_tree,
-    new_group_id, sync_canvas_order, sync_height, take_node, ungroup_node,
+    new_group_id, record_tree_edit, sync_canvas_order, sync_height, take_node, tree_to_core,
+    ungroup_node,
 };
 
 pub(super) fn install_layer_actions(
@@ -165,15 +166,18 @@ pub(super) fn install_layer_actions(
         let ui = ui.clone();
         let area = area.clone();
         let canvas = Rc::clone(canvas);
+        let history = Rc::clone(history);
         let action = gio::SimpleAction::new("layer-group", None);
         action.connect_activate(move |_, _| {
             let ids = ui.selected_layer_ids_in_order();
             if ids.is_empty() {
                 return;
             }
+            let before = tree_to_core(&ui.tree.borrow());
             group_nodes(&mut ui.tree.borrow_mut(), &ids, "Group");
             ui.multi_selected.borrow_mut().clear();
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+            record_tree_edit(&history, before, tree_to_core(&ui.tree.borrow()), "Group layers");
             sync_height(&area, &ui);
             area.queue_draw();
             refresh_action_sensitivity(&ui);
@@ -271,13 +275,16 @@ pub(super) fn install_layer_actions(
         let ui = ui.clone();
         let area = area.clone();
         let canvas = Rc::clone(canvas);
+        let history = Rc::clone(history);
         let action = gio::SimpleAction::new("group-ungroup", None);
         action.connect_activate(move |_, _| {
             let Some(gid) = ui.active_group.borrow().clone() else { return };
+            let before = tree_to_core(&ui.tree.borrow());
             ungroup_node(&mut ui.tree.borrow_mut(), &gid);
             *ui.active_group.borrow_mut() = None;
             sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+            record_tree_edit(&history, before, tree_to_core(&ui.tree.borrow()), "Ungroup");
             sync_height(&area, &ui);
             area.queue_draw();
             refresh_action_sensitivity(&ui);
@@ -295,6 +302,7 @@ pub(super) fn install_layer_actions(
         let action = gio::SimpleAction::new("group-delete", None);
         action.connect_activate(move |_, _| {
             let Some(gid) = ui.active_group.borrow().clone() else { return };
+            let tree_before = tree_to_core(&ui.tree.borrow());
             // Resolve flat indices first, then remove highest-first so earlier
             // removals don't shift indices we still need.
             let leaves = group_leaf_ids(&ui.tree.borrow(), &gid);
@@ -325,16 +333,27 @@ pub(super) fn install_layer_actions(
                     });
                 }
             }
-            if !removals.is_empty() {
-                history.borrow_mut().record(HistoryAction::Batch {
-                    label: "Delete group".to_string(),
-                    actions: removals,
-                });
-            }
             take_node(&mut ui.tree.borrow_mut(), &gid);
             *ui.active_group.borrow_mut() = None;
             ui.multi_selected.borrow_mut().clear();
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+            // One undoable unit: the leaf removals plus dropping the empty group
+            // node from the folder tree. The tree edit rides last so undo runs it
+            // first, restoring the folder before the leaves are re-added into it.
+            let tree_after = tree_to_core(&ui.tree.borrow());
+            let mut actions = removals;
+            if tree_before != tree_after {
+                actions.push(HistoryAction::LayerTreeEdit {
+                    before: tree_before,
+                    after: tree_after,
+                });
+            }
+            if !actions.is_empty() {
+                history.borrow_mut().record(HistoryAction::Batch {
+                    label: "Delete group".to_string(),
+                    actions,
+                });
+            }
             sync_height(&area, &ui);
             area.queue_draw();
             redraw.request();
@@ -406,7 +425,10 @@ pub(super) fn install_layer_actions(
                 masked_leaves: std::collections::HashSet::new(),
             });
 
-            // Insert above the source group so the copy stacks on top.
+            // Insert above the source group so the copy stacks on top. The dup'd
+            // leaves are already on the canvas but not yet in the panel tree, so
+            // this snapshot is the folder tree without the copy group.
+            let tree_before = tree_to_core(&ui.tree.borrow());
             let pos = find_group_position(&ui.tree.borrow(), &gid);
             match pos {
                 Some((None, idx)) => {
@@ -454,7 +476,17 @@ pub(super) fn install_layer_actions(
                 }
                 drop(c);
                 adds.sort_by_key(|(idx, _)| *idx);
-                let actions: Vec<HistoryAction> = adds.into_iter().map(|(_, a)| a).collect();
+                let mut actions: Vec<HistoryAction> = adds.into_iter().map(|(_, a)| a).collect();
+                // Fold in the folder-tree change (the new copy group) so one undo
+                // removes both the copied layers and their group. Rides last so
+                // undo drops the group node before the layers are removed.
+                let tree_after = tree_to_core(&ui.tree.borrow());
+                if tree_before != tree_after {
+                    actions.push(HistoryAction::LayerTreeEdit {
+                        before: tree_before,
+                        after: tree_after,
+                    });
+                }
                 if !actions.is_empty() {
                     history.borrow_mut().record(HistoryAction::Batch {
                         label: "Duplicate group".to_string(),

@@ -527,31 +527,34 @@ fn first_leaf_id(nodes: &[LayerNode]) -> Option<&str> {
     None
 }
 
-/// Record the canvas order change `before` -> `after` into history. Emits a
-/// bare `LayerReorder` for a single-layer move, or a `Batch` of them for group
-/// moves (which shift several layers). No-op when the order is unchanged.
+/// Record a drag-drop into history: the canvas z-order change `before` ->
+/// `after` plus, if the move also restructured folders (dragged a node in/out
+/// of a group), the folder-tree change. Both are captured so one undo reverses
+/// the whole drop. No-op when nothing changed.
 fn record_reorder(
     history: &Rc<RefCell<HistoryStack>>,
     before: &[String],
     after: &[String],
+    tree_before: Vec<LayerTreeNode>,
+    tree_after: Vec<LayerTreeNode>,
 ) {
-    let steps = reorder_steps(before, after);
-    match steps.len() {
+    let mut actions: Vec<HistoryAction> = reorder_steps(before, after)
+        .into_iter()
+        .map(|(from, to)| HistoryAction::LayerReorder { from, to })
+        .collect();
+    if tree_before != tree_after {
+        actions.push(HistoryAction::LayerTreeEdit {
+            before: tree_before,
+            after: tree_after,
+        });
+    }
+    match actions.len() {
         0 => {}
-        1 => {
-            let (from, to) = steps[0];
-            history.borrow_mut().record(HistoryAction::LayerReorder { from, to });
-        }
-        _ => {
-            let actions = steps
-                .into_iter()
-                .map(|(from, to)| HistoryAction::LayerReorder { from, to })
-                .collect();
-            history.borrow_mut().record(HistoryAction::Batch {
-                label: "Reorder layers".to_string(),
-                actions,
-            });
-        }
+        1 => history.borrow_mut().record(actions.into_iter().next().unwrap()),
+        _ => history.borrow_mut().record(HistoryAction::Batch {
+            label: "Move layers".to_string(),
+            actions,
+        }),
     }
 }
 
@@ -607,8 +610,72 @@ fn node_to_core(node: &LayerNode) -> LayerTreeNode {
     }
 }
 
-fn tree_to_core(nodes: &[LayerNode]) -> Vec<LayerTreeNode> {
+pub(super) fn tree_to_core(nodes: &[LayerNode]) -> Vec<LayerTreeNode> {
     nodes.iter().rev().map(node_to_core).collect()
+}
+
+/// Record a folder-structure change (group create / ungroup / rename) for undo.
+/// `before`/`after` are core folder trees. No-op when unchanged. Wrapped in a
+/// labelled `Batch` so the undo toast reads sensibly.
+pub(super) fn record_tree_edit(
+    history: &Rc<RefCell<HistoryStack>>,
+    before: Vec<LayerTreeNode>,
+    after: Vec<LayerTreeNode>,
+    label: &str,
+) {
+    if before == after {
+        return;
+    }
+    history.borrow_mut().record(HistoryAction::Batch {
+        label: label.to_string(),
+        actions: vec![HistoryAction::LayerTreeEdit { before, after }],
+    });
+}
+
+// `masked_leaves` (which leaves a group's eye hid, for the toggle-on restore)
+// isn't carried by the core folder tree, so collect it by id before re-adopting
+// the core tree and overlay it back, keeping the restore set across refreshes.
+// The eye's on/off state itself is derived from leaves (see below), not carried.
+fn collect_group_masks(nodes: &[LayerNode], out: &mut std::collections::HashMap<String, HashSet<String>>) {
+    for n in nodes {
+        if let LayerNode::Group(g) = n {
+            out.insert(g.id.clone(), g.masked_leaves.clone());
+            collect_group_masks(&g.children, out);
+        }
+    }
+}
+
+fn overlay_group_masks(nodes: &mut [LayerNode], masks: &std::collections::HashMap<String, HashSet<String>>) {
+    for n in nodes {
+        if let LayerNode::Group(g) = n {
+            if let Some(masked) = masks.get(&g.id) {
+                g.masked_leaves = masked.clone();
+            }
+            overlay_group_masks(&mut g.children, masks);
+        }
+    }
+}
+
+// A group's eye reflects its leaves: on if any (recursive) leaf is visible.
+// Derived rather than stored through history, so it stays correct after an undo
+// that flips leaf visibility. Returns whether `nodes` holds any visible leaf.
+fn derive_group_visibility(nodes: &mut [LayerNode], visible: &HashSet<String>) -> bool {
+    let mut any = false;
+    for n in nodes.iter_mut() {
+        match n {
+            LayerNode::Layer(id) => {
+                if visible.contains(id) {
+                    any = true;
+                }
+            }
+            LayerNode::Group(g) => {
+                let child_any = derive_group_visibility(&mut g.children, visible);
+                g.visible = child_any;
+                any |= child_any;
+            }
+        }
+    }
+    any
 }
 
 fn node_from_core(node: &LayerTreeNode) -> LayerNode {
@@ -652,16 +719,6 @@ fn dedup_group_ids(nodes: &mut [LayerNode], seen: &mut HashSet<String>) {
             dedup_group_ids(&mut g.children, seen);
         }
     }
-}
-
-// Groups only nest inside other groups, so a group anywhere in the tree implies
-// one at the top level; a top-level scan answers "has folders" for either tree.
-fn ui_tree_has_groups(nodes: &[LayerNode]) -> bool {
-    nodes.iter().any(|n| matches!(n, LayerNode::Group(_)))
-}
-
-fn core_tree_has_groups(nodes: &[LayerTreeNode]) -> bool {
-    nodes.iter().any(|n| matches!(n, LayerTreeNode::Group(_)))
 }
 
 // Push the current panel folder structure to the canvas (recomposites so
@@ -1347,19 +1404,30 @@ fn build_layers_page(
         let canvas = Rc::clone(canvas);
         Rc::new(move || {
             let c = canvas.borrow();
-            // A freshly loaded document gets its folder tree set on the canvas
-            // after this panel was built, so the build-time seed saw an empty
-            // tree. Adopt the canvas tree here, before the commit below would
-            // push the panel's flat tree back over the saved folders.
+            // Re-adopt the folder structure from the canvas, which is the source
+            // of truth for undo/redo (a group create/edit/delete is applied
+            // there). Carry over UI-only group state (eye toggle, masked leaves)
+            // by id so a refresh unrelated to grouping doesn't reset it. Guarded
+            // on a non-empty canvas tree: a never-grouped document keeps its
+            // empty tree, and the build-time flat seed stands.
             {
                 let mut tree = ui.tree.borrow_mut();
-                if !ui_tree_has_groups(&tree) && core_tree_has_groups(c.layer_tree()) {
-                    *tree = tree_from_core(c.layer_tree());
+                if !c.layer_tree().is_empty() {
+                    let mut masks = std::collections::HashMap::new();
+                    collect_group_masks(&tree, &mut masks);
+                    let mut adopted = tree_from_core(c.layer_tree());
+                    overlay_group_masks(&mut adopted, &masks);
+                    *tree = adopted;
                 }
             }
             let snap = c.layers().snapshot();
             reconcile_tree(&mut ui.tree.borrow_mut(), &snap);
             sync_tree_order_from_canvas(&mut ui.tree.borrow_mut(), &c);
+            // Re-derive each group's eye from its leaves so it reflects any
+            // visibility change an undo/redo just applied.
+            let visible_ids: HashSet<String> =
+                snap.iter().filter(|l| l.visible).map(|l| l.id.clone()).collect();
+            derive_group_visibility(&mut ui.tree.borrow_mut(), &visible_ids);
             drop(c);
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
@@ -2792,7 +2860,7 @@ fn install_list_input(
                                 }
                             }
                             RowKind::Group { id, visible, .. } => {
-                                toggle_group_visibility(&ui, &canvas, id, !visible);
+                                toggle_group_visibility(&ui, &canvas, &history, id, !visible);
                                 area_w.queue_draw();
                                 redraw.request();
                             }
@@ -2855,6 +2923,7 @@ fn install_list_input(
                         // layers and groups (which move several layers at once).
                         let before_order: Vec<String> = canvas.borrow().layers()
                             .snapshot().iter().map(|l| l.id.clone()).collect();
+                        let tree_before = tree_to_core(&ui.tree.borrow());
 
                         let dragged_node = take_node(&mut ui.tree.borrow_mut(), &dragged_id);
                         if let Some(node) = dragged_node {
@@ -2882,7 +2951,14 @@ fn install_list_input(
 
                             let after_order: Vec<String> = canvas.borrow().layers()
                                 .snapshot().iter().map(|l| l.id.clone()).collect();
-                            record_reorder(&history, &before_order, &after_order);
+                            let tree_after = tree_to_core(&ui.tree.borrow());
+                            record_reorder(
+                                &history,
+                                &before_order,
+                                &after_order,
+                                tree_before,
+                                tree_after,
+                            );
 
                             sync_height(&area_w, &ui);
                             redraw.request();
@@ -3181,8 +3257,15 @@ fn install_list_input(
 
 // Toggling a group's eye must not overwrite per-leaf state. We record which
 // leaves we hid and restore exactly those on toggle-on; anything the user
-// flipped manually while the group was hidden stays as they left it.
-fn toggle_group_visibility(ui: &Ui, canvas: &Rc<RefCell<Canvas>>, group_id: &str, new_vis: bool) {
+// flipped manually while the group was hidden stays as they left it. Every leaf
+// we flip is recorded so the group eye undoes like a single layer's eye.
+fn toggle_group_visibility(
+    ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
+    history: &Rc<RefCell<HistoryStack>>,
+    group_id: &str,
+    new_vis: bool,
+) {
     let leaves = group_leaf_ids(&ui.tree.borrow(), group_id);
     let mut c = canvas.borrow_mut();
     let snap = c.layers().snapshot();
@@ -3199,12 +3282,26 @@ fn toggle_group_visibility(ui: &Ui, canvas: &Rc<RefCell<Canvas>>, group_id: &str
         }
     };
 
+    let mut changes: Vec<HistoryAction> = Vec::new();
     let new_mask: HashSet<String> = if new_vis {
+        // Restore exactly the leaves the group hid. If that set was lost (e.g.
+        // an intervening undo cleared it), fall back to showing every leaf so
+        // the eye can't get stuck "on" with nothing visible.
+        let restore_all = prior_mask.is_empty();
         for (lid, idx) in &leaf_indices {
-            if prior_mask.contains(lid)
-                && let Err(e) = c.set_layer_visible(*idx, true) {
+            if (restore_all || prior_mask.contains(lid))
+                && snap.get(*idx).is_some_and(|l| !l.visible)
+            {
+                if let Err(e) = c.set_layer_visible(*idx, true) {
                     tracing::error!(error = %e, leaf = %lid, "group eye: show failed");
+                    continue;
                 }
+                changes.push(HistoryAction::LayerVisibility {
+                    id: lid.clone(),
+                    old: false,
+                    new: true,
+                });
+            }
         }
         HashSet::new()
     } else {
@@ -3215,6 +3312,11 @@ fn toggle_group_visibility(ui: &Ui, canvas: &Rc<RefCell<Canvas>>, group_id: &str
                     tracing::error!(error = %e, leaf = %lid, "group eye: hide failed");
                     continue;
                 }
+                changes.push(HistoryAction::LayerVisibility {
+                    id: lid.clone(),
+                    old: true,
+                    new: false,
+                });
                 mask.insert(lid);
             }
         }
@@ -3225,6 +3327,15 @@ fn toggle_group_visibility(ui: &Ui, canvas: &Rc<RefCell<Canvas>>, group_id: &str
     if let Some(g) = find_group_mut(&mut ui.tree.borrow_mut(), group_id) {
         g.visible = new_vis;
         g.masked_leaves = new_mask;
+    }
+
+    match changes.len() {
+        0 => {}
+        1 => history.borrow_mut().record(changes.into_iter().next().unwrap()),
+        _ => history.borrow_mut().record(HistoryAction::Batch {
+            label: "Toggle group visibility".to_string(),
+            actions: changes,
+        }),
     }
 }
 
@@ -3276,9 +3387,12 @@ fn show_rename_popover(
                 });
             }
         } else {
+            let before = tree_to_core(&ui.tree.borrow());
             rename_group_in_tree(&mut ui.tree.borrow_mut(), &id, new_name.trim().to_string());
             // Folder name is metadata-only (no composite change) but must persist.
             commit_groups_quiet(&ui.tree.borrow(), &mut canvas.borrow_mut());
+            let after = tree_to_core(&ui.tree.borrow());
+            record_tree_edit(&history, before, after, "Rename group");
         }
         area.queue_draw();
         pop_c.popdown();

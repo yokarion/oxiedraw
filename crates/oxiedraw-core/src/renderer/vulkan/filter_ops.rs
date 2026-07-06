@@ -16,10 +16,12 @@
 
 use ash::vk;
 
+use crate::document::CompositeStep;
 use crate::filters::FilterSpec;
 
 use super::super::RendererError;
 use super::super::filters::{JfaSlot, Scratch};
+use super::adjust_ops::PreviewTarget;
 use super::VulkanRenderer;
 
 impl VulkanRenderer {
@@ -28,6 +30,8 @@ impl VulkanRenderer {
         self.filter_active = true;
         self.filter_affected = affected;
         self.filter_spec = spec;
+        // Drop any stale per-stroke static-folder cache the scoped preview reuses.
+        self.invalidate_preview_cache();
     }
 
     /// Update the previewed parameters (slider moved). Cheap - the next
@@ -46,6 +50,53 @@ impl VulkanRenderer {
     #[must_use]
     pub const fn filter_active(&self) -> bool {
         self.filter_active
+    }
+
+    /// The single affected layer when exactly one layer is filtered, else
+    /// `None`. Used to route the live preview through the folder-scoped
+    /// composite when an adjustment is in play.
+    #[must_use]
+    pub fn filter_single_target(&self) -> Option<usize> {
+        match self.filter_affected.as_slice() {
+            [idx] => Some(*idx),
+            _ => None,
+        }
+    }
+
+    /// Folder-scoped / adjustment-aware filter preview: run the target layer's
+    /// filter chain, then walk the composite tree with the filtered scratch
+    /// spliced in at the target so an adjustment above (or below) clips exactly
+    /// like the committed recomposite. Mirrors
+    /// [`Self::render_gradient_preview_scoped`]; the flat
+    /// [`Self::render_filter_preview`] is used when no adjustment is in play.
+    pub fn render_filter_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+    ) -> Result<(), RendererError> {
+        let spec = self.filter_spec;
+        let result = self.produce_filtered_layer(target_idx, spec)?;
+        let src_img = self.filter_resources.scratch_handle(result);
+        let set = self.filter_resources.composite_set(result);
+        let (mode, opacity) = self.layer_stack.blend(target_idx);
+        self.build_preview_scoped(
+            steps,
+            target_idx,
+            PreviewTarget::Filter { src_img, set, mode, opacity },
+        )
+    }
+
+    /// As [`Self::render_filter_preview_scoped`] but reads the preview back to
+    /// host memory (tests / diagnostics) instead of presenting it.
+    pub fn read_filter_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+        target_idx: usize,
+    ) -> Result<Vec<u8>, RendererError> {
+        self.render_filter_preview_scoped(steps, target_idx)?;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes()
     }
 
     /// Compose the preview image: every visible layer in z-order, with each

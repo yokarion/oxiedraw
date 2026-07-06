@@ -457,6 +457,39 @@ fn layer_reorder_round_trip() {
 
 #[test]
 #[ignore = "requires vulkan loader and device"]
+fn layer_tree_edit_round_trip() {
+    use crate::document::{LayerGroup, LayerTreeNode};
+
+    let mut c = canvas();
+    let mut s = stack();
+    c.add_layer("Top").expect("add");
+    let ids = layer_ids(&c);
+
+    // before: flat; after: both leaves wrapped in a folder.
+    let before: Vec<LayerTreeNode> =
+        ids.iter().map(|id| LayerTreeNode::layer(id.clone())).collect();
+    let after = vec![LayerTreeNode::Group(LayerGroup {
+        id: "g1".to_string(),
+        name: "Folder".to_string(),
+        expanded: true,
+        children: ids.iter().map(|id| LayerTreeNode::layer(id.clone())).collect(),
+    })];
+
+    c.set_layer_tree(after.clone()).expect("set tree");
+    s.record(HistoryAction::LayerTreeEdit {
+        before: before.clone(),
+        after: after.clone(),
+    });
+
+    s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
+    assert_eq!(c.layer_tree(), before.as_slice());
+
+    s.redo(&mut c, &mut ComponentLibrary::new()).expect("redo");
+    assert_eq!(c.layer_tree(), after.as_slice());
+}
+
+#[test]
+#[ignore = "requires vulkan loader and device"]
 fn layer_rename_round_trip() {
     let mut c = canvas();
     let mut s = stack();

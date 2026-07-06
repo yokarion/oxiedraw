@@ -116,6 +116,8 @@ pub(super) enum PreviewTarget {
     Stroke { push: [f32; 4], erase: bool },
     Warp { set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
     Gradient { endpoints: [f32; 4], extra: [f32; 4] },
+    // The target layer's filtered result, pre-produced into a filter scratch.
+    Filter { src_img: vk::Image, set: vk::DescriptorSet, mode: u32, opacity: f32 },
 }
 
 /// The in-flight mask stroke for a live mask-edit preview: which adjustment slot
@@ -530,6 +532,10 @@ impl VulkanRenderer {
                     endpoints,
                     extra,
                 );
+            }
+            PreviewTarget::Filter { src_img, set, mode, opacity } => {
+                self.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+                self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
             }
         }
     }

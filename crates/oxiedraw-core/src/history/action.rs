@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use super::snapshot::LayerPatch;
 use crate::components::ComponentSnapshot;
-use crate::document::{BlendMode, LayerKind, Placement};
+use crate::document::{BlendMode, LayerKind, LayerTreeNode, Placement};
 use crate::effects::AdjustmentData;
 use crate::text::TextContent;
 
@@ -227,6 +227,15 @@ pub enum HistoryAction {
         index: usize,
         snapshot: ComponentSnapshot,
     },
+    /// The layer folder tree changed structurally: a group was created,
+    /// dissolved, renamed, or a node moved between folders. Both snapshots are
+    /// whole core folder trees; apply swaps the canvas tree wholesale. Any
+    /// layer add/remove that rides along (group delete/duplicate) is a separate
+    /// action in the same [`Self::Batch`].
+    LayerTreeEdit {
+        before: Vec<LayerTreeNode>,
+        after: Vec<LayerTreeNode>,
+    },
     /// Several actions applied as one undoable unit (e.g. deleting a group of
     /// layers). Forward applies `actions` in order; backward inverts them in
     /// reverse order so the canvas returns to its exact prior state.
@@ -300,6 +309,7 @@ impl HistoryAction {
             Self::ComponentRename { .. } => "Rename component",
             Self::ComponentAdd { .. } => "Add component",
             Self::ComponentRemove { .. } => "Remove component",
+            Self::LayerTreeEdit { .. } => "Edit groups",
             Self::Batch { label, .. } => label,
         }
     }
