@@ -16,7 +16,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const RESOURCE_PREFIX: &str = "/io/github/yokarion/OxieDraw/icons";
+const RESOURCE_PREFIX: &str = "/com/yokarion/oxiedraw/icons";
 
 fn main() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));

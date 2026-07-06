@@ -39,7 +39,7 @@ use relm4::RelmApp;
 const APP_ID: &str = "com.yokarion.oxiedraw";
 
 /// Resource path the icon tree is registered under; see `build.rs`.
-const ICON_RESOURCE_PATH: &str = "/io/github/yokarion/OxieDraw/icons";
+const ICON_RESOURCE_PATH: &str = "/com/yokarion/oxiedraw/icons";
 
 // hicolor icon tree (tool symbolics + themed app icon), compiled into a
 // GResource by `build.rs` so the binary is self-contained.

@@ -17,7 +17,7 @@ pub(super) fn build_general_page() -> adw::PreferencesPage {
     identity.set_margin_top(12);
     identity.set_margin_bottom(12);
 
-    let icon = gtk::Image::from_icon_name("io.github.yokarion.OxieDraw");
+    let icon = gtk::Image::from_icon_name(crate::APP_ID);
     icon.set_pixel_size(80);
     identity.append(&icon);
 
