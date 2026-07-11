@@ -6,6 +6,7 @@ use crate::brush_engine::Dab;
 
 use super::RendererError;
 use super::resources::Buffer;
+use super::vulkan::RING_FRAMES;
 
 /// One brush dab on the GPU.
 ///
@@ -149,19 +150,22 @@ impl DabBuffers {
         Ok(Self { vertex, instance })
     }
 
-    /// Returns the number of instances actually uploaded (clamped to
-    /// `MAX_INSTANCES`).
+    /// Upload dabs into ring slot `slot`'s region, returning the count uploaded
+    /// (clamped to `MAX_INSTANCES`). Per-slot regions stop the next upload from
+    /// stomping a dab draw that's still reading this one.
     pub(super) fn upload_instances(
         &mut self,
         instances: &[DabInstance],
+        slot: usize,
     ) -> Result<u32, RendererError> {
         let n_usize = instances.len().min(MAX_INSTANCES as usize);
         let bytes = instances_as_bytes(&instances[..n_usize]);
+        let offset = instance_slot_offset(slot) as usize;
         let dst = self
             .instance
             .mapped_mut()
             .ok_or(RendererError::StagingNotMapped)?;
-        dst[..bytes.len()].copy_from_slice(bytes);
+        dst[offset..offset + bytes.len()].copy_from_slice(bytes);
         Ok(u32::try_from(n_usize).expect("clamped above"))
     }
 
@@ -461,11 +465,17 @@ fn create_vertex_buffer(
     Ok(buf)
 }
 
+/// Byte offset of ring slot `slot`'s instance region (buffer holds RING_FRAMES).
+pub(super) fn instance_slot_offset(slot: usize) -> u64 {
+    slot as u64 * u64::from(MAX_INSTANCES) * u64::from(DAB_INSTANCE_STRIDE)
+}
+
 fn create_instance_buffer(
     device: &Device,
     allocator: &mut Allocator,
 ) -> Result<Buffer, RendererError> {
-    let size = u64::from(MAX_INSTANCES) * u64::from(DAB_INSTANCE_STRIDE);
+    let size =
+        u64::from(MAX_INSTANCES) * u64::from(DAB_INSTANCE_STRIDE) * RING_FRAMES as u64;
     Buffer::new(
         device,
         allocator,

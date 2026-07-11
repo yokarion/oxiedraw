@@ -1134,6 +1134,21 @@ impl VulkanRenderer {
         self.submit_to_ring(record)
     }
 
+    /// Slot the next `submit_to_ring` will record into.
+    pub(super) const fn current_ring_slot(&self) -> usize {
+        self.ring_cursor
+    }
+
+    /// Wait for slot `slot`'s last submission to finish so its instance region
+    /// is safe to overwrite. submit_to_ring waits too, but only after the upload.
+    pub(super) fn wait_ring_slot(&self, slot: usize) -> Result<(), RendererError> {
+        unsafe {
+            self.device
+                .wait_for_fences(&[self.ring_fences[slot]], true, u64::MAX)?;
+        }
+        Ok(())
+    }
+
     /// Wait for the most recent submission to finish.
     pub fn wait_last(&self) -> Result<(), RendererError> {
         unsafe {
@@ -1511,6 +1526,46 @@ mod tests {
         // Was 0xFF in top half, 0 in bottom half; now flipped.
         assert!(mask[0] < 0x10, "top should now be deselected");
         assert!(mask[15 * 16] > 0xF0, "bottom should now be selected");
+    }
+
+    // Fire many single-dab stamps back to back. If an upload overwrites the
+    // instance buffer before the previous async draw has run, dabs get dropped
+    // and the row shows a hole. Repro for the fast-stroke end gaps.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn burst_stamp_no_dropped_dabs() {
+        let size = Size::new(256, 8);
+        let mut r = VulkanRenderer::new(size).expect("renderer init");
+        r.clear_stroke().expect("clear stroke");
+        // One dab every 2px across the row, each its own submit (250 submits).
+        let radius = 2.0;
+        let mut x = 2.0;
+        while x < 254.0 {
+            let dab = round_dab([x, 4.0], radius, [1.0, 1.0, 1.0, 1.0]);
+            r.stamp_mask(DabFamily::SoftRound, &[dab]).expect("stamp");
+            x += 2.0;
+        }
+        let stroke = r.read_stroke().expect("readback");
+        // read_stroke is a single-channel coverage mask (one u8 per pixel). The
+        // row (y=4) should be continuously covered: no wide hole where a dab was
+        // dropped.
+        let width = size.width as usize;
+        let row = 4 * width;
+        let mut worst_run = 0;
+        let mut run = 0;
+        for px in 3..253usize {
+            let a = stroke[row + px];
+            if a < 0x40 {
+                run += 1;
+                worst_run = worst_run.max(run);
+            } else {
+                run = 0;
+            }
+        }
+        assert!(
+            worst_run <= 1,
+            "dropped dabs: {worst_run}px continuous hole in the stamped row",
+        );
     }
 
     #[test]

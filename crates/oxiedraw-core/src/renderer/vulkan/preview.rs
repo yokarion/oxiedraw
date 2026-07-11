@@ -59,7 +59,9 @@ impl VulkanRenderer {
             0
         } else {
             self.accumulate_dirty(instances);
-            self.dab_buffers.upload_instances(instances)?
+            let slot = self.current_ring_slot();
+            self.wait_ring_slot(slot)?;
+            self.dab_buffers.upload_instances(instances, slot)?
         };
         let mask_pipe = self.active_mask_pipelines().get(family);
         let pipeline = mask_pipe.pipeline;

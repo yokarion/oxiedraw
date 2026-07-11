@@ -18,7 +18,9 @@ impl VulkanRenderer {
         if dabs.is_empty() {
             return Ok(());
         }
-        let n = self.dab_buffers.upload_instances(dabs)?;
+        let slot = self.current_ring_slot();
+        self.wait_ring_slot(slot)?;
+        let n = self.dab_buffers.upload_instances(dabs, slot)?;
         let pipe = self.dab_pipelines.get(family);
         let pipeline = pipe.pipeline;
         let layout = pipe.layout;
@@ -112,7 +114,9 @@ impl VulkanRenderer {
             return Ok(());
         }
         self.accumulate_dirty(dabs);
-        let n = self.dab_buffers.upload_instances(dabs)?;
+        let slot = self.current_ring_slot();
+        self.wait_ring_slot(slot)?;
+        let n = self.dab_buffers.upload_instances(dabs, slot)?;
         let pipe = self.active_mask_pipelines().get(family);
         let pipeline = pipe.pipeline;
         let layout = pipe.layout;
@@ -207,11 +211,13 @@ impl VulkanRenderer {
                 &[self.dab_buffers.vertex.handle],
                 &[0],
             );
+            // Bind this slot's instance region. ring_cursor still points at the
+            // slot being recorded, which matches the slot the upload wrote to.
             self.device.cmd_bind_vertex_buffers(
                 self.command_buffer,
                 1,
                 &[self.dab_buffers.instance.handle],
-                &[0],
+                &[super::super::dab::instance_slot_offset(self.ring_cursor)],
             );
             self.device
                 .cmd_draw(self.command_buffer, 4, instance_count, 0, 0);
