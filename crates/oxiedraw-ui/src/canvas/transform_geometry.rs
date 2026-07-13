@@ -107,7 +107,7 @@ pub(super) const fn cursor_name(handle: TransformHandle) -> &'static str {
 
 /// Recompute the `TransformRect` based on which handle is being dragged.
 ///
-/// `shift` constrains the result to a 1:1 aspect ratio (square); `alt`
+/// `shift` constrains scaling to the box's original aspect ratio; `alt`
 /// scales symmetrically about the rect centre instead of pinning the
 /// opposite corner/edge. Both mirror the shape-tool modifier behaviour.
 pub(super) fn compute_rect(
@@ -177,7 +177,8 @@ fn snap_to_pixel_grid(rect: TransformRect) -> TransformRect {
 /// axis, `0` means that axis is not controlled by this handle (edge handles).
 ///
 /// Default (no modifiers) pins the opposite corner/edge. `alt` pins the
-/// rect centre so it grows symmetrically. `shift` forces a square result.
+/// rect centre so it grows symmetrically. `shift` preserves the original
+/// aspect ratio.
 fn scale_handle(
     start: TransformRect,
     delta: Point,
@@ -200,21 +201,24 @@ fn scale_handle(
         axis_resize(start_half_height, sign_y, drag_local_y, alt);
 
     if shift {
-        // 1:1 aspect: derive the target half-size from the controlled axes.
-        let target = match (sign_x != 0.0, sign_y != 0.0) {
-            (true, true) => half_width.max(half_height),
-            (true, false) => half_width,
-            (false, true) => half_height,
+        // Keep the box's original aspect ratio: pick one uniform scale factor
+        // (driven by the controlled axes) and apply it to both half-extents.
+        let scale = match (sign_x != 0.0, sign_y != 0.0) {
+            (true, true) => (half_width / start_half_width).max(half_height / start_half_height),
+            (true, false) => half_width / start_half_width,
+            (false, true) => half_height / start_half_height,
             (false, false) => return start,
         };
-        let (squared_half_width, squared_center_offset_x) =
-            axis_square(start_half_width, sign_x, drag_local_x, alt, target);
-        let (squared_half_height, squared_center_offset_y) =
-            axis_square(start_half_height, sign_y, drag_local_y, alt, target);
-        half_width = squared_half_width;
-        center_offset_x = squared_center_offset_x;
-        half_height = squared_half_height;
-        center_offset_y = squared_center_offset_y;
+        let target_half_width = start_half_width * scale;
+        let target_half_height = start_half_height * scale;
+        let (scaled_half_width, scaled_center_offset_x) =
+            axis_to_target(start_half_width, sign_x, drag_local_x, alt, target_half_width);
+        let (scaled_half_height, scaled_center_offset_y) =
+            axis_to_target(start_half_height, sign_y, drag_local_y, alt, target_half_height);
+        half_width = scaled_half_width;
+        center_offset_x = scaled_center_offset_x;
+        half_height = scaled_half_height;
+        center_offset_y = scaled_center_offset_y;
     }
 
     let new_width = (half_width * 2.0).max(1.0);
@@ -241,9 +245,9 @@ fn axis_resize(start_half: f32, sign: f32, drag: f32, alt: bool) -> (f32, f32) {
     }
 }
 
-/// Like [`axis_resize`] but forces the half-extent to `target` (square mode),
-/// keeping the same anchor semantics.
-fn axis_square(start_half: f32, sign: f32, drag: f32, alt: bool, target: f32) -> (f32, f32) {
+/// Like [`axis_resize`] but forces the half-extent to `target` (constrained
+/// scaling), keeping the same anchor semantics.
+fn axis_to_target(start_half: f32, sign: f32, drag: f32, alt: bool, target: f32) -> (f32, f32) {
     if sign == 0.0 || alt {
         return (target, 0.0);
     }
