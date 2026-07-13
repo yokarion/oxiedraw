@@ -126,6 +126,42 @@ pub fn render_text_local(content: &TextContent, engine: &mut TextEngine) -> (Vec
     (pixels, w, h)
 }
 
+/// Render the text at total scale `(sx, sy)` (over its natural box) into a tight
+/// unrotated BGRA8 buffer `(pixels, w, h)`. Bakes `max(sx, sy)` into the glyph
+/// size so the raster matches the target resolution; the residual squish is
+/// downscaled. Used as the live Transform source for a crisp scaling drag.
+#[must_use]
+pub fn render_visible_local(
+    content: &TextContent,
+    sx: f32,
+    sy: f32,
+    engine: &mut TextEngine,
+) -> (Vec<u8>, u32, u32) {
+    let n = content.box_rect;
+    let vw = ((n.w * sx).ceil() as u32).clamp(1, MAX_LOCAL_DIM);
+    let vh = ((n.h * sy).ceil() as u32).clamp(1, MAX_LOCAL_DIM);
+    if content.is_empty() {
+        return (vec![0u8; (vw as usize) * (vh as usize) * 4], vw, vh);
+    }
+    let uniform = sx.max(sy).max(1e-3);
+    let residual = (sx / uniform, sy / uniform);
+    // Bake the uniform factor into the glyphs and lay out in a high-res box; the
+    // residual squish then downscales that into the vw x vh buffer.
+    let mut c = content.clone();
+    for run in &mut c.runs {
+        run.style.size = (run.style.size * uniform).max(1.0);
+    }
+    c.default_style.size = (c.default_style.size * uniform).max(1.0);
+    #[allow(clippy::cast_precision_loss)]
+    let hi_box = super::TextBox::new(vw as f32 / 2.0, vh as f32 / 2.0, n.w * uniform, n.h * uniform, 0.0);
+    c.box_rect = hi_box;
+    let buffer = shape(&c, engine, wrap_width_for(&c));
+    let pixels = paint_buffer_scaled(
+        &buffer, hi_box, residual, c.resize, c.v_align, c.default_style.color, engine, vw, vh,
+    );
+    (pixels, vw, vh)
+}
+
 /// Wrap width for a content's resize mode: `None` (no wrapping) for AutoWidth,
 /// else the box width.
 #[must_use]
@@ -530,6 +566,32 @@ mod tests {
             (squished as f32) < (natural as f32) * 0.7,
             "squished extent {squished} should be well under natural {natural}"
         );
+    }
+
+    #[test]
+    fn render_visible_local_sizes_to_scaled_box() {
+        let mut eng = engine();
+        if eng.available_families().is_empty() {
+            return;
+        }
+        let style = TextStyle::new(FontId::new(some_family(&eng)), Color::BLACK);
+        let content = TextContent {
+            box_rect: TextBox::new(100.0, 50.0, 180.0, 40.0, 0.0),
+            resize: ResizeMode::Fixed,
+            h_align: HAlign::Left,
+            v_align: VAlign::Top,
+            runs: vec![TextRun::new("Hello", style.clone())],
+            default_style: style,
+            scale: (1.0, 1.0),
+        };
+        // Uniform x2: the local buffer is the visible (2x) size and has glyphs.
+        let (px, w, h) = render_visible_local(&content, 2.0, 2.0, &mut eng);
+        assert_eq!((w, h), (360, 80));
+        assert_eq!(px.len(), (w as usize) * (h as usize) * 4);
+        assert!(px.chunks_exact(4).any(|p| p[3] > 0), "expected glyph pixels");
+        // Anamorphic (wide) stretch still yields the visible box dims.
+        let (_px, w, h) = render_visible_local(&content, 3.0, 1.0, &mut eng);
+        assert_eq!((w, h), (540, 40));
     }
 
     #[test]

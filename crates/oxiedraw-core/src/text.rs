@@ -205,6 +205,26 @@ impl TextContent {
         (self.scale.0 - 1.0).abs() > 1e-3 || (self.scale.1 - 1.0).abs() > 1e-3
     }
 
+    /// Fold a Transform scale into the layout instead of stretching the raster:
+    /// bake the uniform part `max(sx, sy)` into the font/box (crisp re-shape) and
+    /// keep only the residual anamorphic ratio (`<= 1` per axis, so a resample
+    /// only downscales). `sx`/`sy` are the new visible size over the natural box.
+    pub fn bake_transform(&mut self, cx: f32, cy: f32, angle: f32, sx: f32, sy: f32) {
+        let uniform = sx.max(sy).max(1e-3);
+        for run in &mut self.runs {
+            run.style.size = (run.style.size * uniform).max(1.0);
+        }
+        self.default_style.size = (self.default_style.size * uniform).max(1.0);
+        self.box_rect = TextBox::new(
+            cx,
+            cy,
+            (self.box_rect.w * uniform).max(1.0),
+            (self.box_rect.h * uniform).max(1.0),
+            angle,
+        );
+        self.scale = (sx / uniform, sy / uniform);
+    }
+
     /// The on-screen box: the natural [`box_rect`](Self::box_rect) with its
     /// width/height scaled by [`scale`](Self::scale). Centre and angle are
     /// unchanged. This is what the user sees and interacts with.
@@ -303,6 +323,48 @@ mod tests {
         assert!((v.angle - 0.7).abs() < 1e-3);
         assert!((v.w - 160.0).abs() < 1e-3, "w {}", v.w);
         assert!((v.h - 15.0).abs() < 1e-3, "h {}", v.h);
+    }
+
+    #[test]
+    fn bake_transform_uniform_scale_bakes_font_and_clears_residual() {
+        let mut c = TextContent {
+            box_rect: TextBox::new(0.0, 0.0, 100.0, 40.0, 0.0),
+            resize: ResizeMode::Fixed,
+            h_align: HAlign::Left,
+            v_align: VAlign::Top,
+            runs: vec![TextRun::new("Hi", style())],
+            default_style: style(),
+            scale: (1.0, 1.0),
+        };
+        c.bake_transform(10.0, 20.0, 0.5, 2.0, 2.0);
+        // Uniform x2: font size doubled, box doubled, no residual squish.
+        assert!((c.runs[0].style.size - 40.0).abs() < 1e-3);
+        assert!((c.default_style.size - 40.0).abs() < 1e-3);
+        assert!((c.box_rect.w - 200.0).abs() < 1e-3 && (c.box_rect.h - 80.0).abs() < 1e-3);
+        assert!(!c.is_scaled());
+        // Visible box matches the requested transform rect.
+        let v = c.visible_rect();
+        assert!((v.w - 200.0).abs() < 1e-3 && (v.h - 80.0).abs() < 1e-3);
+        assert!((v.cx - 10.0).abs() < 1e-3 && (v.angle - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bake_transform_anamorphic_keeps_residual_below_one() {
+        let mut c = TextContent::empty(
+            TextBox::new(0.0, 0.0, 100.0, 40.0, 0.0),
+            ResizeMode::Fixed,
+            style(),
+        );
+        // Stretch width x3, height unchanged.
+        c.bake_transform(0.0, 0.0, 0.0, 3.0, 1.0);
+        // Uniform factor is max(3, 1) = 3, baked into the box/font.
+        assert!((c.default_style.size - DEFAULT_FONT_SIZE * 3.0).abs() < 1e-3);
+        // Residual is <= 1 on both axes (so resampling only downscales).
+        assert!(c.scale.0 <= 1.0 + 1e-3 && c.scale.1 <= 1.0 + 1e-3);
+        assert!((c.scale.0 - 1.0).abs() < 1e-3 && (c.scale.1 - 1.0 / 3.0).abs() < 1e-3);
+        // Visible box still matches the requested stretch.
+        let v = c.visible_rect();
+        assert!((v.w - 300.0).abs() < 1e-3 && (v.h - 40.0).abs() < 1e-3, "w {} h {}", v.w, v.h);
     }
 
     #[test]

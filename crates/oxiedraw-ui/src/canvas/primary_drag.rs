@@ -721,6 +721,8 @@ impl PrimaryDragHandler {
     /// present through Vulkan. No-op when the GPU preview couldn't start.
     fn update_transform_gpu_preview(&self, rect: TransformRect) {
         self.ensure_transform_gpu_preview();
+        // Text: re-render the warp source as the box grows to keep it crisp.
+        self.refresh_text_transform_source(rect);
         if let Some((sw, sh)) = self.transform.original_src_dims.get()
             && let Some(orig) = self.transform.original_rect.get()
         {
@@ -730,6 +732,54 @@ impl PrimaryDragHandler {
                 present_into_paintable(&mut canvas, &self.paintable, &self.area);
             }
         }
+    }
+
+    /// Re-render a text layer's warp source at the current visible resolution
+    /// once the box grows past it, so scaling stays crisp during the drag. Only
+    /// growth triggers this (downscaling a crisp source is already sharp); the
+    /// headroom keeps small further growth from re-rendering every frame.
+    fn refresh_text_transform_source(&self, rect: TransformRect) {
+        if self.transform.text.borrow().is_none() {
+            return;
+        }
+        let Some(idx) = self.transform.original_layer_idx.get() else {
+            return;
+        };
+        let Some((src_w, src_h)) = self.transform.original_src_dims.get() else {
+            return;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let (src_w_f, src_h_f) = (src_w as f32, src_h as f32);
+        if rect.w.max(1.0) <= src_w_f + 1.0 && rect.h.max(1.0) <= src_h_f + 1.0 {
+            return;
+        }
+        let Some(LayerKind::Text(content)) = self.canvas.borrow().layers().kind(idx) else {
+            return;
+        };
+        let natural = content.box_rect;
+        if natural.w.abs() <= 1e-3 || natural.h.abs() <= 1e-3 {
+            return;
+        }
+        const HEADROOM: f32 = 1.5;
+        let sx = rect.w / natural.w * HEADROOM;
+        let sy = rect.h / natural.h * HEADROOM;
+        let (pixels, sw, sh) = self.text_edit.render_scaled_source(&content, sx, sy);
+        if pixels.len() != (sw as usize) * (sh as usize) * 4 {
+            return;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let orig_full = TransformRect::new(sw as f32 / 2.0, sh as f32 / 2.0, sw as f32, sh as f32, 0.0);
+        {
+            let mut canvas = self.canvas.borrow_mut();
+            if canvas.begin_transform_preview_gpu(idx, &pixels, sw, sh).is_err() {
+                return;
+            }
+        }
+        self.paintable.set_transform_gpu_preview(true);
+        self.paintable.set_transform_source(Some(&pixels), sw, sh, Some(orig_full));
+        self.transform.original_src_dims.set(Some((sw, sh)));
+        self.transform.original_rect.set(Some(orig_full));
+        *self.transform.original_pixels.borrow_mut() = Some(pixels);
     }
 
     /// Begin the live GPU transform preview if it isn't already running. Reads

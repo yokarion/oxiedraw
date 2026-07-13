@@ -483,10 +483,9 @@ impl DocumentSession {
                 // End any live GPU blend preview; the commit recomposites below.
                 canvas_c.borrow_mut().clear_transform_preview();
                 paintable_c.set_transform_gpu_preview(false);
-                // Text layer transform: the natural layout (box w/h, font) is
-                // unchanged - the transform only updates the box centre/angle and
-                // the anamorphic display scale, so a scale squishes the glyphs and
-                // *persists* (the text stays editable at its natural size).
+                // Text layer transform: bake the uniform scale into the font/box
+                // so the text re-shapes crisply, leaving only a residual
+                // anamorphic squish; the new centre/angle come from the rect.
                 let text_marker = transform_c.text.borrow().clone();
                 if let Some((layer_id, _orig_rect)) = text_marker {
                     let (Some(new_rect), Some(idx)) =
@@ -498,18 +497,20 @@ impl DocumentSession {
                     if let Some(LayerKind::Text(content)) = kind {
                         let cs = canvas_c.borrow().size();
                         let natural = content.box_rect;
-                        // Pre-transform state (natural box + current scale).
                         let before_content = content.clone();
-                        // After: same natural layout, new centre/angle, new scale
-                        // = visible (transform rect) / natural.
+                        // Total visible scale over the natural box, then baked in.
                         let mut after_content = content;
-                        after_content.box_rect = oxiedraw_core::text::TextBox::new(
-                            new_rect.cx, new_rect.cy, natural.w, natural.h, new_rect.angle,
-                        );
-                        after_content.scale = (
-                            if natural.w.abs() > 1e-3 { new_rect.w / natural.w } else { after_content.scale.0 },
-                            if natural.h.abs() > 1e-3 { new_rect.h / natural.h } else { after_content.scale.1 },
-                        );
+                        let sx = if natural.w.abs() > 1e-3 {
+                            new_rect.w / natural.w
+                        } else {
+                            after_content.scale.0
+                        };
+                        let sy = if natural.h.abs() > 1e-3 {
+                            new_rect.h / natural.h
+                        } else {
+                            after_content.scale.1
+                        };
+                        after_content.bake_transform(new_rect.cx, new_rect.cy, new_rect.angle, sx, sy);
 
                         let (before, after) = {
                             let mut engine = text_engine_c.borrow_mut();

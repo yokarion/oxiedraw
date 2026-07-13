@@ -163,9 +163,9 @@ pub(crate) fn build(
 
     // Vertical alignment.
     let (v_box, v_buttons) = segmented(&[
-        ("format-justify-left-symbolic", "Top"),
-        ("format-justify-center-symbolic", "Middle"),
-        ("format-justify-right-symbolic", "Bottom"),
+        ("oxiedraw-text-valign-top-symbolic", "Top"),
+        ("oxiedraw-text-valign-middle-symbolic", "Middle"),
+        ("oxiedraw-text-valign-bottom-symbolic", "Bottom"),
     ]);
     list.append(&action_row("Vertical Align", &v_box));
     let v_aligns = [VAlign::Top, VAlign::Middle, VAlign::Bottom];
@@ -185,9 +185,9 @@ pub(crate) fn build(
 
     // Resizing mode.
     let (r_box, r_buttons) = segmented(&[
-        ("object-flip-horizontal-symbolic", "Auto Width"),
-        ("object-flip-vertical-symbolic", "Auto Height"),
-        ("view-fullscreen-symbolic", "Fixed Size"),
+        ("oxiedraw-text-autowidth-symbolic", "Auto Width"),
+        ("oxiedraw-text-autoheight-symbolic", "Auto Height"),
+        ("oxiedraw-text-fixed-symbolic", "Fixed Size"),
     ]);
     list.append(&action_row("Resizing", &r_box));
     let modes = [ResizeMode::AutoWidth, ResizeMode::AutoHeight, ResizeMode::Fixed];

@@ -502,21 +502,28 @@ impl TextEditor {
         self.inner.shape_as_needed(&mut engine.font_system, false);
     }
 
-    /// For auto modes, grow the box to fit content, keeping the top-left fixed.
+    /// For auto modes, grow the box to fit content, keeping the *visible* top-left
+    /// fixed: the natural box is squished about its centre by `scale`, so anchoring
+    /// the natural corner would drift the on-screen origin under an anamorphic
+    /// squish (e.g. after a vertical Transform stretch).
     fn auto_grow(&mut self) {
         let (bw, bh) = self.inner.with_buffer(render::block_size);
-        let left = self.box_rect.cx - self.box_rect.w / 2.0;
-        let top = self.box_rect.cy - self.box_rect.h / 2.0;
+        let (sx, sy) = self.scale;
+        let vis_left = self.box_rect.cx - self.box_rect.w * sx / 2.0;
+        let vis_top = self.box_rect.cy - self.box_rect.h * sy / 2.0;
         let angle = self.box_rect.angle;
         match self.resize {
             ResizeMode::AutoWidth => {
                 let w = bw.max(1.0);
                 let h = bh.max(1.0);
-                self.box_rect = TextBox::new(left + w / 2.0, top + h / 2.0, w, h, angle);
+                let cx = vis_left + w * sx / 2.0;
+                let cy = vis_top + h * sy / 2.0;
+                self.box_rect = TextBox::new(cx, cy, w, h, angle);
             }
             ResizeMode::AutoHeight => {
                 let h = bh.max(1.0);
-                self.box_rect = TextBox::new(self.box_rect.cx, top + h / 2.0, self.box_rect.w, h, angle);
+                let cy = vis_top + h * sy / 2.0;
+                self.box_rect = TextBox::new(self.box_rect.cx, cy, self.box_rect.w, h, angle);
             }
             ResizeMode::Fixed => {}
         }

@@ -140,6 +140,20 @@ impl TextEdit {
         }
     }
 
+    /// Render the live Transform source for `content` at total scale `(sx, sy)`
+    /// over its natural box (see
+    /// [`oxiedraw_core::text::render::render_visible_local`]). Keeps a scaling
+    /// drag sharp instead of magnifying a fixed-res raster.
+    pub(crate) fn render_scaled_source(
+        &self,
+        content: &TextContent,
+        sx: f32,
+        sy: f32,
+    ) -> (Vec<u8>, u32, u32) {
+        let mut engine = self.engine.borrow_mut();
+        oxiedraw_core::text::render::render_visible_local(content, sx, sy, &mut engine)
+    }
+
     /// Current editing properties for the panel, or `None` when not editing.
     #[must_use]
     pub(crate) fn props(&self) -> Option<TextProps> {
