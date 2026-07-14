@@ -162,6 +162,7 @@ pub(super) enum HitZone {
     Edit,    // adjustment layers only: the "edit settings" sliders left of the eye
     Mask,    // adjustment layers only: the "show mask" toggle left of the sliders
     Chevron, // groups only
+    Folder,  // groups only: the folder icon; selects the folder's contents
     Swatch,  // layers only
     Body,
 }
@@ -1069,6 +1070,7 @@ pub(crate) fn build(
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
     toaster: &Toaster,
     select_layer_content: &Rc<dyn Fn(usize)>,
+    select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
     components: &Rc<RefCell<oxiedraw_core::components::ComponentLibrary>>,
     on_edit_component: &Rc<dyn Fn(String)>,
@@ -1121,6 +1123,7 @@ pub(crate) fn build(
             layer_clipboard,
             toaster,
             select_layer_content,
+            select_folder_content,
             history,
             on_edit_component,
             prepare_delete,
@@ -1266,6 +1269,7 @@ fn build_layers_page(
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
     toaster: &Toaster,
     select_layer_content: &Rc<dyn Fn(usize)>,
+    select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
@@ -1305,6 +1309,7 @@ fn build_layers_page(
         Rc::clone(canvas),
         redraw,
         select_layer_content,
+        select_folder_content,
         history,
         on_edit_component,
         prepare_reorder,
@@ -2541,6 +2546,12 @@ fn hit_zone(
         if x <= chevron_right {
             return HitZone::Chevron;
         }
+        // Folder icon sits just right of the chevron; clicking it selects the
+        // folder's contents.
+        let folder_x = chevron_right;
+        if x >= folder_x && x <= folder_x + FOLDER_W {
+            return HitZone::Folder;
+        }
     } else {
         let sx = content_left + ITEM_INNER_PAD;
         let sy = (ITEM_HEIGHT - SWATCH_SIZE) / 2.0;
@@ -2635,6 +2646,7 @@ fn install_list_input(
     canvas: Rc<RefCell<Canvas>>,
     redraw: &RedrawHandle,
     select_layer_content: &Rc<dyn Fn(usize)>,
+    select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_reorder: &Rc<dyn Fn()>,
@@ -2824,6 +2836,7 @@ fn install_list_input(
         let redraw = redraw.clone();
         let canvas = Rc::clone(&canvas);
         let select_layer_content = Rc::clone(select_layer_content);
+        let select_folder_content = Rc::clone(select_folder_content);
         let history = Rc::clone(history);
         let prepare_reorder = Rc::clone(prepare_reorder);
         Rc::new(move |dx: f64, dy: f64, modifiers: gdk::ModifierType| {
@@ -2973,6 +2986,23 @@ fn install_list_input(
                             select_layer_content(*flat_idx);
                         }
                 }
+                HitZone::Folder if is_click => {
+                    if d.from_row < rows.len()
+                        && let RowKind::Group { id, .. } = &rows[d.from_row].kind {
+                            // Map the folder's leaf layers to canvas indices and
+                            // select the union of their alpha.
+                            let leaf_ids = group_leaf_ids(&ui.tree.borrow(), id);
+                            let order: Vec<String> = canvas.borrow().layers()
+                                .snapshot().iter().map(|l| l.id.clone()).collect();
+                            let indices: Vec<usize> = leaf_ids.iter()
+                                .filter_map(|lid| order.iter().position(|o| o == lid))
+                                .collect();
+                            if !indices.is_empty() {
+                                select_folder_content(indices);
+                            }
+                        }
+                }
+                HitZone::Folder => {}
                 HitZone::Body | HitZone::Swatch => {
                     if is_click && d.from_row < rows.len() {
                         let row = &rows[d.from_row];
@@ -3224,9 +3254,12 @@ fn install_list_input(
             // zones use the pointer hand; everything else keeps the default.
             let cursor_name = hit.and_then(|(_, zone)| match zone {
                 HitZone::Handle => Some("row-resize"),
-                HitZone::Eye | HitZone::Edit | HitZone::Mask | HitZone::Chevron | HitZone::Swatch => {
-                    Some("pointer")
-                }
+                HitZone::Eye
+                | HitZone::Edit
+                | HitZone::Mask
+                | HitZone::Chevron
+                | HitZone::Folder
+                | HitZone::Swatch => Some("pointer"),
                 HitZone::Body => None,
             });
             // Only the interactive (non-drag) icons take a hover highlight.

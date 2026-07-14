@@ -790,6 +790,34 @@ impl DocumentSession {
             })
         };
 
+        // -- select_folder_content (folder icon click) ------------------
+        // Selects the union of every layer inside a folder, mirroring the
+        // single-layer swatch behaviour above.
+        let select_folder_content: Rc<dyn Fn(Vec<usize>)> = {
+            let canvas = viewport.canvas();
+            let selection_state = selection.clone();
+            let canvas_size = viewport.canvas_size_handle();
+            let redraw = viewport.redraw_handle();
+            Rc::new(move |layer_indices: Vec<usize>| {
+                {
+                    let mut c = canvas.borrow_mut();
+                    if let Err(e) = c.select_from_layers_alpha(&layer_indices) {
+                        tracing::error!(error = %e, "select_from_layers_alpha failed");
+                        return;
+                    }
+                    selection_state.active.set(c.selection_active());
+                }
+                selection_state.source_layer.set(None);
+                canvas::primary_drag::refresh_selection_contours(
+                    &canvas,
+                    &selection_state,
+                    &canvas_size,
+                );
+                selection_state.notify_changed();
+                redraw.request();
+            })
+        };
+
         // Created early so the component edit closures can swap it out (the
         // dirty `*` marker is driven from it; the dirty timer is set up later).
         let saved_marker = Rc::new(Cell::new(0usize));
@@ -877,6 +905,7 @@ impl DocumentSession {
             &global.clipboard,
             &global.toaster,
             &select_layer_content,
+            &select_folder_content,
             &history,
             &components,
             &on_edit_component,

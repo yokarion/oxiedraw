@@ -1896,13 +1896,28 @@ impl Canvas {
     /// layer's alpha, so anti-aliased edges stay soft. Used when clicking
     /// a layer's thumbnail in the panel.
     pub fn select_from_layer_alpha(&mut self, idx: usize) -> Result<(), RendererError> {
-        let layer = self.renderer.read_layer(idx)?;
-        let n = layer.len() / 4;
-        let mut shape = vec![0u8; n];
-        for i in 0..n {
-            // BGRA8 -> alpha is byte 3; copy it straight through so partial
-            // coverage becomes partial selection.
-            shape[i] = layer[i * 4 + 3];
+        self.select_from_layers_alpha(&[idx])
+    }
+
+    /// Replace the selection mask with the union of several layers' alpha
+    /// channels (per-pixel max), so anti-aliased edges stay soft. Used when
+    /// clicking a folder's icon to select everything inside it.
+    pub fn select_from_layers_alpha(&mut self, indices: &[usize]) -> Result<(), RendererError> {
+        let mut shape: Vec<u8> = Vec::new();
+        for &idx in indices {
+            let layer = self.renderer.read_layer(idx)?;
+            let n = layer.len() / 4;
+            if shape.is_empty() {
+                shape = vec![0u8; n];
+            }
+            for i in 0..n.min(shape.len()) {
+                // BGRA8 -> alpha is byte 3; take the strongest coverage so a
+                // pixel painted on any layer in the set is selected.
+                shape[i] = shape[i].max(layer[i * 4 + 3]);
+            }
+        }
+        if shape.is_empty() {
+            return Ok(());
         }
         self.renderer
             .apply_selection_shape(&shape, SelectionBlendMode::Replace)?;
