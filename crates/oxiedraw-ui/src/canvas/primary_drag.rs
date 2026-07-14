@@ -821,7 +821,8 @@ impl PrimaryDragHandler {
     ) {
         let mode = selection_mode_from_modifiers(gesture);
         self.selection.mode.set(mode);
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        // Snap to the pixel grid so selection edges land on whole pixels.
+        let canvas_pos = snap_to_pixel(widget_to_canvas(x, y, &self.pan, &self.zoom));
         self.selection_drag_start.set(canvas_pos);
         let initial = match tool {
             SelectionTool::Square | SelectionTool::Circle => Some(PendingMarquee::Rect {
@@ -852,16 +853,27 @@ impl PrimaryDragHandler {
         match tool {
             SelectionTool::Square | SelectionTool::Circle => {
                 let start = self.selection_drag_start.get();
+                let cur = snap_to_pixel(cur);
+                let (mut w, mut h) = (cur.x - start.x, cur.y - start.y);
+                // Shift constrains to a 1:1 square/circle, keeping the drag
+                // direction on each axis.
+                let (shift, _) = modifiers_from_gesture(gesture);
+                if shift {
+                    let side = w.abs().max(h.abs());
+                    w = side.copysign(w);
+                    h = side.copysign(h);
+                }
                 let new_pending = PendingMarquee::Rect {
                     x: start.x,
                     y: start.y,
-                    w: cur.x - start.x,
-                    h: cur.y - start.y,
+                    w,
+                    h,
                     circle: matches!(tool, SelectionTool::Circle),
                 };
                 *self.selection.pending.borrow_mut() = Some(new_pending);
             }
             SelectionTool::Free => {
+                let cur = snap_to_pixel(cur);
                 if let Some(PendingMarquee::Lasso(pts)) =
                     self.selection.pending.borrow_mut().as_mut()
                 {
@@ -1529,6 +1541,12 @@ impl PrimaryDragHandler {
     }
 }
 
+/// Round a canvas-space point to the nearest whole-pixel grid line so a
+/// rectangular marquee always covers complete pixels.
+fn snap_to_pixel(p: Point) -> Point {
+    Point::new(p.x.round(), p.y.round())
+}
+
 /// Recompute the marching-ants contours from the current selection mask
 /// and store them on the paintable. Reads the full-resolution mask and
 /// runs a pixel-perfect axis-aligned boundary tracer so the contour
@@ -1553,7 +1571,9 @@ pub(crate) fn refresh_selection_contours(
             }
         }
     };
-    let contours = oxiedraw_core::selection::pixel_perfect_contours(&mask, mw, mh);
+    // iso=1 so the outline hugs every non-empty pixel, including the soft
+    // anti-aliased edge of an alpha-derived selection.
+    let contours = oxiedraw_core::selection::pixel_perfect_contours(&mask, mw, mh, 1);
     *selection.ants_contours.borrow_mut() = contours;
 }
 

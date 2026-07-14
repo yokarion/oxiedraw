@@ -1892,17 +1892,17 @@ impl Canvas {
     }
 
     /// Replace the selection mask with one derived from the alpha
-    /// channel of the layer at `idx`: a pixel is selected iff its alpha
-    /// is above 0. Used when clicking a layer's thumbnail in the panel.
+    /// channel of the layer at `idx`: the selection strength equals the
+    /// layer's alpha, so anti-aliased edges stay soft. Used when clicking
+    /// a layer's thumbnail in the panel.
     pub fn select_from_layer_alpha(&mut self, idx: usize) -> Result<(), RendererError> {
         let layer = self.renderer.read_layer(idx)?;
         let n = layer.len() / 4;
         let mut shape = vec![0u8; n];
         for i in 0..n {
-            // BGRA8 -> alpha is byte 3.
-            if layer[i * 4 + 3] > 0 {
-                shape[i] = 255;
-            }
+            // BGRA8 -> alpha is byte 3; copy it straight through so partial
+            // coverage becomes partial selection.
+            shape[i] = layer[i * 4 + 3];
         }
         self.renderer
             .apply_selection_shape(&shape, SelectionBlendMode::Replace)?;

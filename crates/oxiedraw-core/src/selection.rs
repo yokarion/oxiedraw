@@ -187,15 +187,16 @@ fn rasterise_polygon(points: &[Point], w: u32, h: u32) -> Vec<u8> {
 /// of the pixel grid go from (0, 0) at the top-left of pixel (0, 0) to
 /// (w, h) at the bottom-right of pixel (w-1, h-1).
 ///
-/// Threshold is 128 (matches the rest of the selection pipeline).
+/// A pixel counts as selected when its mask value is `>= iso`. Pass a low
+/// value (e.g. 1) to outline every non-empty pixel including soft
+/// anti-aliased edges; pass 128 for the classic 50% boundary.
 #[must_use]
-pub fn pixel_perfect_contours(buf: &[u8], w: u32, h: u32) -> Vec<Vec<Point>> {
+pub fn pixel_perfect_contours(buf: &[u8], w: u32, h: u32, iso: u8) -> Vec<Vec<Point>> {
     use std::collections::HashMap;
 
     if w == 0 || h == 0 || buf.len() < (w as usize) * (h as usize) {
         return Vec::new();
     }
-    let iso: u8 = 128;
     let sel = |x: i32, y: i32| -> bool {
         if x < 0 || y < 0 || (x as u32) >= w || (y as u32) >= h {
             return false;
@@ -270,7 +271,7 @@ mod tests {
     fn single_pixel_traces_unit_square() {
         let mut buf = vec![0u8; 9];
         buf[4] = 0xFF; // centre of 3x3 grid
-        let contours = pixel_perfect_contours(&buf, 3, 3);
+        let contours = pixel_perfect_contours(&buf, 3, 3, 128);
         assert_eq!(contours.len(), 1);
         let c = &contours[0];
         // After collapse_collinear there should be 4 corners + closing point.
@@ -296,7 +297,7 @@ mod tests {
                 buf[y * w as usize + x] = 0xFF;
             }
         }
-        let contours = pixel_perfect_contours(&buf, w, h);
+        let contours = pixel_perfect_contours(&buf, w, h, 128);
         assert_eq!(contours.len(), 1);
         let c = &contours[0];
         assert!(c.len() <= 5, "expected <=5 vertices after collapse, got {}: {:?}", c.len(), c);
