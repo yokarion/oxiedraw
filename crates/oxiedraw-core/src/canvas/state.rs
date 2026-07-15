@@ -628,6 +628,15 @@ impl Canvas {
         Ok(())
     }
 
+    /// Read back the display dmabuf that [`Self::present`] last wrote, as BGRA8
+    /// bytes (row-major, no padding). These are premultiplied *gamma*
+    /// (`srgb(colour) * alpha`), not the premultiplied-linear form
+    /// [`Self::read_pixels`] returns. Test/diagnostic helper - the live path
+    /// hands this buffer to GTK rather than reading it back.
+    pub fn read_display(&mut self) -> Result<Vec<u8>, RendererError> {
+        self.renderer.read_display()
+    }
+
     /// Read back the canvas as BGRA8 bytes (row-major, no padding).
     ///
     /// During a stroke this returns the preview (canvas composite +
@@ -1978,6 +1987,22 @@ mod tests {
         }
     }
 
+    /// A `BrushEngine` at `size` with crisp-edged presets.
+    ///
+    /// Default Round is an airbrush (`hardness: 0.02`), so its strokes peak
+    /// around 0.93 between dab centres and never saturate. The tests below are
+    /// about compositing rather than falloff, so they pin the edge instead of
+    /// tracking whatever the default preset is tuned to.
+    fn crisp_brush(size: f32) -> BrushEngine {
+        let brush = BrushEngine::new();
+        for preset in brush.brushes.borrow_mut().iter_mut() {
+            preset.hardness = 1.0;
+        }
+        brush.size.set(size);
+        brush.opacity.set(1.0);
+        brush
+    }
+
     // Backs `erase_selection_in_layer` / `clear_selection_from_layer`: a fully
     // masked pixel moves entirely into `masked`, an unmasked one stays in
     // `remaining`, and a half-mask splits the value across both.
@@ -2017,9 +2042,7 @@ mod tests {
         let size = Size::new(128, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
 
-        let brush = BrushEngine::new();
-        brush.size.set(8.0);
-        brush.opacity.set(1.0);
+        let brush = crisp_brush(8.0);
 
         let red = Color::new(255, 0, 0);
 
@@ -2078,9 +2101,7 @@ mod tests {
     #[ignore = "requires vulkan loader and device"]
     fn draw_after_resize_paints() {
         let mut canvas = Canvas::headless(Size::new(128, 64)).expect("canvas init");
-        let brush = BrushEngine::new();
-        brush.size.set(8.0);
-        brush.opacity.set(1.0);
+        let brush = crisp_brush(8.0);
         let red = Color::new(255, 0, 0);
 
         // Helper: paint a short horizontal red stroke centred on `cx`.
@@ -2214,9 +2235,7 @@ mod tests {
         let top = canvas.add_layer_with_pixels("top", &red).expect("top");
         assert_eq!(canvas.layers().active(), Some(top), "top layer active");
 
-        let brush = BrushEngine::new();
-        brush.size.set(12.0);
-        brush.opacity.set(1.0);
+        let brush = crisp_brush(12.0);
         let stroke_color = Color::new(0, 0, 0);
 
         canvas.begin_stroke(stroke_color, 1.0, true).expect("begin erase");
@@ -2472,9 +2491,7 @@ mod tests {
         let mut canvas = Canvas::headless(size).expect("canvas init");
 
         // Paint a red blob centred at (8, 16).
-        let brush = BrushEngine::new();
-        brush.size.set(10.0);
-        brush.opacity.set(1.0);
+        let brush = crisp_brush(10.0);
         let red = Color::new(255, 0, 0);
         canvas.begin_stroke(red, 1.0, false).expect("begin");
         canvas
@@ -2686,9 +2703,7 @@ mod tests {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
 
-        let brush = BrushEngine::new();
-        brush.size.set(20.0);
-        brush.opacity.set(1.0);
+        let brush = crisp_brush(20.0);
 
         // Top layer (1): opaque green disc on the left at (16, 32).
         canvas.add_layer("Top").expect("add layer");

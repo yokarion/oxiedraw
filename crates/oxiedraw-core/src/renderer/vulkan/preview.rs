@@ -32,7 +32,7 @@ impl VulkanRenderer {
             this.record_layered_preview(&visible_indices, target_idx, push, clip);
             this.cmd_frame_timing_mark(1);
             let preview_image = this.preview.handle;
-            this.record_present_copy(preview_image);
+            this.record_present_copy(preview_image, this.preview.view);
             this.cmd_frame_timing_mark(2);
             Ok(())
         });
@@ -93,7 +93,7 @@ impl VulkanRenderer {
             this.record_layered_preview(&visible_indices, target_idx, push, clip);
             this.cmd_frame_timing_mark(1);
             let preview_image = this.preview.handle;
-            this.record_present_copy(preview_image);
+            this.record_present_copy(preview_image, this.preview.view);
             this.cmd_frame_timing_mark(2);
             Ok(())
         });

@@ -7,9 +7,14 @@ use ash::{Device, Instance, vk};
 use super::RendererError;
 
 /// DRM fourcc for "8:8:8:8 ARGB" - bytes in memory order BGRA on
-/// little-endian. Matches `VK_FORMAT_B8G8R8A8_SRGB` and the canvas
-/// format we use everywhere else.
+/// little-endian. GTK imports this as sRGB-encoded, premultiplied; the
+/// present pass writes premultiplied-gamma pixels into a `B8G8R8A8_UNORM`
+/// image (verbatim, no re-encode) so the stored bytes carry exactly that.
 pub(super) const DRM_FORMAT_ARGB8888: u32 = 0x3432_5241;
+
+/// Vulkan format of the display dmabuf image. UNORM so the present pass's
+/// premultiplied-gamma output is stored without a second sRGB encode.
+pub(super) const DISPLAY_FORMAT: vk::Format = vk::Format::B8G8R8A8_UNORM;
 
 /// `DRM_FORMAT_MOD_LINEAR` - the universal "no tiling, no compression"
 /// layout. Every dmabuf-capable compositor speaks this. The trade-off
@@ -65,11 +70,13 @@ impl DmabufImage {
         width: u32,
         height: u32,
     ) -> Result<Self, RendererError> {
-        let format = vk::Format::B8G8R8A8_SRGB;
-        // Just enough for a per-frame copy target + future sampling
-        // (in case we ever want to do `display = composite(stroke, ...)`
-        // directly into the dmabuf).
-        let usage = vk::ImageUsageFlags::TRANSFER_DST
+        // UNORM (not sRGB): the present pass writes already-sRGB-encoded,
+        // premultiplied-gamma bytes and we want them stored verbatim.
+        let format = DISPLAY_FORMAT;
+        // COLOR_ATTACHMENT: the present pass renders straight into this image
+        // (the colour-space conversion). TRANSFER/SAMPLED kept for flexibility.
+        let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
+            | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::TRANSFER_SRC
             | vk::ImageUsageFlags::SAMPLED;
 

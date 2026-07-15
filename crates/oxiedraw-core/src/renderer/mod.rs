@@ -127,6 +127,7 @@ mod instance;
 mod layers;
 mod mask;
 mod pattern_atlas;
+mod present_convert;
 mod resources;
 mod selection;
 mod shape_overlay;

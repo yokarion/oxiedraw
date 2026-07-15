@@ -843,7 +843,7 @@ impl VulkanRenderer {
             }
             // 4. Fold the dmabuf present copy into this same submit.
             if present {
-                this.record_present_copy(acc.image);
+                this.record_present_copy(acc.image, acc.view);
             }
             Ok(())
         });

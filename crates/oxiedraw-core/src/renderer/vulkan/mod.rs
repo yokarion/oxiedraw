@@ -41,8 +41,9 @@ use super::RendererError;
 use super::composite::CompositePipeline;
 use super::dab::DabBuffers;
 use super::device;
-use super::dmabuf::DmabufImage;
+use super::dmabuf::{DISPLAY_FORMAT, DmabufImage};
 use super::erase::ErasePreview;
+use super::present_convert::PresentConvertPipeline;
 use adjust_ops::{GroupAccumulator, MaskEditPreview};
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
@@ -317,6 +318,13 @@ pub struct VulkanRenderer {
     /// one we just wrote while the next present targets a different buffer.
     pub(super) display: Vec<DmabufImage>,
     pub(super) display_cursor: usize,
+    /// Present-time colour-space conversion (premultiplied-linear canvas ->
+    /// premultiplied-gamma display) so GTK's sRGB-space checker composite is
+    /// correct for semi-transparent pixels.
+    pub(super) present_convert: ManuallyDrop<PresentConvertPipeline>,
+    /// One framebuffer per `display` buffer, targeting that dmabuf's view with
+    /// the present-convert render pass.
+    pub(super) display_framebuffers: Vec<vk::Framebuffer>,
 
     pub(super) command_pool: vk::CommandPool,
     /// Ring of command buffers + fences for frames-in-flight: `record_and_submit`
@@ -537,6 +545,21 @@ impl VulkanRenderer {
             })
             .collect::<Result<Vec<_>, _>>()?;
 
+        let present_convert = PresentConvertPipeline::new(&dev.device, DISPLAY_FORMAT)?;
+        let display_framebuffers = display
+            .iter()
+            .map(|buf| {
+                let views = [buf.view];
+                let fb_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(present_convert.render_pass)
+                    .attachments(&views)
+                    .width(canvas_size.width)
+                    .height(canvas_size.height)
+                    .layers(1);
+                unsafe { dev.device.create_framebuffer(&fb_info, None) }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         let pool_info = vk::CommandPoolCreateInfo::default()
             .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(dev.queue_family);
@@ -619,6 +642,8 @@ impl VulkanRenderer {
             filter_spec: crate::filters::FilterSpec::Invert,
             filter_affected: Vec::new(),
             display,
+            present_convert: ManuallyDrop::new(present_convert),
+            display_framebuffers,
             // First present rotates to 0, so buffer 0 is written first.
             display_cursor: DISPLAY_BUFFERS - 1,
             command_pool,
@@ -1281,6 +1306,10 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.dab_pipelines).destroy(&self.device);
             ManuallyDrop::take(&mut self.pattern_atlas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.dab_buffers).destroy(&self.device, &mut self.allocator);
+            for fb in self.display_framebuffers.drain(..) {
+                self.device.destroy_framebuffer(fb, None);
+            }
+            ManuallyDrop::take(&mut self.present_convert).destroy(&self.device);
             for img in self.display.drain(..) {
                 img.destroy(&self.device);
             }

@@ -30,6 +30,21 @@ impl VulkanRenderer {
         self.copy_staging_bytes()
     }
 
+    /// Read back the display dmabuf that `present_to_display` last wrote, as
+    /// BGRA8 (row-major, no padding). Unlike [`Self::read_canvas`] these pixels
+    /// are premultiplied *gamma* (`srgb(colour) * alpha`) - the form GTK's
+    /// sRGB-space compositing expects. Test/diagnostic helper: the live path
+    /// hands this buffer to GTK instead of reading it back.
+    pub fn read_display(&mut self) -> Result<Vec<u8>, RendererError> {
+        // `present_to_display` submits without waiting; make sure that pass has
+        // landed before we copy the buffer out.
+        self.wait_last()?;
+        let image = self.display[self.display_cursor].image;
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(image, extent)?;
+        self.copy_staging_bytes()
+    }
+
     /// Read back the layer at `idx` into a fresh `Vec<u8>` of BGRA8
     /// pixels (row-major, no padding). Uses the shared staging buffer.
     pub fn read_layer(&mut self, idx: usize) -> Result<Vec<u8>, RendererError> {
