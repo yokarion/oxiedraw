@@ -4,7 +4,9 @@ A drawing app, with targeting performance, simplicity and great user experience.
 The idea of the project to make a competitor to ProCreate on IPad, but
 for Linux and other Desktops.
 
-Goals are ambitions, so the project Features Roadmap will be limited:
+![OxieDraw banner](data/splash/banner.png)
+
+## Roadmap
 
 - [x] Basic pen and mouse drawing
 - [x] Layers

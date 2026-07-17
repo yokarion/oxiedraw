@@ -149,31 +149,53 @@ jobs:
           TOKEN: ${{ secrets.CODEBERG_TOKEN }}
         run: |
           set -eu
+          : "${TOKEN:?CODEBERG_TOKEN secret is empty - set it with repo write scope}"
           api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          auth="Authorization: token ${TOKEN}"
           tag="${GITHUB_REF_NAME}"
+          resp="$(mktemp)"
 
-          release_id="$(curl -sS -X POST "${api}/releases" \
-            -H "Authorization: token ${TOKEN}" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -n --arg t "${tag}" \
-                  '{tag_name: $t, name: $t, draft: false, prerelease: false}')" \
-            | jq -r '.id // empty')"
+          # Create the release at the tagged commit.
+          code="$(curl -sS -o "${resp}" -w '%{http_code}' -X POST "${api}/releases" \
+            -H "${auth}" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "${tag}" --arg c "${GITHUB_SHA}" \
+                  '{tag_name: $t, target_commitish: $c, name: $t, draft: false, prerelease: false}')")"
+          release_id="$(jq -r '.id // empty' "${resp}")"
+          echo "create release: HTTP ${code}"
 
-          # Already exists (re-run, or tag pushed before the workflow): reuse it.
+          # Moving a tag leaves its old release behind as a draft, which blocks
+          # creation and is invisible to a by-tag lookup. Scan the full list
+          # (drafts included) and reuse that release instead.
           if [ -z "${release_id}" ]; then
-            release_id="$(curl -sS "${api}/releases/tags/${tag}" \
-              -H "Authorization: token ${TOKEN}" | jq -r '.id // empty')"
+            echo "create returned no id; response was:"
+            head -c 800 "${resp}"; echo
+            curl -sS -o "${resp}" -H "${auth}" "${api}/releases?limit=50"
+            release_id="$(jq -r --arg t "${tag}" \
+              'map(select(.tag_name == $t)) | .[0].id // empty' "${resp}")"
           fi
           if [ -z "${release_id}" ]; then
             echo "could not create or find release for ${tag}" >&2
             exit 1
           fi
+          echo "release id: ${release_id}"
 
+          # Publish it in case we reused a leftover draft.
+          curl -sS -o /dev/null -X PATCH "${api}/releases/${release_id}" \
+            -H "${auth}" -H "Content-Type: application/json" -d '{"draft": false}'
+
+          # Replace any same-named asset from an earlier run so the upload cannot 409.
+          curl -sS -o "${resp}" -H "${auth}" "${api}/releases/${release_id}/assets"
           for file in dist/*; do
             name="$(basename "${file}")"
+            old_id="$(jq -r --arg n "${name}" \
+              'map(select(.name == $n)) | .[0].id // empty' "${resp}")"
+            if [ -n "${old_id}" ]; then
+              echo "replacing asset ${name} (id ${old_id})"
+              curl -sS -o /dev/null -X DELETE \
+                "${api}/releases/${release_id}/assets/${old_id}" -H "${auth}"
+            fi
             echo "uploading ${name}"
-            curl -sS --fail-with-body -X POST \
+            curl -sS --fail-with-body -o /dev/null -X POST \
               "${api}/releases/${release_id}/assets?name=${name}" \
-              -H "Authorization: token ${TOKEN}" \
-              -F "attachment=@${file}" -o /dev/null
+              -H "${auth}" -F "attachment=@${file}"
           done
