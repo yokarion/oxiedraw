@@ -336,6 +336,9 @@ fn marching_squares_pattern(pattern: &PatternData, threshold: f32) -> Vec<(Point
 }
 
 #[cfg(test)]
+// Exact compares are deliberate: fract/signum and round-tripped literals are
+// exact by construction. Approximate checks nearby use an epsilon.
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
     use crate::brush_engine::dynamics::{Curve, DynSource, Mapping};

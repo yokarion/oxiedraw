@@ -2402,18 +2402,18 @@ mod tests {
         // Red should now sit at the new centre (around (14, 14)). Sample
         // the very centre.
         let (b, g, r, a) = px_at(14, 14);
-        assert!(r > 0x80, "translated red R={:02x} at (14,14)", r);
+        assert!(r > 0x80, "translated red R={r:02x} at (14,14)");
         assert!(a > 0x80);
         let _ = (b, g);
 
         // Green square must be untouched.
         let (_, g, _, a) = px_at(22, 22);
-        assert!(g > 0x80, "green survived G={:02x}", g);
+        assert!(g > 0x80, "green survived G={g:02x}");
         assert!(a > 0x80);
 
         // Old position (4..8) must be empty (it was lifted).
         let (_, _, _, a) = px_at(6, 6);
-        assert!(a < 0x10, "old red position should be transparent A={:02x}", a);
+        assert!(a < 0x10, "old red position should be transparent A={a:02x}");
     }
 
     /// extract_selection_pixels lifts the masked pixels off the layer

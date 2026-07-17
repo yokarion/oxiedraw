@@ -8,7 +8,8 @@
 //! These print per-iteration timings so the regression is visible, and assert
 //! that the post-resize draw loop is not dramatically slower than before.
 
-#![allow(clippy::unwrap_used)]
+// Printing the timings is the point of this harness, not a stray debug print.
+#![allow(clippy::unwrap_used, clippy::print_stderr)]
 
 use std::time::{Duration, Instant};
 

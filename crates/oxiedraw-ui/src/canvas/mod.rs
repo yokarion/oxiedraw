@@ -927,12 +927,11 @@ fn build_texture(
     // resize the previous texture is a different size, and feeding GTK a
     // mismatched successor wedges its dmabuf-import reuse into a degraded
     // per-frame path that paces at every-3rd-vsync (the post-resize 24ms cap).
-    if let Some(prev) = previous {
-        if prev.width() == i32::try_from(desc.width).unwrap_or(-1)
-            && prev.height() == i32::try_from(desc.height).unwrap_or(-1)
-        {
-            builder = builder.set_update_texture(Some(prev));
-        }
+    if let Some(prev) = previous
+        && prev.width() == i32::try_from(desc.width).unwrap_or(-1)
+        && prev.height() == i32::try_from(desc.height).unwrap_or(-1)
+    {
+        builder = builder.set_update_texture(Some(prev));
     }
     // SAFETY: `dup` (and thus `raw`) is kept alive by the release
     // closure below until GTK drops the texture.

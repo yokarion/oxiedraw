@@ -48,6 +48,9 @@ pub enum ProjectError {
 }
 
 #[cfg(test)]
+// Exact compares are deliberate: fract/signum and round-tripped literals are
+// exact by construction. Approximate checks nearby use an epsilon.
+#[allow(clippy::float_cmp)]
 mod tests {
     use oxiedraw_utils::geometry::Size;
 

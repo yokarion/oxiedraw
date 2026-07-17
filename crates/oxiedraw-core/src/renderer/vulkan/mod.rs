@@ -920,21 +920,23 @@ impl VulkanRenderer {
         };
         // Honor an active clip rect so the incremental preview copies only the
         // dirty region; otherwise copy the whole canvas.
-        let (offset, extent) = match self.clip {
-            Some(r) => (
-                vk::Offset3D {
-                    x: r.offset.x,
-                    y: r.offset.y,
-                    z: 0,
-                },
-                vk::Extent3D {
-                    width: r.extent.width,
-                    height: r.extent.height,
-                    depth: 1,
-                },
-            ),
-            None => (vk::Offset3D::default(), self.canvas.extent),
-        };
+        let (offset, extent) = self.clip.map_or_else(
+            || (vk::Offset3D::default(), self.canvas.extent),
+            |r| {
+                (
+                    vk::Offset3D {
+                        x: r.offset.x,
+                        y: r.offset.y,
+                        z: 0,
+                    },
+                    vk::Extent3D {
+                        width: r.extent.width,
+                        height: r.extent.height,
+                        depth: 1,
+                    },
+                )
+            },
+        );
         let copy = vk::ImageCopy::default()
             .src_subresource(subresource)
             .src_offset(offset)
@@ -984,7 +986,7 @@ impl VulkanRenderer {
         // The viewport stays full-canvas (the fullscreen triangle's UVs must map
         // to canvas pixels); the clip rect only narrows the scissor + render
         // area so fragments outside the dirty region are not touched.
-        let area = self.clip.unwrap_or(vk::Rect2D {
+        let area = self.clip.unwrap_or_else(|| vk::Rect2D {
             offset: vk::Offset2D::default(),
             extent,
         });

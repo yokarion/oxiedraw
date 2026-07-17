@@ -261,49 +261,6 @@ pub fn pixel_perfect_contours(buf: &[u8], w: u32, h: u32, iso: u8) -> Vec<Vec<Po
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A single isolated selected pixel should produce one 4-corner
-    /// closed-loop contour following its pixel boundary.
-    #[test]
-    fn single_pixel_traces_unit_square() {
-        let mut buf = vec![0u8; 9];
-        buf[4] = 0xFF; // centre of 3x3 grid
-        let contours = pixel_perfect_contours(&buf, 3, 3, 128);
-        assert_eq!(contours.len(), 1);
-        let c = &contours[0];
-        // After collapse_collinear there should be 4 corners + closing point.
-        // The collapse skips co-linear middle vertices so a unit square keeps
-        // its 4 corners; the trace closes back to the start.
-        assert!(c.len() >= 4, "contour: {:?}", c);
-        // All vertices must lie on integer pixel-grid lines.
-        for p in c {
-            assert!((p.x - p.x.round()).abs() < 1e-3);
-            assert!((p.y - p.y.round()).abs() < 1e-3);
-        }
-    }
-
-    /// A 4x4 fully-selected square should produce one rectangular contour
-    /// with exactly 4 distinct corners (after collinear collapse).
-    #[test]
-    fn solid_block_collapses_to_rectangle() {
-        let w = 6_u32;
-        let h = 6_u32;
-        let mut buf = vec![0u8; (w * h) as usize];
-        for y in 1..5 {
-            for x in 1..5 {
-                buf[y * w as usize + x] = 0xFF;
-            }
-        }
-        let contours = pixel_perfect_contours(&buf, w, h, 128);
-        assert_eq!(contours.len(), 1);
-        let c = &contours[0];
-        assert!(c.len() <= 5, "expected <=5 vertices after collapse, got {}: {:?}", c.len(), c);
-    }
-}
-
 /// Drop intermediate vertices that lie on a straight horizontal or
 /// vertical run between their neighbours. Pixel-perfect contours have
 /// long horizontal/vertical runs which compress dramatically.
@@ -483,4 +440,47 @@ fn stitch_segments(mut segments: Vec<(Point, Point)>) -> Vec<Vec<Point>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A single isolated selected pixel should produce one 4-corner
+    /// closed-loop contour following its pixel boundary.
+    #[test]
+    fn single_pixel_traces_unit_square() {
+        let mut buf = vec![0u8; 9];
+        buf[4] = 0xFF; // centre of 3x3 grid
+        let contours = pixel_perfect_contours(&buf, 3, 3, 128);
+        assert_eq!(contours.len(), 1);
+        let c = &contours[0];
+        // After collapse_collinear there should be 4 corners + closing point.
+        // The collapse skips co-linear middle vertices so a unit square keeps
+        // its 4 corners; the trace closes back to the start.
+        assert!(c.len() >= 4, "contour: {c:?}");
+        // All vertices must lie on integer pixel-grid lines.
+        for p in c {
+            assert!((p.x - p.x.round()).abs() < 1e-3);
+            assert!((p.y - p.y.round()).abs() < 1e-3);
+        }
+    }
+
+    /// A 4x4 fully-selected square should produce one rectangular contour
+    /// with exactly 4 distinct corners (after collinear collapse).
+    #[test]
+    fn solid_block_collapses_to_rectangle() {
+        let w = 6_u32;
+        let h = 6_u32;
+        let mut buf = vec![0u8; (w * h) as usize];
+        for y in 1..5 {
+            for x in 1..5 {
+                buf[y * w as usize + x] = 0xFF;
+            }
+        }
+        let contours = pixel_perfect_contours(&buf, w, h, 128);
+        assert_eq!(contours.len(), 1);
+        let c = &contours[0];
+        assert!(c.len() <= 5, "expected <=5 vertices after collapse, got {}: {:?}", c.len(), c);
+    }
 }

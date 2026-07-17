@@ -115,9 +115,8 @@ mod tests {
         let restored = pkg.into_preset(BrushPresetId(7), None).expect("into_preset");
         let _ = std::fs::remove_file(&path);
 
-        let restored_data = match restored.family {
-            BrushFamily::Textured(rc) => rc,
-            _ => panic!("expected textured"),
+        let BrushFamily::Textured(restored_data) = restored.family else {
+            panic!("expected textured")
         };
         assert_eq!(restored_data.width, 4);
         assert_eq!(restored_data.height, 4);

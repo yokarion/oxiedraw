@@ -874,10 +874,10 @@ impl DocumentSession {
             let slot = Rc::clone(set_active_tool_late);
             let tools = global.tools.clone();
             Rc::new(move || {
-                if tools.active.get() == Tool::Cursor {
-                    if let Some(setter) = slot.borrow().as_ref() {
-                        setter(Tool::Transform);
-                    }
+                if tools.active.get() == Tool::Cursor
+                    && let Some(setter) = slot.borrow().as_ref()
+                {
+                    setter(Tool::Transform);
                 }
             })
         };

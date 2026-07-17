@@ -366,12 +366,15 @@ fn parse_faces_parallel(files: &[PathBuf], parsed: &AtomicUsize) -> Vec<fontdb::
         return Vec::new();
     }
     let workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
+        .map_or(4, std::num::NonZero::get)
         .min(files.len());
     let chunk_size = files.len().div_ceil(workers);
 
     std::thread::scope(|scope| {
+        // The collect is load-bearing: it spawns every worker before the first
+        // join. Iterating lazily would join each thread as it is spawned and
+        // parse the fonts one chunk at a time.
+        #[allow(clippy::needless_collect)]
         let handles: Vec<_> = files
             .chunks(chunk_size)
             .map(|chunk| {
@@ -449,6 +452,7 @@ fn is_font_file(path: &Path) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

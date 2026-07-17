@@ -261,6 +261,33 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
     Ok(())
 }
 
+fn decode_png(bytes: &[u8], expected_w: u32, expected_h: u32) -> Result<Vec<u8>, ProjectError> {
+    let decoder = png::Decoder::new(bytes);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| ProjectError::Png(e.to_string()))?;
+
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| ProjectError::Png(e.to_string()))?;
+
+    if info.width != expected_w || info.height != expected_h {
+        return Err(ProjectError::Png(format!(
+            "PNG size {}x{} doesn't match expected {}x{}",
+            info.width, info.height, expected_w, expected_h
+        )));
+    }
+
+    let rgba = &buf[..info.buffer_size()];
+    // RGBA -> BGRA: swap R and B to match the Vulkan layer image byte order.
+    let bgra: Vec<u8> = rgba
+        .chunks_exact(4)
+        .flat_map(|p| [p[2], p[1], p[0], p[3]])
+        .collect();
+    Ok(bgra)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,31 +458,4 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
     }
-}
-
-fn decode_png(bytes: &[u8], expected_w: u32, expected_h: u32) -> Result<Vec<u8>, ProjectError> {
-    let decoder = png::Decoder::new(bytes);
-    let mut reader = decoder
-        .read_info()
-        .map_err(|e| ProjectError::Png(e.to_string()))?;
-
-    let mut buf = vec![0u8; reader.output_buffer_size()];
-    let info = reader
-        .next_frame(&mut buf)
-        .map_err(|e| ProjectError::Png(e.to_string()))?;
-
-    if info.width != expected_w || info.height != expected_h {
-        return Err(ProjectError::Png(format!(
-            "PNG size {}x{} doesn't match expected {}x{}",
-            info.width, info.height, expected_w, expected_h
-        )));
-    }
-
-    let rgba = &buf[..info.buffer_size()];
-    // RGBA -> BGRA: swap R and B to match the Vulkan layer image byte order.
-    let bgra: Vec<u8> = rgba
-        .chunks_exact(4)
-        .flat_map(|p| [p[2], p[1], p[0], p[3]])
-        .collect();
-    Ok(bgra)
 }

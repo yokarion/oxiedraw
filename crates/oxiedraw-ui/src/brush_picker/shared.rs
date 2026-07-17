@@ -39,7 +39,7 @@ pub(crate) fn build_list_row(
         .build();
 
     // Star: grayed-out outline when not default, yellow filled when default.
-    let star_btn = if let Some(cb) = on_set_default {
+    let star_btn = on_set_default.map(|cb| {
         let star = gtk::Button::builder()
             .has_frame(false)
             .valign(gtk::Align::Center)
@@ -50,10 +50,8 @@ pub(crate) fn build_list_row(
         ensure_star_css();
         star.connect_clicked(move |_| cb());
         h.append(&star);
-        Some(star)
-    } else {
-        None
-    };
+        star
+    });
 
     ensure_icon_css();
     let icon = gtk::Image::builder().pixel_size(ROW_ICON_SIZE).build();

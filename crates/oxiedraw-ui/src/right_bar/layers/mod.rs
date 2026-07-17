@@ -87,20 +87,20 @@ fn new_group_id() -> String {
 // reopened document that adds a new folder would mint an id colliding with an
 // existing group - phantom-linking the two (shared expand/select state).
 fn observe_group_id(id: &str) {
-    if let Some(hex) = id.strip_prefix('g') {
-        if let Ok(n) = u64::from_str_radix(hex, 16) {
-            let target = n.saturating_add(1);
-            let mut current = GROUP_COUNTER.load(AOrdering::Relaxed);
-            while current < target {
-                match GROUP_COUNTER.compare_exchange_weak(
-                    current,
-                    target,
-                    AOrdering::Relaxed,
-                    AOrdering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
+    if let Some(hex) = id.strip_prefix('g')
+        && let Ok(n) = u64::from_str_radix(hex, 16)
+    {
+        let target = n.saturating_add(1);
+        let mut current = GROUP_COUNTER.load(AOrdering::Relaxed);
+        while current < target {
+            match GROUP_COUNTER.compare_exchange_weak(
+                current,
+                target,
+                AOrdering::Relaxed,
+                AOrdering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
             }
         }
     }
@@ -549,13 +549,16 @@ fn record_reorder(
             after: tree_after,
         });
     }
-    match actions.len() {
-        0 => {}
-        1 => history.borrow_mut().record(actions.into_iter().next().unwrap()),
-        _ => history.borrow_mut().record(HistoryAction::Batch {
+    let action = match actions.len() {
+        0 => None,
+        1 => actions.into_iter().next(),
+        _ => Some(HistoryAction::Batch {
             label: "Move layers".to_string(),
             actions,
         }),
+    };
+    if let Some(action) = action {
+        history.borrow_mut().record(action);
     }
 }
 
@@ -2088,6 +2091,9 @@ fn row_mask_active(ui: &Ui, row: &VisibleRow) -> bool {
     }
 }
 
+// Row state is a flat set of independent flags; bundling them into a struct
+// would only move the same booleans behind another name.
+#[allow(clippy::fn_params_excessive_bools)]
 fn draw_row(
     ctx: &cairo::Context,
     palette: &Palette,
@@ -3362,13 +3368,16 @@ fn toggle_group_visibility(
         g.masked_leaves = new_mask;
     }
 
-    match changes.len() {
-        0 => {}
-        1 => history.borrow_mut().record(changes.into_iter().next().unwrap()),
-        _ => history.borrow_mut().record(HistoryAction::Batch {
+    let action = match changes.len() {
+        0 => None,
+        1 => changes.into_iter().next(),
+        _ => Some(HistoryAction::Batch {
             label: "Toggle group visibility".to_string(),
             actions: changes,
         }),
+    };
+    if let Some(action) = action {
+        history.borrow_mut().record(action);
     }
 }
 

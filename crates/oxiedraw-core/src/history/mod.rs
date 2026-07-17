@@ -16,6 +16,7 @@ mod snapshot;
 mod stack;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod apply_tests;
 
 pub use action::{CropLayer, Direction, FoldedLayer, HistoryAction, SelectionSnapshot};
@@ -60,7 +61,10 @@ pub fn capture_layer(
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     /// Capacity enforced as a ring buffer - oldest entries drop when full.
@@ -86,11 +90,7 @@ mod tests {
         // Simulate moving the entry to redo (undo would do this but needs a Canvas).
         let e = stack.entries().back().cloned().unwrap();
         let _ = stack;
-        let mut stack = HistoryStack::from_parts(
-            8,
-            Default::default(),
-            vec![e],
-        );
+        let mut stack = HistoryStack::from_parts(8, VecDeque::default(), vec![e]);
         assert!(stack.can_redo());
         stack.record(HistoryAction::LayerReorder { from: 2, to: 3 });
         assert!(!stack.can_redo());

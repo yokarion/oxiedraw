@@ -27,10 +27,10 @@ pub fn generate_effect_id() -> String {
 /// reopened document that adds an adjustment layer would re-mint ids that
 /// collide with effects already in the file.
 pub fn observe_effect_id(id: &str) {
-    if let Some(hex) = id.strip_prefix('e') {
-        if let Ok(n) = u64::from_str_radix(hex, 16) {
-            crate::document::bump_counter_past(&EFFECT_ID_COUNTER, n);
-        }
+    if let Some(hex) = id.strip_prefix('e')
+        && let Ok(n) = u64::from_str_radix(hex, 16)
+    {
+        crate::document::bump_counter_past(&EFFECT_ID_COUNTER, n);
     }
 }
 
@@ -197,6 +197,7 @@ impl AdjustmentData {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

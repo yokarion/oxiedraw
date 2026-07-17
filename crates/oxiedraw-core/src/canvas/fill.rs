@@ -77,13 +77,13 @@ pub fn flood_fill(
     let seed_idx = uy * w + ux;
 
     // Seed outside the selection means there's nothing to fill.
-    if let Some(m) = mask {
-        if m[seed_idx as usize] == 0 {
-            return Some(FillResult {
-                sorted_indices: Vec::new(),
-                distance_mask: vec![255_u8; n],
-            });
-        }
+    if let Some(m) = mask
+        && m[seed_idx as usize] == 0
+    {
+        return Some(FillResult {
+            sorted_indices: Vec::new(),
+            distance_mask: vec![255_u8; n],
+        });
     }
     let seed_off = seed_idx as usize * 4;
     let seed = [

@@ -368,6 +368,7 @@ pub fn corrected_samples(shape: &CorrectedShape) -> Vec<Point> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use std::f32::consts::PI;
 

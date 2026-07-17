@@ -51,6 +51,9 @@ pub fn shape_rect_from_drag(
 }
 
 #[cfg(test)]
+// Exact compares are deliberate: fract/signum and round-tripped literals are
+// exact by construction. Approximate checks nearby use an epsilon.
+#[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
     use std::f32::consts::FRAC_PI_4;

@@ -350,7 +350,7 @@ mod tests {
 
     #[test]
     fn blur_of_constant_is_constant() {
-        let src = vec![40u8, 80, 120, 255].repeat(16); // 4x4 solid
+        let src = [40u8, 80, 120, 255].repeat(16); // 4x4 solid
         let out = apply_cpu(
             FilterSpec::BoxBlur {
                 radius_x: 2.0,
@@ -385,6 +385,8 @@ mod tests {
         // Single bright pixel in a 3x3 black field; a radius-1 box blur
         // should spread it and lower the center.
         let mut src = vec![0u8; 3 * 3 * 4];
+        // Spelled out as (row * width + col) * 4 to show which pixel this is.
+        #[allow(clippy::identity_op)]
         let center = (1 * 3 + 1) * 4;
         src[center] = 255;
         src[center + 3] = 255; // alpha
@@ -411,7 +413,7 @@ mod tests {
 
     #[test]
     fn sharpen_of_constant_is_constant() {
-        let src = vec![40u8, 80, 120, 255].repeat(16);
+        let src = [40u8, 80, 120, 255].repeat(16);
         let out = apply_cpu(FilterSpec::Sharpen { amount: 3.0 }, &src, 4, 4, None);
         assert_eq!(out, src, "sharpening a flat color is a no-op");
     }

@@ -675,13 +675,10 @@ impl VulkanRenderer {
         // (outer) is expanded once more so the effect samples correct input.
         // For local effects margin = 0, so inner == outer == dab.
         let (inner, outer) = if incremental {
-            match self.take_preview_clip() {
-                Some(dab) => {
-                    let m = self.adjusted_effect_margin(&visible_indices, target_idx);
-                    (Some(self.expand_clip(dab, m)), Some(self.expand_clip(dab, m * 2)))
-                }
-                None => (None, None),
-            }
+            self.take_preview_clip().map_or((None, None), |dab| {
+                let m = self.adjusted_effect_margin(&visible_indices, target_idx);
+                (Some(self.expand_clip(dab, m)), Some(self.expand_clip(dab, m * 2)))
+            })
         } else {
             (None, None)
         };
@@ -850,7 +847,7 @@ impl VulkanRenderer {
     }
 
     /// Record (no submit) a plain layer composite into `acc`.
-    fn cmd_compose_layer(&mut self, acc: Accumulator, idx: usize) {
+    fn cmd_compose_layer(&self, acc: Accumulator, idx: usize) {
         let set = self.layer_stack.slots[idx].descriptor_set;
         let (mode, opacity) = self.layer_stack.blend(idx);
         self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
