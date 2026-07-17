@@ -9,13 +9,36 @@ Goals are ambitions, so the project Features Roadmap will be limited:
 - [x] Basic pen and mouse drawing
 - [x] Layers
 - [x] Basic Raster Filters
-- [ ] More Drawing tools
-  - [ ] Shapes
+- [x] More Drawing tools
+  - [x] Shapes
   - [x] Selections
-  - [ ] Masks
+  - [x] Masks
   - [x] Gestures (like in ProCreate)
-- [ ] Full Linux Release + Flatpak
-- [ ] Full Windows Release
+- [x] Adjustment layers
+  - [x] Stroke
+  - [x] Blur
+  - [x] Hue/Saturation/Brightness
+- [ ] Advanced brush engine
+  - [x] Parameters-driven brushes
+  - [x] Patterns
+  - [x] _realistic_ brush
+  - [ ] custom shader/code driven brush
+- [x] Text support
+- [ ] Vector support
+  - [ ] Vector import
+  - [ ] Vector basic transform
+  - [ ] Vector editing transform
+- [ ] Advanced image tools
+  - [ ] Object extraction
+  - [ ] Photoshop-like patch-tool
+  - [ ] Professional color-correction tools
+- [ ] Linux Release
+  - [ ] Binaries and AppImage
+  - [ ] ARM and Asahi Linux support
+  - [ ] Flatpak file
+  - [ ] FlatHub publish
+- [ ] Windows Release
+- [ ] MacOs Release
 
 ## Agenda
 
