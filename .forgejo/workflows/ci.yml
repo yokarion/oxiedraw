@@ -150,14 +150,19 @@ jobs:
             --icon-file data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg \
             --plugin gtk
 
-          # The gtk plugin hardcodes `export GDK_BACKEND=x11` in its AppRun hook
-          # (a stale GTK3 workaround), forcing the app onto XWayland where it
-          # ignores the compositor's monitor scale. This is Wayland-only, so drop
-          # the line and let GTK pick the Wayland backend natively.
+          # Strip two forced env exports the gtk plugin bakes into its AppRun hook:
+          #  - GDK_BACKEND=x11: a stale GTK3 workaround that forces the app onto
+          #    XWayland, where it ignores the compositor's monitor scale.
+          #  - GTK_THEME=Adwaita:<variant>: loads GTK's legacy built-in theme over
+          #    libadwaita's stylesheet, freezing the color-scheme and breaking the
+          #    system accent / named colors that the custom CSS builds on.
+          # Both were compensating for data we now bundle (Wayland libs,
+          # gsettings-desktop-schemas), so removing them makes the AppImage behave
+          # like the native binary.
           hook="AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
           test -f "${hook}"
-          sed -i '/export GDK_BACKEND=x11/d' "${hook}"
-          ! grep -q 'GDK_BACKEND=x11' "${hook}"
+          sed -i '/export GDK_BACKEND=x11/d; /export GTK_THEME=/d' "${hook}"
+          ! grep -qE 'GDK_BACKEND=x11|export GTK_THEME=' "${hook}"
 
           # Package the patched AppDir (no --plugin, so the hook is not rewritten).
           VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
