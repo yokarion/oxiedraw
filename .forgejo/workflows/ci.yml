@@ -143,16 +143,6 @@ jobs:
           sha256sum oxiedraw-*.tar.zst OxieDraw-*.AppImage > SHA256SUMS
           cat SHA256SUMS
 
-      # Retain the packaged output on every run so branch builds are downloadable
-      # from the run page, not just tagged releases. Needs the Forgejo artifacts
-      # backend enabled on the instance.
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: oxiedraw-${{ steps.ver.outputs.version }}-x86_64-linux
-          path: dist/
-          retention-days: 14
-
       - name: Publish to Codeberg Releases
         if: startsWith(github.ref, 'refs/tags/v')
         env:
