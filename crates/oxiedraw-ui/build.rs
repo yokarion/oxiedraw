@@ -29,9 +29,11 @@ fn main() {
     let mut files = Vec::new();
     collect_icons(&icons_dir, &icons_dir, &mut files);
     files.sort();
-    if files.is_empty() {
-        panic!("no icons found under {}", icons_dir.display());
-    }
+    assert!(
+        !files.is_empty(),
+        "no icons found under {}",
+        icons_dir.display()
+    );
 
     let xml_path = out_dir.join("oxiedraw-icons.gresource.xml");
     std::fs::write(&xml_path, build_manifest(&files))

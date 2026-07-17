@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=OxieDraw
+GenericName=Drawing Application
+Comment=A simple, performance and user experience chasing drawing app 
+Exec=oxiedraw
+Icon=com.yokarion.oxiedraw
+Terminal=false
+Categories=Graphics;2DGraphics;RasterGraphics;
+Keywords=draw;paint;sketch;canvas;art;
+StartupNotify=true
+StartupWMClass=oxiedraw

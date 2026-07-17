@@ -74,6 +74,6 @@ fn compile(input: &Path, stage: &str, out_dir: &Path) {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        panic!("glslc failed for {}:\n{stderr}", input.display(),);
+        panic!("glslc failed for {}:\n{stderr}", input.display());
     }
 }

@@ -1,0 +1,180 @@
+name: CI
+
+# lint -> test -> build+release. Release assets are published only for v* tags.
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  pull_request:
+    branches: [master]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  lint:
+    runs-on: cicd-runner
+    container:
+      image: codeberg.org/yokarion/rust-toolchain-container:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: cargo-lint-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-lint-
+
+      # No `cargo fmt --check` on purpose: this repo is not on stock rustfmt
+      # and a format check would rewrite most of the tree.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  test:
+    needs: lint
+    runs-on: cicd-runner
+    container:
+      image: codeberg.org/yokarion/rust-toolchain-container:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: cargo-test-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-test-
+
+      # Only the non-ignored tests run here. The `#[ignore]` GPU tests need
+      # VK_EXT_image_drm_format_modifier for the dmabuf display path, which
+      # lavapipe does not implement, so they stay a local step on real hardware:
+      #   cargo nextest run --workspace --run-ignored ignored-only
+      - name: Tests
+        run: cargo nextest run --workspace --locked
+
+  build:
+    needs: test
+    runs-on: cicd-runner
+    container:
+      image: codeberg.org/yokarion/rust-toolchain-container:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            /usr/local/cargo/registry
+            /usr/local/cargo/git
+            target
+          key: cargo-build-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-build-
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -eu
+          # GITHUB_REF is the one thing every runner sets reliably.
+          case "${GITHUB_REF}" in
+            refs/tags/v*)
+              version="${GITHUB_REF#refs/tags/v}"
+              ;;
+            *)
+              base="$(cargo metadata --no-deps --format-version 1 \
+                      | jq -r '.packages[] | select(.name == "oxiedraw") | .version')"
+              version="${base}-g$(git rev-parse --short HEAD)"
+              ;;
+          esac
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "building version ${version}"
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          set -eu
+          version="${{ steps.ver.outputs.version }}"
+          stage="stage/oxiedraw-${version}-x86_64-linux"
+          mkdir -p "${stage}" dist
+          install -Dm755 target/release/oxiedraw "${stage}/oxiedraw"
+          strip "${stage}/oxiedraw"
+          install -Dm644 LICENSE "${stage}/LICENSE"
+          install -Dm644 README.md "${stage}/README.md"
+          install -Dm644 data/com.yokarion.oxiedraw.desktop "${stage}/com.yokarion.oxiedraw.desktop"
+          install -Dm644 data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg \
+            "${stage}/com.yokarion.oxiedraw.svg"
+          tar -C stage -caf "dist/oxiedraw-${version}-x86_64-linux.tar.zst" \
+            "oxiedraw-${version}-x86_64-linux"
+
+      # linuxdeploy bundles GTK4/libadwaita/glib/pango into the AppDir so the
+      # AppImage runs without GTK installed. No FUSE in the job container,
+      # hence APPIMAGE_EXTRACT_AND_RUN.
+      - name: Build AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+          DEPLOY_GTK_VERSION: "4"
+        run: |
+          set -eu
+          version="${{ steps.ver.outputs.version }}"
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          wget -q https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+          export PATH="${PWD}:${PATH}"
+          VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
+            --appdir AppDir \
+            --executable target/release/oxiedraw \
+            --desktop-file data/com.yokarion.oxiedraw.desktop \
+            --icon-file data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg \
+            --plugin gtk \
+            --output appimage
+          mv OxieDraw-*-x86_64.AppImage "dist/OxieDraw-${version}-x86_64.AppImage"
+
+      - name: Checksums
+        run: |
+          set -eu
+          cd dist
+          # Named explicitly so a re-run cannot hash a stale SHA256SUMS.
+          sha256sum oxiedraw-*.tar.zst OxieDraw-*.AppImage > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish to Codeberg Releases
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+        run: |
+          set -eu
+          api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          tag="${GITHUB_REF_NAME}"
+
+          release_id="$(curl -sS -X POST "${api}/releases" \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -n --arg t "${tag}" \
+                  '{tag_name: $t, name: $t, draft: false, prerelease: false}')" \
+            | jq -r '.id // empty')"
+
+          # Already exists (re-run, or tag pushed before the workflow): reuse it.
+          if [ -z "${release_id}" ]; then
+            release_id="$(curl -sS "${api}/releases/tags/${tag}" \
+              -H "Authorization: token ${TOKEN}" | jq -r '.id // empty')"
+          fi
+          if [ -z "${release_id}" ]; then
+            echo "could not create or find release for ${tag}" >&2
+            exit 1
+          fi
+
+          for file in dist/*; do
+            name="$(basename "${file}")"
+            echo "uploading ${name}"
+            curl -sS --fail-with-body -X POST \
+              "${api}/releases/${release_id}/assets?name=${name}" \
+              -H "Authorization: token ${TOKEN}" \
+              -F "attachment=@${file}" -o /dev/null
+          done

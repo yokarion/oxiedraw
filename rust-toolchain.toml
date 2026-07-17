@@ -1,0 +1,10 @@
+[toolchain]
+# Pinned so CI and local builds lint identically. The workspace opts into
+# clippy pedantic + nursery, which grow with every release, so a floating
+# toolchain turns CI red on commits that changed nothing. Bump deliberately.
+#
+# Exact patch on purpose: a "1.94" channel resolves to a separate toolchain and
+# re-downloads even when the same rustc is already installed. Keep this in step
+# with RUST_VERSION in rust-toolchain-container so CI reuses the preinstalled one.
+channel = "1.94.0"
+components = ["clippy"]
