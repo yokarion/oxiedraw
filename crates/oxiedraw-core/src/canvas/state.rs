@@ -1082,10 +1082,24 @@ impl Canvas {
         Ok(self.renderer.display_descriptor())
     }
 
+    /// Region the last [`Self::present`] rewrote, or `None` if it redrew the
+    /// whole canvas. The UI passes it to GTK as the dmabuf update region.
+    #[must_use]
+    pub fn last_present_region(&self) -> Option<(i32, i32, u32, u32)> {
+        self.renderer.last_present_region()
+    }
+
     /// Whether the dmabuf display image is currently out of date.
     #[must_use]
     pub const fn display_dirty(&self) -> bool {
         self.pixels_version != self.display_version
+    }
+
+    /// Whether the next [`Self::present`] would rebuild the display image.
+    /// Mirrors its internal dirty test, so the render pump can skip idle frames.
+    #[must_use]
+    pub fn present_would_redraw(&self) -> bool {
+        self.display_dirty() || self.mask_view_idx() != self.displayed_mask_idx
     }
 
     /// Whether a stroke is currently in flight (between `begin_stroke`

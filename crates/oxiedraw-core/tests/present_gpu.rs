@@ -174,3 +174,77 @@ fn present_is_idempotent() {
     let second = present_and_read(&mut canvas);
     assert_eq!(first, second, "repeated presents must be stable");
 }
+
+/// The in-stroke present only rewrites the dab's dirty region, so pixels an
+/// earlier present wrote outside the current clip must survive. A regression
+/// shows up as earlier dabs vanishing mid-stroke.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn incremental_present_preserves_pixels_outside_the_clip() {
+    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
+    use oxiedraw_core::color::Color;
+    use oxiedraw_utils::geometry::{Point, Size};
+
+    const BIG: Size = Size { width: 256, height: 256 };
+    const RED: Color = Color::new(255, 0, 0);
+    const START: f32 = 40.0;
+    const END: f32 = 200.0;
+
+    let dab = |x: f32, y: f32, t: u64| InputSample {
+        position: Point::new(x, y),
+        pressure: 1.0,
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+        time_ms: t,
+    };
+
+    let brush = BrushEngine::new();
+    brush.size.set(16.0);
+    brush.opacity.set(1.0);
+
+    let mut canvas = Canvas::headless(BIG).unwrap();
+    canvas.add_layer("paint").unwrap();
+    canvas.begin_stroke(RED, 1.0, false).unwrap();
+
+    // Walk a horizontal line, presenting per sample - the real drag loop. Many
+    // samples so the stabilizer actually tracks the input to the far end.
+    canvas.stamp(|t| brush.begin_stroke(dab(START, START, 0), RED, t)).unwrap();
+    canvas.present().unwrap();
+    let steps: u32 = 120;
+    for i in 1..=steps {
+        let f = f64::from(i) as f32 / f64::from(steps) as f32;
+        let x = START + f * (END - START);
+        canvas.stamp(|t| brush.push_sample(dab(x, START, u64::from(i) * 8), t)).unwrap();
+        canvas.present().unwrap();
+    }
+
+    // Alpha survives the gamma conversion untouched, so the display must match
+    // the preview it converts from; a wrongly skipped region shows up as stale.
+    let preview = canvas.read_pixels().unwrap();
+    let display = canvas.read_display().unwrap();
+    assert_eq!(preview.len(), display.len());
+
+    let mut mismatches = 0u32;
+    let mut first_bad = None;
+    for i in (0..display.len()).step_by(4) {
+        if display[i + 3] != preview[i + 3] {
+            mismatches += 1;
+            if first_bad.is_none() {
+                let px = (i / 4) as u32;
+                first_bad = Some((px % BIG.width, px / BIG.width, preview[i + 3], display[i + 3]));
+            }
+        }
+    }
+    assert_eq!(
+        mismatches, 0,
+        "display diverged from preview in {mismatches} px; first at {first_bad:?} (x, y, want, got)",
+    );
+
+    // Sanity: the stroke travelled, so the check above saw disjoint dirty
+    // regions rather than a blank canvas.
+    let alpha_at = |x: u32, y: u32| display[((y * BIG.width + x) * 4 + 3) as usize];
+    assert!(alpha_at(START as u32, START as u32) > 200, "start of stroke never drawn");
+    assert!(alpha_at(END as u32 - 4, START as u32) > 200, "stroke did not reach the far end");
+    assert_eq!(alpha_at(150, 200), 0, "pixels no dab covered must stay transparent");
+}

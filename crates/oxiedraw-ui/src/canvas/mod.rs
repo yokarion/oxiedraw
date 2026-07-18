@@ -169,7 +169,12 @@ impl RenderPump {
                 me.installed.set(false);
                 return gtk::glib::ControlFlow::Break;
             }
-            present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
+            // The tick alone keeps the clock hot, so an unchanged frame can skip
+            // the present instead of re-importing the dmabuf for identical pixels.
+            let changed = me.canvas.borrow().present_would_redraw();
+            if changed {
+                present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
+            }
             gtk::glib::ControlFlow::Continue
         });
     }
@@ -876,19 +881,19 @@ pub(super) fn present_into_paintable(
     if paintable.perf_enabled() {
         paintable.record_gpu_timings(canvas.frame_timings());
     }
-    apply_descriptor_to_paintable(&desc, paintable, area);
+    apply_descriptor_to_paintable(&desc, canvas.last_present_region(), paintable, area);
 }
 
-/// Build a dmabuf texture from `desc` and hand it to the paintable. The
-/// descriptor-application tail of [`present_into_paintable`], split out so
-/// the combined stamp+present path can reuse it.
+/// Build a dmabuf texture from `desc` and hand it to the paintable. `damage`
+/// is the region the present rewrote, in canvas pixels (`None` = all of it).
 pub(super) fn apply_descriptor_to_paintable(
     desc: &DmabufDescriptor,
+    damage: Option<(i32, i32, u32, u32)>,
     paintable: &CanvasPaintable,
     area: &gtk::Picture,
 ) {
     let previous = paintable.texture();
-    match build_texture(area, desc, previous.as_ref()) {
+    match build_texture(area, desc, previous.as_ref(), damage) {
         Ok(texture) => paintable.set_texture(Some(texture)),
         Err(e) => tracing::error!(error = %e, "dmabuf texture build failed"),
     }
@@ -902,11 +907,13 @@ pub(super) fn apply_descriptor_to_paintable(
 ///
 /// `previous`, when `Some`, is passed via `set_update_texture` so GTK
 /// recognises this build as a successor of that texture and can do
-/// partial-update bookkeeping internally.
+/// partial-update bookkeeping internally. `damage` pairs with it: without a
+/// region GSK assumes the whole texture changed and re-renders the widget.
 fn build_texture(
     area: &gtk::Picture,
     desc: &DmabufDescriptor,
     previous: Option<&gdk::Texture>,
+    damage: Option<(i32, i32, u32, u32)>,
 ) -> Result<gdk::Texture, glib::Error> {
     let display = area.display();
     let dup =
@@ -932,6 +939,14 @@ fn build_texture(
         && prev.height() == i32::try_from(desc.height).unwrap_or(-1)
     {
         builder = builder.set_update_texture(Some(prev));
+        // Only meaningful alongside a chained predecessor: it names the pixels
+        // that differ from it.
+        if let Some((x, y, w, h)) = damage
+            && let (Ok(w), Ok(h)) = (i32::try_from(w), i32::try_from(h))
+        {
+            let rect = gtk::cairo::RectangleInt::new(x, y, w, h);
+            builder = builder.set_update_region(Some(&gtk::cairo::Region::create_rectangle(&rect)));
+        }
     }
     // SAFETY: `dup` (and thus `raw`) is kept alive by the release
     // closure below until GTK drops the texture.

@@ -143,6 +143,7 @@ pub(super) const RING_FRAMES: usize = 3;
 /// frame made wlroots/Hyprland pace our window at every-3rd-vsync (24ms) after a
 /// resize, so we keep this small. 1 = a single stable buffer (like a normal
 /// app); the sync present + frame-clock pacing keep it correct.
+/// Raising this disables the clipped present in `record_present_copy`.
 pub(super) const DISPLAY_BUFFERS: usize = 1;
 
 /// What source the dmabuf display image should mirror.
@@ -199,6 +200,9 @@ pub struct VulkanRenderer {
     /// Forces the next preview frame to rebuild the whole canvas (stroke start
     /// or any layer mutation), after which incremental updates take over.
     pub(super) preview_needs_full: bool,
+    /// Region the last present rewrote, or `None` for a full-canvas one.
+    /// Handed to GTK as the dmabuf update region.
+    pub(super) last_present_area: Option<vk::Rect2D>,
     /// When `Some`, `cmd_copy_image_full` / `cmd_begin_fullscreen_pass` /
     /// `record_present_copy` restrict their work to this canvas-pixel rect. Set
     /// only around the per-frame incremental preview update and reset right
@@ -593,6 +597,7 @@ impl VulkanRenderer {
             stroke_erase: false,
             stroke_dirty: None,
             preview_pending_dirty: None,
+            last_present_area: None,
             preview_needs_full: true,
             clip: None,
             staging: ManuallyDrop::new(staging),

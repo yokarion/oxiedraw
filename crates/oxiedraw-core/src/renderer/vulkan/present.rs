@@ -18,6 +18,14 @@ impl VulkanRenderer {
         self.display[self.display_cursor].descriptor()
     }
 
+    /// Region the last present rewrote, or `None` if it covered the whole
+    /// canvas. GTK takes this as the dmabuf update region.
+    #[must_use]
+    pub fn last_present_region(&self) -> Option<(i32, i32, u32, u32)> {
+        self.last_present_area
+            .map(|r| (r.offset.x, r.offset.y, r.extent.width, r.extent.height))
+    }
+
     /// Copy `source` into the next display buffer and fence-wait so the
     /// display server can safely read it.
     pub fn present_to_display(&mut self, source: PresentSource) -> Result<(), RendererError> {
@@ -25,6 +33,9 @@ impl VulkanRenderer {
             PresentSource::Canvas => (self.canvas.handle, self.canvas.view),
             PresentSource::Preview => (self.preview.handle, self.preview.view),
         };
+        // Full refresh: the incremental clip belongs to the stroke path, and a
+        // stale value here would skip pixels this source needs.
+        self.clip = None;
         // Async: don't stall the input loop on the dmabuf present. GTK syncs to
         // our GPU writes via dma-buf implicit sync, and same-queue order keeps
         // the next preview write after this pass.
@@ -41,8 +52,10 @@ impl VulkanRenderer {
     /// `record_and_submit`. `src_image` must be in GENERAL.
     ///
     /// Advances `display_cursor` to a fresh buffer first, so GTK never samples
-    /// the buffer we write here. The pass always covers the *full* canvas (the
-    /// render pass discards prior contents), independent of any active clip.
+    /// the buffer we write here.
+    ///
+    /// Honors an active clip: with a single display buffer the pixels outside
+    /// it still hold the previous frame's output, which is still correct.
     pub(super) fn record_present_copy(&mut self, src_image: vk::Image, src_view: vk::ImageView) {
         self.display_cursor = (self.display_cursor + 1) % self.display.len();
         let framebuffer = self.display_framebuffers[self.display_cursor];
@@ -71,10 +84,18 @@ impl VulkanRenderer {
             offset: vk::Offset2D::default(),
             extent,
         };
+        // Skipping pixels is only safe with one buffer; a rotating pool would
+        // leave the untouched region of the next buffer stale.
+        let area = if self.display.len() == 1 {
+            self.clip.unwrap_or(full)
+        } else {
+            full
+        };
+        self.last_present_area = (area != full).then_some(area);
         let begin = vk::RenderPassBeginInfo::default()
             .render_pass(self.present_convert.render_pass)
             .framebuffer(framebuffer)
-            .render_area(full);
+            .render_area(area);
         let set = self.present_convert.src_sets[slot];
         unsafe {
             self.device.cmd_begin_render_pass(
@@ -89,7 +110,9 @@ impl VulkanRenderer {
             );
             self.device
                 .cmd_set_viewport(self.command_buffer, 0, &[viewport]);
-            self.device.cmd_set_scissor(self.command_buffer, 0, &[full]);
+            // Viewport stays full-canvas so the triangle's UVs still map to
+            // canvas pixels; only the scissor narrows.
+            self.device.cmd_set_scissor(self.command_buffer, 0, &[area]);
             self.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
