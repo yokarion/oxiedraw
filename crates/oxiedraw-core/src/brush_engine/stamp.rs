@@ -11,6 +11,21 @@ use super::{
 
 const MIN_DAB_RADIUS: f32 = 0.5;
 
+/// Sample interval the preset EMA factors are tuned against. Motion event
+/// rate swings with hardware (GDK coalesces motion to the frame clock when
+/// the loop is busy), so per-sample factors are rescaled to this interval -
+/// otherwise the same preset lags several times harder on a slow machine.
+const EMA_REFERENCE_MS: f32 = 8.0;
+
+/// Rescale a per-sample EMA retention factor to the actual sample interval,
+/// so the filter's time constant stays fixed regardless of event rate.
+fn rate_adjusted_retention(retention: f32, dt_ms: f32) -> f32 {
+    if dt_ms <= f32::EPSILON {
+        return retention;
+    }
+    retention.powf(dt_ms / EMA_REFERENCE_MS)
+}
+
 /// Build a renderer for the given preset + stroke context. The single
 /// entry point for starting a stroke; replaces the per-brush
 /// `start_stroke` method.
@@ -125,7 +140,9 @@ impl PresetStrokeRenderer {
         let Some(prev) = self.history.back().copied() else {
             return sample;
         };
-        let a = self.stabilizer;
+        #[allow(clippy::cast_precision_loss)]
+        let dt_ms = (sample.time_ms.saturating_sub(prev.time_ms)) as f32;
+        let a = rate_adjusted_retention(self.stabilizer, dt_ms);
         let inv = 1.0 - a;
         InputSample {
             position: Point::new(
@@ -232,7 +249,11 @@ impl PresetStrokeRenderer {
         };
         // EMA smoothing: alpha 0.35 (baseline) -> 0.05 (max), clamping
         // out lag-induced spikes without losing real speed variation.
-        let alpha = 0.30f32.mul_add(-self.speed_smoothing, 0.35);
+        let alpha = 1.0
+            - rate_adjusted_retention(
+                1.0 - 0.30f32.mul_add(-self.speed_smoothing, 0.35),
+                dt_ms,
+            );
         let speed_px_ms = if self.smoothed_speed < 0.0 {
             self.smoothed_speed = raw_speed;
             raw_speed
