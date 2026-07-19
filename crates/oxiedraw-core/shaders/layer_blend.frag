@@ -25,6 +25,22 @@ vec3 blend_overlay(vec3 cb, vec3 cs) {
     return mix(2.0 * cb * cs, 1.0 - 2.0 * (1.0 - cb) * (1.0 - cs), step(0.5, cb));
 }
 
+// The layer images are _SRGB, so sampling hands us linear values. Separable
+// blend modes are conventionally defined on the gamma-encoded values instead
+// (what Photoshop/Krita/GIMP do), so the blend math converts to sRGB and back.
+// This matters most for Overlay, which is degenerate at the extremes -
+// overlay(0, cs) == 0 - so in linear space a dark backdrop annihilates the
+// source and the layer looks like it vanished behind the stack.
+vec3 lin_to_srgb(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(12.92 * c, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+}
+
+vec3 srgb_to_lin(vec3 c) {
+    c = clamp(c, 0.0, 1.0);
+    return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
+}
+
 void main() {
     vec4 s = texture(u_src, v_uv) * pc.opacity;
     vec4 d = texture(u_dst, v_uv);
@@ -33,14 +49,17 @@ void main() {
     vec3 sc = s.a > 0.0 ? s.rgb / s.a : vec3(0.0);
     vec3 dc = d.a > 0.0 ? d.rgb / d.a : vec3(0.0);
 
+    vec3 sg = lin_to_srgb(sc);
+    vec3 dg = lin_to_srgb(dc);
+
     vec3 blended;
     switch (pc.mode) {
-        case 1u: blended = sc * dc; break;                 // Multiply
-        case 2u: blended = min(sc + dc, vec3(1.0)); break;  // Addition
-        case 3u: blended = min(sc, dc); break;              // Darken
-        case 4u: blended = sc + dc - sc * dc; break;        // Screen
-        case 5u: blended = blend_overlay(dc, sc); break;    // Overlay
-        default: blended = sc; break;                       // Normal
+        case 1u: blended = srgb_to_lin(sg * dg); break;                      // Multiply
+        case 2u: blended = srgb_to_lin(min(sg + dg, vec3(1.0))); break;      // Addition
+        case 3u: blended = min(sc, dc); break;                               // Darken
+        case 4u: blended = srgb_to_lin(sg + dg - sg * dg); break;            // Screen
+        case 5u: blended = srgb_to_lin(blend_overlay(dg, sg)); break;        // Overlay
+        default: blended = sc; break;                                        // Normal
     }
 
     // Source colour mixed towards the blended colour by the backdrop alpha,

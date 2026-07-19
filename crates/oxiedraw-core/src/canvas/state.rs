@@ -1925,9 +1925,20 @@ impl Canvas {
     /// Replace the selection mask with the union of several layers' alpha
     /// channels (per-pixel max), so anti-aliased edges stay soft. Used when
     /// clicking a folder's icon to select everything inside it.
+    ///
+    /// Adjustment layers are skipped: their image slot holds a grayscale
+    /// *mask*, not colour, and it defaults to fully opaque - unioning it in
+    /// would select the whole canvas rather than the painted artwork.
     pub fn select_from_layers_alpha(&mut self, indices: &[usize]) -> Result<(), RendererError> {
         let mut shape: Vec<u8> = Vec::new();
         for &idx in indices {
+            if self
+                .layers
+                .kind(idx)
+                .is_some_and(|k| k.is_adjustment())
+            {
+                continue;
+            }
             let layer = self.renderer.read_layer(idx)?;
             let n = layer.len() / 4;
             if shape.is_empty() {
