@@ -214,7 +214,7 @@ impl VulkanRenderer {
 
     /// Upload only a sub-rectangle of a layer. `pixels` is tightly packed BGRA8
     /// for the `w x h` region and lands at `(x, y)` in the layer image. The
-    /// region is clamped to the canvas. Far cheaper than [`write_layer`] for a
+    /// region is clamped to the canvas. Far cheaper than [`Self::write_layer`] for a
     /// small dirty rect (e.g. a text box on a large canvas): the staging copy
     /// and GPU upload scale with the region, not the whole canvas.
     pub fn write_layer_region(

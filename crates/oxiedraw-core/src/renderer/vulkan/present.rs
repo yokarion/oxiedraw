@@ -12,7 +12,7 @@ use super::{PresentSource, VulkanRenderer};
 
 impl VulkanRenderer {
     /// Get a descriptor (fd + DRM metadata) of the display buffer most recently
-    /// written by [`Self::record_present_copy`] - the one GTK should import now.
+    /// written by `record_present_copy` - the one GTK should import now.
     #[must_use]
     pub fn display_descriptor(&self) -> DmabufDescriptor {
         self.display[self.display_cursor].descriptor()

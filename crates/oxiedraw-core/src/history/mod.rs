@@ -1,6 +1,6 @@
 //! Undo/redo history.
 //!
-//! See the module-level docs in [`action`] and [`stack`] for the
+//! See the module-level docs in `action` and `stack` for the
 //! compiler-checked extensibility story: one big enum + one exhaustive
 //! match site.
 //!
