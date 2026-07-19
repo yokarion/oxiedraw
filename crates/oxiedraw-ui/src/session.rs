@@ -227,6 +227,512 @@ pub(crate) struct DocumentSession {
     _alive: Rc<()>,
 }
 
+/// Snapshot every layer's pixels plus the canvas size, for a crop history entry.
+fn snapshot_crop_layers(canvas: &Rc<RefCell<Canvas>>) -> ((u32, u32), Vec<CropLayer>) {
+    let mut c = canvas.borrow_mut();
+    let size = c.size();
+    let snap = c.layers().snapshot();
+    let layers = snap
+        .iter()
+        .enumerate()
+        .filter_map(|(i, l)| {
+            c.read_layer(i).ok().map(|px| CropLayer {
+                id: l.id.clone(),
+                name: l.name.clone(),
+                visible: l.visible,
+                pixels: px,
+                kind: l.kind.clone(),
+                blend: l.blend,
+                opacity: l.opacity,
+            })
+        })
+        .collect();
+    ((size.width, size.height), layers)
+}
+
+/// Commit the pending crop rect: resize the canvas, record the undo entry,
+/// refit the view and drop back to the Cursor tool.
+fn build_crop_apply(ctx: &SessionCtx) -> Rc<dyn Fn()> {
+    let ctx = ctx.clone();
+    Rc::new(move || {
+        let Some(rect) = ctx.crop.rect.get() else {
+            return;
+        };
+        let canvas = ctx.canvas();
+        let active_layer = canvas.borrow().layers().active();
+        let (before_size, before_layers) = snapshot_crop_layers(&canvas);
+
+        if ctx.viewport.apply_crop(rect).is_some() {
+            let (after_size, after_layers) = snapshot_crop_layers(&canvas);
+            ctx.history.borrow_mut().record(HistoryAction::CropCanvas {
+                before_size,
+                after_size,
+                before_layers,
+                after_layers,
+                active_layer,
+            });
+            ctx.viewport.zoom_fit();
+            ctx.viewport.redraw_handle().request();
+        }
+        ctx.crop.rect.set(None);
+        ctx.crop.notify_rect_changed();
+        ctx.set_tool(Tool::Cursor);
+    })
+}
+
+/// Refresh the marching-ants contours and repaint after a selection change.
+fn notify_selection_changed(ctx: &SessionCtx) {
+    canvas::primary_drag::refresh_selection_contours(
+        &ctx.canvas(),
+        &ctx.selection,
+        &ctx.viewport.canvas_size_handle(),
+    );
+    ctx.selection.notify_changed();
+    ctx.viewport.redraw_handle().request();
+}
+
+/// Select one layer's opaque pixels (layers-panel thumbnail swatch click).
+fn build_select_layer_content(ctx: &SessionCtx) -> Rc<dyn Fn(usize)> {
+    let ctx = ctx.clone();
+    Rc::new(move |layer_idx: usize| {
+        {
+            let canvas = ctx.canvas();
+            let mut c = canvas.borrow_mut();
+            if let Err(e) = c.select_from_layer_alpha(layer_idx) {
+                tracing::error!(error = %e, "select_from_layer_alpha failed");
+                return;
+            }
+            ctx.selection.active.set(c.selection_active());
+        }
+        ctx.selection.source_layer.set(Some(layer_idx));
+        notify_selection_changed(&ctx);
+    })
+}
+
+/// Select the union of every layer inside a folder (folder icon click),
+/// mirroring the single-layer swatch behaviour.
+fn build_select_folder_content(ctx: &SessionCtx) -> Rc<dyn Fn(Vec<usize>)> {
+    let ctx = ctx.clone();
+    Rc::new(move |layer_indices: Vec<usize>| {
+        {
+            let canvas = ctx.canvas();
+            let mut c = canvas.borrow_mut();
+            if let Err(e) = c.select_from_layers_alpha(&layer_indices) {
+                tracing::error!(error = %e, "select_from_layers_alpha failed");
+                return;
+            }
+            ctx.selection.active.set(c.selection_active());
+        }
+        ctx.selection.source_layer.set(None);
+        notify_selection_changed(&ctx);
+    })
+}
+
+/// Abandon the in-flight transform and put the layer back the way it was.
+///
+/// Text and component layers re-render from their source rather than restoring
+/// pixels, since their geometry was never actually modified.
+fn build_transform_cancel(ctx: &SessionCtx) -> Rc<dyn Fn()> {
+    let ctx = ctx.clone();
+    Rc::new(move || {
+        let canvas = ctx.canvas();
+        let paintable = ctx.viewport.paintable();
+        // End any live GPU blend preview before restoring/recompositing.
+        canvas.borrow_mut().clear_transform_preview();
+        paintable.set_transform_gpu_preview(false);
+
+        // Text layer transform: re-render the text at its (unchanged) box and
+        // restore - the box geometry was never modified.
+        if ctx.transform.text.borrow().is_some() {
+            if let Some(idx) = ctx.transform.original_layer_idx.get() {
+                let kind = canvas.borrow().layers().kind(idx);
+                if let Some(LayerKind::Text(content)) = kind {
+                    let cs = canvas.borrow().size();
+                    let pixels = {
+                        let mut engine = ctx.global.text_engine.borrow_mut();
+                        oxiedraw_core::text::render::render_text(
+                            &content, &mut engine, cs.width, cs.height,
+                        )
+                    };
+                    if let Err(e) = canvas.borrow_mut().restore_layer(idx, &pixels) {
+                        tracing::error!(error = %e, "text transform cancel: restore failed");
+                    }
+                }
+            }
+            ctx.finish_transform();
+            return;
+        }
+
+        // Component instance transform: re-render at the original placement and
+        // clear, no pixel restore (source was the master). Bind the clone first
+        // so the borrow is released before clear().
+        let component_marker = ctx.transform.component.borrow().clone();
+        if let Some((component_id, orig_rect)) = component_marker {
+            if let Some(idx) = ctx.transform.original_layer_idx.get() {
+                let size = canvas.borrow().size();
+                let filter = ctx.transform.filter.get();
+                let pixels = ctx.components.borrow().get(&component_id).map(|c| {
+                    c.render_instance(
+                        size.width,
+                        size.height,
+                        Placement::from_rect(orig_rect),
+                        filter,
+                    )
+                });
+                if let Some(px) = pixels
+                    && let Err(e) = canvas.borrow_mut().restore_layer(idx, &px)
+                {
+                    tracing::error!(error = %e, "component transform cancel: restore failed");
+                }
+            }
+            ctx.finish_transform();
+            return;
+        }
+
+        if let Some(idx) = ctx.transform.original_layer_idx.get() {
+            if ctx.transform.is_paste.get() {
+                if let Err(e) = canvas.borrow_mut().remove_layer(idx) {
+                    tracing::error!(error = %e, "transform cancel: remove_layer failed");
+                }
+            } else if let Some((off_x, off_y)) = ctx.transform.original_src_offset.get() {
+                let pixels = ctx.transform.original_pixels.borrow().clone();
+                if let Some(ref pix) = pixels {
+                    let (ew, eh) = ctx.transform.original_src_dims.get().unwrap_or_else(|| {
+                        let s = canvas.borrow().size();
+                        (s.width, s.height)
+                    });
+                    let cs = canvas.borrow().size();
+                    let canvas_pix =
+                        crop_from_extension(pix, off_x, off_y, ew, eh, cs.width, cs.height);
+                    let mut c = canvas.borrow_mut();
+                    let layer_id = c.layers().snapshot().get(idx).map(|l| l.id.clone());
+                    if let Err(e) = c.restore_layer(idx, &canvas_pix) {
+                        tracing::error!(error = %e, "transform cancel: restore_layer failed");
+                    }
+                    if let Some(id) = layer_id {
+                        ctx.layer_extensions.borrow_mut().insert(
+                            id,
+                            LayerExtension {
+                                offset_x: off_x,
+                                offset_y: off_y,
+                                width: ew,
+                                height: eh,
+                                pixels: pix.clone(),
+                            },
+                        );
+                    }
+                }
+            } else {
+                let pixels = ctx.transform.original_pixels.borrow().clone();
+                if let Some(pixels) = pixels
+                    && let Err(e) = canvas.borrow_mut().restore_layer(idx, &pixels)
+                {
+                    tracing::error!(error = %e, "transform cancel: restore_layer failed");
+                }
+            }
+        }
+        ctx.finish_transform();
+    })
+}
+
+/// Commit the in-flight transform, recording the matching undo entry.
+///
+/// Text and component layers re-render crisply from their source at the new
+/// geometry; raster layers go through the GPU affine path, which can also
+/// produce off-canvas pixels stashed in `layer_extensions`.
+fn build_transform_apply(ctx: &SessionCtx, cancel: &Rc<dyn Fn()>) -> Rc<dyn Fn()> {
+    let ctx = ctx.clone();
+    let cancel = Rc::clone(cancel);
+    Rc::new(move || {
+        let canvas = ctx.canvas();
+        let paintable = ctx.viewport.paintable();
+        // End any live GPU blend preview; the commit recomposites below.
+        canvas.borrow_mut().clear_transform_preview();
+        paintable.set_transform_gpu_preview(false);
+
+        // Text layer transform: bake the uniform scale into the font/box so the
+        // text re-shapes crisply, leaving only a residual anamorphic squish; the
+        // new centre/angle come from the rect.
+        let text_marker = ctx.transform.text.borrow().clone();
+        if let Some((layer_id, _orig_rect)) = text_marker {
+            let (Some(new_rect), Some(idx)) = (
+                ctx.transform.rect.get(),
+                ctx.transform.original_layer_idx.get(),
+            ) else {
+                return;
+            };
+            let kind = canvas.borrow().layers().kind(idx);
+            if let Some(LayerKind::Text(content)) = kind {
+                let cs = canvas.borrow().size();
+                let natural = content.box_rect;
+                let before_content = content.clone();
+                // Total visible scale over the natural box, then baked in.
+                let mut after_content = content;
+                let sx = if natural.w.abs() > 1e-3 {
+                    new_rect.w / natural.w
+                } else {
+                    after_content.scale.0
+                };
+                let sy = if natural.h.abs() > 1e-3 {
+                    new_rect.h / natural.h
+                } else {
+                    after_content.scale.1
+                };
+                after_content.bake_transform(new_rect.cx, new_rect.cy, new_rect.angle, sx, sy);
+
+                let (before, after) = {
+                    let mut engine = ctx.global.text_engine.borrow_mut();
+                    let before = oxiedraw_core::text::render::render_text(
+                        &before_content, &mut engine, cs.width, cs.height,
+                    );
+                    let after = oxiedraw_core::text::render::render_text(
+                        &after_content, &mut engine, cs.width, cs.height,
+                    );
+                    (before, after)
+                };
+                if let Err(e) = canvas.borrow_mut().restore_layer(idx, &after) {
+                    tracing::error!(error = %e, "text transform apply: write failed");
+                }
+                canvas
+                    .borrow()
+                    .layers()
+                    .set_kind(idx, LayerKind::Text(after_content.clone()));
+                if let Some(patch) = LayerPatch::from_full_diff(&before, &after, cs.width, cs.height)
+                {
+                    ctx.history.borrow_mut().record(HistoryAction::TextEdit {
+                        layer_id,
+                        patch,
+                        before_content: Box::new(before_content),
+                        after_content: Box::new(after_content),
+                    });
+                }
+            }
+            ctx.finish_transform();
+            return;
+        }
+
+        // Component instance transform: re-render the master at the new
+        // placement (crisp) and update the layer's placement metadata. Bind the
+        // clone first so the borrow is released before clear().
+        let component_marker = ctx.transform.component.borrow().clone();
+        if let Some((component_id, orig_rect)) = component_marker {
+            let Some(current_rect) = ctx.transform.rect.get() else {
+                return;
+            };
+            let Some(idx) = ctx.transform.original_layer_idx.get() else {
+                return;
+            };
+            let size = canvas.borrow().size();
+            let filter = ctx.transform.filter.get();
+            let new_placement = Placement::from_rect(current_rect);
+            let (before, after, layer_id) = {
+                let lib = ctx.components.borrow();
+                let Some(comp) = lib.get(&component_id) else {
+                    return;
+                };
+                let before = comp.render_instance(
+                    size.width,
+                    size.height,
+                    Placement::from_rect(orig_rect),
+                    filter,
+                );
+                let after = comp.render_instance(size.width, size.height, new_placement, filter);
+                let layer_id = canvas
+                    .borrow()
+                    .layers()
+                    .snapshot()
+                    .get(idx)
+                    .map(|l| l.id.clone());
+                (before, after, layer_id)
+            };
+            if let Err(e) = canvas.borrow_mut().restore_layer(idx, &after) {
+                tracing::error!(error = %e, "component transform apply: write failed");
+            }
+            canvas.borrow().layers().set_kind(
+                idx,
+                LayerKind::Component(ComponentInstance {
+                    component_id: component_id.clone(),
+                    placement: new_placement,
+                }),
+            );
+            if let Some(layer_id) = layer_id
+                && let Some(patch) =
+                    LayerPatch::from_full_diff(&before, &after, size.width, size.height)
+            {
+                ctx.history
+                    .borrow_mut()
+                    .record(HistoryAction::ComponentRetransform {
+                        layer_id,
+                        component_id,
+                        patch,
+                        before_placement: Placement::from_rect(orig_rect),
+                        after_placement: new_placement,
+                    });
+            }
+            ctx.finish_transform();
+            return;
+        }
+
+        let Some(current_rect) = ctx.transform.rect.get() else {
+            return;
+        };
+        let Some(original_rect) = ctx.transform.original_rect.get() else {
+            return;
+        };
+        let Some(idx) = ctx.transform.original_layer_idx.get() else {
+            return;
+        };
+        let pixels = ctx.transform.original_pixels.borrow().clone();
+        let Some(pixels) = pixels else { return };
+        let is_paste = ctx.transform.is_paste.get();
+
+        let canvas_size = canvas.borrow().size();
+        let (src_w, src_h) = ctx
+            .transform
+            .original_src_dims
+            .get()
+            .unwrap_or((canvas_size.width, canvas_size.height));
+
+        let gpu_result = canvas.borrow_mut().apply_layer_transform_gpu(
+            idx,
+            &pixels,
+            src_w,
+            src_h,
+            original_rect,
+            current_rect,
+        );
+        let (full_result, ext_x, ext_y, full_w, full_h) = match gpu_result {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(error = %e, "transform apply (GPU) failed");
+                cancel();
+                let msg = match &e {
+                    RendererError::TransformTooLarge { limit, .. } => format!(
+                        "Error: Can't transform the layer. Max layer texture size: {limit}"
+                    ),
+                    _ => format!("Error: transform failed: {e}"),
+                };
+                ctx.global.toaster.error(&msg);
+                return;
+            }
+        };
+        let layer_snapshot = canvas
+            .borrow()
+            .layers()
+            .snapshot()
+            .get(idx)
+            .map(|l| (l.id.clone(), l.name.clone(), l.visible));
+        if let Some((id, name, visible)) = layer_snapshot {
+            let is_outside = ext_x < 0
+                || ext_y < 0
+                || ext_x.saturating_add(full_w as i32) > canvas_size.width as i32
+                || ext_y.saturating_add(full_h as i32) > canvas_size.height as i32;
+            if is_outside {
+                ctx.layer_extensions.borrow_mut().insert(
+                    id.clone(),
+                    LayerExtension {
+                        offset_x: ext_x,
+                        offset_y: ext_y,
+                        width: full_w,
+                        height: full_h,
+                        pixels: full_result,
+                    },
+                );
+            } else {
+                ctx.layer_extensions.borrow_mut().remove(&id);
+            }
+
+            let after_px = canvas.borrow_mut().read_layer(idx).unwrap_or_default();
+            if is_paste {
+                ctx.history.borrow_mut().record(HistoryAction::LayerAdd {
+                    idx,
+                    id,
+                    name,
+                    visible,
+                    layer_kind: LayerKind::Raster,
+                    blend: oxiedraw_core::document::BlendMode::Normal,
+                    opacity: 1.0,
+                    pixels: after_px,
+                });
+            } else {
+                let before_canvas = if ctx.transform.original_src_offset.get().is_some() {
+                    let (off_x, off_y) = ctx.transform.original_src_offset.get().unwrap_or((0, 0));
+                    let (ew, eh) = ctx
+                        .transform
+                        .original_src_dims
+                        .get()
+                        .unwrap_or((canvas_size.width, canvas_size.height));
+                    crop_from_extension(
+                        &pixels,
+                        off_x,
+                        off_y,
+                        ew,
+                        eh,
+                        canvas_size.width,
+                        canvas_size.height,
+                    )
+                } else {
+                    pixels.clone()
+                };
+                if let Some(patch) = LayerPatch::from_full_diff(
+                    &before_canvas,
+                    &after_px,
+                    canvas_size.width,
+                    canvas_size.height,
+                ) {
+                    ctx.history
+                        .borrow_mut()
+                        .record(HistoryAction::Transform { layer_id: id, patch });
+                }
+            }
+        }
+        ctx.finish_transform();
+    })
+}
+
+/// The handles shared by every wiring closure built in [`DocumentSession::new`].
+///
+/// Each field is a cheap `Rc`/handle clone, so a closure can capture one
+/// `SessionCtx` instead of re-cloning eight individual handles at every call
+/// site. Built once at the top of `new`, then handed to the `build_*` helpers.
+#[derive(Clone)]
+struct SessionCtx {
+    global: GlobalState,
+    set_active_tool: SetActiveToolSlot,
+    history: Rc<RefCell<HistoryStack>>,
+    components: Rc<RefCell<ComponentLibrary>>,
+    layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>>,
+    viewport: Viewport,
+    crop: CropState,
+    transform: TransformState,
+    selection: SelectionState,
+}
+
+impl SessionCtx {
+    fn canvas(&self) -> Rc<RefCell<Canvas>> {
+        self.viewport.canvas()
+    }
+
+    /// Switch the active tool, if the late-bound window setter is wired yet.
+    fn set_tool(&self, tool: Tool) {
+        if let Some(setter) = self.set_active_tool.borrow().as_ref() {
+            setter(tool);
+        }
+    }
+
+    /// Tear down the transform overlay and hand control back to the Cursor
+    /// tool. Every transform apply/cancel path ends with exactly this.
+    fn finish_transform(&self) {
+        self.transform.clear();
+        self.transform.notify_changed();
+        let paintable = self.viewport.paintable();
+        paintable.set_transform_rect(None);
+        paintable.set_transform_source(None, 0, 0, None);
+        self.viewport.redraw_handle().request();
+        self.set_tool(Tool::Cursor);
+    }
+}
+
 impl DocumentSession {
     /// Build a fresh document session of the given canvas size. Creates its own
     /// Vulkan canvas, viewport, right bar, and tool-options bar.
@@ -256,492 +762,23 @@ impl DocumentSession {
         let layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>> =
             Rc::new(RefCell::new(HashMap::new()));
 
-        // -- Crop apply --------------------------------------------------
-        let crop_apply: Rc<dyn Fn()> = {
-            let viewport = viewport.clone();
-            let crop_c = crop.clone();
-            let redraw = viewport.redraw_handle();
-            let set_tool = Rc::clone(set_active_tool_late);
-            let history_for_crop = Rc::clone(&history);
-            let canvas_for_crop = viewport.canvas();
-            Rc::new(move || {
-                let Some(rect) = crop_c.rect.get() else {
-                    return;
-                };
-
-                let (before_size, before_layers, active_layer) = {
-                    let mut c = canvas_for_crop.borrow_mut();
-                    let sz = c.size();
-                    let snap = c.layers().snapshot();
-                    let active = c.layers().active();
-                    let layers: Vec<CropLayer> = snap
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, l)| {
-                            c.read_layer(i).ok().map(|px| CropLayer {
-                                id: l.id.clone(),
-                                name: l.name.clone(),
-                                visible: l.visible,
-                                pixels: px,
-                                kind: l.kind.clone(),
-                                blend: l.blend,
-                                opacity: l.opacity,
-                            })
-                        })
-                        .collect();
-                    ((sz.width, sz.height), layers, active)
-                };
-
-                let new_size = viewport.apply_crop(rect);
-                if new_size.is_some() {
-                    let (after_size, after_layers) = {
-                        let mut c = canvas_for_crop.borrow_mut();
-                        let sz = c.size();
-                        let snap = c.layers().snapshot();
-                        let layers: Vec<CropLayer> = snap
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, l)| {
-                                c.read_layer(i).ok().map(|px| CropLayer {
-                                    id: l.id.clone(),
-                                    name: l.name.clone(),
-                                    visible: l.visible,
-                                    pixels: px,
-                                    kind: l.kind.clone(),
-                                    blend: l.blend,
-                                    opacity: l.opacity,
-                                })
-                            })
-                            .collect();
-                        ((sz.width, sz.height), layers)
-                    };
-                    history_for_crop.borrow_mut().record(HistoryAction::CropCanvas {
-                        before_size,
-                        after_size,
-                        before_layers,
-                        after_layers,
-                        active_layer,
-                    });
-
-                    viewport.zoom_fit();
-                    redraw.request();
-                }
-                crop_c.rect.set(None);
-                crop_c.notify_rect_changed();
-                if let Some(setter) = set_tool.borrow().as_ref() {
-                    setter(Tool::Cursor);
-                }
-            })
+        let ctx = SessionCtx {
+            global: global.clone(),
+            set_active_tool: Rc::clone(set_active_tool_late),
+            history: Rc::clone(&history),
+            components: Rc::clone(&components),
+            layer_extensions: Rc::clone(&layer_extensions),
+            viewport: viewport.clone(),
+            crop: crop.clone(),
+            transform: transform.clone(),
+            selection: selection.clone(),
         };
 
-        // -- Transform cancel --------------------------------------------
-        let transform_cancel: Rc<dyn Fn()> = {
-            let canvas_c = viewport.canvas();
-            let transform_c = transform.clone();
-            let paintable_c = viewport.paintable().clone();
-            let redraw = viewport.redraw_handle();
-            let set_tool = Rc::clone(set_active_tool_late);
-            let extensions_c = Rc::clone(&layer_extensions);
-            let components_c = Rc::clone(&components);
-            let text_engine_c = Rc::clone(&global.text_engine);
-            Rc::new(move || {
-                // End any live GPU blend preview before restoring/recompositing.
-                canvas_c.borrow_mut().clear_transform_preview();
-                paintable_c.set_transform_gpu_preview(false);
-                // Text layer transform: re-render the text at its (unchanged)
-                // box and restore - the box geometry was never modified.
-                if transform_c.text.borrow().is_some() {
-                    if let Some(idx) = transform_c.original_layer_idx.get() {
-                        let kind = canvas_c.borrow().layers().kind(idx);
-                        if let Some(LayerKind::Text(content)) = kind {
-                            let cs = canvas_c.borrow().size();
-                            let pixels = {
-                                let mut engine = text_engine_c.borrow_mut();
-                                oxiedraw_core::text::render::render_text(
-                                    &content, &mut engine, cs.width, cs.height,
-                                )
-                            };
-                            if let Err(e) = canvas_c.borrow_mut().restore_layer(idx, &pixels) {
-                                tracing::error!(error = %e, "text transform cancel: restore failed");
-                            }
-                        }
-                    }
-                    transform_c.clear();
-                    transform_c.notify_changed();
-                    paintable_c.set_transform_rect(None);
-                    paintable_c.set_transform_source(None, 0, 0, None);
-                    redraw.request();
-                    if let Some(setter) = set_tool.borrow().as_ref() {
-                        setter(Tool::Cursor);
-                    }
-                    return;
-                }
-                // Component instance transform: re-render at the original
-                // placement and clear, no pixel restore (source was the master).
-                // Bind the clone first so the borrow is released before clear().
-                let component_marker = transform_c.component.borrow().clone();
-                if let Some((component_id, orig_rect)) = component_marker {
-                    if let Some(idx) = transform_c.original_layer_idx.get() {
-                        let size = canvas_c.borrow().size();
-                        let filter = transform_c.filter.get();
-                        let pixels = components_c
-                            .borrow()
-                            .get(&component_id)
-                            .map(|c| {
-                                c.render_instance(
-                                    size.width,
-                                    size.height,
-                                    Placement::from_rect(orig_rect),
-                                    filter,
-                                )
-                            });
-                        if let Some(px) = pixels
-                            && let Err(e) = canvas_c.borrow_mut().restore_layer(idx, &px)
-                        {
-                            tracing::error!(error = %e, "component transform cancel: restore failed");
-                        }
-                    }
-                    transform_c.clear();
-                    transform_c.notify_changed();
-                    paintable_c.set_transform_rect(None);
-                    paintable_c.set_transform_source(None, 0, 0, None);
-                    redraw.request();
-                    if let Some(setter) = set_tool.borrow().as_ref() {
-                        setter(Tool::Cursor);
-                    }
-                    return;
-                }
-                if let Some(idx) = transform_c.original_layer_idx.get() {
-                    if transform_c.is_paste.get() {
-                        if let Err(e) = canvas_c.borrow_mut().remove_layer(idx) {
-                            tracing::error!(error = %e, "transform cancel: remove_layer failed");
-                        }
-                    } else if let Some((off_x, off_y)) = transform_c.original_src_offset.get() {
-                        let pixels = transform_c.original_pixels.borrow().clone();
-                        if let Some(ref pix) = pixels {
-                            let (ew, eh) =
-                                transform_c.original_src_dims.get().unwrap_or_else(|| {
-                                    let s = canvas_c.borrow().size();
-                                    (s.width, s.height)
-                                });
-                            let cs = canvas_c.borrow().size();
-                            let canvas_pix =
-                                crop_from_extension(pix, off_x, off_y, ew, eh, cs.width, cs.height);
-                            let mut canvas = canvas_c.borrow_mut();
-                            let layer_id =
-                                canvas.layers().snapshot().get(idx).map(|l| l.id.clone());
-                            if let Err(e) = canvas.restore_layer(idx, &canvas_pix) {
-                                tracing::error!(error = %e, "transform cancel: restore_layer failed");
-                            }
-                            if let Some(id) = layer_id {
-                                extensions_c.borrow_mut().insert(
-                                    id,
-                                    LayerExtension {
-                                        offset_x: off_x,
-                                        offset_y: off_y,
-                                        width: ew,
-                                        height: eh,
-                                        pixels: pix.clone(),
-                                    },
-                                );
-                            }
-                        }
-                    } else {
-                        let pixels = transform_c.original_pixels.borrow().clone();
-                        if let Some(pixels) = pixels
-                            && let Err(e) = canvas_c.borrow_mut().restore_layer(idx, &pixels)
-                        {
-                            tracing::error!(error = %e, "transform cancel: restore_layer failed");
-                        }
-                    }
-                }
-                transform_c.clear();
-                transform_c.notify_changed();
-                paintable_c.set_transform_rect(None);
-                paintable_c.set_transform_source(None, 0, 0, None);
-                redraw.request();
-                if let Some(setter) = set_tool.borrow().as_ref() {
-                    setter(Tool::Cursor);
-                }
-            })
-        };
+        let crop_apply = build_crop_apply(&ctx);
 
-        // -- Transform apply ---------------------------------------------
-        let transform_apply: Rc<dyn Fn()> = {
-            let canvas_c = viewport.canvas();
-            let transform_c = transform.clone();
-            let paintable_c = viewport.paintable().clone();
-            let redraw = viewport.redraw_handle();
-            let set_tool = Rc::clone(set_active_tool_late);
-            let extensions_c = Rc::clone(&layer_extensions);
-            let cancel = Rc::clone(&transform_cancel);
-            let toaster = global.toaster.clone();
-            let history_for_xform = Rc::clone(&history);
-            let components_c = Rc::clone(&components);
-            let text_engine_c = Rc::clone(&global.text_engine);
-            Rc::new(move || {
-                // End any live GPU blend preview; the commit recomposites below.
-                canvas_c.borrow_mut().clear_transform_preview();
-                paintable_c.set_transform_gpu_preview(false);
-                // Text layer transform: bake the uniform scale into the font/box
-                // so the text re-shapes crisply, leaving only a residual
-                // anamorphic squish; the new centre/angle come from the rect.
-                let text_marker = transform_c.text.borrow().clone();
-                if let Some((layer_id, _orig_rect)) = text_marker {
-                    let (Some(new_rect), Some(idx)) =
-                        (transform_c.rect.get(), transform_c.original_layer_idx.get())
-                    else {
-                        return;
-                    };
-                    let kind = canvas_c.borrow().layers().kind(idx);
-                    if let Some(LayerKind::Text(content)) = kind {
-                        let cs = canvas_c.borrow().size();
-                        let natural = content.box_rect;
-                        let before_content = content.clone();
-                        // Total visible scale over the natural box, then baked in.
-                        let mut after_content = content;
-                        let sx = if natural.w.abs() > 1e-3 {
-                            new_rect.w / natural.w
-                        } else {
-                            after_content.scale.0
-                        };
-                        let sy = if natural.h.abs() > 1e-3 {
-                            new_rect.h / natural.h
-                        } else {
-                            after_content.scale.1
-                        };
-                        after_content.bake_transform(new_rect.cx, new_rect.cy, new_rect.angle, sx, sy);
+        let transform_cancel = build_transform_cancel(&ctx);
 
-                        let (before, after) = {
-                            let mut engine = text_engine_c.borrow_mut();
-                            let before = oxiedraw_core::text::render::render_text(
-                                &before_content, &mut engine, cs.width, cs.height,
-                            );
-                            let after = oxiedraw_core::text::render::render_text(
-                                &after_content, &mut engine, cs.width, cs.height,
-                            );
-                            (before, after)
-                        };
-                        if let Err(e) = canvas_c.borrow_mut().restore_layer(idx, &after) {
-                            tracing::error!(error = %e, "text transform apply: write failed");
-                        }
-                        canvas_c
-                            .borrow()
-                            .layers()
-                            .set_kind(idx, LayerKind::Text(after_content.clone()));
-                        if let Some(patch) =
-                            LayerPatch::from_full_diff(&before, &after, cs.width, cs.height)
-                        {
-                            history_for_xform.borrow_mut().record(HistoryAction::TextEdit {
-                                layer_id,
-                                patch,
-                                before_content: Box::new(before_content),
-                                after_content: Box::new(after_content),
-                            });
-                        }
-                    }
-                    transform_c.clear();
-                    transform_c.notify_changed();
-                    paintable_c.set_transform_rect(None);
-                    paintable_c.set_transform_source(None, 0, 0, None);
-                    redraw.request();
-                    if let Some(setter) = set_tool.borrow().as_ref() {
-                        setter(Tool::Cursor);
-                    }
-                    return;
-                }
-                // Component instance transform: re-render the master at the new
-                // placement (crisp) and update the layer's placement metadata.
-                // Bind the clone first so the borrow is released before clear().
-                let component_marker = transform_c.component.borrow().clone();
-                if let Some((component_id, orig_rect)) = component_marker {
-                    let Some(current_rect) = transform_c.rect.get() else {
-                        return;
-                    };
-                    let Some(idx) = transform_c.original_layer_idx.get() else {
-                        return;
-                    };
-                    let size = canvas_c.borrow().size();
-                    let filter = transform_c.filter.get();
-                    let new_placement = Placement::from_rect(current_rect);
-                    let (before, after, layer_id) = {
-                        let lib = components_c.borrow();
-                        let Some(comp) = lib.get(&component_id) else {
-                            return;
-                        };
-                        let before = comp.render_instance(
-                            size.width,
-                            size.height,
-                            Placement::from_rect(orig_rect),
-                            filter,
-                        );
-                        let after =
-                            comp.render_instance(size.width, size.height, new_placement, filter);
-                        let layer_id = canvas_c
-                            .borrow()
-                            .layers()
-                            .snapshot()
-                            .get(idx)
-                            .map(|l| l.id.clone());
-                        (before, after, layer_id)
-                    };
-                    if let Err(e) = canvas_c.borrow_mut().restore_layer(idx, &after) {
-                        tracing::error!(error = %e, "component transform apply: write failed");
-                    }
-                    canvas_c.borrow().layers().set_kind(
-                        idx,
-                        LayerKind::Component(ComponentInstance {
-                            component_id: component_id.clone(),
-                            placement: new_placement,
-                        }),
-                    );
-                    if let Some(layer_id) = layer_id
-                        && let Some(patch) =
-                            LayerPatch::from_full_diff(&before, &after, size.width, size.height)
-                    {
-                        history_for_xform.borrow_mut().record(
-                            HistoryAction::ComponentRetransform {
-                                layer_id,
-                                component_id,
-                                patch,
-                                before_placement: Placement::from_rect(orig_rect),
-                                after_placement: new_placement,
-                            },
-                        );
-                    }
-                    transform_c.clear();
-                    transform_c.notify_changed();
-                    paintable_c.set_transform_rect(None);
-                    paintable_c.set_transform_source(None, 0, 0, None);
-                    redraw.request();
-                    if let Some(setter) = set_tool.borrow().as_ref() {
-                        setter(Tool::Cursor);
-                    }
-                    return;
-                }
-                let Some(current_rect) = transform_c.rect.get() else {
-                    return;
-                };
-                let Some(original_rect) = transform_c.original_rect.get() else {
-                    return;
-                };
-                let Some(idx) = transform_c.original_layer_idx.get() else {
-                    return;
-                };
-                let pixels = transform_c.original_pixels.borrow().clone();
-                let Some(pixels) = pixels else { return };
-                let is_paste = transform_c.is_paste.get();
-
-                let canvas_size = canvas_c.borrow().size();
-                let (src_w, src_h) = transform_c
-                    .original_src_dims
-                    .get()
-                    .unwrap_or((canvas_size.width, canvas_size.height));
-
-                let gpu_result = canvas_c.borrow_mut().apply_layer_transform_gpu(
-                    idx,
-                    &pixels,
-                    src_w,
-                    src_h,
-                    original_rect,
-                    current_rect,
-                );
-                let (full_result, ext_x, ext_y, full_w, full_h) = match gpu_result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!(error = %e, "transform apply (GPU) failed");
-                        cancel();
-                        let msg = match &e {
-                            RendererError::TransformTooLarge { limit, .. } => format!(
-                                "Error: Can't transform the layer. Max layer texture size: {limit}"
-                            ),
-                            _ => format!("Error: transform failed: {e}"),
-                        };
-                        toaster.error(&msg);
-                        return;
-                    }
-                };
-                let layer_snapshot = canvas_c
-                    .borrow()
-                    .layers()
-                    .snapshot()
-                    .get(idx)
-                    .map(|l| (l.id.clone(), l.name.clone(), l.visible));
-                if let Some((id, name, visible)) = layer_snapshot {
-                    let is_outside = ext_x < 0
-                        || ext_y < 0
-                        || ext_x.saturating_add(full_w as i32) > canvas_size.width as i32
-                        || ext_y.saturating_add(full_h as i32) > canvas_size.height as i32;
-                    if is_outside {
-                        extensions_c.borrow_mut().insert(
-                            id.clone(),
-                            LayerExtension {
-                                offset_x: ext_x,
-                                offset_y: ext_y,
-                                width: full_w,
-                                height: full_h,
-                                pixels: full_result,
-                            },
-                        );
-                    } else {
-                        extensions_c.borrow_mut().remove(&id);
-                    }
-
-                    let after_px = canvas_c.borrow_mut().read_layer(idx).unwrap_or_default();
-                    if is_paste {
-                        history_for_xform.borrow_mut().record(HistoryAction::LayerAdd {
-                            idx,
-                            id,
-                            name,
-                            visible,
-                            layer_kind: LayerKind::Raster,
-                            blend: oxiedraw_core::document::BlendMode::Normal,
-                            opacity: 1.0,
-                            pixels: after_px,
-                        });
-                    } else {
-                        let before_canvas = if transform_c.original_src_offset.get().is_some() {
-                            let (off_x, off_y) =
-                                transform_c.original_src_offset.get().unwrap_or((0, 0));
-                            let (ew, eh) = transform_c
-                                .original_src_dims
-                                .get()
-                                .unwrap_or((canvas_size.width, canvas_size.height));
-                            crop_from_extension(
-                                &pixels,
-                                off_x,
-                                off_y,
-                                ew,
-                                eh,
-                                canvas_size.width,
-                                canvas_size.height,
-                            )
-                        } else {
-                            pixels.clone()
-                        };
-                        if let Some(patch) = LayerPatch::from_full_diff(
-                            &before_canvas,
-                            &after_px,
-                            canvas_size.width,
-                            canvas_size.height,
-                        ) {
-                            history_for_xform
-                                .borrow_mut()
-                                .record(HistoryAction::Transform { layer_id: id, patch });
-                        }
-                    }
-                }
-
-                transform_c.clear();
-                transform_c.notify_changed();
-                paintable_c.set_transform_rect(None);
-                paintable_c.set_transform_source(None, 0, 0, None);
-                redraw.request();
-                if let Some(setter) = set_tool.borrow().as_ref() {
-                    setter(Tool::Cursor);
-                }
-            })
-        };
+        let transform_apply = build_transform_apply(&ctx, &transform_cancel);
 
         // -- Tool options bar --------------------------------------------
         // The text controller doesn't exist yet (it needs `refresh_layers`),
@@ -764,59 +801,8 @@ impl DocumentSession {
             global.toaster.clone(),
         );
 
-        // -- select_layer_content (thumbnail swatch click) ---------------
-        let select_layer_content: Rc<dyn Fn(usize)> = {
-            let canvas = viewport.canvas();
-            let selection_state = selection.clone();
-            let canvas_size = viewport.canvas_size_handle();
-            let redraw = viewport.redraw_handle();
-            Rc::new(move |layer_idx: usize| {
-                {
-                    let mut c = canvas.borrow_mut();
-                    if let Err(e) = c.select_from_layer_alpha(layer_idx) {
-                        tracing::error!(error = %e, "select_from_layer_alpha failed");
-                        return;
-                    }
-                    selection_state.active.set(c.selection_active());
-                }
-                selection_state.source_layer.set(Some(layer_idx));
-                canvas::primary_drag::refresh_selection_contours(
-                    &canvas,
-                    &selection_state,
-                    &canvas_size,
-                );
-                selection_state.notify_changed();
-                redraw.request();
-            })
-        };
-
-        // -- select_folder_content (folder icon click) ------------------
-        // Selects the union of every layer inside a folder, mirroring the
-        // single-layer swatch behaviour above.
-        let select_folder_content: Rc<dyn Fn(Vec<usize>)> = {
-            let canvas = viewport.canvas();
-            let selection_state = selection.clone();
-            let canvas_size = viewport.canvas_size_handle();
-            let redraw = viewport.redraw_handle();
-            Rc::new(move |layer_indices: Vec<usize>| {
-                {
-                    let mut c = canvas.borrow_mut();
-                    if let Err(e) = c.select_from_layers_alpha(&layer_indices) {
-                        tracing::error!(error = %e, "select_from_layers_alpha failed");
-                        return;
-                    }
-                    selection_state.active.set(c.selection_active());
-                }
-                selection_state.source_layer.set(None);
-                canvas::primary_drag::refresh_selection_contours(
-                    &canvas,
-                    &selection_state,
-                    &canvas_size,
-                );
-                selection_state.notify_changed();
-                redraw.request();
-            })
-        };
+        let select_layer_content = build_select_layer_content(&ctx);
+        let select_folder_content = build_select_folder_content(&ctx);
 
         // Created early so the component edit closures can swap it out (the
         // dirty `*` marker is driven from it; the dirty timer is set up later).
