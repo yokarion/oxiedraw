@@ -5,6 +5,7 @@ use gpu_allocator::vulkan::Allocator;
 use crate::brush_engine::Dab;
 
 use super::RendererError;
+use super::pass::shader_module;
 use super::resources::Buffer;
 use super::vulkan::RING_FRAMES;
 
@@ -486,15 +487,6 @@ fn create_instance_buffer(
     )
 }
 
-fn shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, RendererError> {
-    assert!(bytes.len().is_multiple_of(4), "SPIR-V is 4-byte-aligned");
-    let mut code = vec![0u32; bytes.len() / 4];
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        code[i] = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    let info = vk::ShaderModuleCreateInfo::default().code(&code);
-    Ok(unsafe { device.create_shader_module(&info, None)? })
-}
 
 const fn instances_as_bytes(slice: &[DabInstance]) -> &[u8] {
     // SAFETY: DabInstance is repr(C) and contains only f32 fields, so it

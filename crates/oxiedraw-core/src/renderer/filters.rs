@@ -18,6 +18,7 @@ use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
 
 use super::RendererError;
+use super::pass::{FullscreenPass, nearest_clamp_sampler, pipeline_layout, replace_blend};
 use super::resources::Image;
 
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
@@ -161,7 +162,8 @@ impl FilterResources {
         let framebuffer_b =
             create_framebuffer(device, canvas_render_pass, canvas_extent, scratch_b.view)?;
 
-        let sampler = create_sampler(device)?;
+        // NEAREST so box-blur taps hit exact texels and the mask reads crisply.
+        let sampler = nearest_clamp_sampler(device)?;
         let input_set_layout = create_input_set_layout(device)?;
         let input_pool = create_input_pool(device)?;
         let input_sets = {
@@ -212,7 +214,7 @@ impl FilterResources {
         let jfa_flood =
             create_pipeline(device, pipeline_layout, jfa_render_pass, JFA_FLOOD_FRAG_SPV)?;
         let stroke_layout =
-            create_pipeline_layout_sized(device, input_set_layout, STROKE_PUSH_BYTES)?;
+            super::pass::pipeline_layout(device, input_set_layout, STROKE_PUSH_BYTES)?;
         let jfa_resolve =
             create_pipeline(device, stroke_layout, canvas_render_pass, JFA_RESOLVE_FRAG_SPV)?;
 
@@ -467,23 +469,7 @@ fn create_pipeline_layout(
     device: &Device,
     set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, RendererError> {
-    create_pipeline_layout_sized(device, set_layout, FILTER_PUSH_BYTES)
-}
-
-fn create_pipeline_layout_sized(
-    device: &Device,
-    set_layout: vk::DescriptorSetLayout,
-    push_bytes: u32,
-) -> Result<vk::PipelineLayout, RendererError> {
-    let set_layouts = [set_layout];
-    let push_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .offset(0)
-        .size(push_bytes)];
-    let info = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(&set_layouts)
-        .push_constant_ranges(&push_ranges);
-    Ok(unsafe { device.create_pipeline_layout(&info, None)? })
+    pipeline_layout(device, set_layout, FILTER_PUSH_BYTES)
 }
 
 fn create_pipeline(
@@ -492,78 +478,15 @@ fn create_pipeline(
     render_pass: vk::RenderPass,
     frag_spv: &[u8],
 ) -> Result<vk::Pipeline, RendererError> {
-    let vert = shader_module(device, COMPOSITE_VERT_SPV)?;
-    let frag = shader_module(device, frag_spv)?;
-
-    let entry = c"main";
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert)
-            .name(entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag)
-            .name(entry),
-    ];
-
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-    let raster = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0);
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
     // Replace, not blend: a filter pass fully overwrites its target.
-    let blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(false)
-        .color_write_mask(vk::ColorComponentFlags::RGBA)];
-    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-
-    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .stages(&stages)
-        .vertex_input_state(&vertex_input)
-        .input_assembly_state(&input_assembly)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&raster)
-        .multisample_state(&multisample)
-        .color_blend_state(&blend)
-        .dynamic_state(&dynamic)
-        .layout(layout)
-        .render_pass(render_pass)
-        .subpass(0);
-    let infos = [pipeline_info];
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &infos, None) }
-            .map_err(|(_, e)| RendererError::Vulkan(e))?;
-    unsafe {
-        device.destroy_shader_module(vert, None);
-        device.destroy_shader_module(frag, None);
+    FullscreenPass {
+        vert_spv: COMPOSITE_VERT_SPV,
+        frag_spv,
+        render_pass,
+        layout,
+        blend: replace_blend(),
     }
-    Ok(pipelines[0])
-}
-
-fn create_sampler(device: &Device) -> Result<vk::Sampler, RendererError> {
-    // NEAREST so box-blur taps hit exact texels and the mask is read crisply.
-    let info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::NEAREST)
-        .min_filter(vk::Filter::NEAREST)
-        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-        .min_lod(0.0)
-        .max_lod(0.0);
-    Ok(unsafe { device.create_sampler(&info, None)? })
+    .build(device)
 }
 
 /// A single-attachment render pass for `format`, resting in GENERAL like the
@@ -610,12 +533,3 @@ fn create_framebuffer(
     Ok(unsafe { device.create_framebuffer(&info, None)? })
 }
 
-fn shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, RendererError> {
-    assert!(bytes.len().is_multiple_of(4), "SPIR-V is 4-byte-aligned");
-    let mut code = vec![0u32; bytes.len() / 4];
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        code[i] = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    let info = vk::ShaderModuleCreateInfo::default().code(&code);
-    Ok(unsafe { device.create_shader_module(&info, None)? })
-}

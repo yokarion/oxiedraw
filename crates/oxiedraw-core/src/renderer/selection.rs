@@ -21,6 +21,9 @@ use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
 
 use super::RendererError;
+use super::pass::{
+    FullscreenPass, allocate_sampler_set, linear_clamp_sampler, pipeline_layout, sampler_set_layout,
+};
 use super::resources::Image;
 use super::targets::ImageTarget;
 
@@ -127,25 +130,25 @@ impl SelectionResources {
         let mask_target = ImageTarget::new(device, format, canvas_extent, mask.view)?;
         let edges_target = ImageTarget::new(device, format, edges_extent, edges.view)?;
 
-        let sampler = create_sampler(device)?;
-        let descriptor_set_layout = create_descriptor_set_layout(device)?;
+        let sampler = linear_clamp_sampler(device)?;
+        let descriptor_set_layout = sampler_set_layout(device, 1)?;
         let descriptor_pool = create_descriptor_pool(device)?;
-        let scratch_descriptor_set = allocate_and_update_set(
+        let scratch_descriptor_set = allocate_sampler_set(
             device,
             descriptor_pool,
             descriptor_set_layout,
-            scratch.view,
+            &[scratch.view],
             sampler,
         )?;
-        let mask_descriptor_set = allocate_and_update_set(
+        let mask_descriptor_set = allocate_sampler_set(
             device,
             descriptor_pool,
             descriptor_set_layout,
-            mask.view,
+            &[mask.view],
             sampler,
         )?;
 
-        let blend_layout = create_blend_pipeline_layout(device, descriptor_set_layout)?;
+        let blend_layout = pipeline_layout(device, descriptor_set_layout, 0)?;
         let blend_pipelines = [
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Replace)?,
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Add)?,
@@ -153,7 +156,8 @@ impl SelectionResources {
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Intersect)?,
         ];
 
-        let edges_layout = create_edges_pipeline_layout(device, descriptor_set_layout)?;
+        // 8 bytes of push data: the edge-detect texel step.
+        let edges_layout = pipeline_layout(device, descriptor_set_layout, 8)?;
         let edges_pipeline = create_edges_pipeline(device, edges_layout, edges_target.render_pass)?;
 
         Ok(Self {
@@ -253,16 +257,6 @@ impl BlendMode {
     }
 }
 
-fn create_descriptor_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, RendererError> {
-    let bindings = [vk::DescriptorSetLayoutBinding::default()
-        .binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .descriptor_count(1)
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    Ok(unsafe { device.create_descriptor_set_layout(&info, None)? })
-}
-
 fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, RendererError> {
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
@@ -272,69 +266,6 @@ fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, Rendere
         .pool_sizes(&sizes)
         .max_sets(2);
     Ok(unsafe { device.create_descriptor_pool(&info, None)? })
-}
-
-fn allocate_and_update_set(
-    device: &Device,
-    pool: vk::DescriptorPool,
-    layout: vk::DescriptorSetLayout,
-    view: vk::ImageView,
-    sampler: vk::Sampler,
-) -> Result<vk::DescriptorSet, RendererError> {
-    let layouts = [layout];
-    let info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(pool)
-        .set_layouts(&layouts);
-    let set = unsafe { device.allocate_descriptor_sets(&info)? }[0];
-
-    let image_info = [vk::DescriptorImageInfo::default()
-        .image_view(view)
-        .image_layout(vk::ImageLayout::GENERAL)
-        .sampler(sampler)];
-    let writes = [vk::WriteDescriptorSet::default()
-        .dst_set(set)
-        .dst_binding(0)
-        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-        .image_info(&image_info)];
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
-    Ok(set)
-}
-
-fn create_sampler(device: &Device) -> Result<vk::Sampler, RendererError> {
-    let info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-        .min_lod(0.0)
-        .max_lod(0.0);
-    Ok(unsafe { device.create_sampler(&info, None)? })
-}
-
-fn create_blend_pipeline_layout(
-    device: &Device,
-    set_layout: vk::DescriptorSetLayout,
-) -> Result<vk::PipelineLayout, RendererError> {
-    let set_layouts = [set_layout];
-    let info = vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts);
-    Ok(unsafe { device.create_pipeline_layout(&info, None)? })
-}
-
-fn create_edges_pipeline_layout(
-    device: &Device,
-    set_layout: vk::DescriptorSetLayout,
-) -> Result<vk::PipelineLayout, RendererError> {
-    let set_layouts = [set_layout];
-    let push_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .offset(0)
-        .size(8)];
-    let info = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(&set_layouts)
-        .push_constant_ranges(&push_ranges);
-    Ok(unsafe { device.create_pipeline_layout(&info, None)? })
 }
 
 fn create_blend_pipeline(
@@ -379,69 +310,12 @@ fn build_fullscreen_pipeline(
     frag_spv: &[u8],
     blend_attachment: vk::PipelineColorBlendAttachmentState,
 ) -> Result<vk::Pipeline, RendererError> {
-    let vert = shader_module(device, vert_spv)?;
-    let frag = shader_module(device, frag_spv)?;
-
-    let entry = c"main";
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert)
-            .name(entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag)
-            .name(entry),
-    ];
-
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-    let raster = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0);
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-    let blend_attachments = [blend_attachment];
-    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-
-    let info = vk::GraphicsPipelineCreateInfo::default()
-        .stages(&stages)
-        .vertex_input_state(&vertex_input)
-        .input_assembly_state(&input_assembly)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&raster)
-        .multisample_state(&multisample)
-        .color_blend_state(&blend)
-        .dynamic_state(&dynamic)
-        .layout(layout)
-        .render_pass(render_pass)
-        .subpass(0);
-    let infos = [info];
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &infos, None) }
-            .map_err(|(_, e)| RendererError::Vulkan(e))?;
-    unsafe {
-        device.destroy_shader_module(vert, None);
-        device.destroy_shader_module(frag, None);
+    FullscreenPass {
+        vert_spv,
+        frag_spv,
+        render_pass,
+        layout,
+        blend: blend_attachment,
     }
-    Ok(pipelines[0])
-}
-
-fn shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, RendererError> {
-    assert!(bytes.len().is_multiple_of(4), "SPIR-V is 4-byte-aligned");
-    let mut code = vec![0u32; bytes.len() / 4];
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        code[i] = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    let info = vk::ShaderModuleCreateInfo::default().code(&code);
-    Ok(unsafe { device.create_shader_module(&info, None)? })
+    .build(device)
 }

@@ -1,12 +1,21 @@
+//! Composites the stroke buffer (R8) onto the canvas (sRGB) at a given
+//! tint + opacity, plus the eraser variant that punches coverage back out.
+
 use ash::{Device, vk};
 
 use super::RendererError;
+use super::pass::{
+    FullscreenPass, allocate_sampler_set, dst_out_blend, linear_clamp_sampler, over_blend,
+    pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
+};
 
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const COMPOSITE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.frag.spv"));
 
-/// Composites the stroke buffer (R8) onto the canvas (sRGB) at a given
-/// tint + opacity. Fullscreen triangle, premultiplied-alpha OVER blend.
+/// vec4 tint + one float opacity.
+const COMPOSITE_PUSH_BYTES: u32 = 20;
+
+/// Fullscreen triangle, premultiplied-alpha OVER blend.
 pub(super) struct CompositePipeline {
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
@@ -27,18 +36,28 @@ impl CompositePipeline {
         stroke_image_view: vk::ImageView,
         selection_image_view: vk::ImageView,
     ) -> Result<Self, RendererError> {
-        let descriptor_set_layout = create_descriptor_set_layout(device)?;
-        let layout = create_pipeline_layout(device, descriptor_set_layout)?;
-        let pipeline = create_pipeline(device, layout, canvas_render_pass, over_blend())?;
-        let erase_pipeline = create_pipeline(device, layout, canvas_render_pass, dst_out_blend())?;
-        let sampler = create_sampler(device)?;
-        let descriptor_pool = create_descriptor_pool(device)?;
-        let descriptor_set = allocate_and_update_descriptor_set(
+        let descriptor_set_layout = sampler_set_layout(device, 2)?;
+        let layout = pipeline_layout(device, descriptor_set_layout, COMPOSITE_PUSH_BYTES)?;
+
+        let mut pass = FullscreenPass {
+            vert_spv: COMPOSITE_VERT_SPV,
+            frag_spv: COMPOSITE_FRAG_SPV,
+            render_pass: canvas_render_pass,
+            layout,
+            blend: over_blend(),
+        };
+        let pipeline = pass.build(device)?;
+        pass.blend = dst_out_blend();
+        let erase_pipeline = pass.build(device)?;
+
+        // Linear filtering on the stroke buffer.
+        let sampler = linear_clamp_sampler(device)?;
+        let descriptor_pool = sampler_descriptor_pool(device, 2)?;
+        let descriptor_set = allocate_sampler_set(
             device,
             descriptor_pool,
             descriptor_set_layout,
-            stroke_image_view,
-            selection_image_view,
+            &[stroke_image_view, selection_image_view],
             sampler,
         )?;
 
@@ -65,209 +84,4 @@ impl CompositePipeline {
             device.destroy_sampler(self.sampler, None);
         }
     }
-}
-
-fn create_descriptor_set_layout(device: &Device) -> Result<vk::DescriptorSetLayout, RendererError> {
-    let bindings = [
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-        vk::DescriptorSetLayoutBinding::default()
-            .binding(1)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-    ];
-    let info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
-    Ok(unsafe { device.create_descriptor_set_layout(&info, None)? })
-}
-
-fn create_pipeline_layout(
-    device: &Device,
-    set_layout: vk::DescriptorSetLayout,
-) -> Result<vk::PipelineLayout, RendererError> {
-    let set_layouts = [set_layout];
-    let push_ranges = [vk::PushConstantRange::default()
-        .stage_flags(vk::ShaderStageFlags::FRAGMENT)
-        .offset(0)
-        .size(20)];
-    let info = vk::PipelineLayoutCreateInfo::default()
-        .set_layouts(&set_layouts)
-        .push_constant_ranges(&push_ranges);
-    Ok(unsafe { device.create_pipeline_layout(&info, None)? })
-}
-
-fn create_pipeline(
-    device: &Device,
-    layout: vk::PipelineLayout,
-    render_pass: vk::RenderPass,
-    blend_attachment: vk::PipelineColorBlendAttachmentState,
-) -> Result<vk::Pipeline, RendererError> {
-    let vert = shader_module(device, COMPOSITE_VERT_SPV)?;
-    let frag = shader_module(device, COMPOSITE_FRAG_SPV)?;
-
-    let entry = c"main";
-    let stages = [
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::VERTEX)
-            .module(vert)
-            .name(entry),
-        vk::PipelineShaderStageCreateInfo::default()
-            .stage(vk::ShaderStageFlags::FRAGMENT)
-            .module(frag)
-            .name(entry),
-    ];
-
-    // No vertex input - verts come from gl_VertexIndex.
-    let vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
-
-    let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
-        .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
-
-    let viewport_state = vk::PipelineViewportStateCreateInfo::default()
-        .viewport_count(1)
-        .scissor_count(1);
-
-    let raster = vk::PipelineRasterizationStateCreateInfo::default()
-        .polygon_mode(vk::PolygonMode::FILL)
-        .cull_mode(vk::CullModeFlags::NONE)
-        .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
-        .line_width(1.0);
-
-    let multisample = vk::PipelineMultisampleStateCreateInfo::default()
-        .rasterization_samples(vk::SampleCountFlags::TYPE_1);
-
-    let blend_attachments = [blend_attachment.color_write_mask(vk::ColorComponentFlags::RGBA)];
-    let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&blend_attachments);
-
-    let dyn_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
-    let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dyn_states);
-
-    let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
-        .stages(&stages)
-        .vertex_input_state(&vertex_input)
-        .input_assembly_state(&input_assembly)
-        .viewport_state(&viewport_state)
-        .rasterization_state(&raster)
-        .multisample_state(&multisample)
-        .color_blend_state(&blend)
-        .dynamic_state(&dynamic)
-        .layout(layout)
-        .render_pass(render_pass)
-        .subpass(0);
-    let infos = [pipeline_info];
-    let pipelines =
-        unsafe { device.create_graphics_pipelines(vk::PipelineCache::null(), &infos, None) }
-            .map_err(|(_, e)| RendererError::Vulkan(e))?;
-
-    unsafe {
-        device.destroy_shader_module(vert, None);
-        device.destroy_shader_module(frag, None);
-    }
-
-    Ok(pipelines[0])
-}
-
-/// Premultiplied OVER: out = src + dst * (1 - src.a). Same blend as the
-/// dab and layer-composite pipelines.
-fn over_blend() -> vk::PipelineColorBlendAttachmentState {
-    vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::ONE)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ONE)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .alpha_blend_op(vk::BlendOp::ADD)
-}
-
-/// DST_OUT: out = dst * (1 - src.a). The shader's premultiplied src color
-/// is ignored (src factor 0); only its alpha (coverage * opacity) matters,
-/// scaling the target down. This is the eraser's compositing.
-fn dst_out_blend() -> vk::PipelineColorBlendAttachmentState {
-    vk::PipelineColorBlendAttachmentState::default()
-        .blend_enable(true)
-        .src_color_blend_factor(vk::BlendFactor::ZERO)
-        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .color_blend_op(vk::BlendOp::ADD)
-        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
-        .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
-        .alpha_blend_op(vk::BlendOp::ADD)
-}
-
-fn create_sampler(device: &Device) -> Result<vk::Sampler, RendererError> {
-    // Linear filtering on the stroke buffer; clamp-to-edge so UVs at
-    // the image border don't pull garbage from outside.
-    let info = vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-        .min_lod(0.0)
-        .max_lod(0.0);
-    Ok(unsafe { device.create_sampler(&info, None)? })
-}
-
-fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, RendererError> {
-    let sizes = [vk::DescriptorPoolSize {
-        ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 2,
-    }];
-    let info = vk::DescriptorPoolCreateInfo::default()
-        .pool_sizes(&sizes)
-        .max_sets(1);
-    Ok(unsafe { device.create_descriptor_pool(&info, None)? })
-}
-
-fn allocate_and_update_descriptor_set(
-    device: &Device,
-    pool: vk::DescriptorPool,
-    layout: vk::DescriptorSetLayout,
-    stroke_view: vk::ImageView,
-    selection_view: vk::ImageView,
-    sampler: vk::Sampler,
-) -> Result<vk::DescriptorSet, RendererError> {
-    let layouts = [layout];
-    let info = vk::DescriptorSetAllocateInfo::default()
-        .descriptor_pool(pool)
-        .set_layouts(&layouts);
-    let set = unsafe { device.allocate_descriptor_sets(&info)? }[0];
-
-    let stroke_info = [vk::DescriptorImageInfo::default()
-        .image_view(stroke_view)
-        .image_layout(vk::ImageLayout::GENERAL)
-        .sampler(sampler)];
-    let selection_info = [vk::DescriptorImageInfo::default()
-        .image_view(selection_view)
-        .image_layout(vk::ImageLayout::GENERAL)
-        .sampler(sampler)];
-    let writes = [
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(0)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&stroke_info),
-        vk::WriteDescriptorSet::default()
-            .dst_set(set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-            .image_info(&selection_info),
-    ];
-    unsafe { device.update_descriptor_sets(&writes, &[]) };
-
-    Ok(set)
-}
-
-fn shader_module(device: &Device, bytes: &[u8]) -> Result<vk::ShaderModule, RendererError> {
-    assert!(bytes.len().is_multiple_of(4), "SPIR-V is 4-byte-aligned");
-    let mut code = vec![0u32; bytes.len() / 4];
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
-        code[i] = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-    }
-    let info = vk::ShaderModuleCreateInfo::default().code(&code);
-    Ok(unsafe { device.create_shader_module(&info, None)? })
 }

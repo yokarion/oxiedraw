@@ -126,6 +126,7 @@ mod gradient_overlay;
 mod instance;
 mod layers;
 mod mask;
+mod pass;
 mod pattern_atlas;
 mod present_convert;
 mod resources;
