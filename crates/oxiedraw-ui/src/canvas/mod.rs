@@ -43,6 +43,9 @@ const DEFAULT_FIT_RATIO: f64 = 0.5;
 /// Widget pixels of vertical drag that change the zoom by one octave
 /// (factor of 2) during a Ctrl+middle-drag zoom, Krita-style.
 const ZOOM_DRAG_OCTAVE_PX: f64 = 150.0;
+/// Multiplier applied to touchpad two-finger scroll deltas (surface unit,
+/// already pixel-scaled) when panning the canvas.
+const TOUCHPAD_PAN_SPEED: f32 = 1.0;
 
 /// Which navigation gesture (if any) the middle-mouse drag is currently
 /// performing. Drives both the gesture handlers and the cursor that the
@@ -104,6 +107,9 @@ pub(crate) struct Viewport {
     nav_zoom_start: Rc<Cell<f32>>,
     /// Widget-space point the zoom drag pivots around (the drag origin).
     nav_anchor: Rc<Cell<Point>>,
+    /// Zoom factor captured when a touchpad pinch-zoom gesture begins, so the
+    /// gesture's cumulative scale maps to an absolute zoom level.
+    pinch_zoom_start: Rc<Cell<f32>>,
     centered: Rc<Cell<bool>>,
     canvas: Rc<RefCell<Canvas>>,
     paintable: CanvasPaintable,
@@ -169,11 +175,17 @@ impl RenderPump {
                 me.installed.set(false);
                 return gtk::glib::ControlFlow::Break;
             }
-            // The tick alone keeps the clock hot, so an unchanged frame can skip
-            // the present instead of re-importing the dmabuf for identical pixels.
             let changed = me.canvas.borrow().present_would_redraw();
             if changed {
                 present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
+            } else {
+                // Canvas pixels are unchanged - a pan/zoom that only moves the view,
+                // or a gap between stylus event bursts. Skip the costly dmabuf
+                // re-import, but still repaint so the frame clock stays hot and the
+                // view re-composites at the current transform every frame. Without
+                // this, a pan redraws only on input events, so a stylus's bursty
+                // delivery makes panning visibly jitter while a mouse stays smooth.
+                area.queue_draw();
             }
             gtk::glib::ControlFlow::Continue
         });
@@ -209,6 +221,7 @@ impl Viewport {
             nav: Rc::new(Cell::new(NavDrag::None)),
             nav_zoom_start: Rc::new(Cell::new(1.0)),
             nav_anchor: Rc::new(Cell::new(Point::ZERO)),
+            pinch_zoom_start: Rc::new(Cell::new(1.0)),
             centered: Rc::new(Cell::new(false)),
             canvas,
             paintable,
@@ -426,7 +439,8 @@ pub(crate) fn wire(
         picture, viewport, brush_engine, colors, tools, crop, transform, gradient, text_edit,
     );
     install_pan(picture, viewport);
-    install_zoom(picture, viewport);
+    install_scroll(picture, viewport);
+    install_pinch_zoom(picture, viewport);
     primary_drag::install_primary_drag(
         picture,
         viewport,
@@ -804,13 +818,39 @@ fn pan_increment(current_pan: Point, last_offset: Point, offset: Point) -> Point
     )
 }
 
-fn install_zoom(area: &gtk::Picture, viewport: &Viewport) {
-    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
+/// Scroll-wheel / touchpad two-finger scroll handling.
+///
+/// A mouse wheel (`ScrollUnit::Wheel`) zooms toward the cursor, as before.
+/// A touchpad (`ScrollUnit::Surface`) instead pans the canvas: horizontal
+/// scroll pans horizontally, vertical scroll pans vertically - matching the
+/// native two-finger scroll feel. Touchpad pinch-to-zoom is handled
+/// separately by [`install_pinch_zoom`].
+fn install_scroll(area: &gtk::Picture, viewport: &Viewport) {
+    let scroll = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::BOTH_AXES);
     let pan = Rc::clone(&viewport.pan);
     let zoom = Rc::clone(&viewport.zoom);
     let cursor = Rc::clone(&viewport.cursor);
     let paintable = viewport.paintable.clone();
-    scroll.connect_scroll(move |_, _dx, dy| {
+    scroll.connect_scroll(move |controller, dx, dy| {
+        if controller.unit() == gdk::ScrollUnit::Surface {
+            // Touchpad: pan opposite the finger delta so content tracks
+            // the fingers, exactly like scrolling a document.
+            #[allow(clippy::cast_possible_truncation)]
+            let delta = Point::new(dx as f32, dy as f32);
+            if delta.x == 0.0 && delta.y == 0.0 {
+                return glib::Propagation::Stop;
+            }
+            let p = pan.get();
+            let new_pan = Point::new(
+                delta.x.mul_add(-TOUCHPAD_PAN_SPEED, p.x),
+                delta.y.mul_add(-TOUCHPAD_PAN_SPEED, p.y),
+            );
+            pan.set(new_pan);
+            paintable.set_transform(new_pan.x, new_pan.y, zoom.get());
+            return glib::Propagation::Stop;
+        }
+
+        // Mouse wheel: zoom toward the cursor.
         let old_zoom = zoom.get();
         #[allow(clippy::cast_possible_truncation)]
         let new_zoom = (f64::from(old_zoom) * ZOOM_STEP.powf(-dy))
@@ -832,6 +872,59 @@ fn install_zoom(area: &gtk::Picture, viewport: &Viewport) {
         glib::Propagation::Stop
     });
     area.add_controller(scroll);
+}
+
+/// Touchpad pinch-to-zoom.
+///
+/// We read touchpad-pinch events through a `GtkEventControllerLegacy` rather
+/// than a `GtkGestureZoom`. A gesture participates in GTK's gesture-recognition
+/// arbitration and, sharing the widget with the drawing `GtkGestureDrag`, held
+/// back stylus motion events long enough to make the pen visibly jittery. The
+/// legacy controller just observes each event and lets everything it doesn't
+/// consume flow through untouched, so the stylus path is unaffected.
+///
+/// `pinch_scale()` is cumulative relative to the gesture start (1.0 at begin),
+/// mapped onto an absolute zoom pivoting around the last cursor position - the
+/// same anchor the mouse-wheel zoom uses.
+fn install_pinch_zoom(area: &gtk::Picture, viewport: &Viewport) {
+    let legacy = gtk::EventControllerLegacy::new();
+    let pan = Rc::clone(&viewport.pan);
+    let zoom = Rc::clone(&viewport.zoom);
+    let cursor = Rc::clone(&viewport.cursor);
+    let pinch_start = Rc::clone(&viewport.pinch_zoom_start);
+    let paintable = viewport.paintable.clone();
+    legacy.connect_event(move |_, event| {
+        if event.event_type() != gdk::EventType::TouchpadPinch {
+            return glib::Propagation::Proceed;
+        }
+        let Some(pinch) = event.downcast_ref::<gdk::TouchpadEvent>() else {
+            return glib::Propagation::Proceed;
+        };
+        match pinch.gesture_phase() {
+            gdk::TouchpadGesturePhase::Begin => pinch_start.set(zoom.get()),
+            gdk::TouchpadGesturePhase::Update => {
+                let old_zoom = zoom.get();
+                #[allow(clippy::cast_possible_truncation)]
+                let new_zoom = (f64::from(pinch_start.get()) * pinch.pinch_scale())
+                    .clamp(f64::from(MIN_ZOOM), f64::from(MAX_ZOOM)) as f32;
+                if (new_zoom - old_zoom).abs() >= f32::EPSILON {
+                    let c = cursor.get();
+                    let p = pan.get();
+                    let ratio = new_zoom / old_zoom;
+                    let new_pan = Point::new(
+                        (c.x - p.x).mul_add(-ratio, c.x),
+                        (c.y - p.y).mul_add(-ratio, c.y),
+                    );
+                    pan.set(new_pan);
+                    zoom.set(new_zoom);
+                    paintable.set_transform(new_pan.x, new_pan.y, new_zoom);
+                }
+            }
+            _ => {}
+        }
+        glib::Propagation::Stop
+    });
+    area.add_controller(legacy);
 }
 
 /// One-time hookup that sets the initial pan / zoom (centred fit) once
