@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
+use crate::filters::FilterSpec;
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,31 +45,27 @@ pub enum StrokeSoftness {
     Bilinear,
 }
 
-impl StrokeSoftness {
-    pub const ALL: [Self; 2] = [Self::Pixelated, Self::Bilinear];
+impl crate::enum_meta::EnumMeta for StrokeSoftness {
+    const ALL: &'static [Self] = &[Self::Pixelated, Self::Bilinear];
 
-    #[must_use]
-    pub const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Pixelated => "Pixelated",
             Self::Bilinear => "Bilinear",
         }
     }
-
-    #[must_use]
-    pub fn from_index(index: u32) -> Self {
-        Self::ALL.get(index as usize).copied().unwrap_or_default()
-    }
-
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn to_index(self) -> u32 {
-        Self::ALL.iter().position(|&s| s == self).unwrap_or(0) as u32
-    }
 }
 
 /// An effect kind with its parameters. Each variant maps to one GPU pass
 /// chain run against the accumulator.
+///
+/// Every variant except [`Self::Stroke`] reuses a destructive-filter pass
+/// chain - see [`Self::as_filter_spec`] for the mapping onto [`FilterSpec`].
+/// The two enums stay separate on purpose: `FilterSpec` is a `Copy` pass
+/// parameter with a CPU reference implementation, while `EffectKind` is the
+/// persisted, `Stroke`-carrying effect stored in the project file. They also
+/// brand differently (the destructive filter is "Hue/Saturation/Value", this
+/// adjustment is "Hue/Saturation/Brightness") even though the math is shared.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum EffectKind {
     /// Hue rotation (degrees), saturation multiplier, brightness multiplier.
@@ -116,6 +113,29 @@ impl EffectKind {
             Self::Invert => "Invert",
             Self::Sharpen { .. } => "Sharpen",
             Self::Stroke { .. } => "Stroke",
+        }
+    }
+
+    /// The destructive [`FilterSpec`] pass chain this effect reuses, or `None`
+    /// for [`Self::Stroke`] (which is a standalone SDF pass with no filter
+    /// equivalent). This is the single source of truth for the adjustment ->
+    /// filter mapping; the renderer and the CPU parity tests both go through it.
+    #[must_use]
+    pub const fn as_filter_spec(self) -> Option<FilterSpec> {
+        match self {
+            Self::HueSatBright {
+                hue_degrees,
+                saturation,
+                brightness,
+            } => Some(FilterSpec::Hsv {
+                hue_degrees,
+                saturation,
+                value: brightness,
+            }),
+            Self::Blur { radius_x, radius_y } => Some(FilterSpec::BoxBlur { radius_x, radius_y }),
+            Self::Invert => Some(FilterSpec::Invert),
+            Self::Sharpen { amount } => Some(FilterSpec::Sharpen { amount }),
+            Self::Stroke { .. } => None,
         }
     }
 
@@ -196,6 +216,7 @@ impl AdjustmentData {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::enum_meta::EnumMeta;
 
     #[test]
     fn effect_ids_are_unique() {
@@ -257,7 +278,7 @@ mod tests {
 
     #[test]
     fn softness_index_round_trips() {
-        for s in StrokeSoftness::ALL {
+        for s in StrokeSoftness::ALL.iter().copied() {
             assert_eq!(StrokeSoftness::from_index(s.to_index()), s);
         }
     }

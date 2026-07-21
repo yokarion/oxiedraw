@@ -43,8 +43,16 @@ pub enum CropAspectRatio {
     SixteenNine,
 }
 
-impl CropAspectRatio {
-    pub const fn display_name(self) -> &'static str {
+impl crate::enum_meta::EnumMeta for CropAspectRatio {
+    const ALL: &'static [Self] = &[
+        Self::Free,
+        Self::Square,
+        Self::FourThree,
+        Self::ThreeTwo,
+        Self::SixteenNine,
+    ];
+
+    fn label(self) -> &'static str {
         match self {
             Self::Free => "Free",
             Self::Square => "1 : 1",
@@ -53,7 +61,9 @@ impl CropAspectRatio {
             Self::SixteenNine => "16 : 9",
         }
     }
+}
 
+impl CropAspectRatio {
     pub fn ratio(self) -> Option<f32> {
         match self {
             Self::Free => None,

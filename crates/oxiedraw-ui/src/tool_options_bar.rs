@@ -410,39 +410,25 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     row
 }
 
+use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::tools::CropAspectRatio;
-const ASPECT_RATIOS: [CropAspectRatio; 5] = [
-    CropAspectRatio::Free,
-    CropAspectRatio::Square,
-    CropAspectRatio::FourThree,
-    CropAspectRatio::ThreeTwo,
-    CropAspectRatio::SixteenNine,
-];
 
 fn build_ratio_dropdown(crop: &CropState) -> gtk::DropDown {
-    let names: Vec<&str> = ASPECT_RATIOS.iter().map(|r| r.display_name()).collect();
-    let dropdown = gtk::DropDown::from_strings(&names);
-    let initial = ASPECT_RATIOS
-        .iter()
-        .position(|&r| r == crop.aspect_ratio.get())
-        .unwrap_or(0);
-    #[allow(clippy::cast_possible_truncation)]
-    dropdown.set_selected(initial as u32);
+    let dropdown = gtk::DropDown::from_strings(&CropAspectRatio::labels());
+    dropdown.set_selected(crop.aspect_ratio.get().to_index());
 
     let crop_c = crop.clone();
     dropdown.connect_selected_notify(move |d| {
-        let idx = d.selected() as usize;
-        if let Some(&ratio) = ASPECT_RATIOS.get(idx) {
-            crop_c.aspect_ratio.set(ratio);
-            // Constrain existing rect to the new ratio (keep width, adjust height).
-            if let (Some(r), Some(rx)) = (crop_c.rect.get(), ratio.ratio()) {
-                let n = r.normalized();
-                use oxiedraw_core::tools::CropRect;
-                crop_c
-                    .rect
-                    .set(Some(CropRect::new(n.x, n.y, n.w, n.w / rx)));
-                crop_c.notify_rect_changed();
-            }
+        let ratio = CropAspectRatio::from_index(d.selected());
+        crop_c.aspect_ratio.set(ratio);
+        // Constrain existing rect to the new ratio (keep width, adjust height).
+        if let (Some(r), Some(rx)) = (crop_c.rect.get(), ratio.ratio()) {
+            let n = r.normalized();
+            use oxiedraw_core::tools::CropRect;
+            crop_c
+                .rect
+                .set(Some(CropRect::new(n.x, n.y, n.w, n.w / rx)));
+            crop_c.notify_rect_changed();
         }
     });
     dropdown

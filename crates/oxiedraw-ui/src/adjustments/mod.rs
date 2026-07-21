@@ -23,6 +23,7 @@ use adw::prelude::*;
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::Color;
 use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind, StrokeSoftness};
+use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 
@@ -815,7 +816,7 @@ fn build_stroke_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_liv
     design_list.append(&boxed_list::row("Offset", &off, &[]));
 
     // Softness.
-    let labels: Vec<&str> = StrokeSoftness::ALL.iter().map(|s| s.label()).collect();
+    let labels = StrokeSoftness::labels();
     let dropdown = gtk::DropDown::from_strings(&labels);
     dropdown.set_selected(softness.to_index());
     {

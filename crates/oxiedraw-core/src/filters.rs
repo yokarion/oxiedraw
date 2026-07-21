@@ -12,8 +12,12 @@
 //! with no padding - the same layout [`crate::canvas::Canvas::read_layer`]
 //! returns.
 
-/// A filter and its parameters. Copyable so the live-preview path can
-/// stash the latest value behind a `Cell` without allocation.
+/// A destructive filter and its parameters. Copyable so the live-preview path
+/// can stash the latest value behind a `Cell` without allocation.
+///
+/// Non-destructive adjustment layers reuse these same pass chains: see
+/// [`EffectKind::as_filter_spec`](crate::effects::EffectKind::as_filter_spec),
+/// which maps an adjustment effect onto the matching `FilterSpec`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilterSpec {
     /// Hue rotation (degrees), saturation multiplier, value multiplier.

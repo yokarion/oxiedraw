@@ -13,6 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::document::{BlendMode, LayerGroup, LayerKind, LayerState, LayerTreeNode};
+use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 use relm4::gtk::cairo;
@@ -1606,7 +1607,7 @@ fn build_blend_controls(
         .spacing(TAB_SPACING)
         .build();
 
-    let labels: Vec<&str> = BlendMode::ALL.iter().map(|m| m.label()).collect();
+    let labels = BlendMode::labels();
     let mode_dropdown = gtk::DropDown::from_strings(&labels);
     mode_dropdown.set_hexpand(true);
     mode_dropdown.set_tooltip_text(Some("Blend mode of the selected layers"));

@@ -26,6 +26,7 @@ pub mod color;
 pub mod components;
 pub mod document;
 pub mod effects;
+pub mod enum_meta;
 pub mod export;
 pub mod filters;
 pub mod history;

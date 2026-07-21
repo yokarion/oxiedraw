@@ -130,27 +130,6 @@ pub(in crate::renderer) struct MaskEditPreview {
     pub(super) erase: bool,
 }
 
-/// Map an adjustment effect to the destructive [`FilterSpec`] pass chain it
-/// reuses. `Stroke` has no `FilterSpec` equivalent (it is a separate SDF pass)
-/// and returns `None`.
-fn effect_to_filter_spec(kind: EffectKind) -> Option<FilterSpec> {
-    match kind {
-        EffectKind::HueSatBright {
-            hue_degrees,
-            saturation,
-            brightness,
-        } => Some(FilterSpec::Hsv {
-            hue_degrees,
-            saturation,
-            value: brightness,
-        }),
-        EffectKind::Blur { radius_x, radius_y } => Some(FilterSpec::BoxBlur { radius_x, radius_y }),
-        EffectKind::Invert => Some(FilterSpec::Invert),
-        EffectKind::Sharpen { amount } => Some(FilterSpec::Sharpen { amount }),
-        EffectKind::Stroke { .. } => None,
-    }
-}
-
 impl VulkanRenderer {
     /// Set or clear the adjustment effect stack on slot `idx`. Pure GPU-side
     /// metadata (the effect parameters); the caller re-composites the canvas.
@@ -872,7 +851,7 @@ impl VulkanRenderer {
             if !effect.enabled {
                 continue;
             }
-            let Some(spec) = effect_to_filter_spec(effect.kind) else {
+            let Some(spec) = effect.kind.as_filter_spec() else {
                 if let EffectKind::Stroke { .. } = effect.kind {
                     self.cmd_apply_stroke(acc, effect.kind, mask_view, mask_img, cursor);
                 }
@@ -1296,7 +1275,7 @@ impl VulkanRenderer {
             if !effect.enabled {
                 continue;
             }
-            let Some(spec) = effect_to_filter_spec(effect.kind) else {
+            let Some(spec) = effect.kind.as_filter_spec() else {
                 if let EffectKind::Stroke { .. } = effect.kind {
                     self.apply_stroke_to(acc, effect.kind, mask_view, mask_img)?;
                 }

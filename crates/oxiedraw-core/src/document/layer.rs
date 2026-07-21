@@ -99,9 +99,11 @@ pub enum BlendMode {
     Overlay,
 }
 
-impl BlendMode {
-    /// Every mode in dropdown order.
-    pub const ALL: [Self; 6] = [
+impl crate::enum_meta::EnumMeta for BlendMode {
+    /// Every mode in dropdown order. The `to_index`/`from_index` UI conversions
+    /// come from [`EnumMeta`](crate::enum_meta::EnumMeta); `to_gpu` stays
+    /// separate so the UI order and the shader contract can change independently.
+    const ALL: &'static [Self] = &[
         Self::Normal,
         Self::Multiply,
         Self::Addition,
@@ -110,9 +112,7 @@ impl BlendMode {
         Self::Overlay,
     ];
 
-    /// Human-readable name for the UI dropdown.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
             Self::Multiply => "Multiply",
@@ -122,7 +122,9 @@ impl BlendMode {
             Self::Overlay => "Overlay",
         }
     }
+}
 
+impl BlendMode {
     /// Index passed to the blend shader's push constant.
     #[must_use]
     pub const fn to_gpu(self) -> u32 {
@@ -134,21 +136,6 @@ impl BlendMode {
             Self::Screen => 4,
             Self::Overlay => 5,
         }
-    }
-
-    /// Map a dropdown position back to a mode (clamped to `Normal`).
-    #[must_use]
-    pub fn from_index(index: u32) -> Self {
-        Self::ALL.get(index as usize).copied().unwrap_or(Self::Normal)
-    }
-
-    /// Position of this mode in `ALL` (its dropdown row). Paired with
-    /// `from_index`; kept separate from `to_gpu` so the UI order and the shader
-    /// contract can change independently.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn to_index(self) -> u32 {
-        Self::ALL.iter().position(|&m| m == self).unwrap_or(0) as u32
     }
 }
 
@@ -309,6 +296,7 @@ impl Layer {
 #[cfg(test)]
 mod tests {
     use super::{generate_layer_id, observe_layer_id, BlendMode};
+    use crate::enum_meta::EnumMeta;
 
     // After observing a loaded id, freshly generated ids must sort past it, so a
     // reopened document can never re-mint an id that already exists in the file.
@@ -329,7 +317,7 @@ mod tests {
     // independent of the shader contract (to_gpu).
     #[test]
     fn blend_mode_dropdown_index_round_trips() {
-        for mode in BlendMode::ALL {
+        for mode in BlendMode::ALL.iter().copied() {
             assert_eq!(BlendMode::from_index(mode.to_index()), mode);
         }
         // Normal is the clamp target for an out-of-range dropdown row.
