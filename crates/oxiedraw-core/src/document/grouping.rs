@@ -20,13 +20,9 @@ pub enum LayerTreeNode {
 pub struct LayerGroup {
     pub id: String,
     pub name: String,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::serde_defaults::default_true")]
     pub expanded: bool,
     pub children: Vec<LayerTreeNode>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl LayerTreeNode {

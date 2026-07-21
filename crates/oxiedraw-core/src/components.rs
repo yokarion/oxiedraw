@@ -14,10 +14,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::document::{BlendMode, Placement};
 
-fn default_opacity() -> f32 {
-    1.0
-}
-
 /// Default edit canvas for a freshly created component.
 pub const DEFAULT_COMPONENT_SIZE: Size = Size {
     width: 512,
@@ -54,7 +50,7 @@ pub struct ComponentLayer {
     /// shows in the flattened master (absent in older files -> Normal/1.0).
     #[serde(default)]
     pub blend: BlendMode,
-    #[serde(default = "default_opacity")]
+    #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
     pub pixels: Vec<u8>,
 }

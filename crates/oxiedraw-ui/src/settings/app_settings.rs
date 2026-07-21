@@ -33,13 +33,13 @@ pub(crate) struct AppSettings {
 pub(crate) struct SaveSettings {
     /// Keep the last N project versions next to the file as `<name>-1 ... -N`
     /// (`-N` newest), rotated on every manual save.
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) backups_enabled: bool,
     /// How many numbered backups to keep (`-1 ... -N`). Default 3.
     #[serde(default = "default_backup_count")]
     pub(crate) backup_count: usize,
     /// Autosave the open documents in the background. Default on.
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) autosave_enabled: bool,
     /// Seconds between autosaves. Default 300 (5 minutes).
     #[serde(default = "default_autosave_interval")]
@@ -93,11 +93,11 @@ impl Default for HistorySettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PixelViewSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) enabled: bool,
     #[serde(default = "default_nearest_threshold")]
     pub(crate) nearest_threshold: f32,
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) grid_enabled: bool,
     #[serde(default = "default_grid_threshold")]
     pub(crate) grid_threshold: f32,
@@ -123,23 +123,20 @@ impl Default for PixelViewSettings {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ShapeCorrectionSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) enabled: bool,
     #[serde(default = "default_trigger_delay_ms")]
     pub(crate) trigger_delay_ms: u32,
     #[serde(default = "default_animation_speed_ms")]
     pub(crate) animation_speed_ms: u32,
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) correct_line: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) correct_circle: bool,
-    #[serde(default = "default_true")]
+    #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) correct_rectangle: bool,
 }
 
-fn default_true() -> bool {
-    true
-}
 fn default_trigger_delay_ms() -> u32 {
     1000
 }

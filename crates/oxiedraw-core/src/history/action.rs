@@ -95,7 +95,7 @@ pub enum HistoryAction {
         /// duplicate of a blended layer keep its blend through undo/redo.
         #[serde(default = "default_blend")]
         blend: BlendMode,
-        #[serde(default = "default_opacity")]
+        #[serde(default = "crate::serde_defaults::default_opacity")]
         opacity: f32,
         /// Full-canvas BGRA8 pixels at time of add (e.g. paste content).
         pixels: Vec<u8>,
@@ -110,7 +110,7 @@ pub enum HistoryAction {
         /// Blend mode at removal time (absent in older files -> Normal).
         #[serde(default = "default_blend")]
         blend: BlendMode,
-        #[serde(default = "default_opacity")]
+        #[serde(default = "crate::serde_defaults::default_opacity")]
         opacity: f32,
         pixels: Vec<u8>,
     },
@@ -173,7 +173,7 @@ pub enum HistoryAction {
         layer_kind: LayerKind,
         #[serde(default = "default_blend")]
         blend: BlendMode,
-        #[serde(default = "default_opacity")]
+        #[serde(default = "crate::serde_defaults::default_opacity")]
         opacity: f32,
         pixels: Vec<u8>,
     },
@@ -188,7 +188,7 @@ pub enum HistoryAction {
         /// restore these.
         #[serde(default = "default_blend")]
         survivor_blend: BlendMode,
-        #[serde(default = "default_opacity")]
+        #[serde(default = "crate::serde_defaults::default_opacity")]
         survivor_opacity: f32,
         folded: Vec<FoldedLayer>,
     },
@@ -254,7 +254,7 @@ pub struct FoldedLayer {
     pub pixels: Vec<u8>,
     #[serde(default = "default_blend")]
     pub blend: BlendMode,
-    #[serde(default = "default_opacity")]
+    #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
 }
 
@@ -270,16 +270,12 @@ pub struct CropLayer {
     pub kind: LayerKind,
     #[serde(default = "default_blend")]
     pub blend: BlendMode,
-    #[serde(default = "default_opacity")]
+    #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
 }
 
 const fn default_blend() -> BlendMode {
     BlendMode::Normal
-}
-
-const fn default_opacity() -> f32 {
-    1.0
 }
 
 impl HistoryAction {

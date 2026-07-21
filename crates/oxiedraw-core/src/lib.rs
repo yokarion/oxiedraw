@@ -32,6 +32,7 @@ pub mod history;
 pub mod project;
 pub mod renderer;
 pub mod selection;
+pub mod serde_defaults;
 pub mod shape_correction;
 pub mod shapes;
 pub mod text;

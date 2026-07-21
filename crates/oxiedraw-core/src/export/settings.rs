@@ -79,7 +79,7 @@ impl ChromaSubsampling {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PngSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::serde_defaults::default_true")]
     pub transparency: bool,
     #[serde(default)]
     pub bit_depth: PngBitDepth,
@@ -129,7 +129,7 @@ pub struct WebpSettings {
     pub lossless: bool,
     #[serde(default = "default_webp_quality")]
     pub quality: u8,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::serde_defaults::default_true")]
     pub transparency: bool,
     #[serde(default = "default_webp_effort")]
     pub effort: u8,
@@ -152,7 +152,7 @@ pub struct AvifSettings {
     pub lossless: bool,
     #[serde(default = "default_avif_quality")]
     pub quality: u8,
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::serde_defaults::default_true")]
     pub transparency: bool,
     #[serde(default = "default_avif_speed")]
     pub speed: u8,
@@ -198,9 +198,6 @@ impl Default for ExportSettings {
     }
 }
 
-const fn default_true() -> bool {
-    true
-}
 const fn default_png_compression() -> u8 {
     6
 }

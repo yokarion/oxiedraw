@@ -48,12 +48,8 @@ pub struct LayerEntry {
     #[serde(default)]
     pub blend: BlendMode,
     /// Layer opacity in `0.0..=1.0`. Absent in pre-v5 files (defaults to 1.0).
-    #[serde(default = "default_opacity")]
+    #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
-}
-
-fn default_opacity() -> f32 {
-    1.0
 }
 
 /// One raster layer inside a component (in `components.json`). Its pixels live
@@ -66,7 +62,7 @@ pub struct ComponentLayerEntry {
     /// Composite blend mode + opacity. Absent in pre-v5 files (Normal / 1.0).
     #[serde(default)]
     pub blend: BlendMode,
-    #[serde(default = "default_opacity")]
+    #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
 }
 

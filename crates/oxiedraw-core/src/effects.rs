@@ -159,7 +159,7 @@ pub struct Effect {
     /// Stable id - survives reorders, keys history edits.
     pub id: String,
     /// Disabled effects stay in the stack but are skipped at composite time.
-    #[serde(default = "default_true")]
+    #[serde(default = "crate::serde_defaults::default_true")]
     pub enabled: bool,
     pub kind: EffectKind,
 }
@@ -173,10 +173,6 @@ impl Effect {
             kind,
         }
     }
-}
-
-const fn default_true() -> bool {
-    true
 }
 
 /// The payload of a `LayerKind::Adjustment`: an ordered effect stack applied
