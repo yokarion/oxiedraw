@@ -314,6 +314,7 @@ mod tests {
                 layer_tree: Vec::new(),
                 gradient: None,
                 view_rotation: 0.0,
+                guide: None,
             },
             layer_pixels: HashMap::new(),
             components: vec![ComponentData {

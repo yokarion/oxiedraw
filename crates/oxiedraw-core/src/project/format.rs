@@ -23,8 +23,10 @@ use crate::text::fonts::FontMeta;
 /// primary/secondary colours).
 /// v9 adds the persisted view rotation (`view_rotation`, radians), so reopening
 /// restores the canvas angle. Absent in pre-v9 files (loads at 0).
-pub const SCHEMA_VERSION: u32 = 9;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
+/// v10 adds the drawing guide (`guide`): symmetry / grid / perspective config.
+/// Absent in pre-v10 files (no guide).
+pub const SCHEMA_VERSION: u32 = 10;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -98,6 +100,9 @@ pub struct DocumentData {
     /// Persisted view rotation in radians. Absent (pre-v9) = 0 (no rotation).
     #[serde(default)]
     pub view_rotation: f32,
+    /// Drawing guide (symmetry / grid / perspective). Absent (pre-v10) = none.
+    #[serde(default)]
+    pub guide: Option<crate::guides::GuideConfig>,
 }
 
 /// The complete in-memory representation of an `.oxiedrawproj` archive.

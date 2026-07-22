@@ -45,6 +45,7 @@ pub fn snapshot(
     fonts: &FontRegistry,
     gradient: Option<crate::tools::GradientSettings>,
     view_rotation: f32,
+    guide: Option<crate::guides::GuideConfig>,
 ) -> Result<ProjectSnapshot, ProjectError> {
     let layer_snapshot = canvas.layers().snapshot();
     let canvas_size = canvas.size();
@@ -71,6 +72,7 @@ pub fn snapshot(
         layer_tree: canvas.layer_tree().to_vec(),
         gradient,
         view_rotation,
+        guide,
     };
 
     let mut layer_pixels = Vec::with_capacity(layer_snapshot.len());
@@ -257,9 +259,10 @@ pub fn save(
     fonts: &FontRegistry,
     gradient: Option<crate::tools::GradientSettings>,
     view_rotation: f32,
+    guide: Option<crate::guides::GuideConfig>,
     path: &Path,
 ) -> Result<(), ProjectError> {
-    let snap = snapshot(canvas, props, components, fonts, gradient, view_rotation)?;
+    let snap = snapshot(canvas, props, components, fonts, gradient, view_rotation, guide)?;
     write_snapshot(&snap, path, 0)
 }
 
@@ -403,6 +406,7 @@ mod tests {
             layer_tree: Vec::new(),
             gradient: None,
             view_rotation: 0.0,
+            guide: None,
         }
     }
 

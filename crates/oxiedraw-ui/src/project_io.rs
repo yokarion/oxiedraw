@@ -141,6 +141,7 @@ fn write_project(
         };
         let gradient = session.gradient.settings.borrow().clone();
         let view_rotation = session.viewport.rotation();
+        let guide = session.guide.config.borrow().clone();
         match project::save::snapshot(
             &mut canvas.borrow_mut(),
             &props,
@@ -148,6 +149,7 @@ fn write_project(
             &fonts,
             gradient,
             view_rotation,
+            guide,
         ) {
             Ok(s) => s,
             Err(e) => {

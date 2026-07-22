@@ -61,6 +61,10 @@ pub struct Canvas {
     /// flat. Used to scope adjustment layers to their enclosing folder at
     /// composite time and persisted with the document.
     layer_tree: Vec<LayerTreeNode>,
+    /// Active symmetry transforms pushed from the UI when a Drawing Guide with
+    /// Assisted Drawing is set. Each painted dab is reproduced across these
+    /// copies at stamp time. `None` = no reproduction.
+    active_symmetry: Option<crate::guides::Symmetry>,
 }
 
 impl Canvas {
@@ -89,6 +93,7 @@ impl Canvas {
             displayed_mask_idx: None,
             mask_view_id: None,
             layer_tree: Vec::new(),
+            active_symmetry: None,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -201,6 +206,18 @@ impl Canvas {
         self.renderer.set_stroke_buildup(buildup);
     }
 
+    /// Set (or clear) the symmetry transforms applied to subsequent strokes.
+    /// The UI pushes this from the active Drawing Guide config.
+    pub fn set_symmetry(&mut self, symmetry: Option<crate::guides::Symmetry>) {
+        self.active_symmetry = symmetry;
+    }
+
+    /// True when a symmetry reproduction is active.
+    #[must_use]
+    pub fn has_symmetry(&self) -> bool {
+        self.active_symmetry.is_some()
+    }
+
     /// Run `paint` with a [`PaintTarget`] that stamps dabs into the
     /// stroke buffer. Wraps each `BrushEngine::begin_stroke /
     /// push_sample / end_stroke` call.
@@ -208,7 +225,7 @@ impl Canvas {
     where
         F: FnOnce(&mut dyn PaintTarget),
     {
-        let mut adapter = StrokeStamp::new(&mut self.renderer);
+        let mut adapter = StrokeStamp::new(&mut self.renderer, self.active_symmetry.clone());
         paint(&mut adapter);
         let result = adapter.into_result();
         self.bump_version();
@@ -1063,7 +1080,7 @@ impl Canvas {
         }
 
         let (family, instances) = {
-            let mut batch = BatchStamp::new(&mut self.renderer);
+            let mut batch = BatchStamp::new(&mut self.renderer, self.active_symmetry.clone());
             paint(&mut batch);
             batch.into_result()?
         };

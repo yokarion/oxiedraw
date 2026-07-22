@@ -30,7 +30,7 @@ static SHAPE_SUBTOOLS: [Tool; 4] = [
     Tool::Shapes(ShapeTool::Triangle),
 ];
 
-static GROUPS: [ToolGroupSpec; 9] = [
+static GROUPS: [ToolGroupSpec; 10] = [
     ToolGroupSpec {
         name: "Cursor",
         subtools: &[Tool::Cursor],
@@ -75,6 +75,11 @@ static GROUPS: [ToolGroupSpec; 9] = [
         name: "Crop",
         subtools: &[Tool::Crop],
         action_id: Some("select-crop"),
+    },
+    ToolGroupSpec {
+        name: "Drawing Guide",
+        subtools: &[Tool::DrawingGuide],
+        action_id: Some("select-guide"),
     },
 ];
 

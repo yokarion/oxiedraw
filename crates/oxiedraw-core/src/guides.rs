@@ -1,0 +1,439 @@
+//! Drawing guides: symmetry, 2D grid, isometric, and perspective overlays.
+//!
+//! A [`GuideConfig`] is per-document state (persisted, schema v10). The
+//! Drawing Guide tool edits it live; once "Assisted Drawing" is on the guide
+//! keeps affecting brush strokes even after the tool is left, mirroring
+//! Procreate's committed guides.
+//!
+//! The symmetry assist is implemented as *dab expansion*: [`symmetry_dabs`]
+//! turns each painted point into its mirrored/rotated copies, so the stroke is
+//! reproduced in real time at the GPU dab level with no extra brush state.
+
+use std::cell::RefCell;
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::rc::Rc;
+
+use serde::{Deserialize, Serialize};
+
+use crate::enum_meta::EnumMeta;
+use oxiedraw_utils::geometry::Point;
+
+/// Which family of guide is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum GuideKind {
+    #[default]
+    Symmetry,
+    Grid2D,
+    Isometric,
+    Perspective,
+}
+
+impl EnumMeta for GuideKind {
+    const ALL: &'static [Self] =
+        &[Self::Symmetry, Self::Grid2D, Self::Isometric, Self::Perspective];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Symmetry => "Symmetry",
+            Self::Grid2D => "2D Grid",
+            Self::Isometric => "Isometric",
+            Self::Perspective => "Perspective",
+        }
+    }
+}
+
+/// Symmetry axis layout. Drives both the drawn guide lines and the set of
+/// reproduction transforms. `Axis` is a single mirror line (Procreate's
+/// Vertical and Horizontal are the same operation at different angles, so they
+/// are merged into one rotatable axis).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SymmetryMode {
+    #[default]
+    Axis,
+    Quadrant,
+    Radial,
+}
+
+impl EnumMeta for SymmetryMode {
+    const ALL: &'static [Self] = &[Self::Axis, Self::Quadrant, Self::Radial];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Axis => "Axis",
+            Self::Quadrant => "Quadrant",
+            Self::Radial => "Radial",
+        }
+    }
+}
+
+/// One symmetry group element applied about the guide origin. The identity
+/// (the real dab) is always painted separately, so this only enumerates the
+/// extra copies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SymElement {
+    /// Rotate the copy by `angle` radians about the origin.
+    Rotate { angle: f32 },
+    /// Reflect the copy across the line through the origin at `axis` radians.
+    Reflect { axis: f32 },
+}
+
+impl SymElement {
+    /// Map a painted point (and its dab orientation) to this copy. Returns the
+    /// transformed centre, the copy's rotation, and whether handedness flipped
+    /// (reflections flip - used to mirror asymmetric tips).
+    #[must_use]
+    pub fn apply(self, origin: Point, center: Point, rotation: f32) -> (Point, f32, bool) {
+        let dx = center.x - origin.x;
+        let dy = center.y - origin.y;
+        match self {
+            Self::Rotate { angle } => {
+                let (s, c) = angle.sin_cos();
+                let nx = c * dx - s * dy;
+                let ny = s * dx + c * dy;
+                (
+                    Point::new(origin.x + nx, origin.y + ny),
+                    rotation + angle,
+                    false,
+                )
+            }
+            Self::Reflect { axis } => {
+                // Reflect the offset across a line at `axis`: rotate into the
+                // line frame, flip Y, rotate back. Angle maps r -> 2*axis - r.
+                let (s, c) = (2.0 * axis).sin_cos();
+                let nx = c * dx + s * dy;
+                let ny = s * dx - c * dy;
+                (
+                    Point::new(origin.x + nx, origin.y + ny),
+                    2.0 * axis - rotation,
+                    true,
+                )
+            }
+        }
+    }
+}
+
+/// Resolved symmetry transform set for a live stroke, handed to the renderer
+/// stamp path so each painted dab is reproduced across every copy.
+#[derive(Debug, Clone)]
+pub struct Symmetry {
+    pub origin: Point,
+    pub elements: Vec<SymElement>,
+}
+
+impl Symmetry {
+    /// Build from a guide config, or `None` if it doesn't reproduce strokes.
+    #[must_use]
+    pub fn from_config(cfg: &GuideConfig) -> Option<Self> {
+        if !cfg.reproduces_strokes() {
+            return None;
+        }
+        let elements = symmetry_elements(cfg.symmetry, cfg.rotational, cfg.angle);
+        if elements.is_empty() {
+            return None;
+        }
+        Some(Self { origin: cfg.origin, elements })
+    }
+}
+
+/// The set of extra copies a symmetry mode produces. `angle` is the guide's
+/// primary axis orientation (radians). Mirror mode uses reflections; rotational
+/// mode replaces them with pure rotations of the same order.
+#[must_use]
+pub fn symmetry_elements(mode: SymmetryMode, rotational: bool, angle: f32) -> Vec<SymElement> {
+    match mode {
+        SymmetryMode::Axis => {
+            if rotational {
+                vec![SymElement::Rotate { angle: PI }]
+            } else {
+                vec![SymElement::Reflect { axis: angle }]
+            }
+        }
+        SymmetryMode::Quadrant => {
+            if rotational {
+                vec![
+                    SymElement::Rotate { angle: FRAC_PI_2 },
+                    SymElement::Rotate { angle: PI },
+                    SymElement::Rotate { angle: PI + FRAC_PI_2 },
+                ]
+            } else {
+                vec![
+                    SymElement::Reflect { axis: angle },
+                    SymElement::Reflect { axis: angle + FRAC_PI_2 },
+                    SymElement::Rotate { angle: PI },
+                ]
+            }
+        }
+        SymmetryMode::Radial => {
+            if rotational {
+                (1..8)
+                    .map(|k| SymElement::Rotate { angle: k as f32 * FRAC_PI_4 })
+                    .collect()
+            } else {
+                // Dihedral D4: 3 rotations + 4 reflections (8 segments total
+                // with the identity).
+                vec![
+                    SymElement::Rotate { angle: FRAC_PI_2 },
+                    SymElement::Rotate { angle: PI },
+                    SymElement::Rotate { angle: PI + FRAC_PI_2 },
+                    SymElement::Reflect { axis: angle },
+                    SymElement::Reflect { axis: angle + FRAC_PI_4 },
+                    SymElement::Reflect { axis: angle + FRAC_PI_2 },
+                    SymElement::Reflect { axis: angle + FRAC_PI_4 + FRAC_PI_2 },
+                ]
+            }
+        }
+    }
+}
+
+/// Orientations (radians) of the guide lines drawn through the origin for a
+/// symmetry mode. Used by the canvas overlay.
+#[must_use]
+pub fn symmetry_line_angles(mode: SymmetryMode, angle: f32) -> Vec<f32> {
+    match mode {
+        SymmetryMode::Axis => vec![angle],
+        SymmetryMode::Quadrant => vec![angle, angle + FRAC_PI_2],
+        SymmetryMode::Radial => vec![
+            angle,
+            angle + FRAC_PI_4,
+            angle + FRAC_PI_2,
+            angle + FRAC_PI_4 + FRAC_PI_2,
+        ],
+    }
+}
+
+/// Serde adapter for [`Point`] (which lives in the utils crate and has no
+/// serde derive). Stores it as a plain `[x, y]` pair.
+mod point_serde {
+    use super::Point;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[allow(clippy::trivially_copy_pass_by_ref)] // serde `with` requires &T
+    pub(super) fn serialize<S: Serializer>(p: &Point, s: S) -> Result<S::Ok, S::Error> {
+        [p.x, p.y].serialize(s)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Point, D::Error> {
+        let [x, y] = <[f32; 2]>::deserialize(d)?;
+        Ok(Point::new(x, y))
+    }
+}
+
+/// A perspective vanishing point in canvas-space coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct VanishingPoint {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl VanishingPoint {
+    #[must_use]
+    pub const fn new(x: f32, y: f32) -> Self {
+        Self { x, y }
+    }
+
+    #[must_use]
+    pub const fn point(self) -> Point {
+        Point::new(self.x, self.y)
+    }
+}
+
+/// Full per-document guide configuration. Serialized into `document.json` as
+/// the optional `guide` field (schema v10; absent = no guide).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GuideConfig {
+    pub kind: GuideKind,
+    pub symmetry: SymmetryMode,
+    /// Mirror (false) vs rotational (true) symmetry.
+    pub rotational: bool,
+    /// Drawing Assist: symmetry reproduces strokes; grid/perspective snap them.
+    pub assisted: bool,
+    /// Guide origin (position node) in canvas pixels.
+    #[serde(with = "point_serde")]
+    pub origin: Point,
+    /// Primary axis orientation in radians (rotation node).
+    pub angle: f32,
+    /// Line opacity, `0.0..=1.0`.
+    pub opacity: f32,
+    /// Line thickness in canvas pixels.
+    pub thickness: f32,
+    /// Cell size for the 2D grid / isometric guides, in canvas pixels.
+    pub grid_spacing: f32,
+    /// Number of lines fanned from the vanishing point in perspective mode.
+    #[serde(default = "default_perspective_rays")]
+    pub perspective_rays: u32,
+    /// Perspective vanishing points (1 to 3). Empty for other kinds.
+    #[serde(default)]
+    pub vanishing_points: Vec<VanishingPoint>,
+}
+
+fn default_perspective_rays() -> u32 {
+    12
+}
+
+impl GuideConfig {
+    /// A fresh guide centred on a `width` x `height` canvas.
+    #[must_use]
+    pub fn centered(width: u32, height: u32) -> Self {
+        let cx = width as f32 * 0.5;
+        let cy = height as f32 * 0.5;
+        Self {
+            kind: GuideKind::Symmetry,
+            symmetry: SymmetryMode::Axis,
+            rotational: false,
+            assisted: true,
+            origin: Point::new(cx, cy),
+            // A vertical mirror line (axis pointing straight up).
+            angle: FRAC_PI_2,
+            opacity: 0.9,
+            thickness: 2.0,
+            grid_spacing: 64.0,
+            perspective_rays: default_perspective_rays(),
+            vanishing_points: Vec::new(),
+        }
+    }
+
+    /// Reset only position and rotation to the canvas centre / default axis,
+    /// preserving mode (matches Procreate's node Reset).
+    pub fn reset_position(&mut self, width: u32, height: u32) {
+        self.origin = Point::new(width as f32 * 0.5, height as f32 * 0.5);
+        self.angle = FRAC_PI_2;
+    }
+
+    /// True when this guide reproduces (not just snaps) brush strokes.
+    #[must_use]
+    pub fn reproduces_strokes(&self) -> bool {
+        self.assisted && self.kind == GuideKind::Symmetry
+    }
+}
+
+/// Live, mutable guide state shared across the UI, plus change subscribers.
+/// Backed by `Rc<RefCell>` like [`crate::tools::CropState`]. Holds an entry
+/// snapshot so the tool's Cancel can restore the pre-edit config.
+#[derive(Clone)]
+pub struct GuideState {
+    pub config: Rc<RefCell<Option<GuideConfig>>>,
+    /// Snapshot taken when the Drawing Guide tool is entered, for Cancel.
+    pub entry_snapshot: Rc<RefCell<Option<GuideConfig>>>,
+    changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+}
+
+impl GuideState {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            config: Rc::new(RefCell::new(None)),
+            entry_snapshot: Rc::new(RefCell::new(None)),
+            changed: Rc::new(RefCell::new(Vec::new())),
+        }
+    }
+
+    pub fn notify_changed(&self) {
+        for cb in self.changed.borrow().iter() {
+            cb();
+        }
+    }
+
+    pub fn connect_changed(&self, cb: Box<dyn Fn()>) {
+        self.changed.borrow_mut().push(cb);
+    }
+
+    /// Mutate the config in place (creating nothing if absent) and notify.
+    pub fn update(&self, f: impl FnOnce(&mut GuideConfig)) {
+        if let Some(cfg) = self.config.borrow_mut().as_mut() {
+            f(cfg);
+        }
+        self.notify_changed();
+    }
+}
+
+impl Default for GuideState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: Point, b: Point) {
+        assert!((a.x - b.x).abs() < 1e-3 && (a.y - b.y).abs() < 1e-3, "{a:?} != {b:?}");
+    }
+
+    #[test]
+    fn vertical_axis_reflection_mirrors_x() {
+        // Axis at angle pi/2 is a vertical mirror line: reflects x about origin.
+        let els = symmetry_elements(SymmetryMode::Axis, false, FRAC_PI_2);
+        assert_eq!(els.len(), 1);
+        let origin = Point::new(100.0, 100.0);
+        let (p, _rot, flip) = els[0].apply(origin, Point::new(130.0, 100.0), 0.0);
+        approx(p, Point::new(70.0, 100.0));
+        assert!(flip);
+    }
+
+    #[test]
+    fn horizontal_axis_reflection_mirrors_y() {
+        // Axis at angle 0 is a horizontal mirror line: reflects y about origin.
+        let els = symmetry_elements(SymmetryMode::Axis, false, 0.0);
+        let origin = Point::new(100.0, 100.0);
+        let (p, _r, _f) = els[0].apply(origin, Point::new(100.0, 140.0), 0.0);
+        approx(p, Point::new(100.0, 60.0));
+    }
+
+    #[test]
+    fn quadrant_makes_three_copies() {
+        assert_eq!(symmetry_elements(SymmetryMode::Quadrant, false, 0.0).len(), 3);
+        assert_eq!(symmetry_elements(SymmetryMode::Quadrant, true, 0.0).len(), 3);
+    }
+
+    #[test]
+    fn radial_makes_seven_copies() {
+        assert_eq!(symmetry_elements(SymmetryMode::Radial, false, 0.0).len(), 7);
+        assert_eq!(symmetry_elements(SymmetryMode::Radial, true, 0.0).len(), 7);
+    }
+
+    #[test]
+    fn rotational_preserves_handedness() {
+        let els = symmetry_elements(SymmetryMode::Axis, true, FRAC_PI_2);
+        let (_p, _r, flip) = els[0].apply(Point::ZERO, Point::new(10.0, 5.0), 0.3);
+        assert!(!flip);
+    }
+
+    #[test]
+    fn centered_config_reproduces_when_assisted() {
+        let cfg = GuideConfig::centered(200, 100);
+        approx(cfg.origin, Point::new(100.0, 50.0));
+        assert!(cfg.reproduces_strokes());
+        let sym = Symmetry::from_config(&cfg).expect("assisted symmetry");
+        assert_eq!(sym.elements.len(), 1); // single axis mirror = one copy
+    }
+
+    #[test]
+    fn no_symmetry_when_assist_off_or_non_symmetry_kind() {
+        let mut cfg = GuideConfig::centered(10, 10);
+        cfg.assisted = false;
+        assert!(Symmetry::from_config(&cfg).is_none());
+        cfg.assisted = true;
+        cfg.kind = GuideKind::Grid2D;
+        assert!(Symmetry::from_config(&cfg).is_none());
+    }
+
+    #[test]
+    fn reset_position_recenters() {
+        let mut cfg = GuideConfig::centered(100, 100);
+        cfg.origin = Point::new(3.0, 7.0);
+        cfg.reset_position(80, 40);
+        approx(cfg.origin, Point::new(40.0, 20.0));
+    }
+
+    #[test]
+    fn config_round_trips_through_json() {
+        let mut cfg = GuideConfig::centered(64, 48);
+        cfg.symmetry = SymmetryMode::Radial;
+        cfg.rotational = true;
+        cfg.angle = 0.5;
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let back: GuideConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, back);
+    }
+}

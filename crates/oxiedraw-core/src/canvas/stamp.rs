@@ -1,5 +1,23 @@
 use crate::brush_engine::{BrushFamily, Dab, PaintTarget};
+use crate::guides::Symmetry;
 use crate::renderer::{DabFamily, DabInstance, RendererError, VulkanRenderer};
+
+/// Expand one brush dab into its instance plus every symmetry copy, appending
+/// to `out`. Reflected copies reuse the dab's shape with a mirrored rotation;
+/// asymmetric tips mirror approximately (like Procreate).
+fn expand_dab(dab: &Dab, symmetry: Option<&Symmetry>, out: &mut Vec<DabInstance>) {
+    let base = DabInstance::from_dab(dab);
+    out.push(base);
+    if let Some(sym) = symmetry {
+        for el in &sym.elements {
+            let (p, rotation, _flip) = el.apply(sym.origin, dab.center, dab.rotation);
+            let mut copy = base;
+            copy.center = [p.x, p.y];
+            copy.rotation = rotation;
+            out.push(copy);
+        }
+    }
+}
 
 /// `PaintTarget` adapter that funnels brush dabs into the Vulkan stroke
 /// buffer via `stamp_mask`.
@@ -18,15 +36,17 @@ pub(super) struct StrokeStamp<'a> {
     error: Option<RendererError>,
     scratch: Vec<DabInstance>,
     family: DabFamily,
+    symmetry: Option<Symmetry>,
 }
 
 impl<'a> StrokeStamp<'a> {
-    pub(super) const fn new(renderer: &'a mut VulkanRenderer) -> Self {
+    pub(super) const fn new(renderer: &'a mut VulkanRenderer, symmetry: Option<Symmetry>) -> Self {
         Self {
             renderer,
             error: None,
             scratch: Vec::new(),
             family: DabFamily::SoftRound,
+            symmetry,
         }
     }
 
@@ -57,7 +77,7 @@ impl PaintTarget for StrokeStamp<'_> {
         self.scratch.clear();
         self.scratch.reserve(dabs.len());
         for dab in dabs {
-            self.scratch.push(DabInstance::from_dab(dab));
+            expand_dab(dab, self.symmetry.as_ref(), &mut self.scratch);
         }
         if let Err(e) = self.renderer.stamp_mask(self.family, &self.scratch) {
             self.error = Some(e);
@@ -75,15 +95,17 @@ pub(super) struct BatchStamp<'a> {
     error: Option<RendererError>,
     family: DabFamily,
     instances: Vec<DabInstance>,
+    symmetry: Option<Symmetry>,
 }
 
 impl<'a> BatchStamp<'a> {
-    pub(super) const fn new(renderer: &'a mut VulkanRenderer) -> Self {
+    pub(super) const fn new(renderer: &'a mut VulkanRenderer, symmetry: Option<Symmetry>) -> Self {
         Self {
             renderer,
             error: None,
             family: DabFamily::SoftRound,
             instances: Vec::new(),
+            symmetry,
         }
     }
 
@@ -130,7 +152,7 @@ impl PaintTarget for BatchStamp<'_> {
         }
         self.instances.reserve(dabs.len());
         for dab in dabs {
-            self.instances.push(DabInstance::from_dab(dab));
+            expand_dab(dab, self.symmetry.as_ref(), &mut self.instances);
         }
     }
 }

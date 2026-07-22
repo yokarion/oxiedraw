@@ -19,6 +19,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::ColorState;
 use oxiedraw_core::document::LayerState;
 use oxiedraw_core::renderer::DmabufDescriptor;
+use oxiedraw_core::guides::GuideState;
 use oxiedraw_core::tools::{
     CropRect, CropState, FillState, FillTool, GradientState, SelectionState, ShapeState, Tool,
     ToolState, TransformState,
@@ -579,6 +580,11 @@ impl Viewport {
         widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation)
     }
 
+    /// The canvas `Picture` widget, once wired. Used to read theme colours.
+    pub(crate) fn picture_widget(&self) -> Option<gtk::Picture> {
+        self.picture.borrow().clone()
+    }
+
     fn zoom_toward(&self, new_zoom: f32) {
         let old_zoom = self.zoom.get();
         #[allow(clippy::cast_precision_loss)]
@@ -613,6 +619,7 @@ pub(crate) fn wire(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    guide: &GuideState,
     history: &Rc<RefCell<oxiedraw_core::history::HistoryStack>>,
     toaster: &crate::toaster::Toaster,
     text_edit: &crate::text_edit::TextEdit,
@@ -654,6 +661,7 @@ pub(crate) fn wire(
         fill,
         shape,
         gradient,
+        guide,
         history,
         toaster,
         text_edit,

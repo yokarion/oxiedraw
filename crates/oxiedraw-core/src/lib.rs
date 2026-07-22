@@ -29,6 +29,7 @@ pub mod effects;
 pub mod enum_meta;
 pub mod export;
 pub mod filters;
+pub mod guides;
 pub mod history;
 pub mod project;
 pub mod renderer;

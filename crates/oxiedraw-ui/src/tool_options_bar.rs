@@ -38,6 +38,7 @@ const STACK_FILL: &str = "fill";
 const STACK_SHAPE: &str = "shape";
 const STACK_GRADIENT: &str = "gradient";
 const STACK_TEXT: &str = "text";
+const STACK_GUIDE: &str = "guide";
 const STACK_NONE: &str = "none";
 
 const TOLERANCE_SLIDER_WIDTH: i32 = 160;
@@ -96,6 +97,7 @@ pub(crate) fn build(
     stack.add_named(&build_shape_page(shape), Some(STACK_SHAPE));
     stack.add_named(&build_gradient_page(gradient), Some(STACK_GRADIENT));
     stack.add_named(&build_text_page(text_edit), Some(STACK_TEXT));
+    stack.add_named(&build_guide_page(), Some(STACK_GUIDE));
     stack.add_named(
         &gtk::Box::new(gtk::Orientation::Horizontal, 0),
         Some(STACK_NONE),
@@ -119,6 +121,7 @@ const fn stack_name_for(tool: Tool) -> &'static str {
         Tool::Fill(FillTool::Gradient) => STACK_GRADIENT,
         Tool::Shapes(_) => STACK_SHAPE,
         Tool::Text => STACK_TEXT,
+        Tool::DrawingGuide => STACK_GUIDE,
         Tool::Cursor | Tool::Selection(_) | Tool::ColorPicker => STACK_NONE,
     }
 }
@@ -251,6 +254,39 @@ fn build_opacity_slider(brush_engine: &BrushEngine) -> gtk::Scale {
 // ---------------------------------------------------------------------------
 // Crop page
 // ---------------------------------------------------------------------------
+
+/// Drawing Guide bottom-bar page: right-aligned Cancel / Done, styled like the
+/// crop tool's Cancel / Apply. Buttons drive the window-level guide actions.
+fn build_guide_page() -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(6)
+        .margin_end(8)
+        .valign(gtk::Align::Center)
+        .build();
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    row.append(&spacer);
+
+    let cancel_btn = gtk::Button::builder()
+        .label("Cancel")
+        .valign(gtk::Align::Center)
+        .action_name("app.guide-cancel")
+        .build();
+    cancel_btn.add_css_class("flat");
+    row.append(&cancel_btn);
+
+    let done_btn = gtk::Button::builder()
+        .label("Done")
+        .valign(gtk::Align::Center)
+        .action_name("app.guide-done")
+        .build();
+    done_btn.add_css_class("suggested-action");
+    row.append(&done_btn);
+
+    row
+}
 
 fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     let row = gtk::Box::builder()

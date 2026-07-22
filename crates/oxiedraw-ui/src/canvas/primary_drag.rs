@@ -10,6 +10,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::canvas::fill::{FillResult, flood_fill, paint_indices};
 use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::document::LayerKind;
+use oxiedraw_core::guides::{GuideKind, GuideState, VanishingPoint};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::shape_correction::{CorrectedShape, corrected_samples, detect_shape};
@@ -55,6 +56,21 @@ struct PendingCorrection {
     /// Original samples (pen dynamics preserved) remapped onto the corrected
     /// path - i.e. the stroke at animation end (`t == 1`).
     final_samples: Vec<InputSample>,
+}
+
+/// Distance (screen px) from origin to the rotation node. Matches the overlay
+/// constant in `canvas_paintable`.
+const GUIDE_ROT_HANDLE_PX: f32 = 64.0;
+/// Pointer-to-node grab radius in screen pixels (node radius + slack).
+const GUIDE_NODE_HIT_PX: f32 = 14.0;
+
+/// Which drawing-guide node a gesture is manipulating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum GuideDrag {
+    #[default]
+    None,
+    Position,
+    Rotation,
 }
 
 pub(super) struct PrimaryDragHandler {
@@ -123,6 +139,18 @@ pub(super) struct PrimaryDragHandler {
     gradient_cur_endpoints: Rc<Cell<Option<[f32; 4]>>>,
     /// Layer pixels + id captured at gradient_begin for the history patch.
     gradient_pending: Rc<RefCell<Option<GradientPending>>>,
+    // -- drawing guide ----------------------------------------------------
+    guide: GuideState,
+    /// Which guide node the current gesture grabbed.
+    guide_drag: Rc<Cell<GuideDrag>>,
+    /// `(start pointer canvas pos, start origin, start angle)` captured at
+    /// guide_begin so the update maps deltas onto the pre-drag config.
+    guide_drag_start: Rc<Cell<Option<(Point, Point, f32)>>>,
+    /// Index of the perspective vanishing point being dragged, if any.
+    guide_vp_drag: Rc<Cell<Option<usize>>>,
+    /// Canvas point where a tap (no drag) on empty space would add a new
+    /// vanishing point. Cleared once the pointer moves past the node radius.
+    guide_pending_add: Rc<Cell<Option<Point>>>,
     // -- text -------------------------------------------------------------
     /// Canvas-space point where a text drag/click started.
     text_drag_start: Rc<Cell<Point>>,
@@ -215,6 +243,7 @@ impl PrimaryDragHandler {
             Tool::Shapes(kind) => self.shape_begin(kind, x, y),
             Tool::ColorPicker => self.color_pick_begin(x, y),
             Tool::Text => self.text_begin(x, y),
+            Tool::DrawingGuide => self.guide_begin(x, y),
             Tool::Cursor => {
                 (self.cursor_activates_transform)();
                 gesture.set_state(gtk::EventSequenceState::Denied);
@@ -232,6 +261,7 @@ impl PrimaryDragHandler {
             Tool::Fill(FillTool::Gradient) => self.gradient_update(gesture, dx, dy),
             Tool::ColorPicker => self.color_pick_update(),
             Tool::Text => self.text_update(gesture, dx, dy),
+            Tool::DrawingGuide => self.guide_update(gesture),
             _ => {}
         }
     }
@@ -244,8 +274,123 @@ impl PrimaryDragHandler {
             Tool::Shapes(kind) => self.shape_end(kind),
             Tool::Fill(FillTool::Gradient) => self.gradient_end(),
             Tool::Text => self.text_end(),
+            Tool::DrawingGuide => self.guide_end(),
             _ => {}
         }
+    }
+
+    // -- drawing guide -----------------------------------------------------
+
+    fn guide_begin(&self, x: f64, y: f64) {
+        let Some(cfg) = self.guide.config.borrow().clone() else {
+            return;
+        };
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
+        let zoom = self.zoom.get();
+        // Node sizes are screen-fixed; convert to canvas units for hit-testing.
+        let hit = (GUIDE_NODE_HIT_PX) / zoom;
+
+        // Reset per-gesture state.
+        self.guide_vp_drag.set(None);
+        self.guide_pending_add.set(None);
+        self.guide_drag.set(GuideDrag::None);
+        self.guide_drag_start.set(None);
+
+        // Perspective: grab a vanishing point to drag it, or arm a tap on empty
+        // space to add a new one.
+        if cfg.kind == GuideKind::Perspective {
+            if let Some(i) = cfg
+                .vanishing_points
+                .iter()
+                .position(|vp| canvas_pos.distance(vp.point()) <= hit)
+            {
+                self.guide_vp_drag.set(Some(i));
+            } else {
+                self.guide_pending_add.set(Some(canvas_pos));
+            }
+            return;
+        }
+
+        let rot_dist = GUIDE_ROT_HANDLE_PX / zoom;
+        let (s, c) = cfg.angle.sin_cos();
+        let rot_node = Point::new(cfg.origin.x + c * rot_dist, cfg.origin.y + s * rot_dist);
+
+        let drag = if canvas_pos.distance(rot_node) <= hit {
+            GuideDrag::Rotation
+        } else {
+            // Grabbing the position node or anywhere else moves the whole guide.
+            GuideDrag::Position
+        };
+        self.guide_drag.set(drag);
+        self.guide_drag_start.set(Some((canvas_pos, cfg.origin, cfg.angle)));
+    }
+
+    fn guide_update(&self, gesture: &gtk::GestureDrag) {
+        let Some((sx, sy)) = gesture.start_point() else {
+            return;
+        };
+        let Some((offset_x, offset_y)) = gesture.offset() else {
+            return;
+        };
+        let cur = widget_to_canvas(sx + offset_x, sy + offset_y, &self.pan, &self.zoom, &self.rotation);
+
+        // Perspective: drag a vanishing point, or cancel a pending tap-to-add
+        // once the pointer has clearly moved (so a drag isn't read as a tap).
+        if let Some(i) = self.guide_vp_drag.get() {
+            self.guide.update(|c| {
+                if let Some(vp) = c.vanishing_points.get_mut(i) {
+                    vp.x = cur.x;
+                    vp.y = cur.y;
+                }
+            });
+            return;
+        }
+        if let Some(start) = self.guide_pending_add.get() {
+            if cur.distance(start) > GUIDE_NODE_HIT_PX / self.zoom.get() {
+                self.guide_pending_add.set(None);
+            }
+            return;
+        }
+
+        let Some((start_pos, start_origin, start_angle)) = self.guide_drag_start.get() else {
+            return;
+        };
+        match self.guide_drag.get() {
+            GuideDrag::Position => {
+                let nx = start_origin.x + (cur.x - start_pos.x);
+                let ny = start_origin.y + (cur.y - start_pos.y);
+                self.guide.update(|c| c.origin = Point::new(nx, ny));
+            }
+            GuideDrag::Rotation => {
+                let mut angle = (cur.y - start_origin.y).atan2(cur.x - start_origin.x);
+                // Ctrl snaps to 15-degree increments, like canvas rotation.
+                if gesture
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::CONTROL_MASK)
+                {
+                    let step = std::f32::consts::FRAC_PI_2 / 6.0;
+                    angle = (angle / step).round() * step;
+                }
+                let _ = start_angle;
+                self.guide.update(|c| c.angle = angle);
+            }
+            GuideDrag::None => {}
+        }
+    }
+
+    fn guide_end(&self) {
+        // A tap on empty space (still pending, i.e. not dragged away) adds a
+        // vanishing point, up to Procreate's three-point maximum.
+        if let Some(p) = self.guide_pending_add.take() {
+            self.guide.update(|c| {
+                if c.kind == GuideKind::Perspective && c.vanishing_points.len() < 3 {
+                    c.vanishing_points.push(VanishingPoint::new(p.x, p.y));
+                }
+            });
+        }
+        self.guide_vp_drag.set(None);
+        self.guide_drag.set(GuideDrag::None);
+        self.guide_drag_start.set(None);
     }
 
     // -- brush -------------------------------------------------------------
@@ -1914,6 +2059,7 @@ pub(super) fn install_primary_drag(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    guide: &GuideState,
     history: &Rc<RefCell<HistoryStack>>,
     toaster: &crate::toaster::Toaster,
     text_edit: &crate::text_edit::TextEdit,
@@ -1959,6 +2105,11 @@ pub(super) fn install_primary_drag(
         gradient_drag_start: Rc::new(Cell::new(Point::ZERO)),
         gradient_cur_endpoints: Rc::new(Cell::new(None)),
         gradient_pending: Rc::new(RefCell::new(None)),
+        guide: guide.clone(),
+        guide_drag: Rc::new(Cell::new(GuideDrag::None)),
+        guide_drag_start: Rc::new(Cell::new(None)),
+        guide_vp_drag: Rc::new(Cell::new(None)),
+        guide_pending_add: Rc::new(Cell::new(None)),
         text_drag_start: Rc::new(Cell::new(Point::ZERO)),
         text_cur_rect: Rc::new(Cell::new(None)),
         text_editing_gesture: Rc::new(Cell::new(false)),

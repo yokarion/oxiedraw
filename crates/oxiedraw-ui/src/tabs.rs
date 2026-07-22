@@ -294,6 +294,15 @@ impl TabManager {
             .viewport
             .set_rotation_raw(project.document.view_rotation);
 
+        // Restore the persisted drawing guide and push its symmetry + overlay
+        // to the canvas (notify_changed drives the session's guide sync).
+        session
+            .guide
+            .config
+            .borrow_mut()
+            .clone_from(&project.document.guide);
+        session.guide.notify_changed();
+
         // Restore the per-document component library.
         *session.components.borrow_mut() = project::load::build_components(&project);
         (session.refresh_components)();
@@ -461,12 +470,35 @@ impl TabManager {
             ),
             ("select-text", Tool::Text),
             ("select-crop", Tool::Crop),
+            ("select-guide", Tool::DrawingGuide),
         ];
         for &(id, tool) in tool_actions {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new(id, None);
             action.connect_activate(move |_, _| manager.set_active_tool(tool));
             app.add_action(&action);
+        }
+
+        // Drawing Guide commit / cancel (top-bar buttons). Done keeps the live
+        // config; Cancel restores the snapshot taken when the tool was entered.
+        {
+            let manager = Rc::clone(self);
+            let done = gio::SimpleAction::new("guide-done", None);
+            done.connect_activate(move |_, _| manager.set_active_tool(Tool::Brush));
+            app.add_action(&done);
+        }
+        {
+            let manager = Rc::clone(self);
+            let cancel = gio::SimpleAction::new("guide-cancel", None);
+            cancel.connect_activate(move |_, _| {
+                if let Some(s) = manager.active.borrow().as_ref() {
+                    let snapshot = s.guide.entry_snapshot.borrow().clone();
+                    *s.guide.config.borrow_mut() = snapshot;
+                    s.guide.notify_changed();
+                }
+                manager.set_active_tool(Tool::Brush);
+            });
+            app.add_action(&cancel);
         }
 
         // Eraser mode toggle (brush). Stateful boolean action: the brush bar's

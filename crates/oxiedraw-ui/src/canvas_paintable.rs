@@ -9,7 +9,7 @@
 //! drive the transform from the existing `Viewport` cells.
 
 use std::cell::{Cell, RefCell};
-use std::f64::consts::PI;
+use std::f64::consts::{FRAC_PI_3, PI, TAU};
 
 use oxiedraw_core::brush_engine::BrushCursor;
 use oxiedraw_core::color::Color;
@@ -114,6 +114,27 @@ impl CanvasPaintable {
     pub(crate) fn set_crop_active(&self, active: bool) {
         self.imp().crop_active.set(active);
         gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
+    /// Update the drawing-guide overlay config. Pass `None` to hide the guide.
+    /// Triggers a redraw. The cached texture is dropped so it re-renders.
+    pub(crate) fn set_guide(&self, config: Option<oxiedraw_core::guides::GuideConfig>) {
+        let imp = self.imp();
+        *imp.guide.borrow_mut() = config;
+        *imp.guide_cache.borrow_mut() = None;
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
+    /// Toggle guide edit mode (draws the position + rotation nodes and
+    /// brightens the guide lines). Set while the Drawing Guide tool is active.
+    pub(crate) fn set_guide_editing(&self, editing: bool) {
+        self.imp().guide_editing.set(editing);
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
+    /// Set the accent colour used for the guide nodes (straight RGB).
+    pub(crate) fn set_guide_accent(&self, accent: (f32, f32, f32)) {
+        self.imp().guide_accent.set(accent);
     }
 
     /// Update the transform overlay rect. Pass `None` to hide.
@@ -613,6 +634,528 @@ fn draw_crop_grid(
             cr.stroke().ok();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Drawing guide overlay (widget-space cairo)
+// ---------------------------------------------------------------------------
+
+/// Minimum on-screen cell size (widget px) for the 2D grid and isometric
+/// guides. Finer than this and the guide is coarsened by an integer factor,
+/// bounding the line count so a tiny canvas spacing (or a zoomed-out view)
+/// stays smooth. Zooming in grows the screen spacing and restores full detail.
+const MIN_GRID_SCREEN_PX: f64 = 24.0;
+const MIN_ISO_SCREEN_PX: f64 = 30.0;
+
+/// Screen-fixed radius of the guide position/rotation nodes, in widget pixels.
+const GUIDE_NODE_RADIUS: f64 = 7.0;
+/// Distance from the origin to the rotation node, in widget pixels.
+const GUIDE_ROT_HANDLE_DIST: f64 = 64.0;
+
+/// Extra pixels rendered around the widget so pan/zoom can just translate+scale
+/// the cached texture instead of re-rasterizing the (expensive) overlay.
+/// Re-rendering is deferred to when motion stops, so during a pan/zoom the
+/// blit shows content up to this far past the edges before any gap appears -
+/// hence a generous margin. The one re-render on stop can be a bigger texture
+/// since it's a single frame, not a per-motion cost.
+const GUIDE_CACHE_MARGIN: f32 = 320.0;
+
+/// Everything the rendered guide overlay depends on EXCEPT the view transform
+/// (pan/zoom, handled by the translate+scale blit). When this is unchanged, and
+/// the pan is within the margin and the zoom near the render zoom, the cached
+/// texture is reused (shifted/scaled) instead of re-rasterized.
+#[derive(PartialEq)]
+pub(super) struct GuideCacheKey {
+    guide: oxiedraw_core::guides::GuideConfig,
+    rotation: f32,
+    w: u32,
+    h: u32,
+    editing: bool,
+    accent: (f32, f32, f32),
+}
+
+/// A cached guide overlay: the texture (rendered margin-extended around the
+/// widget), the key it was built for, and the pan/zoom at render time so later
+/// frames can blit it shifted by the pan delta and scaled by the zoom ratio.
+pub(super) struct GuideCacheEntry {
+    key: GuideCacheKey,
+    ref_pan_x: f32,
+    ref_pan_y: f32,
+    ref_zoom: f32,
+    margin: f32,
+    texture: gdk::MemoryTexture,
+}
+
+/// Render the guide overlay into a margin-extended `MemoryTexture` anchored at
+/// the current pan. The margin lets later frames pan by translating the blit,
+/// so this expensive rasterization only re-runs on a real view/config change.
+fn render_guide_texture(
+    guide: &oxiedraw_core::guides::GuideConfig,
+    w: u32,
+    h: u32,
+    key: &GuideCacheKey,
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+    rotation: f32,
+) -> Option<GuideCacheEntry> {
+    use gtk::cairo::{Context, Format, ImageSurface};
+
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let t_start = std::time::Instant::now();
+    let margin = GUIDE_CACHE_MARGIN;
+    // Texture covers [-margin, w+margin] x [-margin, h+margin] of the widget.
+    // Render it as a (tw x th) "virtual widget" with the pan shifted by the
+    // margin, so the overlay (which clips itself to the widget it's given)
+    // fills the whole texture, margin included - otherwise a panned blit would
+    // show empty edges.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let (tw, th) = ((w as f32 + 2.0 * margin) as u32, (h as f32 + 2.0 * margin) as u32);
+    #[allow(clippy::cast_possible_wrap)]
+    let mut surface = ImageSurface::create(Format::ARgb32, tw as i32, th as i32).ok()?;
+    let t_alloc = t_start.elapsed();
+    {
+        let cr = Context::new(&surface).ok()?;
+        let (pan_tx, pan_ty) = (pan_x + margin, pan_y + margin);
+        apply_view_rotation(&cr, pan_tx, pan_ty, rotation);
+        #[allow(clippy::cast_precision_loss)]
+        draw_guide_overlay_cairo(
+            &cr, guide, tw as f32, th as f32, key.editing, key.accent, pan_tx, pan_ty, zoom,
+        );
+    }
+    surface.flush();
+    let t_draw = t_start.elapsed();
+
+    let stride = surface.stride() as usize;
+    let data = surface.data().ok()?;
+    let bytes = glib::Bytes::from(&data[..]);
+    drop(data);
+    let texture = gdk::MemoryTexture::new(
+        tw as i32,
+        th as i32,
+        gdk::MemoryFormat::B8g8r8a8Premultiplied,
+        &bytes,
+        stride,
+    );
+    let t_total = t_start.elapsed();
+    tracing::info!(
+        target: "guide_perf",
+        kind = ?guide.kind,
+        vps = guide.vanishing_points.len(),
+        rays = guide.perspective_rays,
+        tw,
+        th,
+        alloc_us = t_alloc.as_micros() as u64,
+        draw_us = (t_draw - t_alloc).as_micros() as u64,
+        tex_us = (t_total - t_draw).as_micros() as u64,
+        total_us = t_total.as_micros() as u64,
+        "guide overlay re-render",
+    );
+    Some(GuideCacheEntry {
+        key: GuideCacheKey {
+            guide: guide.clone(),
+            rotation,
+            w,
+            h,
+            editing: key.editing,
+            accent: key.accent,
+        },
+        ref_pan_x: pan_x,
+        ref_pan_y: pan_y,
+        ref_zoom: zoom,
+        margin,
+        texture,
+    })
+}
+
+/// Draw the active guide: symmetry / grid / perspective lines, plus the two
+/// draggable nodes while the tool is active. Cairo user space is already
+/// rotated about the pan origin, so all geometry is plain `pan + canvas*zoom`.
+#[allow(clippy::too_many_arguments)]
+fn draw_guide_overlay_cairo(
+    cr: &gtk::cairo::Context,
+    guide: &oxiedraw_core::guides::GuideConfig,
+    w: f32,
+    h: f32,
+    editing: bool,
+    accent: (f32, f32, f32),
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) {
+    use oxiedraw_core::guides::{symmetry_line_angles, GuideKind};
+
+    let ox = f64::from(pan_x + guide.origin.x * zoom);
+    let oy = f64::from(pan_y + guide.origin.y * zoom);
+    // Half-length long enough to cross the whole widget from any origin.
+    let span = f64::from(w.hypot(h)) * 2.0;
+
+    // Perspective is drawn on its own (fade gradient + horizon lines), so it
+    // can't share the single-path two-pass stroke below.
+    if guide.kind == GuideKind::Perspective {
+        draw_perspective(cr, guide, w, h, editing, accent, pan_x, pan_y, zoom);
+        return;
+    }
+
+    // Editing brightens the lines so they read clearly against artwork.
+    let alpha = f64::from(guide.opacity) * if editing { 1.0 } else { 0.85 };
+    let thickness = f64::from(guide.thickness).max(0.5);
+    cr.set_dash(&[], 0.0);
+    cr.set_line_cap(gtk::cairo::LineCap::Butt);
+
+    // Build the line path for this guide kind.
+    match guide.kind {
+        GuideKind::Symmetry => {
+            for a in symmetry_line_angles(guide.symmetry, guide.angle) {
+                draw_line_through(cr, ox, oy, f64::from(a), span);
+            }
+        }
+        GuideKind::Grid2D => draw_grid_lines(cr, guide, w, h, pan_x, pan_y, zoom),
+        GuideKind::Isometric => draw_isometric_grid(cr, guide, ox, oy, w, h, zoom),
+        GuideKind::Perspective => {}
+    }
+
+    // Cursor-style stroke: black outline under a white core, so the guide
+    // reads against any artwork regardless of colour. Opacity is preserved.
+    cr.set_line_width(thickness + 2.0);
+    cr.set_source_rgba(0.0, 0.0, 0.0, alpha * 0.85);
+    cr.stroke_preserve().ok();
+    cr.set_line_width(thickness);
+    cr.set_source_rgba(1.0, 1.0, 1.0, alpha);
+    cr.stroke().ok();
+
+    if editing {
+        let (ar, ag, ab) = (f64::from(accent.0), f64::from(accent.1), f64::from(accent.2));
+        draw_guide_nodes(cr, ox, oy, f64::from(guide.angle), ar, ag, ab);
+    }
+}
+
+thread_local! {
+    /// Radial alpha falloff (0 at centre -> 1 at the edge), built once and
+    /// sampled as a scaled pattern to fade the perspective rays near each
+    /// vanishing point. Sampling a tile is far cheaper than evaluating a radial
+    /// gradient per pixel per VP on every re-render.
+    static RADIAL_FADE_TILE: gtk::cairo::ImageSurface = build_radial_fade_tile();
+}
+
+fn build_radial_fade_tile() -> gtk::cairo::ImageSurface {
+    use gtk::cairo::{Context, Format, ImageSurface, RadialGradient};
+    const N: f64 = 256.0;
+    /// Fraction of the radius over which the ray fades in: it's transparent at
+    /// the vanishing point and reaches FULL opacity by this fraction, so the
+    /// fade is a tight, sharp vignette right at the point rather than a broad
+    /// gradient (lower = sharper falloff, more of each ray stays opaque).
+    const FADE_KNEE: f64 = 0.32;
+    let surface = ImageSurface::create(Format::ARgb32, N as i32, N as i32)
+        .expect("radial fade tile surface");
+    {
+        let cr = Context::new(&surface).expect("radial fade tile context");
+        let grad = RadialGradient::new(N / 2.0, N / 2.0, 0.0, N / 2.0, N / 2.0, N / 2.0);
+        grad.add_color_stop_rgba(0.0, 1.0, 1.0, 1.0, 0.0);
+        grad.add_color_stop_rgba(FADE_KNEE, 1.0, 1.0, 1.0, 1.0);
+        grad.add_color_stop_rgba(1.0, 1.0, 1.0, 1.0, 1.0);
+        let _ = cr.set_source(&grad);
+        cr.paint().ok();
+    }
+    surface.flush();
+    surface
+}
+
+/// Perspective guide: rays fanned from each vanishing point, faded radially
+/// toward each point (like ProCreate); the points are joined by accent horizon
+/// lines (a horizontal one for a lone point) and drawn as nodes.
+#[allow(clippy::too_many_arguments)]
+fn draw_perspective(
+    cr: &gtk::cairo::Context,
+    guide: &oxiedraw_core::guides::GuideConfig,
+    w: f32,
+    h: f32,
+    editing: bool,
+    accent: (f32, f32, f32),
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) {
+
+    let base_alpha = f64::from(guide.opacity) * if editing { 1.0 } else { 0.85 };
+    let thickness = f64::from(guide.thickness).max(0.5);
+    let (ar, ag, ab) = (f64::from(accent.0), f64::from(accent.1), f64::from(accent.2));
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    cr.set_dash(&[], 0.0);
+    cr.set_line_cap(gtk::cairo::LineCap::Butt);
+
+    // Clip every line to the visible widget: the rays are otherwise many
+    // canvas-diagonals long, which both tanks the (per-pan) rasterization and
+    // stretches the fade gradient so far that only its faint middle is visible.
+    let clipped = |vx: f64, vy: f64, ang: f64| {
+        let (s, c) = ang.sin_cos();
+        clip_line_to_rect(vx, vy, c, s, wf, hf).map(|(t0, t1)| {
+            ((vx + c * t0, vy + s * t0), (vx + c * t1, vy + s * t1))
+        })
+    };
+
+    let vps: Vec<(f64, f64)> = guide
+        .vanishing_points
+        .iter()
+        .map(|vp| (f64::from(pan_x + vp.x * zoom), f64::from(pan_y + vp.y * zoom)))
+        .collect();
+    if vps.is_empty() {
+        return;
+    }
+
+    // Rays fanned evenly from every vanishing point, clipped to the widget and
+    // stroked SOLID (black outline + white core). Solid strokes are far cheaper
+    // than gradient ones, and the fade is applied afterwards as a single mask
+    // fill whose cost is independent of the ray/point count.
+    let rays = guide.perspective_rays.max(1);
+    for &(vx, vy) in &vps {
+        for k in 0..rays {
+            let a = f64::from(k) * PI / f64::from(rays);
+            if let Some((p0, p1)) = clipped(vx, vy, a) {
+                cr.move_to(p0.0, p0.1);
+                cr.line_to(p1.0, p1.1);
+            }
+        }
+    }
+    cr.set_line_width(thickness + 2.0);
+    cr.set_source_rgba(0.0, 0.0, 0.0, base_alpha);
+    cr.stroke_preserve().ok();
+    cr.set_line_width(thickness);
+    cr.set_source_rgba(1.0, 1.0, 1.0, base_alpha);
+    cr.stroke().ok();
+
+    // Fade each ray toward its vanishing point, like ProCreate: transparent AT
+    // the point (where the perspective compresses to nothing) ramping to full a
+    // ways out. One `DestIn` fill per VP (dest * source-alpha), multiplied
+    // together so a pixel fades if it's near ANY vanishing point and stays full
+    // in the open foreground/sky. The falloff is a precomputed tile sampled as a
+    // scaled pattern - a per-pixel radial GRADIENT here cost ~13ms per VP.
+    let radius = wf.min(hf) * 0.55;
+    cr.set_operator(gtk::cairo::Operator::DestIn);
+    RADIAL_FADE_TILE.with(|tile| {
+        let n = f64::from(tile.width());
+        let s = n / (2.0 * radius);
+        for &(vx, vy) in &vps {
+            let pattern = gtk::cairo::SurfacePattern::create(tile);
+            pattern.set_extend(gtk::cairo::Extend::Pad);
+            pattern.set_matrix(gtk::cairo::Matrix::new(
+                s, 0.0, 0.0, s, -s * (vx - radius), -s * (vy - radius),
+            ));
+            let _ = cr.set_source(&pattern);
+            // Only the VP's bounding box can be affected (outside `radius` the
+            // mask is 1 = no-op); clipping to it keeps the fill cheap.
+            cr.save().ok();
+            cr.rectangle(vx - radius, vy - radius, 2.0 * radius, 2.0 * radius);
+            cr.clip();
+            cr.paint().ok();
+            cr.restore().ok();
+        }
+    });
+    cr.set_operator(gtk::cairo::Operator::Over);
+
+    // Horizon line(s), solid accent. One point gets a horizontal horizon through
+    // it; multiple points are joined pairwise so they read as one guide.
+    let horizon = |x0: f64, y0: f64, ang: f64| {
+        if let Some((p0, p1)) = clipped(x0, y0, ang) {
+            cr.move_to(p0.0, p0.1);
+            cr.line_to(p1.0, p1.1);
+            cr.set_line_width(thickness + 2.0);
+            cr.set_source_rgba(0.0, 0.0, 0.0, base_alpha * 0.8);
+            cr.stroke_preserve().ok();
+            cr.set_line_width(thickness);
+            cr.set_source_rgba(ar, ag, ab, base_alpha);
+            cr.stroke().ok();
+        }
+    };
+    if vps.len() == 1 {
+        horizon(vps[0].0, vps[0].1, 0.0);
+    } else {
+        for i in 0..vps.len() {
+            for j in (i + 1)..vps.len() {
+                let ang = (vps[j].1 - vps[i].1).atan2(vps[j].0 - vps[i].0);
+                horizon(vps[i].0, vps[i].1, ang);
+            }
+        }
+    }
+
+    if editing {
+        for &(vx, vy) in &vps {
+            draw_node_disc(cr, vx, vy, ar, ag, ab);
+        }
+    }
+}
+
+/// Stroke-append an infinite line through `(cx, cy)` at `angle`, half-length
+/// `span` each way. The caller issues the `stroke()`.
+fn draw_line_through(cr: &gtk::cairo::Context, cx: f64, cy: f64, angle: f64, span: f64) {
+    let (s, c) = angle.sin_cos();
+    cr.move_to(cx - c * span, cy - s * span);
+    cr.line_to(cx + c * span, cy + s * span);
+}
+
+/// Axis-aligned 2D grid across the whole widget at the guide spacing.
+fn draw_grid_lines(
+    cr: &gtk::cairo::Context,
+    guide: &oxiedraw_core::guides::GuideConfig,
+    w: f32,
+    h: f32,
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) {
+    let step = f64::from(guide.grid_spacing.max(4.0)) * f64::from(zoom);
+    if step < 2.0 {
+        return;
+    }
+    // Adaptive: never draw denser than `MIN_GRID_SCREEN_PX` on screen. A finer
+    // canvas spacing is an unreadable haze when zoomed out and costs thousands
+    // of lines; zooming in restores full detail (screen spacing grows).
+    let step = coarsen_to_min_screen(step, MIN_GRID_SCREEN_PX);
+    let ox = f64::from(pan_x + guide.origin.x * zoom);
+    let oy = f64::from(pan_y + guide.origin.y * zoom);
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    // Verticals, anchored on the origin, walking both directions.
+    let mut x = ox.rem_euclid(step);
+    while x < wf {
+        cr.move_to(x, 0.0);
+        cr.line_to(x, hf);
+        x += step;
+    }
+    let mut y = oy.rem_euclid(step);
+    while y < hf {
+        cr.move_to(0.0, y);
+        cr.line_to(wf, y);
+        y += step;
+    }
+}
+
+/// Isometric guide: a true triangular grid - three line families 60deg apart
+/// (the guide axis plus +/-60deg), each spaced by `grid_spacing`. Equal-spaced
+/// families at 60deg are concurrent, so they tessellate into triangles.
+fn draw_isometric_grid(
+    cr: &gtk::cairo::Context,
+    guide: &oxiedraw_core::guides::GuideConfig,
+    ox: f64,
+    oy: f64,
+    w: f32,
+    h: f32,
+    zoom: f32,
+) {
+    let spacing = f64::from(guide.grid_spacing.max(4.0)) * f64::from(zoom);
+    if spacing < 3.0 {
+        return;
+    }
+    // Same adaptive coarsening as the 2D grid, but a larger floor since the
+    // isometric grid draws three (diagonal, pricier) families. The integer
+    // factor is uniform across families so they stay concurrent and the
+    // triangles keep connecting.
+    let spacing = coarsen_to_min_screen(spacing, MIN_ISO_SCREEN_PX);
+    let base = f64::from(guide.angle);
+    for a in [base, base + FRAC_PI_3, base - FRAC_PI_3] {
+        draw_line_family(cr, ox, oy, a, spacing, f64::from(w), f64::from(h));
+    }
+}
+
+/// Round `spacing` (screen px) up to an integer multiple that is at least
+/// `min_screen`. Using an integer factor keeps the coarsened lines a subset of
+/// the original, so grids stay aligned and triangular families stay concurrent.
+fn coarsen_to_min_screen(spacing: f64, min_screen: f64) -> f64 {
+    if spacing >= min_screen {
+        spacing
+    } else {
+        spacing * (min_screen / spacing).ceil()
+    }
+}
+
+/// Draw a family of parallel lines at `angle`, `spacing` apart (perpendicular),
+/// anchored on `(ox, oy)`. Only the lines that cross the `w` x `h` widget are
+/// emitted, each clipped to the widget rect - so a small spacing costs work
+/// proportional to what's actually visible, not to the whole plane.
+fn draw_line_family(cr: &gtk::cairo::Context, ox: f64, oy: f64, angle: f64, spacing: f64, w: f64, h: f64) {
+    if spacing < 1.0 {
+        return; // caller guarantees a sane spacing; guard against a busy loop
+    }
+    let (s, c) = angle.sin_cos();
+    let (nx, ny) = (-s, c); // unit perpendicular
+    // Range of perpendicular offsets covering the widget corners.
+    let mut dmin = f64::INFINITY;
+    let mut dmax = f64::NEG_INFINITY;
+    for (cx, cy) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+        let d = (cx - ox) * nx + (cy - oy) * ny;
+        dmin = dmin.min(d);
+        dmax = dmax.max(d);
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let (k0, k1) = ((dmin / spacing).floor() as i64, (dmax / spacing).ceil() as i64);
+    for k in k0..=k1 {
+        let off = k as f64 * spacing;
+        let (bx, by) = (ox + nx * off, oy + ny * off);
+        if let Some((t0, t1)) = clip_line_to_rect(bx, by, c, s, w, h) {
+            cr.move_to(bx + c * t0, by + s * t0);
+            cr.line_to(bx + c * t1, by + s * t1);
+        }
+    }
+}
+
+/// Liang-Barsky: clip the infinite line through `(px, py)` with direction
+/// `(dx, dy)` to the rect `[0, w] x [0, h]`, returning the parameter range
+/// `(t0, t1)` inside it, or `None` if it misses.
+fn clip_line_to_rect(px: f64, py: f64, dx: f64, dy: f64, w: f64, h: f64) -> Option<(f64, f64)> {
+    let mut t0 = f64::NEG_INFINITY;
+    let mut t1 = f64::INFINITY;
+    for (p, q) in [(-dx, px), (dx, w - px), (-dy, py), (dy, h - py)] {
+        if p.abs() < 1e-9 {
+            if q < 0.0 {
+                return None; // parallel to this edge and outside it
+            }
+        } else {
+            let r = q / p;
+            if p < 0.0 {
+                t0 = t0.max(r);
+            } else {
+                t1 = t1.min(r);
+            }
+        }
+    }
+    (t0 <= t1).then_some((t0, t1))
+}
+
+/// The position (filled disc) and rotation (ring) nodes in the accent colour.
+fn draw_guide_nodes(cr: &gtk::cairo::Context, ox: f64, oy: f64, angle: f64, r: f64, g: f64, b: f64) {
+    let (s, c) = angle.sin_cos();
+    let hx = ox + c * GUIDE_ROT_HANDLE_DIST;
+    let hy = oy + s * GUIDE_ROT_HANDLE_DIST;
+
+    // Connector from position node to rotation node.
+    cr.set_source_rgba(r, g, b, 0.9);
+    cr.set_line_width(1.5);
+    cr.move_to(ox, oy);
+    cr.line_to(hx, hy);
+    cr.stroke().ok();
+
+    // Position node: filled accent disc with a white ring.
+    draw_node_disc(cr, ox, oy, r, g, b);
+
+    // Rotation node: hollow accent ring.
+    cr.arc(hx, hy, GUIDE_NODE_RADIUS, 0.0, TAU);
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    cr.set_line_width(2.0);
+    cr.stroke_preserve().ok();
+    cr.set_source_rgba(r, g, b, 1.0);
+    cr.set_line_width(1.0);
+    cr.stroke().ok();
+}
+
+/// A filled accent disc with a white ring (position node / vanishing point).
+fn draw_node_disc(cr: &gtk::cairo::Context, x: f64, y: f64, r: f64, g: f64, b: f64) {
+    cr.arc(x, y, GUIDE_NODE_RADIUS, 0.0, TAU);
+    cr.set_source_rgba(r, g, b, 1.0);
+    cr.fill_preserve().ok();
+    cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+    cr.set_line_width(2.0);
+    cr.stroke().ok();
 }
 
 // ---------------------------------------------------------------------------
@@ -1340,10 +1883,12 @@ fn draw_gradient_cursor_cairo(cr: &gtk::cairo::Context, overlay: &GradientCursor
 mod imp {
     use super::{
         BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
-        GradientCursorOverlay, PendingMarquee, Point, RefCell, TransformRect, apply_view_rotation,
-        draw_brush_cursor_cairo, draw_color_picker_cairo, draw_crop_overlay_cairo,
-        draw_gradient_cursor_cairo, draw_pixel_grid_cairo, draw_selection_overlay_cairo,
-        draw_text_edit_overlay_cairo, draw_transform_overlay_cairo, gdk, glib, graphene, gsk, gtk,
+        GradientCursorOverlay, GuideCacheEntry, GuideCacheKey, PendingMarquee, Point, RefCell,
+        TransformRect,
+        apply_view_rotation, draw_brush_cursor_cairo, draw_color_picker_cairo,
+        draw_crop_overlay_cairo, draw_gradient_cursor_cairo, draw_pixel_grid_cairo,
+        draw_selection_overlay_cairo, draw_text_edit_overlay_cairo, draw_transform_overlay_cairo,
+        gdk, glib, graphene, gsk, gtk, render_guide_texture,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -1421,6 +1966,30 @@ mod imp {
         /// `text_edit_box` is the natural box; caret/selection/handles are in
         /// natural-local coords, so the overlay applies this scale when drawing.
         pub(super) text_scale: Cell<(f32, f32)>,
+        // drawing guide overlay (symmetry / grid lines + edit nodes)
+        pub(super) guide: RefCell<Option<oxiedraw_core::guides::GuideConfig>>,
+        /// True while the Drawing Guide tool is active - draws the position and
+        /// rotation nodes and brightens the guide lines.
+        pub(super) guide_editing: Cell<bool>,
+        /// Theme accent (straight RGB) for the guide nodes, kept fixed like
+        /// Procreate's blue/green handles while the line colour is user-chosen.
+        pub(super) guide_accent: Cell<(f32, f32, f32)>,
+        /// Cached rendered guide overlay + the inputs it was built from. The
+        /// overlay (esp. the isometric/grid line families) is expensive to
+        /// rasterize, but only changes when the config / view transform / size
+        /// change - so it's cached and reused across the frequent redraws (each
+        /// dab preview, pointer move) that keep those inputs constant.
+        pub(super) guide_cache: RefCell<Option<GuideCacheEntry>>,
+        /// Pan/zoom seen on the previous frame, to detect when the view is still
+        /// moving (blit) vs has settled (re-render crisp).
+        pub(super) guide_last_zoom: Cell<f32>,
+        pub(super) guide_last_pan: Cell<(f32, f32)>,
+        /// Set by the settle timer to request one crisp re-render once panning /
+        /// zooming stops, so motion itself is pure (cheap) blits with no spikes.
+        pub(super) guide_do_rerender: Cell<bool>,
+        /// Bumped on every armed settle timer; the timer only acts if it still
+        /// holds the latest generation (debounce over a burst of motion frames).
+        pub(super) guide_zoom_gen: Cell<u64>,
         /// Performance overlay (toggle with F3). Records one sample per snapshot
         /// and paints itself in the top-left corner.
         pub(super) perf: RefCell<super::PerfGraph>,
@@ -1476,6 +2045,14 @@ mod imp {
                 text_handles: RefCell::new(Vec::new()),
                 text_pending_box: Cell::new(None),
                 text_scale: Cell::new((1.0, 1.0)),
+                guide: RefCell::new(None),
+                guide_editing: Cell::new(false),
+                guide_accent: Cell::new((0.21, 0.52, 0.89)),
+                guide_cache: RefCell::new(None),
+                guide_last_zoom: Cell::new(1.0),
+                guide_last_pan: Cell::new((0.0, 0.0)),
+                guide_do_rerender: Cell::new(false),
+                guide_zoom_gen: Cell::new(0),
                 perf: RefCell::new(super::PerfGraph::default()),
             }
         }
@@ -1491,6 +2068,23 @@ mod imp {
     impl ObjectImpl for CanvasPaintable {}
 
     impl CanvasPaintable {
+        /// Schedule a debounced crisp re-render of the guide overlay once pan /
+        /// zoom stops (during motion it's a cheap translated+scaled blit). Each
+        /// call supersedes the previous via a generation counter, so only the
+        /// last - fired after motion settles - flags the re-render and redraws.
+        fn arm_guide_settle(&self) {
+            let generation = self.guide_zoom_gen.get().wrapping_add(1);
+            self.guide_zoom_gen.set(generation);
+            let obj = self.obj().clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(120), move || {
+                let imp = obj.imp();
+                if imp.guide_zoom_gen.get() == generation {
+                    imp.guide_do_rerender.set(true);
+                    gdk::prelude::PaintableExt::invalidate_contents(&obj);
+                }
+            });
+        }
+
         /// Draw the color-picker loupe (magnified nearest-neighbour canvas
         /// clipped to a circle) and the eyedropper cursor. Split out of
         /// `snapshot` to keep that method readable.
@@ -1865,6 +2459,66 @@ mod imp {
                 );
             }
 
+            // 5-bis. Drawing guide overlay: symmetry / grid lines, plus the
+            //        position + rotation nodes while the tool is active. Cached
+            //        as a texture (see `guide_cache`) so the frequent redraws
+            //        that don't move the view just blit it.
+            if let Some(guide) = self.guide.borrow().clone() {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                let (w, h) = (width as u32, height as u32);
+                let key = GuideCacheKey {
+                    guide: guide.clone(),
+                    rotation,
+                    w,
+                    h,
+                    editing: self.guide_editing.get(),
+                    accent: self.guide_accent.get(),
+                };
+                let (last_px, last_py) = self.guide_last_pan.get();
+                let moving = (pan_x - last_px).abs() > f32::EPSILON
+                    || (pan_y - last_py).abs() > f32::EPSILON
+                    || (zoom - self.guide_last_zoom.get()).abs() > f32::EPSILON;
+                self.guide_last_pan.set((pan_x, pan_y));
+                self.guide_last_zoom.set(zoom);
+
+                let mut cache = self.guide_cache.borrow_mut();
+                // The overlay is expensive to rasterize, so during a pan/zoom it
+                // is NEVER re-rendered - only translated + scaled (a cheap blit),
+                // which keeps motion smooth (no per-frame spikes). It re-renders
+                // only when: there's no cache yet / the config (key) changed /
+                // the view is rotated (blit invalid then) / the view has drifted
+                // absurdly far (a safety net so a very long drag still refreshes)
+                // / or the settle timer fired after motion stopped.
+                let need = cache.as_ref().map_or(true, |e| {
+                    if e.key != key || rotation != 0.0 {
+                        return true;
+                    }
+                    let s = zoom / e.ref_zoom;
+                    let drift = (pan_x - e.ref_pan_x).abs().max((pan_y - e.ref_pan_y).abs());
+                    drift > e.margin * 6.0 || !(0.25..4.0).contains(&s)
+                });
+                let rerender = need || (!moving && self.guide_do_rerender.get());
+                self.guide_do_rerender.set(false);
+                if rerender {
+                    *cache = render_guide_texture(&guide, w, h, &key, pan_x, pan_y, zoom, rotation);
+                    // Supersede any pending settle timer; we're crisp now.
+                    self.guide_zoom_gen.set(self.guide_zoom_gen.get().wrapping_add(1));
+                } else if moving {
+                    self.arm_guide_settle(); // crisp re-render once motion stops
+                }
+                if let Some(e) = cache.as_ref() {
+                    let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
+                    // Blit the margin-extended texture, shifted by how far the
+                    // view panned and scaled by how much it zoomed since render.
+                    let s = zoom / e.ref_zoom;
+                    let x = pan_x - s * (e.margin + e.ref_pan_x);
+                    let y = pan_y - s * (e.margin + e.ref_pan_y);
+                    let tw = e.texture.width() as f32 * s;
+                    let th = e.texture.height() as f32 * s;
+                    gtk_snap.append_texture(&e.texture, &graphene::Rect::new(x, y, tw, th));
+                }
+            }
+
             // 6. Transform handles + dashed border in widget space (cairo).
             //    The live pixel preview was already drawn via GSK in step 3b.
             if self.transform_active.get()
@@ -2026,6 +2680,73 @@ mod imp {
 
         fn flags(&self) -> gdk::PaintableFlags {
             gdk::PaintableFlags::empty()
+        }
+    }
+}
+
+#[cfg(test)]
+mod guide_perf_bench {
+    use super::*;
+    use oxiedraw_core::guides::{GuideConfig, GuideKind, VanishingPoint};
+    use std::time::Instant;
+
+    // Headless timing of the guide overlay's cairo draw (no GPU/texture), to
+    // separate the rasterization cost from the texture upload. Run with:
+    //   cargo test -p oxiedraw-ui guide_perf -- --nocapture --ignored
+    #[test]
+    #[ignore]
+    fn perspective_draw_scaling() {
+        let (w, h) = (1900i32, 1040i32);
+        let accent = (0.5f32, 0.4, 0.9);
+        for n_vps in 0..=3 {
+            let mut cfg = GuideConfig::centered(2048, 2048);
+            cfg.kind = GuideKind::Perspective;
+            cfg.perspective_rays = 23;
+            cfg.vanishing_points.clear();
+            for i in 0..n_vps {
+                cfg.vanishing_points
+                    .push(VanishingPoint::new(600.0 + 250.0 * i as f32, 900.0 + 40.0 * i as f32));
+            }
+
+            // Time only the cairo draw into a fresh ARGB surface, like a render.
+            let iters = 200;
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let surface =
+                    gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w, h).unwrap();
+                let cr = gtk::cairo::Context::new(&surface).unwrap();
+                let t = Instant::now();
+                draw_guide_overlay_cairo(&cr, &cfg, w as f32, h as f32, true, accent, 0.0, 0.0, 1.0);
+                surface.flush();
+                total += t.elapsed();
+            }
+            let avg_us = total.as_micros() as f64 / f64::from(iters);
+            println!("perspective vps={n_vps} rays=23 -> cairo draw avg {avg_us:.1} us");
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn isometric_draw_scaling() {
+        let (w, h) = (1900i32, 1040i32);
+        let accent = (0.5f32, 0.4, 0.9);
+        for spacing in [8.0f32, 16.0, 32.0, 64.0] {
+            let mut cfg = GuideConfig::centered(2048, 2048);
+            cfg.kind = GuideKind::Isometric;
+            cfg.grid_spacing = spacing;
+            let iters = 200;
+            let mut total = std::time::Duration::ZERO;
+            for _ in 0..iters {
+                let surface =
+                    gtk::cairo::ImageSurface::create(gtk::cairo::Format::ARgb32, w, h).unwrap();
+                let cr = gtk::cairo::Context::new(&surface).unwrap();
+                let t = Instant::now();
+                draw_guide_overlay_cairo(&cr, &cfg, w as f32, h as f32, true, accent, 0.0, 0.0, 1.0);
+                surface.flush();
+                total += t.elapsed();
+            }
+            let avg_us = total.as_micros() as f64 / f64::from(iters);
+            println!("isometric spacing={spacing} -> cairo draw avg {avg_us:.1} us");
         }
     }
 }

@@ -2,6 +2,7 @@ mod color_picker;
 mod components;
 mod crop_properties;
 mod gradient_properties;
+mod guide_properties;
 mod layers;
 mod text_properties;
 
@@ -12,6 +13,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::ColorState;
 use oxiedraw_core::components::ComponentLibrary;
 use oxiedraw_core::document::LayerState;
+use oxiedraw_core::guides::GuideState;
 use oxiedraw_core::history::HistoryStack;
 use oxiedraw_core::text::fonts::TextEngine;
 use oxiedraw_core::tools::{CropState, FillTool, GradientState, Tool, ToolState};
@@ -23,6 +25,7 @@ use crate::canvas::RedrawHandle;
 const WIDTH: i32 = 300;
 const STACK_NORMAL: &str = "normal";
 const STACK_CROP: &str = "crop";
+const STACK_GUIDE: &str = "guide";
 
 /// Build the right sidebar.
 ///
@@ -37,6 +40,7 @@ pub(crate) fn build(
     crop: &CropState,
     tools: &ToolState,
     gradient: &GradientState,
+    guide: &GuideState,
     layer_clipboard: &Rc<RefCell<Option<crate::clipboard::LayerClipboard>>>,
     toaster: &crate::toaster::Toaster,
     select_layer_content: &Rc<dyn Fn(usize)>,
@@ -73,6 +77,7 @@ pub(crate) fn build(
         .build();
     // Colour picker with the gradient panel revealed on top of it while the
     // Gradient tool is active.
+    let guide_panel = guide_properties::build(guide, canvas);
     let (gradient_panel, set_gradient_active) = gradient_properties::build(gradient, &colors);
     let picker_column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -146,23 +151,19 @@ pub(crate) fn build(
         .build();
     stack.add_named(&normal_root, Some(STACK_NORMAL));
     stack.add_named(&crop_panel, Some(STACK_CROP));
+    stack.add_named(&guide_panel, Some(STACK_GUIDE));
 
-    let initial = if tools.active.get() == Tool::Crop {
-        STACK_CROP
-    } else {
-        STACK_NORMAL
+    let page_for_tool = |t: Tool| match t {
+        Tool::Crop => STACK_CROP,
+        Tool::DrawingGuide => STACK_GUIDE,
+        _ => STACK_NORMAL,
     };
-    stack.set_visible_child_name(initial);
+    stack.set_visible_child_name(page_for_tool(tools.active.get()));
 
     let setter: Rc<dyn Fn(Tool)> = {
         let stack = stack.clone();
         Rc::new(move |t: Tool| {
-            let page = if t == Tool::Crop {
-                STACK_CROP
-            } else {
-                STACK_NORMAL
-            };
-            stack.set_visible_child_name(page);
+            stack.set_visible_child_name(page_for_tool(t));
             set_gradient_active(t == Tool::Fill(FillTool::Gradient));
         })
     };

@@ -24,6 +24,7 @@ use oxiedraw_core::document::{
 use oxiedraw_core::history::{
     CropLayer, HistoryAction, HistoryConfig, HistoryStack, LayerPatch, SelectionSnapshot,
 };
+use oxiedraw_core::guides::{GuideConfig, GuideState, Symmetry};
 use oxiedraw_core::renderer::RendererError;
 use oxiedraw_core::tools::{
     CropRect, CropState, FillState, GradientState, SelectionState, ShapeState, Tool, ToolState,
@@ -166,6 +167,9 @@ pub(crate) struct DocumentSession {
     pub(crate) fill: FillState,
     pub(crate) shape: ShapeState,
     pub(crate) gradient: GradientState,
+    /// Per-document drawing guide (symmetry / grid / perspective). Edited by the
+    /// Drawing Guide tool; its symmetry keeps affecting strokes once assisted.
+    pub(crate) guide: GuideState,
     pub(crate) viewport: Viewport,
     pub(crate) doc_props: DocumentProperties,
     pub(crate) layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>>,
@@ -760,10 +764,28 @@ impl DocumentSession {
         let fill = FillState::new();
         let shape = ShapeState::new();
         let gradient = GradientState::new();
+        let guide = GuideState::new();
         let doc_props = document.properties.clone();
         let viewport = Viewport::new(init_size, document.layers.clone());
         let layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>> =
             Rc::new(RefCell::new(HashMap::new()));
+
+        // Live guide sync: whenever the guide config changes, push its symmetry
+        // transforms to the canvas (so assisted strokes reproduce) and refresh
+        // the on-canvas overlay.
+        {
+            let canvas = viewport.canvas();
+            let paintable = viewport.paintable().clone();
+            let redraw = viewport.redraw_handle();
+            let guide_c = guide.clone();
+            guide.connect_changed(Box::new(move || {
+                let cfg = guide_c.config.borrow().clone();
+                let sym = cfg.as_ref().and_then(Symmetry::from_config);
+                canvas.borrow_mut().set_symmetry(sym);
+                paintable.set_guide(cfg);
+                redraw.request();
+            }));
+        }
 
         let ctx = SessionCtx {
             global: global.clone(),
@@ -891,6 +913,7 @@ impl DocumentSession {
             &crop,
             &global.tools,
             &gradient,
+            &guide,
             &global.clipboard,
             &global.toaster,
             &select_layer_content,
@@ -975,6 +998,7 @@ impl DocumentSession {
             &crop,
             &transform,
             &selection,
+            &guide,
             &layer_extensions,
             &components,
             &global.text_engine,
@@ -1022,6 +1046,7 @@ impl DocumentSession {
             &fill,
             &shape,
             &gradient,
+            &guide,
             &history,
             &global.toaster,
             &text_edit,
@@ -1161,6 +1186,7 @@ impl DocumentSession {
             fill,
             shape,
             gradient,
+            guide,
             viewport,
             doc_props,
             layer_extensions,
@@ -1895,6 +1921,7 @@ fn build_apply_tool(
     crop: &CropState,
     transform: &TransformState,
     selection: &SelectionState,
+    guide: &GuideState,
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     components: &Rc<RefCell<ComponentLibrary>>,
     text_engine: &Rc<RefCell<oxiedraw_core::text::fonts::TextEngine>>,
@@ -1904,6 +1931,8 @@ fn build_apply_tool(
     let paintable = viewport.paintable().clone();
     let crop_for_tool = crop.clone();
     let transform_for_tool = transform.clone();
+    let guide_for_tool = guide.clone();
+    let viewport_for_guide = viewport.clone();
     let canvas_for_tool = viewport.canvas();
     let redraw_for_tool = viewport.redraw_handle();
     let extensions_for_sat = Rc::clone(layer_extensions);
@@ -1917,6 +1946,31 @@ fn build_apply_tool(
         paintable.set_crop_active(t == Tool::Crop);
         if t != Tool::ColorPicker {
             paintable.set_color_picker(None);
+        }
+
+        // Drawing guide: entering the tool seeds a default guide (centred on
+        // the canvas, accent-coloured) if none exists, snapshots the config for
+        // Cancel, and shows the edit nodes. Leaving hides only the nodes - the
+        // guide (and its assist) stays live.
+        paintable.set_guide_editing(t == Tool::DrawingGuide);
+        if t == Tool::DrawingGuide {
+            // Resolve the libadwaita accent so both the nodes and the default
+            // line colour match the theme (Procreate's blue/green -> accent).
+            let accent_rgb = viewport_for_guide
+                .picture_widget()
+                .map_or(COMPONENT_ACCENT, |w| accent_rgb(w.upcast_ref::<gtk::Widget>()));
+            paintable.set_guide_accent(accent_rgb);
+            if guide_for_tool.config.borrow().is_none() {
+                let cs = canvas_for_tool.borrow().size();
+                *guide_for_tool.config.borrow_mut() = Some(GuideConfig::centered(cs.width, cs.height));
+            }
+            guide_for_tool
+                .entry_snapshot
+                .borrow_mut()
+                .clone_from(&guide_for_tool.config.borrow());
+            guide_for_tool.notify_changed();
+        } else {
+            redraw_for_tool.request();
         }
         // The gradient ramp cursor is transient; drop it on any tool switch
         // (the next pointer motion re-arms it when the Gradient tool is active).
