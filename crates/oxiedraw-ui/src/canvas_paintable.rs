@@ -35,6 +35,12 @@ const PICKER_MAG_RADIUS: f32 = 58.0;
 /// enough that individual pixels read clearly under nearest-neighbour.
 const PICKER_MAG_SCALE: f32 = 12.0;
 
+/// Rotation (radians) at or below which the view counts as unrotated for the
+/// pixel-perfect paths (nearest fill + grid). Snapping/easing back toward 0 can
+/// leave sub-milliradian residue, so an exact `== 0.0` would keep those paths
+/// off; ~0.06 deg is well under a pixel of skew yet catches the residue.
+const UNROTATED_EPS: f32 = 1e-3;
+
 /// Color-picker loupe + eyedropper overlay state. `cursor` is the
 /// widget-space pointer position; `color` is the currently sampled
 /// color (shown in the swatch / used to tint the eyedropper).
@@ -85,11 +91,12 @@ impl CanvasPaintable {
     /// Update the viewport transform. Cheap - no GPU work, just queues
     /// a redraw that will paint the existing texture at the new
     /// translation/scale.
-    pub(crate) fn set_transform(&self, pan_x: f32, pan_y: f32, zoom: f32) {
+    pub(crate) fn set_transform(&self, pan_x: f32, pan_y: f32, zoom: f32, rotation: f32) {
         let imp = self.imp();
         imp.pan_x.set(pan_x);
         imp.pan_y.set(pan_y);
         imp.zoom.set(zoom);
+        imp.rotation.set(rotation);
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
@@ -404,6 +411,20 @@ fn build_checker_texture() -> gdk::MemoryTexture {
 // Crop overlay drawing (widget-space cairo)
 // ---------------------------------------------------------------------------
 
+/// Rotate cairo user space by `rotation` (radians) about the pan origin, so
+/// overlay geometry expressed as unrotated widget coords (`pan + canvas*zoom`)
+/// lands at the correct rotated position without touching the per-overlay math.
+/// Rotation preserves lengths, so screen-fixed handle/line sizes stay fixed.
+/// No-op at 0. Applied to the cairo context before an overlay draws.
+fn apply_view_rotation(cr: &gtk::cairo::Context, pan_x: f32, pan_y: f32, rotation: f32) {
+    if rotation == 0.0 {
+        return;
+    }
+    cr.translate(f64::from(pan_x), f64::from(pan_y));
+    cr.rotate(f64::from(rotation));
+    cr.translate(f64::from(-pan_x), f64::from(-pan_y));
+}
+
 fn draw_crop_overlay_cairo(
     cr: &gtk::cairo::Context,
     w: i32,
@@ -419,19 +440,30 @@ fn draw_crop_overlay_cairo(
     let wy1 = f64::from(pan_y + n.y * zoom);
     let wx2 = f64::from(pan_x + n.right() * zoom);
     let wy2 = f64::from(pan_y + n.bottom() * zoom);
-    let wf = f64::from(w);
-    let hf = f64::from(h);
 
-    // Dark vignette outside the crop region - four rectangles.
+    // Dark vignette outside the crop region: one big square minus the crop rect,
+    // filled even-odd. The caller has rotated cairo about the pan origin, so we
+    // centre the outer square on that pivot and size it past the farthest widget
+    // (and crop) corner - a square centred on the rotation pivot stays covering
+    // its inscribed disc at any angle, so the viewport is always covered.
+    let (px, py) = (f64::from(pan_x), f64::from(pan_y));
+    let dist = |x: f64, y: f64| (x - px).hypot(y - py);
+    let (wf, hf) = (f64::from(w), f64::from(h));
+    let far = dist(0.0, 0.0)
+        .max(dist(wf, 0.0))
+        .max(dist(0.0, hf))
+        .max(dist(wf, hf))
+        .max(dist(wx1, wy1))
+        .max(dist(wx2, wy2))
+        .max(dist(wx1, wy2))
+        .max(dist(wx2, wy1))
+        + 2.0;
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.50);
-    cr.rectangle(0.0, 0.0, wf, wy1.max(0.0));
+    cr.set_fill_rule(gtk::cairo::FillRule::EvenOdd);
+    cr.rectangle(px - far, py - far, 2.0 * far, 2.0 * far);
+    cr.rectangle(wx1, wy1, wx2 - wx1, wy2 - wy1);
     cr.fill().ok();
-    cr.rectangle(0.0, wy2.min(hf), wf, (hf - wy2).max(0.0));
-    cr.fill().ok();
-    cr.rectangle(0.0, wy1, wx1.max(0.0), wy2 - wy1);
-    cr.fill().ok();
-    cr.rectangle(wx2.min(wf), wy1, (wf - wx2).max(0.0), wy2 - wy1);
-    cr.fill().ok();
+    cr.set_fill_rule(gtk::cairo::FillRule::Winding);
 
     // Grid overlay inside the crop rect.
     draw_crop_grid(cr, wx1, wy1, wx2, wy2, overlay);
@@ -1308,7 +1340,7 @@ fn draw_gradient_cursor_cairo(cr: &gtk::cairo::Context, overlay: &GradientCursor
 mod imp {
     use super::{
         BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
-        GradientCursorOverlay, PendingMarquee, Point, RefCell, TransformRect,
+        GradientCursorOverlay, PendingMarquee, Point, RefCell, TransformRect, apply_view_rotation,
         draw_brush_cursor_cairo, draw_color_picker_cairo, draw_crop_overlay_cairo,
         draw_gradient_cursor_cairo, draw_pixel_grid_cairo, draw_selection_overlay_cairo,
         draw_text_edit_overlay_cairo, draw_transform_overlay_cairo, gdk, glib, graphene, gsk, gtk,
@@ -1324,6 +1356,8 @@ mod imp {
         pub(super) pan_x: Cell<f32>,
         pub(super) pan_y: Cell<f32>,
         pub(super) zoom: Cell<f32>,
+        /// Canvas rotation in radians, applied around the pan/zoom origin.
+        pub(super) rotation: Cell<f32>,
         // crop overlay
         pub(super) crop_rect: Cell<Option<CropRect>>,
         pub(super) crop_overlay: Cell<CropOverlay>,
@@ -1406,6 +1440,7 @@ mod imp {
                 pan_x: Cell::new(0.0),
                 pan_y: Cell::new(0.0),
                 zoom: Cell::new(1.0),
+                rotation: Cell::new(0.0),
                 crop_rect: Cell::new(None),
                 crop_overlay: Cell::new(CropOverlay::default()),
                 crop_active: Cell::new(false),
@@ -1468,6 +1503,7 @@ mod imp {
             pan_x: f32,
             pan_y: f32,
             zoom: f32,
+            rotation: f32,
             canvas_w: f32,
             canvas_h: f32,
         ) {
@@ -1480,8 +1516,18 @@ mod imp {
             let height = widget_rect.height();
 
             // Canvas pixel under the cursor; map its centre to the loupe centre.
-            let cxp = (picker.cursor.x - pan_x) / zoom;
-            let cyp = (picker.cursor.y - pan_y) / zoom;
+            // Invert the full view transform (rotation included) so the loupe
+            // magnifies the pixel actually under the pointer, not the one that
+            // would sit there with the view unrotated.
+            let canvas_pt = crate::canvas::widget_to_canvas_xf(
+                picker.cursor.x,
+                picker.cursor.y,
+                Point::new(pan_x, pan_y),
+                zoom,
+                rotation,
+            );
+            let cxp = canvas_pt.x;
+            let cyp = canvas_pt.y;
             let sample_cx = cxp.floor() + 0.5;
             let sample_cy = cyp.floor() + 0.5;
 
@@ -1547,49 +1593,65 @@ mod imp {
             let pan_x = self.pan_x.get();
             let pan_y = self.pan_y.get();
             let zoom = self.zoom.get().max(f32::EPSILON);
+            let rotation = self.rotation.get();
 
             // Pixel-perfect mode: above the configured threshold the checker
-            // *and* the canvas image are sampled with nearest-neighbour so
-            // cell boundaries and individual pixels stay crisp. GSK's filter
-            // hint only applies to scale-to-fit inside a node's bounds, so
-            // both layers are emitted in widget space at this zoom.
-            let use_nearest = self.pixel_view_enabled.get() && zoom >= self.nearest_threshold.get();
+            // *and* the canvas image are sampled with nearest-neighbour so cell
+            // boundaries and individual pixels stay crisp. GSK's filter hint only
+            // applies to the scale-up inside a node's bounds, so both layers are
+            // emitted as scale nodes whose bounds already absorb the zoom, under a
+            // translate (+ optional rotate) frame - crisp at any view angle.
+            let use_nearest =
+                self.pixel_view_enabled.get() && zoom >= self.nearest_threshold.get();
 
             let canvas_rect = graphene::Rect::new(0.0, 0.0, canvas_w, canvas_h);
 
             if use_nearest {
-                let widget_canvas_rect =
-                    graphene::Rect::new(pan_x, pan_y, canvas_w * zoom, canvas_h * zoom);
+                let rotated = rotation.abs() >= super::UNROTATED_EPS;
+                // A TextureScaleNode under a rotation transform makes GSK render
+                // an offscreen the size of the node bounds - the whole zoomed
+                // canvas, ~200ms/frame. Clip to the viewport first so that
+                // offscreen is bounded to screen size. At 0deg the scale nodes
+                // draw directly, so the clip is skipped.
+                if rotated {
+                    snapshot.push_clip(&widget_rect);
+                }
+                snapshot.save();
+                snapshot.translate(&graphene::Point::new(pan_x, pan_y));
+                if rotated {
+                    snapshot.rotate(rotation.to_degrees());
+                }
+                let zoomed = graphene::Rect::new(0.0, 0.0, canvas_w * zoom, canvas_h * zoom);
 
-                // 2. Checker tile - widget-space scale node with NEAREST filter.
+                // 2. Checker tile - scale node with NEAREST filter.
                 if let Some(checker) = self.checker.borrow().clone() {
                     #[allow(clippy::cast_precision_loss)]
                     let tile_widget = CHECKER_TILE as f32 * zoom;
-                    let tile_rect = graphene::Rect::new(pan_x, pan_y, tile_widget, tile_widget);
-                    let tile_node = gsk::TextureScaleNode::new(
-                        &checker,
-                        &tile_rect,
-                        gsk::ScalingFilter::Nearest,
-                    );
-                    let repeat =
-                        gsk::RepeatNode::new(&widget_canvas_rect, &tile_node, Some(&tile_rect));
+                    let tile_rect = graphene::Rect::new(0.0, 0.0, tile_widget, tile_widget);
+                    let tile_node =
+                        gsk::TextureScaleNode::new(&checker, &tile_rect, gsk::ScalingFilter::Nearest);
+                    let repeat = gsk::RepeatNode::new(&zoomed, &tile_node, Some(&tile_rect));
                     snapshot.append_node(&repeat);
                 }
 
-                // 3. Canvas texture - append_scaled_texture honours the filter.
+                // 3. Canvas texture - scale node with NEAREST filter.
                 if let Some(texture) = self.texture.borrow().clone() {
-                    let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
-                    gtk_snap.append_scaled_texture(
-                        &texture,
-                        gsk::ScalingFilter::Nearest,
-                        &widget_canvas_rect,
-                    );
+                    let node =
+                        gsk::TextureScaleNode::new(&texture, &zoomed, gsk::ScalingFilter::Nearest);
+                    snapshot.append_node(&node);
+                }
+                snapshot.restore();
+                if rotated {
+                    snapshot.pop();
                 }
             } else {
                 // Standard path: draw in canvas space; GSK default (linear)
-                // sampling renders the outer zoom transform smoothly.
+                // sampling renders the outer zoom+rotation transform smoothly.
                 snapshot.save();
                 snapshot.translate(&graphene::Point::new(pan_x, pan_y));
+                if rotation != 0.0 {
+                    snapshot.rotate(rotation.to_degrees());
+                }
                 snapshot.scale(zoom, zoom);
 
                 if let Some(checker) = self.checker.borrow().clone() {
@@ -1632,12 +1694,20 @@ mod imp {
                 let sy = if orig.h > 0.0 { rect.h / orig.h } else { 1.0 };
                 let final_sx = sx * zoom;
                 let final_sy = sy * zoom;
+                // Unrotated widget centre, then rotate it about the pan origin
+                // for the current view rotation (which also adds to the box's
+                // own angle since the whole canvas turns).
                 let center_wx = rect.cx.mul_add(zoom, pan_x);
                 let center_wy = rect.cy.mul_add(zoom, pan_y);
+                let (view_sin, view_cos) = rotation.sin_cos();
+                let dx = center_wx - pan_x;
+                let dy = center_wy - pan_y;
+                let center_rx = pan_x + view_cos.mul_add(dx, -view_sin * dy);
+                let center_ry = pan_y + view_sin.mul_add(dx, view_cos * dy);
 
                 snapshot.save();
-                snapshot.translate(&graphene::Point::new(center_wx, center_wy));
-                snapshot.rotate(rect.angle.to_degrees());
+                snapshot.translate(&graphene::Point::new(center_rx, center_ry));
+                snapshot.rotate((rect.angle + rotation).to_degrees());
                 #[allow(clippy::cast_precision_loss)]
                 let local_rect = graphene::Rect::new(
                     -orig.cx * final_sx,
@@ -1666,6 +1736,9 @@ mod imp {
                     } else {
                         snapshot.save();
                         snapshot.translate(&graphene::Point::new(pan_x, pan_y));
+                        if rotation != 0.0 {
+                            snapshot.rotate(rotation.to_degrees());
+                        }
                         snapshot.scale(zoom, zoom);
                         snapshot.append_texture(&above, &canvas_rect);
                         snapshot.restore();
@@ -1676,6 +1749,9 @@ mod imp {
             // Re-enter canvas space for the document border.
             snapshot.save();
             snapshot.translate(&graphene::Point::new(pan_x, pan_y));
+            if rotation != 0.0 {
+                snapshot.rotate(rotation.to_degrees());
+            }
             snapshot.scale(zoom, zoom);
 
             // 4. Document-edge border.
@@ -1742,9 +1818,13 @@ mod imp {
 
             // 4b. Pixel grid - drawn in widget space, just above the canvas
             //     border. Only visible above the configured zoom threshold.
+            // Grid is a widget-space cairo overlay; under rotation it becomes
+            // hundreds of diagonal antialiased lines on a full-widget software
+            // surface (~200ms/frame), so it draws at 0deg only.
             if self.pixel_view_enabled.get()
                 && self.grid_enabled.get()
                 && zoom >= self.grid_threshold.get()
+                && rotation.abs() < super::UNROTATED_EPS
             {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 #[allow(clippy::cast_possible_truncation)]
@@ -1771,6 +1851,7 @@ mod imp {
                 // gdk::Snapshot parameter is just the base-class type.
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 #[allow(clippy::cast_possible_truncation)]
                 draw_crop_overlay_cairo(
                     &cr,
@@ -1791,6 +1872,7 @@ mod imp {
             {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 draw_transform_overlay_cairo(&cr, rect, pan_x, pan_y, zoom);
             }
 
@@ -1800,6 +1882,7 @@ mod imp {
             {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 draw_text_edit_overlay_cairo(
                     &cr,
                     box_rect,
@@ -1818,6 +1901,7 @@ mod imp {
             if let Some(rect) = self.text_pending_box.get() {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 let lx = f64::from(pan_x + (rect.cx - rect.half_w()) * zoom);
                 let ly = f64::from(pan_y + (rect.cy - rect.half_h()) * zoom);
                 cr.set_source_rgba(0.21, 0.52, 0.89, 0.9);
@@ -1842,6 +1926,7 @@ mod imp {
             if let Some(cursor) = brush_cursor.as_ref() {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 draw_brush_cursor_cairo(
                     &cr,
                     cursor,
@@ -1861,6 +1946,7 @@ mod imp {
             if !contours.is_empty() || pending.is_some() {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
                 draw_selection_overlay_cairo(
                     &cr,
                     &contours,
@@ -1884,6 +1970,7 @@ mod imp {
                     pan_x,
                     pan_y,
                     zoom,
+                    rotation,
                     canvas_w,
                     canvas_h,
                 );

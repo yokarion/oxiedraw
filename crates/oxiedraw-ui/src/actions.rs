@@ -72,6 +72,10 @@ pub(crate) fn register(active_viewport: Rc<dyn Fn() -> Option<Viewport>>) {
 pub(crate) fn apply_all_accels(app: &gtk::Application, settings: &AppSettings) {
     for group in ALL_ACTION_GROUPS {
         for info in group.actions {
+            // Modifier-only bindings qualify a canvas drag; they have no GAction.
+            if crate::settings::keybinds::is_modifier_only(info.id) {
+                continue;
+            }
             let target = format!("app.{}", info.id);
             match info.resolve_accel(settings) {
                 Some(a) => app.set_accels_for_action(&target, &[a]),

@@ -140,8 +140,15 @@ fn write_project(
             session.global.text_engine.borrow().embed_used_fonts(&families)
         };
         let gradient = session.gradient.settings.borrow().clone();
-        match project::save::snapshot(&mut canvas.borrow_mut(), &props, &components, &fonts, gradient)
-        {
+        let view_rotation = session.viewport.rotation();
+        match project::save::snapshot(
+            &mut canvas.borrow_mut(),
+            &props,
+            &components,
+            &fonts,
+            gradient,
+            view_rotation,
+        ) {
             Ok(s) => s,
             Err(e) => {
                 if kind == SaveKind::Manual {

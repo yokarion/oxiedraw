@@ -4,8 +4,12 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use adw::prelude::*;
+use relm4::gtk;
 
 use crate::settings::{AppSettings, PixelViewSettings};
+
+/// Selectable rotation snap steps (degrees).
+const SNAP_STEPS: [f32; 7] = [5.0, 10.0, 15.0, 22.5, 30.0, 45.0, 90.0];
 
 pub(super) fn build_canvas_page(
     settings: Rc<RefCell<AppSettings>>,
@@ -237,6 +241,39 @@ pub(super) fn build_canvas_page(
 
     pv_group.add(&pv_expander);
     page.add(&pv_group);
+
+    // -- Rotation group -------------------------------------------------------
+    let rot_group = adw::PreferencesGroup::new();
+    rot_group.set_title("Rotation");
+
+    let labels: Vec<String> = SNAP_STEPS.iter().map(|d| format!("{d} deg")).collect();
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+
+    let snap_row = adw::ComboRow::new();
+    snap_row.set_title("Snap step");
+    snap_row.set_subtitle(
+        "Angle increment for the rotator dial and snap-modifier rotation",
+    );
+    snap_row.set_model(Some(&gtk::StringList::new(&label_refs)));
+    // Select the current value, falling back to 45 deg if it isn't a preset.
+    let current = settings.borrow().rotation_snap_deg;
+    let selected = SNAP_STEPS
+        .iter()
+        .position(|d| (d - current).abs() < 0.01)
+        .or_else(|| SNAP_STEPS.iter().position(|d| (*d - 45.0).abs() < 0.01))
+        .unwrap_or(0);
+    #[allow(clippy::cast_possible_truncation)]
+    snap_row.set_selected(selected as u32);
+    {
+        let settings = Rc::clone(&settings);
+        snap_row.connect_selected_notify(move |r| {
+            let idx = (r.selected() as usize).min(SNAP_STEPS.len() - 1);
+            settings.borrow_mut().rotation_snap_deg = SNAP_STEPS[idx];
+            settings.borrow().save();
+        });
+    }
+    rot_group.add(&snap_row);
+    page.add(&rot_group);
 
     page
 }

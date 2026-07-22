@@ -46,6 +46,18 @@ const ZOOM_DRAG_OCTAVE_PX: f64 = 150.0;
 /// Multiplier applied to touchpad two-finger scroll deltas (surface unit,
 /// already pixel-scaled) when panning the canvas.
 const TOUCHPAD_PAN_SPEED: f32 = 1.0;
+/// Exponential-smoothing time constant (seconds) for the snap ease. Time-based
+/// so the animation is frame-rate independent. ~3x this = settle time.
+const SNAP_EASE_TAU: f64 = 0.012;
+/// Stop the snap ease once within this many radians of the target.
+const SNAP_EASE_EPSILON: f32 = 0.0015;
+
+/// Rotation snap step in radians, from settings (degrees). Falls back to 45 deg.
+pub(crate) fn rotation_snap_rad() -> f32 {
+    let deg = crate::settings::AppSettings::load().rotation_snap_deg;
+    deg.to_radians().max(0.017) // >= ~1 deg to avoid divide-by-zero snapping
+}
+
 
 /// Which navigation gesture (if any) the middle-mouse drag is currently
 /// performing. Drives both the gesture handlers and the cursor that the
@@ -55,6 +67,7 @@ enum NavDrag {
     None,
     Pan,
     Zoom,
+    Rotate,
 }
 
 /// Late-bound "redraw the canvas" callable. Created empty by
@@ -97,6 +110,30 @@ pub(crate) struct Viewport {
     /// touchpad kinetic scrolling) modifies `pan` mid-drag.
     pan_last_offset: Rc<Cell<Point>>,
     zoom: Rc<Cell<f32>>,
+    /// Canvas rotation in radians (view-only; also persisted per document).
+    rotation: Rc<Cell<f32>>,
+    /// Accumulated free (un-snapped) rotation target during a rotate drag.
+    /// Seeded with the current rotation at drag-begin, then advanced by the
+    /// pointer's angular travel around the pivot each update (Krita-style).
+    nav_rotate_target: Rc<Cell<f32>>,
+    /// Pointer angle (radians, around the viewport centre) at the previous
+    /// rotate update, for accumulating angular travel across the branch cut.
+    nav_rotate_last_angle: Rc<Cell<f32>>,
+    /// Snap modifier mask + step (radians) resolved once at rotate-drag begin,
+    /// so the per-event update path never re-reads settings from disk.
+    nav_rotate_snap_mask: Rc<Cell<Option<gdk::ModifierType>>>,
+    nav_rotate_snap_step: Rc<Cell<f32>>,
+    /// Target angle (radians) the snap ease is animating toward, or `None` when
+    /// idle. Set while rotating with the snap modifier held.
+    snap_target: Rc<Cell<Option<f32>>>,
+    /// Whether the snap-ease frame tick is currently installed.
+    snap_tick_installed: Rc<Cell<bool>>,
+    /// Frame-clock time (us) of the previous ease tick, for the time-based lerp.
+    snap_last_time: Rc<Cell<i64>>,
+    /// Observer fired on every view change (pan/zoom/rotation) so the
+    /// per-canvas info bar can refresh its size + angle readout. Installed by
+    /// the session once the info bar widget exists.
+    info_observer: Rc<RefCell<Option<Box<dyn Fn(Size, f32)>>>>,
     cursor: Rc<Cell<Point>>,
     /// Active middle-mouse navigation gesture (pan vs. Ctrl+drag zoom),
     /// or `None` when idle. Set on drag-begin, cleared on drag-end; the
@@ -202,7 +239,110 @@ impl std::fmt::Debug for Viewport {
         f.debug_struct("Viewport")
             .field("pan", &self.pan.get())
             .field("zoom", &self.zoom.get())
+            .field("rotation", &self.rotation.get())
             .finish_non_exhaustive()
+    }
+}
+
+/// Closure-friendly bundle of the view-transform cells + paintable + info-bar
+/// observer. Gesture handlers clone one of these and call [`ViewSync::commit`]
+/// after mutating the cells, so the paintable transform and the bottom info bar
+/// stay in lockstep through a single path.
+#[derive(Clone)]
+struct ViewSync {
+    pan: Rc<Cell<Point>>,
+    zoom: Rc<Cell<f32>>,
+    rotation: Rc<Cell<f32>>,
+    canvas_size: Rc<Cell<Size>>,
+    paintable: CanvasPaintable,
+    info_observer: Rc<RefCell<Option<Box<dyn Fn(Size, f32)>>>>,
+}
+
+impl ViewSync {
+    /// Push the current pan/zoom/rotation to the paintable and notify the info
+    /// bar. Call after mutating any of the cells.
+    fn commit(&self) {
+        let p = self.pan.get();
+        self.paintable
+            .set_transform(p.x, p.y, self.zoom.get(), self.rotation.get());
+        if let Some(cb) = self.info_observer.borrow().as_ref() {
+            cb(self.canvas_size.get(), self.rotation.get());
+        }
+    }
+}
+
+/// Eases the view rotation toward a target angle over a few frames, pivoting
+/// around the viewport centre. Used only while rotating with the snap modifier
+/// held, so the canvas glides to each 45 deg stop instead of jumping.
+#[derive(Clone)]
+struct RotationAnimator {
+    sync: ViewSync,
+    picture: Rc<RefCell<Option<gtk::Picture>>>,
+    target: Rc<Cell<Option<f32>>>,
+    installed: Rc<Cell<bool>>,
+    last_time: Rc<Cell<i64>>,
+}
+
+impl RotationAnimator {
+    /// (Re)aim the ease at `target` and ensure the frame tick is running.
+    fn animate_to(&self, target: f32) {
+        self.target.set(Some(target));
+        if self.installed.replace(true) {
+            return; // tick already running; it will pick up the new target
+        }
+        let Some(area) = self.picture.borrow().clone() else {
+            self.installed.set(false);
+            return;
+        };
+        self.last_time.set(0);
+        let me = self.clone();
+        area.add_tick_callback(move |_area, clock| {
+            let Some(target) = me.target.get() else {
+                me.installed.set(false);
+                return glib::ControlFlow::Break;
+            };
+            let cur = me.sync.rotation.get();
+            let delta = target - cur;
+            if delta.abs() < SNAP_EASE_EPSILON {
+                me.target.set(None);
+                me.installed.set(false);
+                me.apply(target);
+                return glib::ControlFlow::Break;
+            }
+            // Frame-rate-independent exponential smoothing.
+            let now = clock.frame_time();
+            let last = me.last_time.replace(now);
+            let dt = if last == 0 {
+                1.0 / 60.0
+            } else {
+                #[allow(clippy::cast_precision_loss)]
+                let d = (now - last) as f64 / 1_000_000.0;
+                d.clamp(0.0, 0.1)
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let factor = (1.0 - (-dt / SNAP_EASE_TAU).exp()) as f32;
+            me.apply(delta.mul_add(factor, cur));
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Stop the ease where it is (used when snap is released mid-drag).
+    fn cancel(&self) {
+        self.target.set(None);
+    }
+
+    fn apply(&self, theta: f32) {
+        rotate_about_center(
+            &self.sync.pan,
+            &self.sync.zoom,
+            &self.sync.rotation,
+            &self.picture,
+            theta,
+        );
+        self.sync.commit();
+        if let Some(area) = self.picture.borrow().as_ref() {
+            area.queue_draw();
+        }
     }
 }
 
@@ -217,6 +357,15 @@ impl Viewport {
             pan: Rc::new(Cell::new(Point::ZERO)),
             pan_last_offset: Rc::new(Cell::new(Point::ZERO)),
             zoom: Rc::new(Cell::new(1.0)),
+            rotation: Rc::new(Cell::new(0.0)),
+            nav_rotate_target: Rc::new(Cell::new(0.0)),
+            nav_rotate_last_angle: Rc::new(Cell::new(0.0)),
+            nav_rotate_snap_mask: Rc::new(Cell::new(None)),
+            nav_rotate_snap_step: Rc::new(Cell::new(0.0)),
+            snap_target: Rc::new(Cell::new(None)),
+            snap_tick_installed: Rc::new(Cell::new(false)),
+            snap_last_time: Rc::new(Cell::new(0)),
+            info_observer: Rc::new(RefCell::new(None)),
             cursor: Rc::new(Cell::new(Point::ZERO)),
             nav: Rc::new(Cell::new(NavDrag::None)),
             nav_zoom_start: Rc::new(Cell::new(1.0)),
@@ -292,6 +441,54 @@ impl Viewport {
         Rc::clone(&self.zoom)
     }
 
+    /// Current canvas rotation in radians (persisted per document).
+    pub(crate) fn rotation(&self) -> f32 {
+        self.rotation.get()
+    }
+
+    /// Register the per-canvas info bar's refresh callback. Fired on every
+    /// view change with the current canvas size + rotation.
+    pub(crate) fn set_info_observer(&self, cb: Box<dyn Fn(Size, f32)>) {
+        // Push the current state immediately so the bar starts correct.
+        cb(self.canvas_size.get(), self.rotation.get());
+        *self.info_observer.borrow_mut() = Some(cb);
+    }
+
+    fn view_sync(&self) -> ViewSync {
+        ViewSync {
+            pan: Rc::clone(&self.pan),
+            zoom: Rc::clone(&self.zoom),
+            rotation: Rc::clone(&self.rotation),
+            canvas_size: Rc::clone(&self.canvas_size),
+            paintable: self.paintable.clone(),
+            info_observer: Rc::clone(&self.info_observer),
+        }
+    }
+
+    fn rotation_animator(&self) -> RotationAnimator {
+        RotationAnimator {
+            sync: self.view_sync(),
+            picture: Rc::clone(&self.picture),
+            target: Rc::clone(&self.snap_target),
+            installed: Rc::clone(&self.snap_tick_installed),
+            last_time: Rc::clone(&self.snap_last_time),
+        }
+    }
+
+    /// Rotate the view to an absolute angle (radians), pivoting around the
+    /// viewport centre so the canvas point under the centre stays fixed.
+    pub(crate) fn rotate_to(&self, new_theta: f32) {
+        rotate_about_center(&self.pan, &self.zoom, &self.rotation, &self.picture, new_theta);
+        self.view_sync().commit();
+    }
+
+    /// Set the rotation directly (used when loading a document). Pairs with a
+    /// subsequent `zoom_fit`, which re-centres pan for the loaded angle.
+    pub(crate) fn set_rotation_raw(&self, theta: f32) {
+        self.rotation.set(theta);
+        self.view_sync().commit();
+    }
+
     pub(crate) fn zoom_in(&self) {
         let old = self.zoom.get();
         #[allow(clippy::cast_possible_truncation)]
@@ -349,6 +546,8 @@ impl Viewport {
         self.canvas_size.set(new_size);
         self.paintable
             .set_canvas_size(new_size.width, new_size.height);
+        // Refresh the info bar's size readout (crop doesn't refit the zoom).
+        self.view_sync().commit();
         Some(new_size)
     }
 
@@ -377,7 +576,7 @@ impl Viewport {
     /// Map a widget-space point (picture coordinates) to canvas-pixel space
     /// using the current pan/zoom. Used by the component drag-drop target.
     pub(crate) fn widget_to_canvas_point(&self, x: f64, y: f64) -> Point {
-        widget_to_canvas(x, y, &self.pan, &self.zoom)
+        widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation)
     }
 
     fn zoom_toward(&self, new_zoom: f32) {
@@ -388,6 +587,8 @@ impl Viewport {
             .borrow()
             .as_ref()
             .map_or((0.0, 0.0), |p| (p.width() as f32 / 2.0, p.height() as f32 / 2.0));
+        // The pivot recompute is rotation-invariant: R*zoom*canvas == A - pan,
+        // so the same ratio formula keeps the point under the centre fixed.
         let p = self.pan.get();
         let ratio = new_zoom / old_zoom;
         let new_pan = Point::new(
@@ -396,7 +597,7 @@ impl Viewport {
         );
         self.pan.set(new_pan);
         self.zoom.set(new_zoom);
-        self.paintable.set_transform(new_pan.x, new_pan.y, new_zoom);
+        self.view_sync().commit();
     }
 }
 
@@ -477,6 +678,7 @@ fn install_motion(
     let nav = Rc::clone(&viewport.nav);
     let pan = Rc::clone(&viewport.pan);
     let zoom = Rc::clone(&viewport.zoom);
+    let rotation = Rc::clone(&viewport.rotation);
     let canvas = Rc::clone(&viewport.canvas);
     let paintable = viewport.paintable.clone();
     let tools_c = tools.clone();
@@ -538,7 +740,8 @@ fn install_motion(
             Tool::Transform => {
                 if let Some(rect) = transform.rect.get() {
                     #[allow(clippy::cast_possible_truncation)]
-                    let handle = transform_geometry::hit_test(rect, x as f32, y as f32, &pan, &zoom);
+                    let handle =
+                        transform_geometry::hit_test(rect, x as f32, y as f32, &pan, &zoom, &rotation);
                     area_c.set_cursor_from_name(Some(transform_geometry::cursor_name(handle)));
                 } else {
                     area_c.set_cursor_from_name(None);
@@ -550,7 +753,7 @@ fn install_motion(
                 // Hide the OS pointer; the drawn eyedropper is the cursor.
                 area_c.set_cursor_from_name(Some("none"));
                 paintable.set_brush_cursor(None, Point::ZERO);
-                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom);
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
                 let color = sample_canvas_color(&canvas, canvas_pos);
                 #[allow(clippy::cast_possible_truncation)]
                 paintable.set_color_picker(Some(ColorPickerOverlay {
@@ -564,7 +767,7 @@ fn install_motion(
                 // area only; switching tools restores normal cursors.
                 area_c.set_cursor_from_name(Some("none"));
                 paintable.set_color_picker(None);
-                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom);
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
                 let time_ms = u64::from(ctrl.current_event_time());
                 let (speed_px_ms, direction_rad) =
                     motion_kinematics(&last_motion_c, &last_direction_c, canvas_pos, time_ms);
@@ -593,7 +796,7 @@ fn install_motion(
             Tool::Text => {
                 // Resize cursor over a handle of the box being edited;
                 // otherwise the text/I-beam cursor.
-                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom);
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
                 let name = text_edit.cursor_for(canvas_pos).unwrap_or("text");
                 area_c.set_cursor_from_name(Some(name));
                 paintable.set_brush_cursor(None, Point::ZERO);
@@ -705,9 +908,24 @@ fn stable_random_for(pos: Point) -> f32 {
     v / ((1u32 << 24) as f32)
 }
 
-/// Middle-mouse drag. Plain drag pans the canvas (grabbing-hand cursor);
-/// holding Ctrl turns it into a Krita-style continuous zoom centred on the
-/// drag origin (magnifier cursor), dragging up to zoom in, down to zoom out.
+/// Resolve a modifier-only keybind (e.g. "rotate-modifier") to its GDK mask, or
+/// `None` if the user has unbound it. Loaded from settings at drag-begin so
+/// changes in Preferences > Keybinds take effect on the next drag.
+fn drag_modifier_mask(id: &str) -> Option<gdk::ModifierType> {
+    let settings = crate::settings::AppSettings::load();
+    let parts = crate::settings::keybinds::accel_parts_for(id, &settings)?;
+    parts.iter().find_map(|p| match p.as_str() {
+        "Shift" => Some(gdk::ModifierType::SHIFT_MASK),
+        "Ctrl" => Some(gdk::ModifierType::CONTROL_MASK),
+        "Alt" => Some(gdk::ModifierType::ALT_MASK),
+        _ => None,
+    })
+}
+
+/// Middle-mouse (or stylus pan) drag. Plain drag pans the canvas; holding Ctrl
+/// turns it into a Krita-style continuous zoom centred on the drag origin;
+/// holding the configured rotate modifier rotates the canvas about the viewport
+/// centre (add the snap modifier for 45 deg steps).
 fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
     let drag = gtk::GestureDrag::new();
     drag.set_button(BUTTON_MIDDLE);
@@ -717,16 +935,44 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let nav = Rc::clone(&viewport.nav);
         let nav_zoom_start = Rc::clone(&viewport.nav_zoom_start);
         let nav_anchor = Rc::clone(&viewport.nav_anchor);
+        let nav_rotate_target = Rc::clone(&viewport.nav_rotate_target);
+        let nav_rotate_last_angle = Rc::clone(&viewport.nav_rotate_last_angle);
+        let nav_rotate_snap_mask = Rc::clone(&viewport.nav_rotate_snap_mask);
+        let nav_rotate_snap_step = Rc::clone(&viewport.nav_rotate_snap_step);
         let zoom = Rc::clone(&viewport.zoom);
+        let rotation = Rc::clone(&viewport.rotation);
+        let animator = viewport.rotation_animator();
         let pump = viewport.render_pump.clone();
         let area_c = area.clone();
         drag.connect_drag_begin(move |gesture, start_x, start_y| {
             pump.arm();
             last.set(Point::ZERO);
-            let ctrl_held = gesture
-                .current_event_state()
-                .contains(gdk::ModifierType::CONTROL_MASK);
-            if ctrl_held {
+            // Any in-flight snap ease from a previous drag ends here.
+            animator.cancel();
+            let state = gesture.current_event_state();
+            let rotate_mask = drag_modifier_mask("rotate-modifier");
+            let ctrl_held = state.contains(gdk::ModifierType::CONTROL_MASK);
+            let rotate_held = rotate_mask.is_some_and(|m| state.contains(m));
+            // Rotate takes precedence over the Ctrl-zoom when its modifier is
+            // held (unless that modifier *is* Ctrl, in which case zoom wins).
+            if rotate_held && rotate_mask != Some(gdk::ModifierType::CONTROL_MASK) {
+                nav.set(NavDrag::Rotate);
+                nav_rotate_target.set(rotation.get());
+                // Resolve the snap modifier + step once here, off the per-event
+                // path, so drag-update never re-reads settings from disk.
+                nav_rotate_snap_mask.set(drag_modifier_mask("rotate-snap-modifier"));
+                nav_rotate_snap_step.set(rotation_snap_rad());
+                // Seed the angular tracker with the pointer's angle about the
+                // viewport centre - rotation then follows the pointer like a
+                // handle (Krita-style), not left/right travel.
+                #[allow(clippy::cast_possible_truncation)]
+                let (sx, sy) = (start_x as f32, start_y as f32);
+                #[allow(clippy::cast_possible_truncation)]
+                let (cx, cy) = (area_c.width() as f32 / 2.0, area_c.height() as f32 / 2.0);
+                nav_anchor.set(Point::new(sx, sy));
+                nav_rotate_last_angle.set((sy - cy).atan2(sx - cx));
+                area_c.set_cursor_from_name(Some("crosshair"));
+            } else if ctrl_held {
                 nav.set(NavDrag::Zoom);
                 nav_zoom_start.set(zoom.get());
                 #[allow(clippy::cast_possible_truncation)]
@@ -741,15 +987,49 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
     {
         let pan = Rc::clone(&viewport.pan);
         let last = Rc::clone(&viewport.pan_last_offset);
-        let paintable = viewport.paintable.clone();
         let zoom = Rc::clone(&viewport.zoom);
+        let rotation = Rc::clone(&viewport.rotation);
         let nav = Rc::clone(&viewport.nav);
         let nav_zoom_start = Rc::clone(&viewport.nav_zoom_start);
         let nav_anchor = Rc::clone(&viewport.nav_anchor);
+        let nav_rotate_target = Rc::clone(&viewport.nav_rotate_target);
+        let nav_rotate_last_angle = Rc::clone(&viewport.nav_rotate_last_angle);
+        let nav_rotate_snap_mask = Rc::clone(&viewport.nav_rotate_snap_mask);
+        let nav_rotate_snap_step = Rc::clone(&viewport.nav_rotate_snap_step);
+        let sync = viewport.view_sync();
+        let animator = viewport.rotation_animator();
+        let picture = Rc::clone(&viewport.picture);
         let area_c = area.clone();
-        drag.connect_drag_update(move |_, dx, dy| {
+        drag.connect_drag_update(move |gesture, dx, dy| {
             #[allow(clippy::cast_possible_truncation)]
             let offset = Point::new(dx as f32, dy as f32);
+            if nav.get() == NavDrag::Rotate {
+                // Angular travel of the pointer around the viewport centre since
+                // the last update, accumulated into the free target.
+                let sp = nav_anchor.get();
+                #[allow(clippy::cast_possible_truncation)]
+                let (cx, cy) = (area_c.width() as f32 / 2.0, area_c.height() as f32 / 2.0);
+                #[allow(clippy::cast_possible_truncation)]
+                let cur_angle = (sp.y + dy as f32 - cy).atan2(sp.x + dx as f32 - cx);
+                let d = oxiedraw_utils::math::wrap_pi(cur_angle - nav_rotate_last_angle.get());
+                nav_rotate_last_angle.set(cur_angle);
+                let target = nav_rotate_target.get() + d;
+                nav_rotate_target.set(target);
+
+                let snap_mask = nav_rotate_snap_mask.get();
+                if snap_mask.is_some_and(|m| gesture.current_event_state().contains(m)) {
+                    // Ease toward the snapped stop instead of jumping to it.
+                    let step = nav_rotate_snap_step.get();
+                    let snapped = (target / step).round() * step;
+                    animator.animate_to(snapped);
+                } else {
+                    // Free rotation: cancel any in-flight ease and track directly.
+                    animator.cancel();
+                    rotate_about_center(&pan, &zoom, &rotation, &picture, target);
+                    sync.commit();
+                }
+                return;
+            }
             if nav.get() == NavDrag::Zoom {
                 let old_zoom = zoom.get();
                 let new_zoom = (f64::from(nav_zoom_start.get())
@@ -773,12 +1053,12 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
                 );
                 pan.set(new_pan);
                 zoom.set(new_zoom);
-                paintable.set_transform(new_pan.x, new_pan.y, new_zoom);
+                sync.commit();
             } else {
                 let new_pan = pan_increment(pan.get(), last.get(), offset);
                 last.set(offset);
                 pan.set(new_pan);
-                paintable.set_transform(new_pan.x, new_pan.y, zoom.get());
+                sync.commit();
             }
             // The render pump (armed at drag-begin) re-presents every frame, so
             // just updating the transform here is enough - no per-event present.
@@ -818,6 +1098,30 @@ fn pan_increment(current_pan: Point, last_offset: Point, offset: Point) -> Point
     )
 }
 
+/// Set the rotation to `theta` while keeping the canvas point under the
+/// viewport centre fixed (recomputes `pan`). Cell-based twin of
+/// [`Viewport::rotate_to`] for use inside gesture closures.
+fn rotate_about_center(
+    pan: &Rc<Cell<Point>>,
+    zoom: &Rc<Cell<f32>>,
+    rotation: &Rc<Cell<f32>>,
+    picture: &Rc<RefCell<Option<gtk::Picture>>>,
+    theta: f32,
+) {
+    #[allow(clippy::cast_precision_loss)]
+    let (cx, cy) = picture
+        .borrow()
+        .as_ref()
+        .map_or((0.0, 0.0), |p| (p.width() as f32 / 2.0, p.height() as f32 / 2.0));
+    let pivot = widget_to_canvas_xf(cx, cy, pan.get(), zoom.get(), rotation.get());
+    rotation.set(theta);
+    let z = zoom.get();
+    let (s, co) = theta.sin_cos();
+    let rx = co.mul_add(pivot.x, -s * pivot.y);
+    let ry = s.mul_add(pivot.x, co * pivot.y);
+    pan.set(Point::new(cx - z * rx, cy - z * ry));
+}
+
 /// Scroll-wheel / touchpad two-finger scroll handling.
 ///
 /// A mouse wheel (`ScrollUnit::Wheel`) zooms toward the cursor, as before.
@@ -830,7 +1134,7 @@ fn install_scroll(area: &gtk::Picture, viewport: &Viewport) {
     let pan = Rc::clone(&viewport.pan);
     let zoom = Rc::clone(&viewport.zoom);
     let cursor = Rc::clone(&viewport.cursor);
-    let paintable = viewport.paintable.clone();
+    let sync = viewport.view_sync();
     scroll.connect_scroll(move |controller, dx, dy| {
         if controller.unit() == gdk::ScrollUnit::Surface {
             // Touchpad: pan opposite the finger delta so content tracks
@@ -846,7 +1150,7 @@ fn install_scroll(area: &gtk::Picture, viewport: &Viewport) {
                 delta.y.mul_add(-TOUCHPAD_PAN_SPEED, p.y),
             );
             pan.set(new_pan);
-            paintable.set_transform(new_pan.x, new_pan.y, zoom.get());
+            sync.commit();
             return glib::Propagation::Stop;
         }
 
@@ -868,7 +1172,7 @@ fn install_scroll(area: &gtk::Picture, viewport: &Viewport) {
         );
         pan.set(new_pan);
         zoom.set(new_zoom);
-        paintable.set_transform(new_pan.x, new_pan.y, new_zoom);
+        sync.commit();
         glib::Propagation::Stop
     });
     area.add_controller(scroll);
@@ -892,7 +1196,7 @@ fn install_pinch_zoom(area: &gtk::Picture, viewport: &Viewport) {
     let zoom = Rc::clone(&viewport.zoom);
     let cursor = Rc::clone(&viewport.cursor);
     let pinch_start = Rc::clone(&viewport.pinch_zoom_start);
-    let paintable = viewport.paintable.clone();
+    let sync = viewport.view_sync();
     legacy.connect_event(move |_, event| {
         if event.event_type() != gdk::EventType::TouchpadPinch {
             return glib::Propagation::Proceed;
@@ -917,7 +1221,7 @@ fn install_pinch_zoom(area: &gtk::Picture, viewport: &Viewport) {
                     );
                     pan.set(new_pan);
                     zoom.set(new_zoom);
-                    paintable.set_transform(new_pan.x, new_pan.y, new_zoom);
+                    sync.commit();
                 }
             }
             _ => {}
@@ -1089,12 +1393,22 @@ pub(super) fn widget_to_canvas(
     y: f64,
     pan: &Rc<Cell<Point>>,
     zoom: &Rc<Cell<f32>>,
+    rotation: &Rc<Cell<f32>>,
 ) -> Point {
-    let p = pan.get();
-    let z = zoom.get();
     #[allow(clippy::cast_possible_truncation)]
     let (xf, yf) = (x as f32, y as f32);
-    Point::new((xf - p.x) / z, (yf - p.y) / z)
+    widget_to_canvas_xf(xf, yf, pan.get(), zoom.get(), rotation.get())
+}
+
+/// Invert `widget = pan + zoom * R(theta) * canvas` for a widget-space point:
+/// undo the pan, rotate by `-theta`, and divide out the zoom.
+pub(super) fn widget_to_canvas_xf(x: f32, y: f32, pan: Point, zoom: f32, rotation: f32) -> Point {
+    let z = zoom.max(f32::EPSILON);
+    let dx = x - pan.x;
+    let dy = y - pan.y;
+    let (s, c) = rotation.sin_cos();
+    // R(-theta) * (dx, dy) / z
+    Point::new(c.mul_add(dx, s * dy) / z, (-s).mul_add(dx, c * dy) / z)
 }
 
 fn pressure_from(gesture: &gtk::GestureDrag) -> f32 {
@@ -1124,21 +1438,24 @@ fn fit_and_center(viewport: &Viewport, canvas_size: Size, w: i32, h: i32) {
     #[allow(clippy::cast_possible_truncation)]
     let z = (fit * DEFAULT_FIT_RATIO) as f32;
     let z_clamped = z.clamp(MIN_ZOOM, MAX_ZOOM);
-    let z64 = f64::from(z_clamped);
-    let cx = cw.mul_add(-z64, area_w) / 2.0;
-    let cy = ch.mul_add(-z64, area_h) / 2.0;
     viewport.zoom.set(z_clamped);
+    // Map the canvas centre to the viewport centre for the current rotation:
+    // pan = C_view - zoom * R(theta) * canvas_centre.
     #[allow(clippy::cast_possible_truncation)]
-    let new_pan = Point::new(cx as f32, cy as f32);
+    let (view_cx, view_cy) = (area_w as f32 / 2.0, area_h as f32 / 2.0);
+    #[allow(clippy::cast_possible_truncation)]
+    let (ccx, ccy) = (cw as f32 / 2.0, ch as f32 / 2.0);
+    let (s, co) = viewport.rotation.get().sin_cos();
+    let rx = co.mul_add(ccx, -s * ccy);
+    let ry = s.mul_add(ccx, co * ccy);
+    let new_pan = Point::new(z_clamped.mul_add(-rx, view_cx), z_clamped.mul_add(-ry, view_cy));
     viewport.pan.set(new_pan);
     viewport.centered.set(true);
-    viewport
-        .paintable
-        .set_transform(new_pan.x, new_pan.y, z_clamped);
+    viewport.view_sync().commit();
     tracing::debug!(
         zoom = z_clamped,
-        pan_x = cx,
-        pan_y = cy,
+        pan_x = new_pan.x,
+        pan_y = new_pan.y,
         "viewport centered"
     );
 }

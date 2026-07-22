@@ -17,16 +17,22 @@ pub(super) fn hit_test(
     widget_y: f32,
     pan: &Rc<Cell<Point>>,
     zoom: &Rc<Cell<f32>>,
+    rotation: &Rc<Cell<f32>>,
 ) -> TransformHandle {
     let pan_offset = pan.get();
     let zoom = zoom.get();
+    let view = rotation.get();
 
-    let center_x = pan_offset.x + rect.cx * zoom;
-    let center_y = pan_offset.y + rect.cy * zoom;
+    // Canvas -> widget for the rect centre: pan + zoom * R(view) * centre.
+    let (view_sin, view_cos) = view.sin_cos();
+    let scaled_cx = rect.cx * zoom;
+    let scaled_cy = rect.cy * zoom;
+    let center_x = pan_offset.x + view_cos.mul_add(scaled_cx, -view_sin * scaled_cy);
+    let center_y = pan_offset.y + view_sin.mul_add(scaled_cx, view_cos * scaled_cy);
     let half_width = rect.half_w() * zoom;
     let half_height = rect.half_h() * zoom;
-    let sin_angle = rect.angle.sin();
-    let cos_angle = rect.angle.cos();
+    // The view rotation stacks on top of the rect's own angle.
+    let (sin_angle, cos_angle) = (rect.angle + view).sin_cos();
 
     let top_mid_x = center_x + half_height * sin_angle;
     let top_mid_y = center_y - half_height * cos_angle;

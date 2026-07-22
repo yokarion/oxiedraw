@@ -416,6 +416,17 @@ pub(super) fn is_modifier_key(k: gdk::Key) -> bool {
     )
 }
 
+/// Map a bare modifier key to its accel string, for modifier-only bindings
+/// (canvas rotate / snap). Returns `None` for non-modifier or unsupported keys.
+pub(super) fn modifier_only_accel(keyval: gdk::Key) -> Option<&'static str> {
+    match keyval {
+        gdk::Key::Shift_L | gdk::Key::Shift_R => Some("<Shift>"),
+        gdk::Key::Control_L | gdk::Key::Control_R => Some("<Primary>"),
+        gdk::Key::Alt_L | gdk::Key::Alt_R => Some("<Alt>"),
+        _ => None,
+    }
+}
+
 pub(super) fn build_accel_string(keyval: gdk::Key, state: gdk::ModifierType) -> String {
     let mut s = String::new();
     if state.contains(gdk::ModifierType::CONTROL_MASK) {

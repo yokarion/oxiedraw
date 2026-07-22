@@ -88,7 +88,7 @@ impl TabManager {
 
     /// Register an already-built session as a tab and select it.
     pub(crate) fn add_session(self: &Rc<Self>, session: &Rc<DocumentSession>) {
-        let page = self.tab_view.add_page(&session.picture, None);
+        let page = self.tab_view.add_page(&session.canvas_root, None);
         page.set_title(&session.display_title());
         *session.tab_page.borrow_mut() = Some(page.clone());
         self.sessions.borrow_mut().push(Rc::clone(session));
@@ -287,6 +287,12 @@ impl TabManager {
             .settings
             .borrow_mut()
             .clone_from(&project.document.gradient);
+
+        // Restore the persisted view rotation. The centering tick that runs on
+        // the first frame re-centres pan for this angle (see fit_and_center).
+        session
+            .viewport
+            .set_rotation_raw(project.document.view_rotation);
 
         // Restore the per-document component library.
         *session.components.borrow_mut() = project::load::build_components(&project);

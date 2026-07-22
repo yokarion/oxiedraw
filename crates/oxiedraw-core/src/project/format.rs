@@ -21,8 +21,10 @@ use crate::text::fonts::FontMeta;
 /// v8 adds the document's default gradient stops (`gradient`), the persisted
 /// setting for the Gradient tool. Absent in pre-v8 files (tool falls back to
 /// primary/secondary colours).
-pub const SCHEMA_VERSION: u32 = 8;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8];
+/// v9 adds the persisted view rotation (`view_rotation`, radians), so reopening
+/// restores the canvas angle. Absent in pre-v9 files (loads at 0).
+pub const SCHEMA_VERSION: u32 = 9;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -93,6 +95,9 @@ pub struct DocumentData {
     /// or `None` = derive the ramp from the primary/secondary colours.
     #[serde(default)]
     pub gradient: Option<crate::tools::GradientSettings>,
+    /// Persisted view rotation in radians. Absent (pre-v9) = 0 (no rotation).
+    #[serde(default)]
+    pub view_rotation: f32,
 }
 
 /// The complete in-memory representation of an `.oxiedrawproj` archive.

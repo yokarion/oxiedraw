@@ -13,3 +13,18 @@ pub fn clamp01(x: f32) -> f32 {
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     (b - a).mul_add(t, a)
 }
+
+/// Wrap an angle (radians) into `(-pi, pi]`, so accumulated rotation takes the
+/// short way around and crosses the atan2 branch cut smoothly.
+#[inline]
+#[must_use]
+pub fn wrap_pi(a: f32) -> f32 {
+    use std::f32::consts::{PI, TAU};
+    let mut a = a % TAU;
+    if a <= -PI {
+        a += TAU;
+    } else if a > PI {
+        a -= TAU;
+    }
+    a
+}

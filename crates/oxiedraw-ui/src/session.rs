@@ -207,6 +207,9 @@ pub(crate) struct DocumentSession {
     pub(crate) right_bar: gtk::Widget,
     pub(crate) tool_options: gtk::Widget,
     pub(crate) picture: gtk::Picture,
+    /// The canvas picture plus the per-document bottom info bar, stacked
+    /// vertically. This (not `picture`) is what gets added as the tab page.
+    pub(crate) canvas_root: gtk::Widget,
 
     // Metadata.
     pub(crate) file_path: RefCell<Option<PathBuf>>,
@@ -1025,6 +1028,30 @@ impl DocumentSession {
             Rc::clone(&cursor_activates_transform),
         );
 
+        // -- Per-canvas bottom info bar (size + rotation + rotator dial) -----
+        let info_bar = {
+            let viewport_c = viewport.clone();
+            let redraw = viewport.redraw_handle();
+            let on_rotate: Rc<dyn Fn(f32)> = Rc::new(move |theta| {
+                // The dial always snaps to the configured rotation step.
+                let step = canvas::rotation_snap_rad();
+                viewport_c.rotate_to((theta / step).round() * step);
+                redraw.request();
+            });
+            crate::widgets::canvas_info_bar::CanvasInfoBar::new(on_rotate)
+        };
+        // Weak-capturing observer: it must not strong-hold the bar, or the
+        // dial gesture's viewport handle would close a leak cycle on tab close.
+        viewport.set_info_observer(info_bar.observer());
+        let canvas_root = {
+            let column = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .build();
+            column.append(&picture);
+            column.append(&info_bar.widget());
+            column.upcast::<gtk::Widget>()
+        };
+
         // Drag-and-drop a component card onto the canvas to place an instance.
         {
             let drop = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::COPY);
@@ -1156,6 +1183,7 @@ impl DocumentSession {
             right_bar: right_bar_widget,
             tool_options: tool_options_widget.upcast::<gtk::Widget>(),
             picture,
+            canvas_root,
             file_path: RefCell::new(None),
             saved_marker,
             title,

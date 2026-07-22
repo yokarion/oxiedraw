@@ -63,6 +63,7 @@ pub(super) struct PrimaryDragHandler {
     paintable: CanvasPaintable,
     pan: Rc<Cell<Point>>,
     zoom: Rc<Cell<f32>>,
+    rotation: Rc<Cell<f32>>,
     canvas_size: Rc<Cell<Size>>,
     tools: ToolState,
     area: gtk::Picture,
@@ -285,7 +286,7 @@ impl PrimaryDragHandler {
         self.pending_erase.set(erase);
         self.stroke_points.borrow_mut().clear();
 
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         let sample = sample_from(gesture, canvas_pos);
         self.stroke_points.borrow_mut().push(sample);
 
@@ -328,7 +329,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let canvas_pos = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         let sample = sample_from(gesture, canvas_pos);
 
         // Record the full sample (position + pen dynamics) for shape detection
@@ -601,7 +602,7 @@ impl PrimaryDragHandler {
     fn crop_begin(&self, x: f64, y: f64) {
         let pan = self.pan.get();
         let zoom = self.zoom.get();
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         let rect = self.crop.rect.get();
 
         let rect_widget = rect.map(|r| {
@@ -613,8 +614,12 @@ impl PrimaryDragHandler {
                 pan.y + n.bottom() * zoom,
             )
         });
-        #[allow(clippy::cast_possible_truncation)]
-        let h = crop_geom::hit_test_widget(rect_widget, x as f32, y as f32);
+        // The crop handles are stored in unrotated widget space (pan + canvas *
+        // zoom); map the pointer into that same frame so hit-testing lands on
+        // the handles under a rotated view.
+        let hx = pan.x + canvas_pos.x * zoom;
+        let hy = pan.y + canvas_pos.y * zoom;
+        let h = crop_geom::hit_test_widget(rect_widget, hx, hy);
         self.crop_handle.set(h);
         self.crop_start.set(canvas_pos);
         self.crop_start_rect.set(rect);
@@ -624,12 +629,9 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let pan = self.pan.get();
-        let zoom = self.zoom.get();
-        #[allow(clippy::cast_possible_truncation)]
-        let cx = ((sx + dx) as f32 - pan.x) / zoom;
-        #[allow(clippy::cast_possible_truncation)]
-        let cy = ((sy + dy) as f32 - pan.y) / zoom;
+        // Rotation-aware inverse map, matching crop_begin and the other tools.
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
+        let (cx, cy) = (cur.x, cur.y);
         let sc = self.crop_start.get();
         let old = self.crop_start_rect.get();
 
@@ -676,9 +678,9 @@ impl PrimaryDragHandler {
             return;
         };
         #[allow(clippy::cast_possible_truncation)]
-        let handle = transform_geometry::hit_test(rect, x as f32, y as f32, &self.pan, &self.zoom);
+        let handle = transform_geometry::hit_test(rect, x as f32, y as f32, &self.pan, &self.zoom, &self.rotation);
         self.transform_handle.set(handle);
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         self.transform_drag_start_canvas.set(canvas_pos);
         self.transform_drag_start_rect.set(Some(rect));
         if handle == TransformHandle::Rotate {
@@ -694,7 +696,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         let Some(start_rect) = self.transform_drag_start_rect.get() else {
             return;
         };
@@ -822,7 +824,7 @@ impl PrimaryDragHandler {
         let mode = selection_mode_from_modifiers(gesture);
         self.selection.mode.set(mode);
         // Snap to the pixel grid so selection edges land on whole pixels.
-        let canvas_pos = snap_to_pixel(widget_to_canvas(x, y, &self.pan, &self.zoom));
+        let canvas_pos = snap_to_pixel(widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation));
         self.selection_drag_start.set(canvas_pos);
         let initial = match tool {
             SelectionTool::Square | SelectionTool::Circle => Some(PendingMarquee::Rect {
@@ -849,7 +851,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         match tool {
             SelectionTool::Square | SelectionTool::Circle => {
                 let start = self.selection_drag_start.get();
@@ -1014,7 +1016,7 @@ impl PrimaryDragHandler {
             src.remove();
         }
 
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         #[allow(clippy::cast_possible_truncation)]
         let sx = canvas_pos.x.floor() as i32;
         #[allow(clippy::cast_possible_truncation)]
@@ -1171,7 +1173,7 @@ impl PrimaryDragHandler {
     // -- shapes ------------------------------------------------------------
 
     fn shape_begin(&self, _kind: ShapeTool, x: f64, y: f64) {
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         self.shape_drag_start.set(canvas_pos);
         self.shape_cur_rect.set(None);
 
@@ -1207,7 +1209,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         let (shift, alt) = modifiers_from_gesture(gesture);
         let rect = oxiedraw_core::shapes::shape_rect_from_drag(
             self.shape_drag_start.get(),
@@ -1308,7 +1310,7 @@ impl PrimaryDragHandler {
     // -- gradient ----------------------------------------------------------
 
     fn gradient_begin(&self, x: f64, y: f64) {
-        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         self.gradient_drag_start.set(canvas_pos);
         self.gradient_cur_endpoints.set(None);
 
@@ -1347,7 +1349,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         let start = self.gradient_drag_start.get();
         let endpoints = [start.x, start.y, cur.x, cur.y];
         self.gradient_cur_endpoints.set(Some(endpoints));
@@ -1447,7 +1449,7 @@ impl PrimaryDragHandler {
         // sampled this pixel on hover; reuse that. Fall back to a direct read
         // for a click on a spot the loupe hasn't sampled yet.
         let color = self.paintable.picker_color().or_else(|| {
-            let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom);
+            let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
             super::sample_canvas_color(&self.canvas, canvas_pos)
         });
         self.commit_picked_color(color);
@@ -1476,7 +1478,7 @@ impl PrimaryDragHandler {
     const TEXT_DRAG_MIN: f32 = 3.0;
 
     fn text_begin(&self, x: f64, y: f64) {
-        let start = widget_to_canvas(x, y, &self.pan, &self.zoom);
+        let start = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         self.text_drag_start.set(start);
         self.text_cur_rect.set(None);
         // If the editor consumed the press (caret placement inside an active
@@ -1493,7 +1495,7 @@ impl PrimaryDragHandler {
         let Some((sx, sy)) = gesture.start_point() else {
             return;
         };
-        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom);
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
         if self.text_editing_gesture.get() {
             self.text_edit.pointer_motion(cur);
             return;
@@ -1922,6 +1924,7 @@ pub(super) fn install_primary_drag(
         paintable: viewport.paintable.clone(),
         pan: Rc::clone(&viewport.pan),
         zoom: Rc::clone(&viewport.zoom),
+        rotation: Rc::clone(&viewport.rotation),
         canvas_size: Rc::clone(&viewport.canvas_size),
         tools: tools.clone(),
         area: area.clone(),

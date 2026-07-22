@@ -23,6 +23,13 @@ impl ActionInfo {
     }
 }
 
+/// True for bindings that record a bare modifier (no key), used to qualify a
+/// canvas pan-button drag rather than trigger a GAction. The keybind recorder
+/// and `apply_all_accels` treat these specially.
+pub(crate) fn is_modifier_only(id: &str) -> bool {
+    matches!(id, "rotate-modifier" | "rotate-snap-modifier")
+}
+
 // Returns the user's current accelerator parts for `id`, or `None` if unbound.
 pub(crate) fn accel_parts_for(id: &str, settings: &AppSettings) -> Option<Vec<String>> {
     for group in ALL_ACTION_GROUPS {
@@ -50,6 +57,11 @@ pub(crate) fn format_accel(accel: &str) -> Vec<String> {
             parts.push((*display).to_string());
             key = key.replace(tag, "");
         }
+    }
+
+    // Modifier-only accels (e.g. "<Shift>") leave no key part.
+    if key.is_empty() {
+        return parts;
     }
 
     let display = match key.as_str() {
@@ -337,6 +349,24 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
                 id: "perf-graph",
                 label: "Performance Graph",
                 default_accel: Some("F3"),
+            },
+        ],
+    },
+    ActionGroup {
+        label: "Canvas Navigation",
+        // Modifier-only bindings (see `is_modifier_only`): held together with
+        // the pan button (middle click / stylus pan) while dragging, not
+        // pressed as keyboard shortcuts.
+        actions: &[
+            ActionInfo {
+                id: "rotate-modifier",
+                label: "Rotate canvas (hold + pan-drag)",
+                default_accel: Some("<Shift>"),
+            },
+            ActionInfo {
+                id: "rotate-snap-modifier",
+                label: "Snap rotation to step (hold + pan-drag)",
+                default_accel: Some("<Primary>"),
             },
         ],
     },

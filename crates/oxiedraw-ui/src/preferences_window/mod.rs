@@ -24,7 +24,7 @@ use self::canvas::build_canvas_page;
 use self::general::build_general_page;
 use self::keybinds::{
     RowHandles, build_accel_string, build_keybinds_page, count_modified, is_modifier_key,
-    refresh_row,
+    modifier_only_accel, refresh_row,
 };
 use self::project::build_project_page;
 
@@ -82,11 +82,8 @@ pub(crate) fn show(
                 return glib::Propagation::Proceed;
             };
 
-            if is_modifier_key(keyval) {
-                return glib::Propagation::Stop;
-            }
-
-            let new_binding: Option<String> = if keyval == gdk::Key::Escape {
+            // Escape cancels recording for any row.
+            if keyval == gdk::Key::Escape {
                 *recording_id.borrow_mut() = None;
                 refresh_row(
                     &action_id,
@@ -96,8 +93,20 @@ pub(crate) fn show(
                     None,
                 );
                 return glib::Propagation::Stop;
-            } else if keyval == gdk::Key::BackSpace {
+            }
+
+            let modifier_only = crate::settings::keybinds::is_modifier_only(&action_id);
+
+            let new_binding: Option<String> = if keyval == gdk::Key::BackSpace {
                 None
+            } else if modifier_only {
+                // These bindings record a bare modifier; ignore any other key.
+                match modifier_only_accel(keyval) {
+                    Some(a) => Some(a.to_string()),
+                    None => return glib::Propagation::Stop,
+                }
+            } else if is_modifier_key(keyval) {
+                return glib::Propagation::Stop;
             } else {
                 Some(build_accel_string(keyval, state))
             };

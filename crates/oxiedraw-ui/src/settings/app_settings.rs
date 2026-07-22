@@ -22,6 +22,10 @@ pub(crate) struct AppSettings {
     pub(crate) history: HistorySettings,
     #[serde(default)]
     pub(crate) save: SaveSettings,
+    /// Snap increment (degrees) for canvas rotation - used by the snap-modifier
+    /// rotate drag and the bottom rotator dial. Default 45.
+    #[serde(default = "default_rotation_snap_deg")]
+    pub(crate) rotation_snap_deg: f32,
     /// Name of the brush that should be active on startup. Falls back to
     /// "Ink Pen" -> "Default Round" -> first brush if not found.
     #[serde(default)]
@@ -48,6 +52,9 @@ pub(crate) struct SaveSettings {
 
 fn default_backup_count() -> usize {
     3
+}
+fn default_rotation_snap_deg() -> f32 {
+    45.0
 }
 fn default_autosave_interval() -> u32 {
     300
@@ -181,6 +188,7 @@ impl Default for AppSettings {
             pixel_view: PixelViewSettings::default(),
             history: HistorySettings::default(),
             save: SaveSettings::default(),
+            rotation_snap_deg: default_rotation_snap_deg(),
             default_brush_name: Some("Ink Pen".to_string()),
         }
     }
