@@ -10,7 +10,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::canvas::fill::{FillResult, flood_fill, paint_indices};
 use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::document::LayerKind;
-use oxiedraw_core::guides::{GuideKind, GuideState, VanishingPoint};
+use oxiedraw_core::guides::{assist_lock, AssistLock, GuideKind, GuideState, VanishingPoint};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::shape_correction::{CorrectedShape, corrected_samples, detect_shape};
@@ -63,6 +63,10 @@ struct PendingCorrection {
 const GUIDE_ROT_HANDLE_PX: f32 = 64.0;
 /// Pointer-to-node grab radius in screen pixels (node radius + slack).
 const GUIDE_NODE_HIT_PX: f32 = 14.0;
+/// Screen-space deadzone before Drawing Assist locks a stroke to a guide line.
+/// The lock direction is chosen from the drag once it clears this, so a short
+/// nudge doesn't commit to the wrong axis (helpful, not twitchy).
+const GUIDE_SNAP_LOCK_PX: f32 = 8.0;
 
 /// Which drawing-guide node a gesture is manipulating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -151,6 +155,13 @@ pub(super) struct PrimaryDragHandler {
     /// Canvas point where a tap (no drag) on empty space would add a new
     /// vanishing point. Cleared once the pointer moves past the node radius.
     guide_pending_add: Rc<Cell<Option<Point>>>,
+    /// Stroke start when Drawing Assist snapping is armed for the current brush
+    /// stroke (grid/isometric/perspective). `None` when the active guide doesn't
+    /// snap - symmetry reproduces instead, and no guide leaves it unset.
+    guide_snap_start: Rc<Cell<Option<Point>>>,
+    /// The locked snap line once the pointer has moved past the deadzone. All
+    /// further stroke points are projected onto it (straight guide line).
+    guide_snap: Rc<RefCell<Option<AssistLock>>>,
     // -- text -------------------------------------------------------------
     /// Canvas-space point where a text drag/click started.
     text_drag_start: Rc<Cell<Point>>,
@@ -393,6 +404,51 @@ impl PrimaryDragHandler {
         self.guide_drag_start.set(None);
     }
 
+    // -- drawing assist (stroke snapping) ---------------------------------
+
+    /// Arm stroke snapping for the guide in effect, if it snaps (grid /
+    /// isometric / perspective with Assist on). `start` is the stroke anchor.
+    fn arm_guide_snap(&self, start: Point) {
+        *self.guide_snap.borrow_mut() = None;
+        self.guide_snap_start.set(None);
+        let cfg = self.guide.config.borrow();
+        let snaps = cfg.as_ref().is_some_and(|c| c.snaps_strokes());
+        tracing::info!(
+            target: "guide_assist",
+            has_cfg = cfg.is_some(),
+            kind = ?cfg.as_ref().map(|c| c.kind),
+            assisted = ?cfg.as_ref().map(|c| c.assisted),
+            snaps,
+            "arm_guide_snap"
+        );
+        if snaps {
+            self.guide_snap_start.set(Some(start));
+        }
+    }
+
+    /// Map a raw stroke point through the armed guide snap. Before the deadzone
+    /// is cleared it returns the point unchanged; once a drag direction is clear
+    /// it locks onto the best-matching guide line and projects onto it.
+    fn snap_guide_point(&self, raw: Point) -> Point {
+        let Some(start) = self.guide_snap_start.get() else {
+            return raw;
+        };
+        if let Some(lock) = *self.guide_snap.borrow() {
+            return lock.project(raw);
+        }
+        if raw.distance(start) < GUIDE_SNAP_LOCK_PX / self.zoom.get() {
+            return raw;
+        }
+        if let Some(cfg) = self.guide.config.borrow().as_ref() {
+            if let Some(lock) = assist_lock(cfg, start, raw) {
+                tracing::info!(target: "guide_assist", dir = ?lock.dir, "snap locked");
+                *self.guide_snap.borrow_mut() = Some(lock);
+                return lock.project(raw);
+            }
+        }
+        raw
+    }
+
     // -- brush -------------------------------------------------------------
 
     fn brush_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
@@ -432,6 +488,9 @@ impl PrimaryDragHandler {
         self.stroke_points.borrow_mut().clear();
 
         let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
+        // Arm Drawing Assist snapping for this stroke (grid/iso/perspective);
+        // the anchor point itself is never moved.
+        self.arm_guide_snap(canvas_pos);
         let sample = sample_from(gesture, canvas_pos);
         self.stroke_points.borrow_mut().push(sample);
 
@@ -475,6 +534,9 @@ impl PrimaryDragHandler {
             return;
         };
         let canvas_pos = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
+        // Drawing Assist: snap the point onto the active guide line (no-op when
+        // no snapping guide is armed).
+        let canvas_pos = self.snap_guide_point(canvas_pos);
         let sample = sample_from(gesture, canvas_pos);
 
         // Record the full sample (position + pen dynamics) for shape detection
@@ -622,6 +684,12 @@ impl PrimaryDragHandler {
     fn reset_idle_timer(&self) {
         if let Some(src) = self.pending_timer.borrow_mut().take() {
             src.remove();
+        }
+
+        // Drawing Assist already constrains the stroke to a straight guide line;
+        // don't also run shape correction over it.
+        if self.guide_snap_start.get().is_some() {
+            return;
         }
 
         let sc = self.stroke_shape_correction.borrow().clone();
@@ -2110,6 +2178,8 @@ pub(super) fn install_primary_drag(
         guide_drag_start: Rc::new(Cell::new(None)),
         guide_vp_drag: Rc::new(Cell::new(None)),
         guide_pending_add: Rc::new(Cell::new(None)),
+        guide_snap_start: Rc::new(Cell::new(None)),
+        guide_snap: Rc::new(RefCell::new(None)),
         text_drag_start: Rc::new(Cell::new(Point::ZERO)),
         text_cur_rect: Rc::new(Cell::new(None)),
         text_editing_gesture: Rc::new(Cell::new(false)),

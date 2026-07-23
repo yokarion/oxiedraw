@@ -10,7 +10,7 @@
 //! reproduced in real time at the GPU dab level with no extra brush state.
 
 use std::cell::RefCell;
-use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+use std::f32::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4, PI};
 use std::rc::Rc;
 
 use serde::{Deserialize, Serialize};
@@ -304,6 +304,92 @@ impl GuideConfig {
     pub fn reproduces_strokes(&self) -> bool {
         self.assisted && self.kind == GuideKind::Symmetry
     }
+
+    /// True when this guide snaps a live stroke onto its lines (grid / isometric
+    /// / perspective). Symmetry reproduces instead, so it never snaps.
+    #[must_use]
+    pub fn snaps_strokes(&self) -> bool {
+        self.assisted
+            && matches!(
+                self.kind,
+                GuideKind::Grid2D | GuideKind::Isometric | GuideKind::Perspective
+            )
+    }
+}
+
+/// A stroke locked onto one guide line: the anchor point plus the line's unit
+/// direction. Every incoming point is projected onto this line so the stroke
+/// runs perfectly straight along the guide, converging to a vanishing point in
+/// perspective mode (the line toward a fixed VP is itself straight).
+#[derive(Debug, Clone, Copy)]
+pub struct AssistLock {
+    pub start: Point,
+    pub dir: Point,
+}
+
+impl AssistLock {
+    /// Foot of the perpendicular from `p` onto the locked line.
+    #[must_use]
+    pub fn project(&self, p: Point) -> Point {
+        let vx = p.x - self.start.x;
+        let vy = p.y - self.start.y;
+        let t = vx * self.dir.x + vy * self.dir.y;
+        Point::new(self.start.x + self.dir.x * t, self.start.y + self.dir.y * t)
+    }
+}
+
+/// Candidate snap-line directions (unit vectors, canvas space) for a stroke
+/// starting at `start`. Grid/isometric give fixed axes; perspective gives the
+/// direction toward each vanishing point plus horizontal/vertical (Procreate
+/// also snaps horizon and upright lines). Empty when the guide doesn't snap.
+#[must_use]
+pub fn assist_candidates(cfg: &GuideConfig, start: Point) -> Vec<Point> {
+    let unit = |a: f32| Point::new(a.cos(), a.sin());
+    match cfg.kind {
+        GuideKind::Symmetry => Vec::new(),
+        GuideKind::Grid2D => vec![unit(0.0), unit(FRAC_PI_2)],
+        GuideKind::Isometric => {
+            let b = cfg.angle;
+            vec![unit(b), unit(b + FRAC_PI_3), unit(b - FRAC_PI_3)]
+        }
+        GuideKind::Perspective => {
+            let mut dirs: Vec<Point> = cfg
+                .vanishing_points
+                .iter()
+                .filter_map(|vp| {
+                    let d = Point::new(vp.x - start.x, vp.y - start.y);
+                    (d.x.hypot(d.y) > 1e-3).then(|| d.normalize())
+                })
+                .collect();
+            dirs.push(unit(0.0));
+            dirs.push(unit(FRAC_PI_2));
+            dirs
+        }
+    }
+}
+
+/// Pick the guide line that best matches the drag from `start` toward `toward`
+/// and lock the stroke to it. A line and its reverse are equivalent, so the
+/// candidate with the largest absolute alignment wins. `None` if the guide
+/// doesn't snap or the pointer hasn't moved.
+#[must_use]
+pub fn assist_lock(cfg: &GuideConfig, start: Point, toward: Point) -> Option<AssistLock> {
+    let cands = assist_candidates(cfg, start);
+    if cands.is_empty() {
+        return None;
+    }
+    let drag = Point::new(toward.x - start.x, toward.y - start.y);
+    let len = drag.x.hypot(drag.y);
+    if len < 1e-3 {
+        return None;
+    }
+    let (ux, uy) = (drag.x / len, drag.y / len);
+    let best = cands.into_iter().max_by(|a, b| {
+        let da = (a.x * ux + a.y * uy).abs();
+        let db = (b.x * ux + b.y * uy).abs();
+        da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+    })?;
+    Some(AssistLock { start, dir: best })
 }
 
 /// Live, mutable guide state shared across the UI, plus change subscribers.
@@ -424,6 +510,38 @@ mod tests {
         cfg.origin = Point::new(3.0, 7.0);
         cfg.reset_position(80, 40);
         approx(cfg.origin, Point::new(40.0, 20.0));
+    }
+
+    #[test]
+    fn grid_assist_snaps_to_nearest_axis() {
+        let mut cfg = GuideConfig::centered(200, 200);
+        cfg.kind = GuideKind::Grid2D;
+        let start = Point::new(50.0, 50.0);
+        // A mostly-horizontal drag locks to the horizontal axis, flattening y.
+        let lock = assist_lock(&cfg, start, Point::new(150.0, 60.0)).expect("lock");
+        let snapped = lock.project(Point::new(150.0, 60.0));
+        approx(snapped, Point::new(150.0, 50.0));
+    }
+
+    #[test]
+    fn perspective_assist_points_at_vanishing_point() {
+        let mut cfg = GuideConfig::centered(200, 200);
+        cfg.kind = GuideKind::Perspective;
+        cfg.vanishing_points = vec![VanishingPoint::new(200.0, 0.0)];
+        let start = Point::new(0.0, 100.0);
+        // Drag roughly toward the VP; the snapped point stays on the start->VP ray.
+        let lock = assist_lock(&cfg, start, Point::new(90.0, 60.0)).expect("lock");
+        let snapped = lock.project(Point::new(90.0, 60.0));
+        // Ray start(0,100)->vp(200,0) has slope -0.5, so at x it is y=100-0.5x.
+        assert!((snapped.y - (100.0 - 0.5 * snapped.x)).abs() < 1e-2, "{snapped:?}");
+    }
+
+    #[test]
+    fn symmetry_never_snaps() {
+        let cfg = GuideConfig::centered(100, 100);
+        assert!(cfg.reproduces_strokes());
+        assert!(!cfg.snaps_strokes());
+        assert!(assist_lock(&cfg, Point::ZERO, Point::new(10.0, 3.0)).is_none());
     }
 
     #[test]

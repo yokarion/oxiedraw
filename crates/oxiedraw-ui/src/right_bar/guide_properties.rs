@@ -373,7 +373,7 @@ fn build_behavior_list(guide: &GuideState, syncing: &Rc<Cell<bool>>, refreshers:
     ));
     list.append(&switch_row(
         "Assisted Drawing",
-        "Reproduce strokes across the guide",
+        "Snap or mirror strokes onto the guide",
         guide,
         syncing,
         refreshers,
