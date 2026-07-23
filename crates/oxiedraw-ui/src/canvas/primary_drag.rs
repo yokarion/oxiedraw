@@ -10,7 +10,9 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::canvas::fill::{FillResult, flood_fill, paint_indices};
 use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::document::LayerKind;
-use oxiedraw_core::guides::{assist_lock, AssistLock, GuideKind, GuideState, VanishingPoint};
+use oxiedraw_core::guides::{
+    assist_lock, vp_default_color, AssistLock, GuideKind, GuideState, VanishingPoint,
+};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::shape_correction::{CorrectedShape, corrected_samples, detect_shape};
@@ -67,6 +69,12 @@ const GUIDE_NODE_HIT_PX: f32 = 14.0;
 /// The lock direction is chosen from the drag once it clears this, so a short
 /// nudge doesn't commit to the wrong axis (helpful, not twitchy).
 const GUIDE_SNAP_LOCK_PX: f32 = 8.0;
+
+/// Straight RGB (`0.0..=1.0` per channel) for a [`Color`], for seeding guide
+/// colours from the primary colour.
+fn color_to_rgb(c: Color) -> (f32, f32, f32) {
+    (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0)
+}
 
 /// Which drawing-guide node a gesture is manipulating.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -393,9 +401,11 @@ impl PrimaryDragHandler {
         // A tap on empty space (still pending, i.e. not dragged away) adds a
         // vanishing point, up to Procreate's three-point maximum.
         if let Some(p) = self.guide_pending_add.take() {
+            let primary = color_to_rgb(self.colors.current());
             self.guide.update(|c| {
                 if c.kind == GuideKind::Perspective && c.vanishing_points.len() < 3 {
-                    c.vanishing_points.push(VanishingPoint::new(p.x, p.y));
+                    let color = vp_default_color(c.vanishing_points.len(), primary);
+                    c.vanishing_points.push(VanishingPoint::new(p.x, p.y, color));
                 }
             });
         }

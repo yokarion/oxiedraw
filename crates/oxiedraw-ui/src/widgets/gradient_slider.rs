@@ -24,6 +24,7 @@ const GRADIENT_STOPS: usize = 64;
 /// A built gradient slider. Append [`Self::widget`] to a container; read the
 /// current value with [`Self::value`]; call [`Self::refresh`] to repaint the
 /// gradient after the ramp it depends on has changed.
+#[derive(Clone)]
 pub(crate) struct GradientSlider {
     pub widget: gtk::Box,
     area: gtk::DrawingArea,
@@ -40,6 +41,20 @@ impl GradientSlider {
     /// Run `f` with the new value on every change (bar drag or spin edit).
     pub(crate) fn connect_changed(&self, f: impl Fn(f64) + 'static) {
         self.spin.connect_value_changed(move |s| f(s.value()));
+    }
+
+    /// Set the value programmatically (e.g. an external refresh). This still
+    /// fires the spin's `value-changed`, so callers that want to avoid a
+    /// feedback loop should guard their `on_change` with their own sync flag.
+    pub(crate) fn set_value(&self, v: f64) {
+        self.spin.set_value(v);
+    }
+
+    /// Hide the numeric spin button, leaving just the gradient bar. Used where
+    /// the exact number is meaningless (e.g. a colour picker). The spin stays
+    /// live under the hood, so bar drags still drive `on_change`.
+    pub(crate) fn hide_spin(&self) {
+        self.spin.set_visible(false);
     }
 }
 

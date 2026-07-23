@@ -817,13 +817,10 @@ fn draw_guide_overlay_cairo(
         GuideKind::Perspective => {}
     }
 
-    // Cursor-style stroke: black outline under a white core, so the guide
-    // reads against any artwork regardless of colour. Opacity is preserved.
-    cr.set_line_width(thickness + 2.0);
-    cr.set_source_rgba(0.0, 0.0, 0.0, alpha * 0.85);
-    cr.stroke_preserve().ok();
+    // Solid line in the guide's chosen ramp colour (opacity/thickness honoured).
+    let (lr, lg, lb) = oxiedraw_core::guides::guide_line_color(guide.color);
     cr.set_line_width(thickness);
-    cr.set_source_rgba(1.0, 1.0, 1.0, alpha);
+    cr.set_source_rgba(f64::from(lr), f64::from(lg), f64::from(lb), alpha);
     cr.stroke().ok();
 
     if editing {
@@ -896,21 +893,24 @@ fn draw_perspective(
         })
     };
 
-    let vps: Vec<(f64, f64)> = guide
+    // Each VP carries its screen position plus its own ramp colour.
+    let vps: Vec<(f64, f64, f32)> = guide
         .vanishing_points
         .iter()
-        .map(|vp| (f64::from(pan_x + vp.x * zoom), f64::from(pan_y + vp.y * zoom)))
+        .map(|vp| (f64::from(pan_x + vp.x * zoom), f64::from(pan_y + vp.y * zoom), vp.color))
         .collect();
     if vps.is_empty() {
         return;
     }
 
     // Rays fanned evenly from every vanishing point, clipped to the widget and
-    // stroked SOLID (black outline + white core). Solid strokes are far cheaper
-    // than gradient ones, and the fade is applied afterwards as a single mask
-    // fill whose cost is independent of the ray/point count.
+    // stroked SOLID in that point's colour. Solid strokes are far cheaper than
+    // gradient ones, and the fade is applied afterwards as a single mask fill
+    // whose cost is independent of the ray/point count. Stroked per VP so each
+    // fan can take its own colour.
     let rays = guide.perspective_rays.max(1);
-    for &(vx, vy) in &vps {
+    cr.set_line_width(thickness);
+    for &(vx, vy, color) in &vps {
         for k in 0..rays {
             let a = f64::from(k) * PI / f64::from(rays);
             if let Some((p0, p1)) = clipped(vx, vy, a) {
@@ -918,13 +918,10 @@ fn draw_perspective(
                 cr.line_to(p1.0, p1.1);
             }
         }
+        let (lr, lg, lb) = oxiedraw_core::guides::guide_line_color(color);
+        cr.set_source_rgba(f64::from(lr), f64::from(lg), f64::from(lb), base_alpha);
+        cr.stroke().ok();
     }
-    cr.set_line_width(thickness + 2.0);
-    cr.set_source_rgba(0.0, 0.0, 0.0, base_alpha);
-    cr.stroke_preserve().ok();
-    cr.set_line_width(thickness);
-    cr.set_source_rgba(1.0, 1.0, 1.0, base_alpha);
-    cr.stroke().ok();
 
     // Fade each ray toward its vanishing point, like ProCreate: transparent AT
     // the point (where the perspective compresses to nothing) ramping to full a
@@ -937,7 +934,7 @@ fn draw_perspective(
     RADIAL_FADE_TILE.with(|tile| {
         let n = f64::from(tile.width());
         let s = n / (2.0 * radius);
-        for &(vx, vy) in &vps {
+        for &(vx, vy, _) in &vps {
             let pattern = gtk::cairo::SurfacePattern::create(tile);
             pattern.set_extend(gtk::cairo::Extend::Pad);
             pattern.set_matrix(gtk::cairo::Matrix::new(
@@ -981,7 +978,7 @@ fn draw_perspective(
     }
 
     if editing {
-        for &(vx, vy) in &vps {
+        for &(vx, vy, _) in &vps {
             draw_node_disc(cr, vx, vy, ar, ag, ab);
         }
     }
@@ -2704,8 +2701,11 @@ mod guide_perf_bench {
             cfg.perspective_rays = 23;
             cfg.vanishing_points.clear();
             for i in 0..n_vps {
-                cfg.vanishing_points
-                    .push(VanishingPoint::new(600.0 + 250.0 * i as f32, 900.0 + 40.0 * i as f32));
+                cfg.vanishing_points.push(VanishingPoint::new(
+                    600.0 + 250.0 * i as f32,
+                    900.0 + 40.0 * i as f32,
+                    0.2 * i as f32,
+                ));
             }
 
             // Time only the cairo draw into a fresh ARGB surface, like a render.

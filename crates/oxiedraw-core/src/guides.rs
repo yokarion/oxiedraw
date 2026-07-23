@@ -218,17 +218,23 @@ mod point_serde {
     }
 }
 
-/// A perspective vanishing point in canvas-space coordinates.
+/// A perspective vanishing point in canvas-space coordinates, with its own
+/// line colour (a position along the guide colour ramp) so each point's rays
+/// are drawn in a distinct hue.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VanishingPoint {
     pub x: f32,
     pub y: f32,
+    /// Ray colour as a position `0.0..=1.0` along the guide ramp. Absent in
+    /// pre-v11 files (defaults to the ramp's blue).
+    #[serde(default = "default_guide_color")]
+    pub color: f32,
 }
 
 impl VanishingPoint {
     #[must_use]
-    pub const fn new(x: f32, y: f32) -> Self {
-        Self { x, y }
+    pub const fn new(x: f32, y: f32, color: f32) -> Self {
+        Self { x, y, color }
     }
 
     #[must_use]
@@ -264,10 +270,89 @@ pub struct GuideConfig {
     /// Perspective vanishing points (1 to 3). Empty for other kinds.
     #[serde(default)]
     pub vanishing_points: Vec<VanishingPoint>,
+    /// Line colour as a position `0.0..=1.0` along the guide colour ramp
+    /// (see [`guide_line_color`]). Stored as the slider position so the ramp
+    /// stays the single source of truth. Absent in pre-v11 files.
+    #[serde(default = "default_guide_color")]
+    pub color: f32,
 }
 
 fn default_perspective_rays() -> u32 {
     12
+}
+
+fn default_guide_color() -> f32 {
+    // A blue near the start of the ramp, like Procreate's default guides.
+    0.13
+}
+
+/// Resolve a guide line colour from its ramp position `t` (`0.0..=1.0`).
+/// The ramp is a fixed, non-cyclic sweep: black -> blue -> cyan -> green ->
+/// yellow -> orange -> red -> purple -> pink -> white (10 evenly spaced stops).
+#[must_use]
+pub fn guide_line_color(t: f32) -> (f32, f32, f32) {
+    const STOPS: [(f32, f32, f32); 10] = [
+        (0.0, 0.0, 0.0),   // black
+        (0.0, 0.0, 1.0),   // blue
+        (0.0, 1.0, 1.0),   // cyan
+        (0.0, 1.0, 0.0),   // green
+        (1.0, 1.0, 0.0),   // yellow
+        (1.0, 0.5, 0.0),   // orange
+        (1.0, 0.0, 0.0),   // red
+        (0.5, 0.0, 1.0),   // purple
+        (1.0, 0.4, 0.8),   // pink
+        (1.0, 1.0, 1.0),   // white
+    ];
+    let segments = (STOPS.len() - 1) as f32;
+    let scaled = t.clamp(0.0, 1.0) * segments;
+    let i = (scaled.floor() as usize).min(STOPS.len() - 2);
+    let f = scaled - i as f32;
+    let (r0, g0, b0) = STOPS[i];
+    let (r1, g1, b1) = STOPS[i + 1];
+    (
+        r0 + (r1 - r0) * f,
+        g0 + (g1 - g0) * f,
+        b0 + (b1 - b0) * f,
+    )
+}
+
+/// Nearest ramp position (`0.0..=1.0`) to an arbitrary RGB colour (channels
+/// `0.0..=1.0`). Used to seed a guide's colour from the theme accent or a VP's
+/// from the primary colour - the ramp is coarse, so this only *approximately*
+/// matches, which is the intent ("barely match").
+#[must_use]
+pub fn guide_pos_from_rgb(r: f32, g: f32, b: f32) -> f32 {
+    const SAMPLES: u32 = 128;
+    let mut best_t = 0.0;
+    let mut best_d = f32::INFINITY;
+    for i in 0..=SAMPLES {
+        let t = i as f32 / SAMPLES as f32;
+        let (cr, cg, cb) = guide_line_color(t);
+        let d = (cr - r).powi(2) + (cg - g).powi(2) + (cb - b).powi(2);
+        if d < best_d {
+            best_d = d;
+            best_t = t;
+        }
+    }
+    best_t
+}
+
+/// Default ramp colour for vanishing point `index`: the primary colour for the
+/// first point, then a 60-degree hue step per subsequent point, each snapped to
+/// the ramp. Saturation/value are floored so a dull or near-gray primary still
+/// lands on a visible ramp hue.
+#[must_use]
+pub fn vp_default_color(index: usize, primary: (f32, f32, f32)) -> f32 {
+    let to_u8 = |c: f32| (c.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let (h, s, v) = oxiedraw_utils::color::rgb_to_hsv(
+        to_u8(primary.0),
+        to_u8(primary.1),
+        to_u8(primary.2),
+    );
+    // Hue is normalized to `0.0..1.0`, so 60 degrees is 1/6 of a turn.
+    let h = h + index as f32 / 6.0;
+    let [r, g, b] = oxiedraw_utils::color::hsv_to_rgb(h, s.max(0.55), v.max(0.7));
+    guide_pos_from_rgb(f32::from(r) / 255.0, f32::from(g) / 255.0, f32::from(b) / 255.0)
 }
 
 impl GuideConfig {
@@ -289,6 +374,7 @@ impl GuideConfig {
             grid_spacing: 64.0,
             perspective_rays: default_perspective_rays(),
             vanishing_points: Vec::new(),
+            color: default_guide_color(),
         }
     }
 
@@ -527,7 +613,7 @@ mod tests {
     fn perspective_assist_points_at_vanishing_point() {
         let mut cfg = GuideConfig::centered(200, 200);
         cfg.kind = GuideKind::Perspective;
-        cfg.vanishing_points = vec![VanishingPoint::new(200.0, 0.0)];
+        cfg.vanishing_points = vec![VanishingPoint::new(200.0, 0.0, 0.13)];
         let start = Point::new(0.0, 100.0);
         // Drag roughly toward the VP; the snapped point stays on the start->VP ray.
         let lock = assist_lock(&cfg, start, Point::new(90.0, 60.0)).expect("lock");
@@ -542,6 +628,39 @@ mod tests {
         assert!(cfg.reproduces_strokes());
         assert!(!cfg.snaps_strokes());
         assert!(assist_lock(&cfg, Point::ZERO, Point::new(10.0, 3.0)).is_none());
+    }
+
+    #[test]
+    fn guide_ramp_endpoints_are_black_and_white() {
+        assert_eq!(guide_line_color(0.0), (0.0, 0.0, 0.0));
+        assert_eq!(guide_line_color(1.0), (1.0, 1.0, 1.0));
+        // Out-of-range clamps instead of panicking on the index.
+        assert_eq!(guide_line_color(-5.0), (0.0, 0.0, 0.0));
+        assert_eq!(guide_line_color(9.9), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn pos_from_rgb_snaps_pure_blue_near_blue_stop() {
+        // Pure blue is the second ramp stop at t = 1/9.
+        let t = guide_pos_from_rgb(0.0, 0.0, 1.0);
+        approx_f(t, 1.0 / 9.0);
+    }
+
+    #[test]
+    fn vp_default_colors_are_distinct_across_points() {
+        // A saturated red primary; each point steps hue +60deg, so the three
+        // land on visibly different ramp positions.
+        let primary = (1.0, 0.0, 0.0);
+        let c0 = vp_default_color(0, primary);
+        let c1 = vp_default_color(1, primary);
+        let c2 = vp_default_color(2, primary);
+        assert!((c0 - c1).abs() > 0.05, "{c0} vs {c1}");
+        assert!((c1 - c2).abs() > 0.05, "{c1} vs {c2}");
+        assert!((c0 - c2).abs() > 0.05, "{c0} vs {c2}");
+    }
+
+    fn approx_f(a: f32, b: f32) {
+        assert!((a - b).abs() < 1e-2, "{a} != {b}");
     }
 
     #[test]

@@ -1514,7 +1514,7 @@ const COMPONENT_ACCENT: (f32, f32, f32) = (0.21, 0.52, 0.89);
 /// Resolve the libadwaita accent color (`accent_bg_color`) from a themed
 /// widget, as straight RGB in `0.0..=1.0`. Falls back to [`COMPONENT_ACCENT`].
 #[allow(deprecated)]
-fn accent_rgb(widget: &gtk::Widget) -> (f32, f32, f32) {
+pub(crate) fn accent_rgb(widget: &gtk::Widget) -> (f32, f32, f32) {
     widget
         .style_context()
         .lookup_color("accent_bg_color")
@@ -1962,7 +1962,10 @@ fn build_apply_tool(
             paintable.set_guide_accent(accent_rgb);
             if guide_for_tool.config.borrow().is_none() {
                 let cs = canvas_for_tool.borrow().size();
-                *guide_for_tool.config.borrow_mut() = Some(GuideConfig::centered(cs.width, cs.height));
+                let mut cfg = GuideConfig::centered(cs.width, cs.height);
+                cfg.color =
+                    oxiedraw_core::guides::guide_pos_from_rgb(accent_rgb.0, accent_rgb.1, accent_rgb.2);
+                *guide_for_tool.config.borrow_mut() = Some(cfg);
             }
             guide_for_tool
                 .entry_snapshot

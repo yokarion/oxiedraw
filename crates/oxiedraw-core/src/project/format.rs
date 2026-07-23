@@ -25,8 +25,11 @@ use crate::text::fonts::FontMeta;
 /// restores the canvas angle. Absent in pre-v9 files (loads at 0).
 /// v10 adds the drawing guide (`guide`): symmetry / grid / perspective config.
 /// Absent in pre-v10 files (no guide).
-pub const SCHEMA_VERSION: u32 = 10;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+/// v11 adds guide line colours (a position along the guide colour ramp): a
+/// `color` on the guide and a per-vanishing-point `color`. Absent in pre-v11
+/// files (both default to the ramp's blue).
+pub const SCHEMA_VERSION: u32 = 11;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.

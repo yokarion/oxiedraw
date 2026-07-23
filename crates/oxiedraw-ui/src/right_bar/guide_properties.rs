@@ -11,16 +11,27 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::guides::{GuideConfig, GuideKind, GuideState, SymmetryMode};
+use oxiedraw_core::color::ColorState;
+use oxiedraw_core::guides::{
+    guide_line_color, guide_pos_from_rgb, vp_default_color, GuideConfig, GuideKind, GuideState,
+    SymmetryMode, VanishingPoint,
+};
 use relm4::RelmWidgetExt;
 use relm4::gtk;
 use relm4::gtk::glib;
+
+use crate::session::accent_rgb;
+use crate::widgets::gradient_slider::{self, GradientSlider};
 
 const PANEL_MARGIN: i32 = 12;
 
 type Refreshers = Rc<RefCell<Vec<Box<dyn Fn(&GuideConfig)>>>>;
 
-pub(crate) fn build(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> gtk::Box {
+pub(crate) fn build(
+    guide: &GuideState,
+    canvas: &Rc<RefCell<Canvas>>,
+    colors: &ColorState,
+) -> gtk::Box {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
@@ -46,15 +57,18 @@ pub(crate) fn build(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> gtk::Bo
     // One unified card grid: the three symmetry variants plus grid / isometric
     // / perspective, each a selectable guide type (like the crop overlay cards).
     content.append(&section_label("Guide Type"));
-    content.append(&build_guide_cards(guide, canvas, &syncing, &refreshers));
+    content.append(&build_guide_cards(guide, canvas, colors, &syncing, &refreshers));
 
     // Behaviour switches (boxed list), only meaningful for symmetry.
     let behavior = build_behavior_list(guide, &syncing, &refreshers);
     content.append(&behavior);
 
-    // Appearance: opacity + thickness (+ grid spacing for grid/iso), boxed list.
+    // Appearance: opacity + thickness (+ grid spacing for grid/iso), then the
+    // colour ramp slider(s) at the bottom of the same boxed list (one per
+    // vanishing point in perspective mode).
     content.append(&section_label("Appearance"));
     let (appearance, grid_row, rays_row) = build_appearance_list(guide, &syncing, &refreshers);
+    setup_color_rows(&appearance, guide, &syncing, &refreshers);
     content.append(&appearance);
 
     content.append(&build_position_section(guide));
@@ -162,6 +176,7 @@ fn preset_index(cfg: &GuideConfig) -> usize {
 fn build_guide_cards(
     guide: &GuideState,
     canvas: &Rc<RefCell<Canvas>>,
+    colors: &ColorState,
     syncing: &Rc<Cell<bool>>,
     refreshers: &Refreshers,
 ) -> gtk::Box {
@@ -181,30 +196,37 @@ fn build_guide_cards(
         {
             let guide = guide.clone();
             let canvas = Rc::clone(canvas);
+            let colors = colors.clone();
             let syncing = Rc::clone(syncing);
             let preset = *preset;
             // `clicked` (not `toggled`) so re-picking the already-selected card
             // after a Reset re-creates the guide.
-            btn.connect_clicked(move |_| {
+            btn.connect_clicked(move |btn| {
                 if syncing.get() {
                     return;
                 }
+                let primary = color_to_rgb(colors.current());
+                let accent = accent_rgb(btn.upcast_ref::<gtk::Widget>());
                 // Reset clears the config; picking a card starts a fresh guide
-                // of that type centred on the canvas.
+                // of that type centred on the canvas, its line colour seeded to
+                // roughly match the theme accent.
                 if guide.config.borrow().is_none() {
                     let cs = canvas.borrow().size();
-                    *guide.config.borrow_mut() = Some(GuideConfig::centered(cs.width, cs.height));
+                    let mut cfg = GuideConfig::centered(cs.width, cs.height);
+                    cfg.color = guide_pos_from_rgb(accent.0, accent.1, accent.2);
+                    *guide.config.borrow_mut() = Some(cfg);
                 }
                 guide.update(|c| {
                     c.kind = preset.kind;
                     if let Some(m) = preset.symmetry {
                         c.symmetry = m;
                     }
-                    // Perspective starts with one vanishing point; tapping the
-                    // canvas adds more (up to three).
+                    // Perspective starts with one vanishing point (primary
+                    // colour); tapping the canvas adds more (up to three).
                     if preset.kind == GuideKind::Perspective && c.vanishing_points.is_empty() {
+                        let color = vp_default_color(0, primary);
                         c.vanishing_points
-                            .push(oxiedraw_core::guides::VanishingPoint::new(c.origin.x, c.origin.y));
+                            .push(VanishingPoint::new(c.origin.x, c.origin.y, color));
                     }
                 });
             });
@@ -406,6 +428,134 @@ fn build_appearance_list(
     list.append(&rays);
 
     (list, grid, rays)
+}
+
+/// Which colour a colour slider edits: the guide-wide line colour, or one
+/// vanishing point's colour (perspective mode).
+#[derive(Clone, Copy, PartialEq)]
+enum ColorTarget {
+    Guide,
+    Vp(usize),
+}
+
+impl ColorTarget {
+    fn get(self, cfg: &GuideConfig) -> f32 {
+        match self {
+            Self::Guide => cfg.color,
+            Self::Vp(i) => cfg.vanishing_points.get(i).map_or(cfg.color, |vp| vp.color),
+        }
+    }
+
+    fn set(self, cfg: &mut GuideConfig, v: f32) {
+        match self {
+            Self::Guide => cfg.color = v,
+            Self::Vp(i) => {
+                if let Some(vp) = cfg.vanishing_points.get_mut(i) {
+                    vp.color = v;
+                }
+            }
+        }
+    }
+}
+
+/// A colour slider bound to a target, in a boxed-list row. Values are integer
+/// percentages (0..100) - no fractional input, since the ramp is coarse.
+fn make_color_slider(
+    label: &str,
+    initial: f32,
+    guide: &GuideState,
+    syncing: &Rc<Cell<bool>>,
+    target: ColorTarget,
+) -> GradientSlider {
+    let slider = gradient_slider::build(
+        label,
+        (0.0, 100.0),
+        1.0,
+        0,
+        f64::from(initial) * 100.0,
+        |t| {
+            let (r, g, b) = guide_line_color(t as f32);
+            (f64::from(r), f64::from(g), f64::from(b))
+        },
+        {
+            let guide = guide.clone();
+            let syncing = Rc::clone(syncing);
+            move |v| {
+                if !syncing.get() {
+                    guide.update(|c| target.set(c, (v / 100.0) as f32));
+                }
+            }
+        },
+    );
+    // The exact ramp position is meaningless as a number - just show the bar.
+    slider.hide_spin();
+    slider.widget.set_margin_top(6);
+    slider.widget.set_margin_bottom(6);
+    slider.widget.set_margin_start(12);
+    slider.widget.set_margin_end(12);
+    slider
+}
+
+/// Add the colour ramp slider(s) to the bottom of the appearance boxed list:
+/// one "Color" slider normally, or one per vanishing point in perspective mode.
+/// The rows are rebuilt only when the structure changes (kind or VP count), so
+/// dragging a slider doesn't tear its own widget down mid-drag.
+fn setup_color_rows(
+    list: &gtk::ListBox,
+    guide: &GuideState,
+    syncing: &Rc<Cell<bool>>,
+    refreshers: &Refreshers,
+) {
+    // (structural signature, live slider rows) so a rebuild only happens on a
+    // real structure change, not on every value edit.
+    type Rows = (Option<(GuideKind, usize)>, Vec<(ColorTarget, GradientSlider)>);
+    let state: Rc<RefCell<Rows>> = Rc::new(RefCell::new((None, Vec::new())));
+
+    let list = list.clone();
+    let guide_c = guide.clone();
+    let syncing_c = Rc::clone(syncing);
+    refreshers.borrow_mut().push(Box::new(move |cfg: &GuideConfig| {
+        let vp_count = if cfg.kind == GuideKind::Perspective {
+            cfg.vanishing_points.len()
+        } else {
+            0
+        };
+        let sig = (cfg.kind, vp_count);
+        let mut st = state.borrow_mut();
+
+        if st.0 != Some(sig) {
+            for (_, slider) in st.1.drain(..) {
+                if let Some(row) = slider.widget.parent().and_downcast::<gtk::ListBoxRow>() {
+                    list.remove(&row);
+                }
+            }
+            let targets: Vec<(String, ColorTarget)> = if cfg.kind == GuideKind::Perspective {
+                (0..vp_count)
+                    .map(|i| (format!("Point {}", i + 1), ColorTarget::Vp(i)))
+                    .collect()
+            } else {
+                vec![("Color".to_string(), ColorTarget::Guide)]
+            };
+            for (label, target) in targets {
+                let slider =
+                    make_color_slider(&label, target.get(cfg), &guide_c, &syncing_c, target);
+                list.append(&slider.widget); // appended last = bottom of the list
+                st.1.push((target, slider));
+            }
+            st.0 = Some(sig);
+        }
+
+        // Refresh values (e.g. after load / repick). `syncing` is set around
+        // refreshers, so this doesn't loop back through the sliders' on_change.
+        for (target, slider) in &st.1 {
+            slider.set_value(f64::from(target.get(cfg)) * 100.0);
+        }
+    }));
+}
+
+/// Straight RGB (`0.0..=1.0`) for a [`oxiedraw_core::color::Color`].
+fn color_to_rgb(c: oxiedraw_core::color::Color) -> (f32, f32, f32) {
+    (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0)
 }
 
 // ---------------------------------------------------------------------------

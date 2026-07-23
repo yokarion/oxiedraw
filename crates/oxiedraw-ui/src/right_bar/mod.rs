@@ -77,7 +77,7 @@ pub(crate) fn build(
         .build();
     // Colour picker with the gradient panel revealed on top of it while the
     // Gradient tool is active.
-    let guide_panel = guide_properties::build(guide, canvas);
+    let guide_panel = guide_properties::build(guide, canvas, &colors);
     let (gradient_panel, set_gradient_active) = gradient_properties::build(gradient, &colors);
     let picker_column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
