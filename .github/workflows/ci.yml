@@ -1,6 +1,5 @@
 name: CI
 
-# lint -> test -> build+release. Release assets are published only for v* tags.
 on:
   push:
     branches: [master]
@@ -15,9 +14,9 @@ env:
 
 jobs:
   lint:
-    runs-on: cicd-runner
+    runs-on: ubuntu-latest
     container:
-      image: codeberg.org/yokarion/rust-toolchain-container:latest
+      image: ghcr.io/yokarion/rust-toolchain-container:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -30,15 +29,13 @@ jobs:
           key: cargo-lint-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-lint-
 
-      # No `cargo fmt --check` on purpose: this repo is not on stock rustfmt
-      # and a format check would rewrite most of the tree.
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   test:
-    runs-on: cicd-runner
+    runs-on: ubuntu-latest
     container:
-      image: codeberg.org/yokarion/rust-toolchain-container:latest
+      image: ghcr.io/yokarion/rust-toolchain-container:latest
     steps:
       - uses: actions/checkout@v4
 
@@ -60,9 +57,11 @@ jobs:
 
   build:
     needs: [lint, test]
-    runs-on: cicd-runner
+    runs-on: ubuntu-latest
     container:
-      image: codeberg.org/yokarion/rust-toolchain-container:latest
+      image: ghcr.io/yokarion/rust-toolchain-container:latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -178,59 +177,10 @@ jobs:
           sha256sum oxiedraw-*.tar.zst OxieDraw-*.AppImage > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Publish to Codeberg Releases
+      - name: Publish to GitHub Releases
         if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          TOKEN: ${{ secrets.CODEBERG_TOKEN }}
-        run: |
-          set -eu
-          : "${TOKEN:?CODEBERG_TOKEN secret is empty - set it with repo write scope}"
-          api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
-          auth="Authorization: token ${TOKEN}"
-          tag="${GITHUB_REF_NAME}"
-          resp="$(mktemp)"
-
-          # Create the release at the tagged commit.
-          code="$(curl -sS -o "${resp}" -w '%{http_code}' -X POST "${api}/releases" \
-            -H "${auth}" -H "Content-Type: application/json" \
-            -d "$(jq -n --arg t "${tag}" --arg c "${GITHUB_SHA}" \
-                  '{tag_name: $t, target_commitish: $c, name: $t, draft: false, prerelease: false}')")"
-          release_id="$(jq -r '.id // empty' "${resp}")"
-          echo "create release: HTTP ${code}"
-
-          # Moving a tag leaves its old release behind as a draft, which blocks
-          # creation and is invisible to a by-tag lookup. Scan the full list
-          # (drafts included) and reuse that release instead.
-          if [ -z "${release_id}" ]; then
-            echo "create returned no id; response was:"
-            head -c 800 "${resp}"; echo
-            curl -sS -o "${resp}" -H "${auth}" "${api}/releases?limit=50"
-            release_id="$(jq -r --arg t "${tag}" \
-              'map(select(.tag_name == $t)) | .[0].id // empty' "${resp}")"
-          fi
-          if [ -z "${release_id}" ]; then
-            echo "could not create or find release for ${tag}" >&2
-            exit 1
-          fi
-          echo "release id: ${release_id}"
-
-          # Publish it in case we reused a leftover draft.
-          curl -sS -o /dev/null -X PATCH "${api}/releases/${release_id}" \
-            -H "${auth}" -H "Content-Type: application/json" -d '{"draft": false}'
-
-          # Replace any same-named asset from an earlier run so the upload cannot 409.
-          curl -sS -o "${resp}" -H "${auth}" "${api}/releases/${release_id}/assets"
-          for file in dist/*; do
-            name="$(basename "${file}")"
-            old_id="$(jq -r --arg n "${name}" \
-              'map(select(.name == $n)) | .[0].id // empty' "${resp}")"
-            if [ -n "${old_id}" ]; then
-              echo "replacing asset ${name} (id ${old_id})"
-              curl -sS -o /dev/null -X DELETE \
-                "${api}/releases/${release_id}/assets/${old_id}" -H "${auth}"
-            fi
-            echo "uploading ${name}"
-            curl -sS --fail-with-body -o /dev/null -X POST \
-              "${api}/releases/${release_id}/assets?name=${name}" \
-              -H "${auth}" -F "attachment=@${file}"
-          done
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
