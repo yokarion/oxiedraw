@@ -78,6 +78,9 @@ jobs:
         id: ver
         run: |
           set -eu
+          # The container user differs from the checkout owner, so git refuses to
+          # run here until the workspace is marked safe.
+          git config --global --add safe.directory "${GITHUB_WORKSPACE}"
           # GITHUB_REF is the one thing every runner sets reliably.
           case "${GITHUB_REF}" in
             refs/tags/v*)
