@@ -8,35 +8,77 @@ layout(location = 4) in float v_hardness;
 layout(location = 5) in float v_tip_kind;
 layout(location = 6) in float v_tex_scale;
 layout(location = 7) in float v_tex_strength;
+layout(location = 8) in float v_radius;
+layout(location = 9) in vec2 v_tip_uv;
+layout(location = 10) in float v_tex_mode;      // 0 multiply, 1 subtract
 
 layout(set = 0, binding = 0) uniform sampler2DArray u_atlas;
 
 layout(push_constant) uniform Push {
     vec2 inv_size;
-    uint slice;
+    uint slice;      // grain / texture slice (NO_SLICE = none)
+    uint tip_slice;  // stamped image-tip slice (NO_SLICE = procedural tip)
 } push;
+
+// Matches renderer::dab::NO_SLICE.
+const uint NO_SLICE = 0xFFFFFFFFu;
 
 layout(location = 0) out vec4 out_color;
 
-float tip_coverage(vec2 q, float hardness, float kind) {
-    float dist = (kind > 0.5) ? max(abs(q.x), abs(q.y)) : length(q);
-    float aa = 0.04;
-    float inner = min(hardness, 1.0 - aa);
-    return 1.0 - smoothstep(inner, 1.0, dist);
+// Round tip ported from Krita's KisCircleMaskGenerator::valueAt: solid core
+// of radius fade*R, then a falloff linear in squared distance. `q` is the raw
+// quad corner in [-1,+1]; multiply by radius to work in canvas pixels so the
+// +1px edge AA matches. The square tip keeps a simple chebyshev falloff.
+float tip_coverage(vec2 q, float hardness, float kind, float radius) {
+    if (kind > 0.5) {
+        float dist = max(abs(q.x), abs(q.y));
+        float inner = min(hardness, 0.96);
+        return 1.0 - smoothstep(inner, 1.0, dist);
+    }
+    float r = max(radius, 1e-4);
+    vec2 local = q * r;
+    float n = dot(local, local) / (r * r);
+    if (n > 1.0) {
+        return 0.0;
+    }
+    float fade = max(hardness, 0.01);
+    float invFadeR = 1.0 / (fade * r);
+    vec2 aa = abs(local) + vec2(1.0);
+    float nf = dot(aa, aa) * invFadeR * invFadeR;
+    if (nf < 1.0) {
+        return 1.0;
+    }
+    return 1.0 - n * (nf - 1.0) / max(nf - n, 1e-6);
 }
 
-float grain_factor() {
-    if (v_tex_scale <= 0.0 || v_tex_strength <= 0.0) {
-        return 1.0;
+// Base dab coverage: either the procedural round/square tip, or a stamped
+// image tip sampled in dab-local space (Krita predefined-tip brushes).
+float base_coverage() {
+    if (push.tip_slice != NO_SLICE) {
+        vec2 uv = clamp(v_tip_uv, 0.0, 1.0);
+        return texture(u_atlas, vec3(uv, float(push.tip_slice))).a;
+    }
+    return tip_coverage(v_tip, v_hardness, v_tip_kind, v_radius);
+}
+
+// Apply the canvas-anchored texture pattern to `coverage`, matching Krita's
+// texture option: MULTIPLY darkens, SUBTRACT carves holes. `g` is the baked
+// pattern mask (brightness/contrast already applied on the CPU).
+float apply_texture(float coverage) {
+    if (push.slice == NO_SLICE || v_tex_scale <= 0.0 || v_tex_strength <= 0.0) {
+        return coverage;
     }
     vec2 uv = v_canvas_px / v_tex_scale;
     // Force the base mip so the canvas-minified grain stays crisp.
     float g = textureLod(u_atlas, vec3(uv, float(push.slice)), 0.0).a;
-    return mix(1.0, g, v_tex_strength);
+    if (v_tex_mode > 0.5) {
+        return max(0.0, coverage - g * v_tex_strength);
+    }
+    return coverage * mix(1.0, g, v_tex_strength);
 }
 
 void main() {
-    float coverage = tip_coverage(v_tip, v_hardness, v_tip_kind) * grain_factor();
+    float coverage = apply_texture(base_coverage());
     // v_color is premultiplied; scale colour + alpha by coverage * flow.
     out_color = v_color * coverage * v_flow;
 }

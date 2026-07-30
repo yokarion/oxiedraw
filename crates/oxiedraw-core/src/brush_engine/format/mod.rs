@@ -44,6 +44,7 @@ mod tests {
             tip: super::super::preset::TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: super::super::preset::TexturingMode::Multiply,
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,
@@ -104,6 +105,7 @@ mod tests {
             tip: super::super::preset::TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: super::super::preset::TexturingMode::Multiply,
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -128,5 +130,72 @@ mod tests {
                 "byte differs by more than 2: orig={orig} got={got}"
             );
         }
+    }
+
+    #[test]
+    fn round_trip_image_tip_preserves_tip_grain_and_mode() {
+        let mk = |v: u8| {
+            let mut rgba = vec![0u8; 4 * 4 * 4];
+            for px in rgba.chunks_exact_mut(4) {
+                px.copy_from_slice(&[v, v, v, v]);
+            }
+            Rc::new(PatternData::new(rgba, 4, 4))
+        };
+        let preset = BrushPreset {
+            id: BrushPresetId(0),
+            name: "Trip ImageTip".into(),
+            family: BrushFamily::ImageTip {
+                tip: mk(200),
+                grain: Some(mk(120)),
+            },
+            default_size: 30.0,
+            default_opacity: 1.0,
+            spacing_ratio: 0.06,
+            stabilizer: 0.0,
+            speed_smoothing: 0.0,
+            buildup: false,
+            hardness: 1.0,
+            tip: super::super::preset::TipShape::Round,
+            texture_scale: 512.0,
+            texture_strength: 1.0,
+            texturing_mode: super::super::preset::TexturingMode::Subtract,
+            dynamics: Dynamics::default(),
+            icon: None,
+            preview: None,
+            source_path: None,
+        };
+        let path = temp_path("image_tip");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(9), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.texturing_mode, super::super::preset::TexturingMode::Subtract);
+        let BrushFamily::ImageTip { tip, grain } = restored.family else {
+            panic!("expected image tip")
+        };
+        assert_eq!(tip.width, 4);
+        let grain = grain.expect("grain preserved");
+        assert!(tip.rgba[3].abs_diff(200) <= 2, "tip alpha preserved");
+        assert!(grain.rgba[3].abs_diff(120) <= 2, "grain alpha preserved");
+    }
+
+    #[test]
+    fn round_trip_smudge_family_and_dynamics() {
+        // The real Real Brush preset - exercises the Smudge family + the
+        // smudge dynamics serialising through the archive.
+        let preset = BrushPreset::real_brush(BrushPresetId(0));
+        assert!(matches!(preset.family, BrushFamily::Smudge));
+        let path = temp_path("smudge");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(3), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(restored.family, BrushFamily::Smudge));
+        // Real Brush drives colour rate + size by pressure; smudge rate is left
+        // constant (its dynamic was removed to stop the deposit pulsing).
+        assert!(restored.dynamics.color_rate.is_some());
+        assert!(restored.dynamics.size.is_some());
     }
 }

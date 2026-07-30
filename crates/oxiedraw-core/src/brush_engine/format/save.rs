@@ -25,17 +25,29 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
     };
     append_json(&mut archive, "manifest.json", &manifest)?;
 
-    let (family_doc, pattern_payload) = match &preset.family {
-        BrushFamily::SoftRound => (FamilyDoc::SoftRound, None),
-        BrushFamily::Pixel => (FamilyDoc::Pixel, None),
+    // Each `(filename, PatternData)` is written into `patterns/`.
+    let mut pattern_payloads: Vec<(String, Rc<PatternData>)> = Vec::new();
+    let family_doc = match &preset.family {
+        BrushFamily::SoftRound => FamilyDoc::SoftRound,
+        BrushFamily::Pixel => FamilyDoc::Pixel,
+        BrushFamily::Smudge => FamilyDoc::Smudge,
         BrushFamily::Textured(data) => {
             let filename = "pattern.png".to_string();
-            (
-                FamilyDoc::Textured {
-                    pattern: filename.clone(),
-                },
-                Some((filename, data.clone())),
-            )
+            pattern_payloads.push((filename.clone(), data.clone()));
+            FamilyDoc::Textured { pattern: filename }
+        }
+        BrushFamily::ImageTip { tip, grain } => {
+            let tip_name = "tip.png".to_string();
+            pattern_payloads.push((tip_name.clone(), tip.clone()));
+            let grain_name = grain.as_ref().map(|g| {
+                let name = "grain.png".to_string();
+                pattern_payloads.push((name.clone(), g.clone()));
+                name
+            });
+            FamilyDoc::ImageTip {
+                tip: tip_name,
+                grain: grain_name,
+            }
         }
     };
 
@@ -51,12 +63,13 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
         tip: preset.tip,
         texture_scale: preset.texture_scale,
         texture_strength: preset.texture_strength,
+        texturing_mode: preset.texturing_mode,
         dynamics: preset.dynamics.clone(),
     };
     append_json(&mut archive, "brush.json", &document)?;
 
-    if let Some((filename, data)) = pattern_payload {
-        let png_bytes = encode_premul_rgba_to_png(&data)?;
+    for (filename, data) in &pattern_payloads {
+        let png_bytes = encode_premul_rgba_to_png(data)?;
         append_bytes(&mut archive, &format!("patterns/{filename}"), &png_bytes)?;
     }
 

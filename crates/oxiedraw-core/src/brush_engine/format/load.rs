@@ -93,16 +93,30 @@ impl BrushPackage {
         id: BrushPresetId,
         source_path: Option<PathBuf>,
     ) -> Result<BrushPreset, BrushError> {
-        let family = match self.document.family {
+        let resolve = |name: &str| -> Result<PatternData, BrushError> {
+            let (rgba, w, h) = self
+                .patterns
+                .get(name)
+                .ok_or_else(|| BrushError::MissingPattern(name.to_string()))?;
+            Ok(PatternData::new(rgba.clone(), *w, *h))
+        };
+        let family = match &self.document.family {
             FamilyDoc::SoftRound => BrushFamily::SoftRound,
             FamilyDoc::Pixel => BrushFamily::Pixel,
+            FamilyDoc::Smudge => BrushFamily::Smudge,
             FamilyDoc::Textured { pattern } => {
-                let (rgba, w, h) = self
-                    .patterns
-                    .get(&pattern)
-                    .ok_or_else(|| BrushError::MissingPattern(pattern.clone()))?;
-                let data = PatternData::new(rgba.clone(), *w, *h);
-                BrushFamily::Textured(Rc::new(data))
+                BrushFamily::Textured(Rc::new(resolve(pattern)?))
+            }
+            FamilyDoc::ImageTip { tip, grain } => {
+                let tip_data = Rc::new(resolve(tip)?);
+                let grain_data = match grain {
+                    Some(name) => Some(Rc::new(resolve(name)?)),
+                    None => None,
+                };
+                BrushFamily::ImageTip {
+                    tip: tip_data,
+                    grain: grain_data,
+                }
             }
         };
         Ok(BrushPreset {
@@ -119,6 +133,7 @@ impl BrushPackage {
             tip: self.document.tip,
             texture_scale: self.document.texture_scale,
             texture_strength: self.document.texture_strength,
+            texturing_mode: self.document.texturing_mode,
             dynamics: self.document.dynamics,
             icon: self.icon,
             preview: self.preview,

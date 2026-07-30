@@ -252,6 +252,12 @@ pub struct Dynamics {
     /// guarantees overlapping dabs.
     #[serde(default)]
     pub spacing: Option<Mapping>,
+    /// Smudge family: colour-pickup rate, `0..=1`.
+    #[serde(default)]
+    pub smudge_rate: Option<Mapping>,
+    /// Smudge family: paint-colour mix rate, `0..=1`.
+    #[serde(default)]
+    pub color_rate: Option<Mapping>,
 }
 
 impl Dynamics {
@@ -261,6 +267,8 @@ impl Dynamics {
             || self.rotation.is_some()
             || self.scatter.is_some()
             || self.spacing.is_some()
+            || self.smudge_rate.is_some()
+            || self.color_rate.is_some()
     }
 }
 
@@ -291,6 +299,12 @@ pub fn evaluate(
         let (rx, ry) = scatter_seed;
         dab.center.x += rx.mul_add(2.0, -1.0) * radius;
         dab.center.y += ry.mul_add(2.0, -1.0) * radius;
+    }
+    if let Some(m) = &dynamics.smudge_rate {
+        dab.smudge_rate = m.apply(input).clamp(0.0, 1.0);
+    }
+    if let Some(m) = &dynamics.color_rate {
+        dab.color_rate = m.apply(input).clamp(0.0, 1.0);
     }
     // `Color` does not yet have an alpha channel, so hue / sat / val
     // dynamics are deferred until the stroke buffer is promoted to RGBA

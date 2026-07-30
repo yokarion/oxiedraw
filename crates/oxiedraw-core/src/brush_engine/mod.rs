@@ -15,7 +15,7 @@ pub use cursor::{BrushCursor, compute_brush_cursor};
 pub use dynamics::{Curve, DynSource, Dynamics, Mapping, SpawnInput, evaluate, make_spawn_input};
 pub use input::InputSample;
 pub use pattern::PatternData;
-pub use preset::{BrushFamily, BrushPreset, TipShape};
+pub use preset::{BrushFamily, BrushPreset, TexturingMode, TipShape};
 pub use registry::BrushRegistry;
 pub use stamp::start_stroke;
 

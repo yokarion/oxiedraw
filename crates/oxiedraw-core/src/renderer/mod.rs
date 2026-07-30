@@ -138,11 +138,11 @@ mod vulkan;
 
 pub use dmabuf::DmabufDescriptor;
 
-pub use dab::{DabFamily, DabInstance};
+pub use dab::{DabFamily, DabInstance, NO_SLICE};
 pub use error::RendererError;
 pub use layers::MAX_LAYERS;
 pub use selection::SelectionBlendMode;
 pub use vulkan::{
-    CANVAS_FORMAT, EdgesBuffer, GradientKind, PresentSource, STROKE_FORMAT, ShapeKind,
+    CANVAS_FORMAT, EdgesBuffer, GradientKind, PresentSource, STROKE_FORMAT, ShapeKind, SmudgeDab,
     VulkanRenderer,
 };

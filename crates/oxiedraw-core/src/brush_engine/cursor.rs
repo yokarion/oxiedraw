@@ -97,6 +97,17 @@ pub fn compute_brush_cursor(
                 textured_outline(pattern, &dab, scatter_max)
             }
         }
+        BrushFamily::ImageTip { .. } => {
+            // The stamped tip fills the dab quad; approximate its footprint
+            // by the dab's bounding ellipse rather than tracing the tip mask.
+            let outline = ellipse_outline(&dab);
+            vec![expand_outward(&outline, dab.center, scatter_max)]
+        }
+        BrushFamily::Smudge => {
+            // Round tip shaped by hardness - same footprint as soft round.
+            let outline = ellipse_outline(&dab);
+            vec![expand_outward(&outline, dab.center, scatter_max)]
+        }
     };
 
     BrushCursor { strokes }
@@ -406,6 +417,7 @@ mod tests {
             tip: crate::brush_engine::TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: crate::brush_engine::TexturingMode::Multiply,
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -699,6 +711,9 @@ mod tests {
             tip: 0.0,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: 0.0,
+            smudge_rate: 1.0,
+            color_rate: 0.0,
         };
         let outline = ellipse_outline(&dab);
         let (mut xmin, mut xmax, mut ymin, mut ymax) =

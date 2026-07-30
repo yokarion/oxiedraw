@@ -20,6 +20,7 @@ mod pattern_ops;
 mod present;
 mod preview;
 mod selection_ops;
+mod smudge_ops;
 mod shape_ops;
 mod stroke;
 mod transform_ops;
@@ -27,6 +28,7 @@ mod transform_preview;
 
 pub use gradient_ops::GradientKind;
 pub use shape_ops::ShapeKind;
+pub use smudge_ops::SmudgeDab;
 
 use std::cell::RefCell;
 use std::mem::ManuallyDrop;
@@ -314,6 +316,16 @@ pub struct VulkanRenderer {
     pub(super) filter_spec: crate::filters::FilterSpec,
     /// Layer indices the filter applies to (z-order independent).
     pub(super) filter_affected: Vec<usize>,
+
+    /// Colour-smudge dab pipeline `(layout, pipeline)`, built lazily on first
+    /// smudge stroke (most sessions never use it). Samples `blend_scratch`
+    /// (a per-dab copy of the target layer) + `smudge_before`, and deposits the
+    /// dragged colour lerped from the pre-stroke layer by opacity.
+    pub(super) smudge_pipeline: Option<(vk::PipelineLayout, vk::Pipeline)>,
+    /// Pre-stroke snapshot of the smudged layer `(image, pool, set)`, taken at
+    /// stroke start; the dab shader lerps from it so opacity is a ceiling.
+    /// Lazily allocated on first smudge stroke.
+    pub(super) smudge_before: Option<(ManuallyDrop<Image>, vk::DescriptorPool, vk::DescriptorSet)>,
 
     /// Display-side dmabuf image. Per-frame `present_to_display` copies
     /// the chosen source (canvas or preview) into here.
@@ -646,6 +658,8 @@ impl VulkanRenderer {
             filter_active: false,
             filter_spec: crate::filters::FilterSpec::Invert,
             filter_affected: Vec::new(),
+            smudge_pipeline: None,
+            smudge_before: None,
             display,
             present_convert: ManuallyDrop::new(present_convert),
             display_framebuffers,
@@ -1298,6 +1312,14 @@ impl Drop for VulkanRenderer {
             for mut ga in self.scoped_group_cache.drain(..) {
                 ga.destroy(&self.device, &mut self.allocator);
             }
+            if let Some((layout, pipeline)) = self.smudge_pipeline.take() {
+                self.device.destroy_pipeline(pipeline, None);
+                self.device.destroy_pipeline_layout(layout, None);
+            }
+            if let Some((mut image, pool, _)) = self.smudge_before.take() {
+                self.device.destroy_descriptor_pool(pool, None);
+                ManuallyDrop::take(&mut image).destroy(&self.device, &mut self.allocator);
+            }
             ManuallyDrop::take(&mut self.layer_blend_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.layer_composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);
@@ -1447,6 +1469,7 @@ mod tests {
             tip: 0.0,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: 0.0,
         }
     }
 

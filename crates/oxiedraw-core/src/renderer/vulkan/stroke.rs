@@ -183,6 +183,7 @@ impl VulkanRenderer {
         let push = DabPushConstants {
             inv_size,
             slice: family.slice(),
+            tip_slice: family.tip_slice(),
         };
         let atlas_set = self.pattern_atlas.descriptor_set();
         let binds_atlas = family.binds_atlas();

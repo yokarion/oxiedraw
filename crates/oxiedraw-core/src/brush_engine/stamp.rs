@@ -50,6 +50,7 @@ pub(super) struct DabStyle {
     tip: f32,
     texture_scale: f32,
     texture_strength: f32,
+    texturing_mode: f32,
 }
 
 impl DabStyle {
@@ -59,6 +60,7 @@ impl DabStyle {
             tip: preset.tip.as_gpu(),
             texture_scale: preset.texture_scale,
             texture_strength: preset.texture_strength,
+            texturing_mode: preset.texturing_mode.as_gpu(),
         }
     }
 
@@ -67,6 +69,7 @@ impl DabStyle {
         dab.tip = self.tip;
         dab.texture_scale = self.texture_scale;
         dab.texture_strength = self.texture_strength;
+        dab.texturing_mode = self.texturing_mode;
     }
 }
 

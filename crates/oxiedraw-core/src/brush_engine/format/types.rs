@@ -3,12 +3,12 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use super::super::dynamics::Dynamics;
-use super::super::preset::TipShape;
+use super::super::preset::{TexturingMode, TipShape};
 
-/// Bumped to 2 when the global-texture brush fields (hardness, tip,
-/// texture scale/strength) landed. New fields are `#[serde(default)]`, so
-/// the loader still accepts older archives - see `load::load`.
-pub const SCHEMA_VERSION: u32 = 2;
+/// Bumped to 3 when the image-tip family (stamped tip + separate grain) and
+/// `texturing_mode` landed. New fields are `#[serde(default)]`, so the loader
+/// still accepts older archives - see `load::load`.
+pub const SCHEMA_VERSION: u32 = 3;
 pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Manifest discriminator distinguishing brushes from other future TAR
 /// archive types so the loader can reject the wrong file early.
@@ -18,7 +18,7 @@ pub(super) const KIND: &str = "brush";
 /// whenever a builtin factory changes in a way that should reach existing
 /// installs (tuned spacing, new grain, etc.) without a schema change.
 /// `seed_missing` re-writes any builtin whose on-disk revision is older.
-pub const BUILTIN_REVISION: u32 = 6;
+pub const BUILTIN_REVISION: u32 = 8;
 
 /// `manifest.json` - fast metadata read for the brush picker so we can
 /// list brushes without fully deserialising `brush.json`.
@@ -34,13 +34,23 @@ pub struct BrushManifest {
     pub builtin_revision: u32,
 }
 
-/// Family discriminator in `brush.json`. `Textured` carries the
-/// filename inside `patterns/` so loaders can fetch the PNG.
+/// Family discriminator in `brush.json`. `Textured` / `ImageTip` carry the
+/// filename(s) inside `patterns/` so loaders can fetch the PNG(s).
 #[derive(Debug, Serialize, Deserialize)]
 pub enum FamilyDoc {
     SoftRound,
     Pixel,
-    Textured { pattern: String },
+    Textured {
+        pattern: String,
+    },
+    /// Stamped image tip plus an optional canvas-anchored grain texture.
+    ImageTip {
+        tip: String,
+        #[serde(default)]
+        grain: Option<String>,
+    },
+    /// Colour-smudge brush - no pattern; the round tip is shaped by `hardness`.
+    Smudge,
 }
 
 /// `brush.json` - full data needed to reconstruct a `BrushPreset`.
@@ -65,6 +75,9 @@ pub struct BrushDocument {
     pub texture_scale: f32,
     #[serde(default)]
     pub texture_strength: f32,
+    /// Grain composite mode. Defaults to `Multiply` for pre-schema-3 archives.
+    #[serde(default)]
+    pub texturing_mode: TexturingMode,
     pub dynamics: Dynamics,
 }
 

@@ -51,6 +51,15 @@ pub struct Dab {
     /// How strongly the global grain modulates coverage, `0..=1`.
     /// `0.0` = tip only, `1.0` = grain fully gates the tip.
     pub texture_strength: f32,
+    /// Texture composite mode: `0.0` multiply, `1.0` subtract. See
+    /// `TexturingMode`.
+    pub texturing_mode: f32,
+    /// Smudge family only: how much of the picked-up colour under the dab
+    /// carries into the smudge colour, `0..=1` (Krita "smudge rate").
+    pub smudge_rate: f32,
+    /// Smudge family only: how much of the brush paint colour is mixed into
+    /// the deposited dab, `0..=1` (Krita "color rate").
+    pub color_rate: f32,
 }
 
 impl Dab {
@@ -69,6 +78,9 @@ impl Dab {
             tip: 0.0,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: 0.0,
+            smudge_rate: 1.0,
+            color_rate: 0.0,
         }
     }
 }

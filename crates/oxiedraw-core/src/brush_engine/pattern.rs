@@ -82,6 +82,101 @@ impl PatternData {
         Ok(Self::new(premul, info.width, info.height))
     }
 
+    /// Decode a PNG to straight (non-premultiplied) RGBA8. Shared by the
+    /// tip / texture bakers below, which need the raw luma + alpha to apply
+    /// Krita's mask math before premultiplying.
+    fn decode_straight(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+        let decoder = png::Decoder::new(bytes);
+        let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
+        let mut buf = vec![0u8; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
+        let src = &buf[..info.buffer_size()];
+        let n = (info.width as usize) * (info.height as usize);
+        let mut rgba = Vec::with_capacity(n * 4);
+        match info.color_type {
+            png::ColorType::Rgba => rgba.extend_from_slice(src),
+            png::ColorType::Rgb => {
+                for c in src.chunks_exact(3) {
+                    rgba.extend_from_slice(&[c[0], c[1], c[2], 0xFF]);
+                }
+            }
+            png::ColorType::GrayscaleAlpha => {
+                for c in src.chunks_exact(2) {
+                    rgba.extend_from_slice(&[c[0], c[0], c[0], c[1]]);
+                }
+            }
+            png::ColorType::Grayscale => {
+                for &v in src {
+                    rgba.extend_from_slice(&[v, v, v, 0xFF]);
+                }
+            }
+            other => return Err(format!("unsupported PNG color type {other:?}")),
+        }
+        Ok((rgba, info.width, info.height))
+    }
+
+    /// Krita's luma weighting (`kis_texture_mask_info.cpp`):
+    /// `(r*11 + g*16 + b*5) / 32`, normalised to `0..=1`.
+    fn krita_luma(r: u8, g: u8, b: u8) -> f32 {
+        let y = (u32::from(r) * 11 + u32::from(g) * 16 + u32::from(b) * 5) / 32;
+        y as f32 / 255.0
+    }
+
+    /// Build a stamped-tip mask from a predefined brush-tip PNG, matching
+    /// Krita's MASK/ALPHAMASK path (`kis_png_brush.cpp`): the tip is drawn
+    /// over white, converted to grey, and the coverage is `1 - grey`, so a
+    /// white background paints nothing and dark marks paint fully. Any real
+    /// alpha in the source multiplies in.
+    pub fn tip_from_png_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let (rgba, w, h) = Self::decode_straight(bytes)?;
+        Ok(Self::from_value_fn_over(w, h, |i| {
+            let p = &rgba[i * 4..i * 4 + 4];
+            let alpha = f32::from(p[3]) / 255.0;
+            let grey_over_white = Self::krita_luma(p[0], p[1], p[2]).mul_add(alpha, 1.0 - alpha);
+            1.0 - grey_over_white
+        }))
+    }
+
+    /// Build a canvas-space texture mask from a pattern PNG, matching
+    /// Krita's texture option (`kis_texture_mask_info.cpp`): grey over white,
+    /// then brightness shift and contrast around 0.5, optional invert. The
+    /// baked mask is later composited (multiply / subtract) against dab
+    /// coverage in the shader.
+    pub fn texture_from_png_bytes(
+        bytes: &[u8],
+        brightness: f32,
+        contrast: f32,
+        invert: bool,
+    ) -> Result<Self, String> {
+        let (rgba, w, h) = Self::decode_straight(bytes)?;
+        Ok(Self::from_value_fn_over(w, h, |i| {
+            let p = &rgba[i * 4..i * 4 + 4];
+            let alpha = f32::from(p[3]) / 255.0;
+            let mut m = Self::krita_luma(p[0], p[1], p[2]).mul_add(alpha, 1.0 - alpha);
+            m -= brightness;
+            m = (m - 0.5).mul_add(contrast, 0.5);
+            m = m.clamp(0.0, 1.0);
+            if invert { 1.0 - m } else { m }
+        }))
+    }
+
+    /// Like `from_value_fn` but indexed by flat pixel position over an
+    /// arbitrary `w x h` source (the atlas resizes to its slice dim later).
+    fn from_value_fn_over(w: u32, h: u32, f: impl Fn(usize) -> f32) -> Self {
+        let count = (w as usize) * (h as usize);
+        let mut rgba = vec![0u8; count * 4];
+        for i in 0..count {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let a = (f(i).clamp(0.0, 1.0) * 255.0) as u8;
+            let o = i * 4;
+            rgba[o] = a;
+            rgba[o + 1] = a;
+            rgba[o + 2] = a;
+            rgba[o + 3] = a;
+        }
+        Self::new(rgba, w, h)
+    }
+
     /// Seamless chalk grit: dense deposit broken up by fine paper-tooth
     /// holes. Meant to be sampled in canvas space (REPEAT wrap) as a
     /// global grain behind a square-ish tip, so a chalk stroke reveals

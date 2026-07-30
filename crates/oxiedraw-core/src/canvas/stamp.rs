@@ -1,6 +1,6 @@
 use crate::brush_engine::{BrushFamily, Dab, PaintTarget};
 use crate::guides::Symmetry;
-use crate::renderer::{DabFamily, DabInstance, RendererError, VulkanRenderer};
+use crate::renderer::{DabFamily, DabInstance, NO_SLICE, RendererError, SmudgeDab, VulkanRenderer};
 
 /// Expand one brush dab into its instance plus every symmetry copy, appending
 /// to `out`. Reflected copies reuse the dab's shape with a mirrored rotation;
@@ -60,13 +60,9 @@ impl PaintTarget for StrokeStamp<'_> {
         if self.error.is_some() {
             return;
         }
-        match family {
-            BrushFamily::SoftRound => self.family = DabFamily::SoftRound,
-            BrushFamily::Pixel => self.family = DabFamily::Pixel,
-            BrushFamily::Textured(data) => match self.renderer.upload_pattern(data) {
-                Ok(slice) => self.family = DabFamily::Textured { slice },
-                Err(e) => self.error = Some(e),
-            },
+        match resolve_family(self.renderer, family) {
+            Ok(f) => self.family = f,
+            Err(e) => self.error = Some(e),
         }
     }
 
@@ -124,16 +120,12 @@ impl PaintTarget for BatchStamp<'_> {
         if self.error.is_some() {
             return;
         }
-        let new_family = match family {
-            BrushFamily::SoftRound => DabFamily::SoftRound,
-            BrushFamily::Pixel => DabFamily::Pixel,
-            BrushFamily::Textured(data) => match self.renderer.upload_pattern(data) {
-                Ok(slice) => DabFamily::Textured { slice },
-                Err(e) => {
-                    self.error = Some(e);
-                    return;
-                }
-            },
+        let new_family = match resolve_family(self.renderer, family) {
+            Ok(f) => f,
+            Err(e) => {
+                self.error = Some(e);
+                return;
+            }
         };
         // A family change with pending instances can't share one draw, so
         // flush the pending batch now (its own submit) and start fresh.
@@ -157,12 +149,162 @@ impl PaintTarget for BatchStamp<'_> {
     }
 }
 
+/// `PaintTarget` for colour-smudge brushes. Each dab is painted straight into
+/// the active layer via the GPU smudge path (no stroke buffer). `prev_center`
+/// carries across `paint_dabs` calls so each dab's drag vector is relative to
+/// the previous one; the caller seeds it from and reads it back into canvas
+/// state so it persists across the whole stroke.
+pub(super) struct SmudgeStamp<'a> {
+    renderer: &'a mut VulkanRenderer,
+    layer_idx: usize,
+    paint_linear: [f32; 4],
+    opacity: f32,
+    prev_center: Option<[f32; 2]>,
+    error: Option<RendererError>,
+    scratch: Vec<SmudgeDab>,
+}
+
+impl<'a> SmudgeStamp<'a> {
+    pub(super) const fn new(
+        renderer: &'a mut VulkanRenderer,
+        layer_idx: usize,
+        paint_linear: [f32; 4],
+        opacity: f32,
+        prev_center: Option<[f32; 2]>,
+    ) -> Self {
+        Self {
+            renderer,
+            layer_idx,
+            paint_linear,
+            opacity,
+            prev_center,
+            error: None,
+            scratch: Vec::new(),
+        }
+    }
+
+    /// Returns the error (if any) plus the updated previous-centre so the
+    /// caller can persist it for the next `paint_dabs` batch of this stroke.
+    pub(super) fn into_result(self) -> (Result<(), RendererError>, Option<[f32; 2]>) {
+        (self.error.map_or(Ok(()), Err), self.prev_center)
+    }
+}
+
+/// Convert a brush `Dab` into a `SmudgeDab`, computing the drag vector against
+/// (and advancing) the running previous centre. Shared by both smudge adapters.
+fn push_smudge_dab(out: &mut Vec<SmudgeDab>, prev: &mut Option<[f32; 2]>, dab: &Dab) {
+    let center = [dab.center.x, dab.center.y];
+    let p = prev.unwrap_or(center);
+    out.push(SmudgeDab {
+        center,
+        delta: [center[0] - p[0], center[1] - p[1]],
+        radius: dab.radius,
+        hardness: dab.hardness,
+        smudge_rate: dab.smudge_rate,
+        color_rate: dab.color_rate,
+    });
+    *prev = Some(center);
+}
+
+impl PaintTarget for SmudgeStamp<'_> {
+    // The tip is always a round mask; the smudge family carries no pattern.
+    fn set_family(&mut self, _family: &BrushFamily) {}
+
+    fn paint_dabs(&mut self, dabs: &[Dab]) {
+        if self.error.is_some() || dabs.is_empty() {
+            return;
+        }
+        self.scratch.clear();
+        self.scratch.reserve(dabs.len());
+        for dab in dabs {
+            push_smudge_dab(&mut self.scratch, &mut self.prev_center, dab);
+        }
+        if let Err(e) =
+            self.renderer
+                .smudge_dabs(self.layer_idx, self.paint_linear, self.opacity, &self.scratch)
+        {
+            self.error = Some(e);
+        }
+    }
+}
+
+/// `PaintTarget` that accumulates smudge dabs WITHOUT submitting, so the whole
+/// motion event (dabs + recomposite + present) can go in one async submit -
+/// matching the normal brush's hot path. Tracks `prev_center` across
+/// `paint_dabs` calls for the drag vectors; the caller persists it.
+pub(super) struct SmudgeBatchStamp {
+    prev_center: Option<[f32; 2]>,
+    dabs: Vec<SmudgeDab>,
+}
+
+impl SmudgeBatchStamp {
+    pub(super) const fn new(prev_center: Option<[f32; 2]>) -> Self {
+        Self {
+            prev_center,
+            dabs: Vec::new(),
+        }
+    }
+
+    /// The accumulated dabs plus the updated previous-centre.
+    pub(super) fn into_dabs(self) -> (Vec<SmudgeDab>, Option<[f32; 2]>) {
+        (self.dabs, self.prev_center)
+    }
+}
+
+impl PaintTarget for SmudgeBatchStamp {
+    fn set_family(&mut self, _family: &BrushFamily) {}
+
+    fn paint_dabs(&mut self, dabs: &[Dab]) {
+        self.dabs.reserve(dabs.len());
+        for dab in dabs {
+            push_smudge_dab(&mut self.dabs, &mut self.prev_center, dab);
+        }
+    }
+}
+
+/// Resolve a brush-engine `BrushFamily` (which carries pattern data) into
+/// the renderer `DabFamily` with atlas slices uploaded/cached. Shared by
+/// both `PaintTarget` adapters so the two-slice image-tip logic lives once.
+fn resolve_family(
+    renderer: &mut VulkanRenderer,
+    family: &BrushFamily,
+) -> Result<DabFamily, RendererError> {
+    match family {
+        // Smudge is painted by the dedicated GPU path, not `stamp_mask`; it
+        // never reaches this resolver in practice (canvas routes smudge brushes
+        // to `SmudgeStamp`), but map it to a round mask to stay exhaustive.
+        BrushFamily::SoftRound | BrushFamily::Smudge => Ok(DabFamily::SoftRound),
+        BrushFamily::Pixel => Ok(DabFamily::Pixel),
+        BrushFamily::Textured(grain) => {
+            let grain_slice = renderer.upload_pattern(grain)?;
+            Ok(DabFamily::Textured {
+                grain_slice,
+                tip_slice: NO_SLICE,
+            })
+        }
+        BrushFamily::ImageTip { tip, grain } => {
+            let tip_slice = renderer.upload_pattern(tip)?;
+            let grain_slice = match grain {
+                Some(g) => renderer.upload_pattern(g)?,
+                None => NO_SLICE,
+            };
+            Ok(DabFamily::Textured {
+                grain_slice,
+                tip_slice,
+            })
+        }
+    }
+}
+
 const fn same_family(a: DabFamily, b: DabFamily) -> bool {
     matches!(
         (a, b),
         (DabFamily::SoftRound, DabFamily::SoftRound) | (DabFamily::Pixel, DabFamily::Pixel)
     ) || matches!(
         (a, b),
-        (DabFamily::Textured { slice: s1 }, DabFamily::Textured { slice: s2 }) if s1 == s2
+        (
+            DabFamily::Textured { grain_slice: g1, tip_slice: t1 },
+            DabFamily::Textured { grain_slice: g2, tip_slice: t2 },
+        ) if g1 == g2 && t1 == t2
     )
 }

@@ -27,6 +27,29 @@ impl TipShape {
     }
 }
 
+/// How the canvas-space texture pattern modulates dab coverage, mirroring
+/// Krita's texture option (`KisMaskingBrushCompositeOp`). Only the two
+/// modes the built-in brushes use are implemented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TexturingMode {
+    /// `coverage *= mix(1, pattern, strength)` - the classic grain darken.
+    #[default]
+    Multiply,
+    /// `coverage = max(0, coverage - pattern * strength)` - carves holes,
+    /// Krita's default and what Chalk_Soft uses.
+    Subtract,
+}
+
+impl TexturingMode {
+    /// Encoding passed to the GPU: `0.0` multiply, `1.0` subtract.
+    pub const fn as_gpu(self) -> f32 {
+        match self {
+            Self::Multiply => 0.0,
+            Self::Subtract => 1.0,
+        }
+    }
+}
+
 // Built-in brush icons live in `data/icons/builtin-brush-icons/` at the
 // repo root. `include_bytes!` compiles them straight into the binary so
 // `seed_missing` can write them into each `.oxiebrush` archive on first
@@ -64,6 +87,19 @@ const ICON_REAL_BRUSH: &[u8] = include_bytes!(concat!(
     "/../../data/icons/builtin-brush-icons/real_brush.png"
 ));
 
+// Predefined brush-tip + texture images extracted from Krita's default
+// resource bundle (`Krita_4_Default_Resources.bundle`), converted to plain
+// RGBA8. Chalk_Soft stamps the oil-bristle tip and subtracts the dotted
+// paper texture. Compiled straight into the binary like the icons.
+const TIP_OIL_BRISTLE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/builtin-brush-assets/oil_bristle.png"
+));
+const TEXTURE_DRAWED_DOTTED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/builtin-brush-assets/10_drawed_dotted.png"
+));
+
 /// Side length of the synthesised grain tiles. Matches the pattern atlas
 /// slice dimension so the upload resize is an identity - no resampling
 /// artefacts on the crisp halftone dots.
@@ -78,20 +114,44 @@ pub enum BrushFamily {
     /// disabled for this family by convention (the curves don't match
     /// the pixel grid).
     Pixel,
-    /// Sample from a bitmap pattern. The `Rc` is shared with the
-    /// pattern atlas; the renderer caches uploads by `Rc::as_ptr` so
-    /// switching brushes mid-session doesn't re-upload the same data.
+    /// Sample from a bitmap pattern used as a canvas-anchored grain behind a
+    /// procedural tip. The `Rc` is shared with the pattern atlas; the
+    /// renderer caches uploads by `Rc::as_ptr` so switching brushes
+    /// mid-session doesn't re-upload the same data.
     Textured(Rc<PatternData>),
+    /// Stamped image tip (mask sampled from `tip` in dab-local space),
+    /// optionally modulated by a canvas-anchored `grain` texture. This is
+    /// how Krita's predefined-tip brushes (e.g. Chalk_Soft) work. Shares the
+    /// textured GPU pipeline; the renderer resolves both patterns to atlas
+    /// slices.
+    ImageTip {
+        tip: Rc<PatternData>,
+        grain: Option<Rc<PatternData>>,
+    },
+    /// Colour-smudge brush (Krita colorsmudge): each dab picks up the colour
+    /// under it from the layer, blends it with the carried smudge colour, and
+    /// deposits it (plus a little paint). Painted by a dedicated GPU path, not
+    /// the mask pipelines, so it carries no pattern data - the tip is a round
+    /// mask shaped by `hardness`.
+    Smudge,
 }
 
 impl BrushFamily {
-    /// Stable discriminator used to index renderer pipeline arrays.
+    /// Stable discriminator used to index renderer mask-pipeline arrays.
+    /// `ImageTip` reuses the textured pipeline (slot 2); `Smudge` doesn't use
+    /// the mask pipelines at all (it has its own GPU path) - map it to slot 0.
     pub const fn kind_index(&self) -> usize {
         match self {
-            Self::SoftRound => 0,
+            Self::SoftRound | Self::Smudge => 0,
             Self::Pixel => 1,
-            Self::Textured(_) => 2,
+            Self::Textured(_) | Self::ImageTip { .. } => 2,
         }
+    }
+
+    /// True for the colour-smudge family, which is painted by the dedicated
+    /// GPU smudge path rather than the stroke-buffer mask pipelines.
+    pub const fn is_smudge(&self) -> bool {
+        matches!(self, Self::Smudge)
     }
 
     /// Total number of pipeline slots the renderer reserves.
@@ -132,6 +192,8 @@ pub struct BrushPreset {
     pub texture_scale: f32,
     /// How strongly the global grain gates coverage, `0..=1`.
     pub texture_strength: f32,
+    /// How the grain/texture pattern composites onto dab coverage.
+    pub texturing_mode: TexturingMode,
     pub dynamics: Dynamics,
     /// Optional custom icon shown in the brush picker. Raw PNG bytes,
     /// decoded lazily by the UI. `None` -> picker uses a generic placeholder.
@@ -151,8 +213,9 @@ pub struct BrushPreset {
 }
 
 impl BrushPreset {
-    /// Soft round brush - a gentle airbrush-like circle whose alpha
-    /// falls off almost from the centre.
+    /// Default round brush, matching Krita's default paintbrush
+    /// (`b) Basic-2 Opacity`): a circle mask with fade 0.5 (solid core, soft
+    /// edge), tight 0.1 spacing, pressure driving both size and opacity.
     pub fn default_round(id: BrushPresetId) -> Self {
         Self {
             id,
@@ -160,22 +223,22 @@ impl BrushPreset {
             family: BrushFamily::SoftRound,
             default_size: 80.0,
             default_opacity: 1.0,
-            // Tight spacing so the very soft dabs merge into an even stroke
-            // instead of scalloping (a wider spacing shows the soft edge of
-            // each dab as ripples along the line).
-            spacing_ratio: 0.025,
+            // Krita's default auto-brush spacing.
+            spacing_ratio: 0.1,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
-            // Very soft: fade begins near the centre for the airbrush look.
-            hardness: 0.02,
+            // Krita fade 0.5: a defined solid core with a soft falloff, not
+            // the old near-centre airbrush fade.
+            hardness: 0.5,
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
-            // Pressure drives both size AND opacity. Tying flow to pressure
+            texturing_mode: TexturingMode::Multiply,
+            // Pressure drives both size AND opacity (Krita PressureSize +
+            // PressureOpacity, linear curves). Tying flow to pressure also
             // stops low-pressure (small) dabs from punching full-opacity
-            // specks through the faint falloff of the larger dabs via the
-            // MAX blend - they fade in with pressure instead.
+            // specks through the softer larger dabs via the MAX blend.
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 flow: Some(Mapping::pressure_linear()),
@@ -204,6 +267,7 @@ impl BrushPreset {
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -231,6 +295,7 @@ impl BrushPreset {
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics::default(),
             icon: Some(ICON_PIXEL.to_vec()),
             preview: None,
@@ -256,6 +321,7 @@ impl BrushPreset {
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 scatter: Some(Mapping {
@@ -272,25 +338,41 @@ impl BrushPreset {
         }
     }
 
-    /// Chalk - a square-ish tip dragged over a global chalk-grit grain.
-    /// The grain is anchored in canvas space, so the stroke shows one
-    /// continuous, non-repeating chalky texture instead of stamped bumps.
+    /// Chalk, matching Krita's `h) Chalk_Soft`: the oil-bristle image tip
+    /// stamped along the stroke and the dotted paper texture subtracted from
+    /// coverage (canvas-anchored), giving a broken dry-media edge and grain.
+    /// Krita values: tip scale 0.45, spacing 0.06, texture SUBTRACT strength
+    /// 1, brightness 0.55, contrast 0.6.
     pub fn chalk(id: BrushPresetId) -> Self {
-        let pattern = Rc::new(PatternData::chalk_grain(GRAIN_DIM));
+        let tip = Rc::new(
+            PatternData::tip_from_png_bytes(TIP_OIL_BRISTLE).expect("built-in tip decodes"),
+        );
+        let grain = Rc::new(
+            PatternData::texture_from_png_bytes(TEXTURE_DRAWED_DOTTED, 0.55, 0.6, false)
+                .expect("built-in texture decodes"),
+        );
         Self {
             id,
             name: "Chalk".into(),
-            family: BrushFamily::Textured(pattern),
+            family: BrushFamily::ImageTip {
+                tip,
+                grain: Some(grain),
+            },
             default_size: 140.0,
             default_opacity: 1.0,
-            spacing_ratio: 0.08,
+            spacing_ratio: 0.06,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
             buildup: false,
-            hardness: 0.72,
-            tip: TipShape::Square,
-            texture_scale: 200.0,
-            texture_strength: 0.85,
+            // Tip mask comes from the image, so procedural hardness/tip are
+            // unused; keep neutral values.
+            hardness: 1.0,
+            tip: TipShape::Round,
+            // Texture tile size in canvas px (Krita pattern scale 1 on the
+            // 512px pattern).
+            texture_scale: 512.0,
+            texture_strength: 1.0,
+            texturing_mode: TexturingMode::Subtract,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -320,6 +402,7 @@ impl BrushPreset {
             tip: TipShape::Round,
             texture_scale: 160.0,
             texture_strength: 1.0,
+            texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -330,45 +413,48 @@ impl BrushPreset {
         }
     }
 
-    /// Real Brush - a nearly crisp-edged round brush whose deposit is
-    /// driven by pressure and builds up where it passes over the same
-    /// area, capped near 90%, like an ink/watercolour brush. A very subtle
-    /// low-frequency wash adds life without graininess.
+    /// Real Brush, a colour-smudge brush modelled on Krita's `i) Wet Paint`
+    /// (colorsmudge engine, dulling mode): each dab picks up the colour under
+    /// it, blends it into the carried smudge colour, and deposits that plus a
+    /// little paint. Soft round tip (fade 0.5), tight spacing; pressure drives
+    /// size, smudge rate, colour rate and pickup radius. Painted by the GPU
+    /// smudge path, so it carries no pattern.
     pub fn real_brush(id: BrushPresetId) -> Self {
-        let pattern = Rc::new(PatternData::soft_wash(GRAIN_DIM));
+        let pressure = |lo: f32, hi: f32| Mapping {
+            source: DynSource::Pressure,
+            curve: Curve::linear(),
+            range: (lo, hi),
+            invert: false,
+        };
         Self {
             id,
             name: "Real Brush".into(),
-            family: BrushFamily::Textured(pattern),
-            default_size: 90.0,
-            // Hard per-stroke opacity ceiling: build-up accumulates in the
-            // stroke buffer and composites once at this value, so one stroke
-            // can't exceed 90% however much it overlaps itself.
-            default_opacity: 0.9,
-            spacing_ratio: 0.04,
+            family: BrushFamily::Smudge,
+            default_size: 60.0,
+            default_opacity: 1.0,
+            // Krita Wet Paint spacing.
+            spacing_ratio: 0.07,
             stabilizer: 0.2,
             speed_smoothing: 0.0,
-            // Build-up: passing over the same area accumulates opacity like
-            // ink/watercolour.
-            buildup: true,
-            // Only ~1% soft: essentially a crisp edge.
-            hardness: 0.99,
+            buildup: false,
+            // Krita mask fade 0.5.
+            hardness: 0.5,
             tip: TipShape::Round,
-            // Large, very subtle wash - a whisper of variation, not grain.
-            texture_scale: 320.0,
-            texture_strength: 0.15,
-            // Pressure drives the per-dab deposit rate. Values are small
-            // because dabs OVER-accumulate in the stroke buffer (~25 overlap
-            // each point per pass), so a light touch stays faint and a firm
-            // one fills toward the opacity cap; going over an area again
-            // builds it up further, up to the 90% ceiling.
+            texture_scale: 0.0,
+            texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
+            // Pressure drives size + the three smudge parameters (Krita has
+            // PressureSize / PressureSmudgeRate / PressureColorRate /
+            // PressureSmudgeRadius all on). Light touch smears faintly; firmer
+            // pressure smears harder and lays down more paint.
             dynamics: Dynamics {
-                flow: Some(Mapping {
-                    source: DynSource::Pressure,
-                    curve: Curve::linear(),
-                    range: (0.006, 0.15),
-                    invert: false,
-                }),
+                size: Some(Mapping::pressure_linear()),
+                // Colour rate stays small so the brush mostly smears existing
+                // paint and lays down only a little of its own colour (a wet
+                // brush, not a paintbrush). Smudge rate is left at its 1.0
+                // default (constant) so the deposit strength does NOT pulse
+                // with pressure - that pulsing beaded into dots on dark areas.
+                color_rate: Some(pressure(0.015, 0.09)),
                 ..Dynamics::default()
             },
             icon: Some(ICON_REAL_BRUSH.to_vec()),
@@ -395,6 +481,7 @@ impl BrushPreset {
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,

@@ -654,7 +654,12 @@ fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
     match family {
         BrushFamily::SoftRound => 0,
         BrushFamily::Pixel => 1,
-        BrushFamily::Textured(_) => 2,
+        // Image-tip brushes (built-in chalk) share the "Textured" slot in the
+        // editor dropdown; the tip itself isn't user-editable yet.
+        BrushFamily::Textured(_) | BrushFamily::ImageTip { .. } => 2,
+        // Smudge isn't a user-selectable family in the editor yet; show it in
+        // the soft-round slot.
+        BrushFamily::Smudge => 0,
     }
 }
 
@@ -669,12 +674,21 @@ fn apply_pattern_visibility(
     strength_row: &adw::ActionRow,
     family: &BrushFamily,
 ) {
-    let textured = matches!(family, BrushFamily::Textured(_));
+    let textured = matches!(
+        family,
+        BrushFamily::Textured(_) | BrushFamily::ImageTip { .. }
+    );
     row.set_visible(textured);
     size_row.set_visible(textured);
     strength_row.set_visible(textured);
-    if let BrushFamily::Textured(rc) = family {
-        apply_pattern_thumb(thumb, rc);
+    match family {
+        BrushFamily::Textured(rc) => apply_pattern_thumb(thumb, rc),
+        // Show the grain texture thumb; fall back to the tip if there's no
+        // grain so the row isn't blank.
+        BrushFamily::ImageTip { tip, grain } => {
+            apply_pattern_thumb(thumb, grain.as_ref().unwrap_or(tip));
+        }
+        _ => {}
     }
 }
 

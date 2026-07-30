@@ -18,6 +18,7 @@ layout(location = 8) in float a_hardness;        // tip edge falloff
 layout(location = 9) in float a_tip;             // 0 = round, 1 = square
 layout(location = 10) in float a_texture_scale;  // grain tile size in canvas px
 layout(location = 11) in float a_texture_strength;
+layout(location = 12) in float a_texturing_mode; // 0 multiply, 1 subtract
 
 layout(push_constant) uniform Push {
     vec2 inv_size;
@@ -32,6 +33,9 @@ layout(location = 4) out float v_hardness;
 layout(location = 5) out float v_tip_kind;
 layout(location = 6) out float v_tex_scale;
 layout(location = 7) out float v_tex_strength;
+layout(location = 8) out float v_radius;         // canvas pixels, for edge AA
+layout(location = 9) out vec2 v_tip_uv;          // stamped-tip sample coords [0,1]
+layout(location = 10) out float v_tex_mode;      // 0 multiply, 1 subtract
 
 void main() {
     // Apply aspect (squish on Y) then rotation, then radius scale.
@@ -52,4 +56,9 @@ void main() {
     v_tip_kind = a_tip;
     v_tex_scale = a_texture_scale;
     v_tex_strength = a_texture_strength;
+    v_radius = a_radius;
+    // Map the raw quad corner [-1,+1] to tip-image UV [0,1]. The tip mask
+    // is stamped in dab-local space, so it scales/rotates with the dab.
+    v_tip_uv = a_quad * 0.5 + 0.5;
+    v_tex_mode = a_texturing_mode;
 }

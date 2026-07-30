@@ -472,7 +472,16 @@ impl PrimaryDragHandler {
         *self.stroke_shape_correction.borrow_mut() = AppSettings::load().shape_correction;
 
         let opacity = self.brush_engine.opacity.get();
-        let buildup = self.brush_engine.active_brush().buildup;
+        let active_brush = self.brush_engine.active_brush();
+        let buildup = active_brush.buildup;
+        // Colour-smudge brushes paint straight into the layer during the drag,
+        // so the layer must be snapshotted before the first dab for undo.
+        let smudge = active_brush.family.is_smudge();
+        // Shape correction re-draws the stroke through the mask path at pen-up,
+        // which doesn't apply to smudge - disable it for this stroke.
+        if smudge {
+            self.stroke_shape_correction.borrow_mut().enabled = false;
+        }
 
         // Adjustment-layer masks are grayscale and can't be erased; mirror the
         // core invariant here so the live preview matches the committed stroke.
@@ -527,6 +536,15 @@ impl PrimaryDragHandler {
         // overlapping dabs darken, capped at the stroke opacity by the single
         // commit composite. The render pump presents the live buffer.
         canvas.set_stroke_buildup(buildup);
+        // Route smudge brushes to the GPU smudge path. `set_smudge_stroke`
+        // snapshots the pristine layer on the GPU (`smudge_before`); undo reads
+        // just the dirty region back from it at pen-up, so there's no
+        // full-canvas readback here at pen-down.
+        if smudge {
+            if let Err(e) = canvas.set_smudge_stroke(true) {
+                tracing::error!(error = %e, "set_smudge_stroke failed");
+            }
+        }
         if let Err(e) = canvas.stamp(|target| {
             self.brush_engine.begin_stroke(sample, color, target);
         }) {
@@ -607,12 +625,19 @@ impl PrimaryDragHandler {
         let bounds = canvas.stroke_dirty_bounds();
 
         // Non-build-up strokes leave the layer pristine until commit, so
-        // capture the before-region now (pre-commit). Build-up strokes
-        // already hold a full snapshot from begin.
+        // capture the before-region now (pre-commit). Smudge mutated the layer
+        // live, so read its pristine before-state from the pre-stroke snapshot
+        // instead of the (now-smudged) layer. Runs before `commit_stroke`,
+        // which clears the smudge flag.
         let before_region = match (pending.as_ref(), bounds) {
             (Some(p), Some((x, y, w, h))) if p.before_full.is_none() => {
                 let mut buf = Vec::new();
-                match canvas.read_layer_region_into(p.idx, x, y, w, h, &mut buf) {
+                let res = if canvas.is_smudge_stroke() {
+                    canvas.read_smudge_before_region_into(x, y, w, h, &mut buf)
+                } else {
+                    canvas.read_layer_region_into(p.idx, x, y, w, h, &mut buf)
+                };
+                match res {
                     Ok(()) => Some(buf),
                     Err(e) => {
                         tracing::warn!(error = %e, "history: before-region read failed");

@@ -23,7 +23,8 @@ use super::vulkan::RING_FRAMES;
 /// - `tip`             60   f32 (textured tip: 0 round, 1 square)
 /// - `texture_scale`   64   f32 (global grain tile size in canvas px)
 /// - `texture_strength` 68  f32 (grain modulation 0..=1)
-/// Total stride = 72, all components 4-byte aligned.
+/// - `texturing_mode`  72   f32 (0 multiply, 1 subtract)
+/// Total stride = 76, all components 4-byte aligned.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DabInstance {
@@ -38,11 +39,12 @@ pub struct DabInstance {
     pub tip: f32,
     pub texture_scale: f32,
     pub texture_strength: f32,
+    pub texturing_mode: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<DabInstance>() == DAB_INSTANCE_STRIDE as usize);
 
-pub(super) const DAB_INSTANCE_STRIDE: u32 = 72;
+pub(super) const DAB_INSTANCE_STRIDE: u32 = 76;
 
 /// Maximum dabs uploadable in a single call. ~4.7 MB at 72 bytes each.
 pub(super) const MAX_INSTANCES: u32 = 64 * 1024;
@@ -61,11 +63,18 @@ const DAB_TEXTURED_FRAG_SPV: &[u8] =
 /// Renderer-side brush family. The bridge in `canvas/stamp.rs`
 /// translates the brush-engine `BrushFamily` (which carries pattern
 /// data) into this slimmer enum with the atlas slice already resolved.
+/// Sentinel slice index meaning "no pattern in this slot". Passed to the
+/// textured shaders so they fall back to the procedural tip / skip the grain.
+pub const NO_SLICE: u32 = u32::MAX;
+
 #[derive(Debug, Clone, Copy)]
 pub enum DabFamily {
     SoftRound,
     Pixel,
-    Textured { slice: u32 },
+    /// Textured / image-tip family. `grain_slice` is the canvas-anchored
+    /// texture (or `NO_SLICE`); `tip_slice` is the stamped image tip (or
+    /// `NO_SLICE` for the procedural round/square tip).
+    Textured { grain_slice: u32, tip_slice: u32 },
 }
 
 impl DabFamily {
@@ -81,8 +90,15 @@ impl DabFamily {
 
     pub const fn slice(self) -> u32 {
         match self {
-            Self::Textured { slice } => slice,
+            Self::Textured { grain_slice, .. } => grain_slice,
             _ => 0,
+        }
+    }
+
+    pub const fn tip_slice(self) -> u32 {
+        match self {
+            Self::Textured { tip_slice, .. } => tip_slice,
+            _ => NO_SLICE,
         }
     }
 
@@ -91,17 +107,29 @@ impl DabFamily {
     }
 }
 
-/// `vec2 inv_size + uint slice`, padded to 12 bytes. Shared across
-/// every dab/mask pipeline so the renderer can push uniformly.
+/// `vec2 inv_size + uint slice (grain) + uint tip_slice`, 16 bytes. Shared
+/// across every dab/mask pipeline so the renderer can push uniformly; the
+/// soft-round / pixel shaders only read the first 12 bytes.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub(super) struct DabPushConstants {
     pub inv_size: [f32; 2],
     pub slice: u32,
+    pub tip_slice: u32,
+}
+
+impl Default for DabPushConstants {
+    fn default() -> Self {
+        Self {
+            inv_size: [0.0, 0.0],
+            slice: 0,
+            tip_slice: NO_SLICE,
+        }
+    }
 }
 
 impl DabPushConstants {
-    pub(super) const SIZE: u32 = 12;
+    pub(super) const SIZE: u32 = 16;
 
     pub(super) const fn as_bytes(&self) -> &[u8] {
         // SAFETY: `repr(C)` POD with only f32/u32 fields.
@@ -133,6 +161,7 @@ impl DabInstance {
             tip: dab.tip,
             texture_scale: dab.texture_scale,
             texture_strength: dab.texture_strength,
+            texturing_mode: dab.texturing_mode,
         }
     }
 }
@@ -384,6 +413,11 @@ pub(super) fn build_dab_instanced_pipeline(
             .binding(1)
             .format(vk::Format::R32_SFLOAT)
             .offset(68), // texture_strength
+        vk::VertexInputAttributeDescription::default()
+            .location(12)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(72), // texturing_mode
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)

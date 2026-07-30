@@ -15,7 +15,7 @@ use crate::renderer::{
 use crate::selection::SelectionShape;
 use crate::tools::{CropRect, SelectionMode};
 
-use super::stamp::{BatchStamp, StrokeStamp};
+use super::stamp::{BatchStamp, SmudgeBatchStamp, SmudgeStamp, StrokeStamp};
 
 /// Captured stroke context - what was true when the user pressed down.
 /// Held so a mid-drag change of color, opacity, or active layer
@@ -65,6 +65,14 @@ pub struct Canvas {
     /// Assisted Drawing is set. Each painted dab is reproduced across these
     /// copies at stamp time. `None` = no reproduction.
     active_symmetry: Option<crate::guides::Symmetry>,
+    /// True while the in-flight stroke is a colour-smudge brush. Smudge dabs
+    /// paint straight into the active layer via the GPU smudge path instead of
+    /// accumulating in the stroke buffer, so `stamp` / `stamp_and_present` /
+    /// `commit_stroke` take a different branch. Set by `set_smudge_stroke`.
+    is_smudge_stroke: bool,
+    /// Previous smudge dab centre, so each dab's drag vector can be computed.
+    /// Reset at stroke start.
+    smudge_prev_center: Option<[f32; 2]>,
 }
 
 impl Canvas {
@@ -94,6 +102,8 @@ impl Canvas {
             mask_view_id: None,
             layer_tree: Vec::new(),
             active_symmetry: None,
+            is_smudge_stroke: false,
+            smudge_prev_center: None,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -182,6 +192,10 @@ impl Canvas {
         // Default to MAX-blend; a build-up brush opts in via
         // `set_stroke_buildup(true)` right after this call.
         self.renderer.set_stroke_buildup(false);
+        // Default to the mask path; a smudge brush opts in via
+        // `set_smudge_stroke(true)` right after this call.
+        self.is_smudge_stroke = false;
+        self.smudge_prev_center = None;
         self.renderer.clear_stroke()?;
         // New stroke target / fresh layer state: the cached below-stack
         // composite must be rebuilt on the first preview of this stroke.
@@ -206,6 +220,30 @@ impl Canvas {
         self.renderer.set_stroke_buildup(buildup);
     }
 
+    /// Opt the in-flight stroke into the colour-smudge path. Call right after
+    /// `begin_stroke`. Smudge dabs paint straight into the active layer (the
+    /// GPU smudge path) rather than the stroke buffer, so overlapping the
+    /// layer's own colours smears them. The caller must have captured the
+    /// layer's pre-stroke pixels for undo (smudge mutates the layer live).
+    /// Whether the in-flight stroke is a colour-smudge brush (paints straight
+    /// into the layer). Undo reads its before-state from the smudge snapshot.
+    #[must_use]
+    pub const fn is_smudge_stroke(&self) -> bool {
+        self.is_smudge_stroke
+    }
+
+    pub fn set_smudge_stroke(&mut self, smudge: bool) -> Result<(), RendererError> {
+        self.is_smudge_stroke = smudge;
+        // Snapshot the layer so the smudge dabs can lerp from it (opacity
+        // ceiling). Only meaningful once a stroke context (active layer) exists.
+        if smudge {
+            if let Some(ctx) = self.current_stroke {
+                self.renderer.begin_smudge_stroke(ctx.layer_idx)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Set (or clear) the symmetry transforms applied to subsequent strokes.
     /// The UI pushes this from the active Drawing Guide config.
     pub fn set_symmetry(&mut self, symmetry: Option<crate::guides::Symmetry>) {
@@ -225,11 +263,49 @@ impl Canvas {
     where
         F: FnOnce(&mut dyn PaintTarget),
     {
-        let mut adapter = StrokeStamp::new(&mut self.renderer, self.active_symmetry.clone());
-        paint(&mut adapter);
-        let result = adapter.into_result();
+        let result = if self.is_smudge_stroke {
+            self.stamp_smudge(paint)
+        } else {
+            let mut adapter = StrokeStamp::new(&mut self.renderer, self.active_symmetry.clone());
+            paint(&mut adapter);
+            adapter.into_result()
+        };
         self.bump_version();
         result
+    }
+
+    /// Shared smudge stamping used by `stamp` and `stamp_and_present`: routes
+    /// dabs to the GPU smudge path (which paints straight into the active
+    /// layer), carries `smudge_prev_center` across batches, then rebuilds the
+    /// canvas from the layer stack so the next present shows the smear. No-op
+    /// (Ok) if the smudge stroke has no active layer context.
+    fn stamp_smudge<F>(&mut self, paint: F) -> Result<(), RendererError>
+    where
+        F: FnOnce(&mut dyn PaintTarget),
+    {
+        let Some(ctx) = self.current_stroke else {
+            return Ok(());
+        };
+        let mut paint_linear = [0.0f32; 4];
+        let rgb = ctx.color.to_linear_rgb();
+        paint_linear[..3].copy_from_slice(&rgb);
+        paint_linear[3] = 1.0;
+        let mut adapter = SmudgeStamp::new(
+            &mut self.renderer,
+            ctx.layer_idx,
+            paint_linear,
+            ctx.opacity,
+            self.smudge_prev_center,
+        );
+        paint(&mut adapter);
+        let (result, prev) = adapter.into_result();
+        self.smudge_prev_center = prev;
+        result?;
+        // Smudge mutated the layer, so the cached canvas is stale - rebuild it
+        // (folder-scoped if needed) so `present()` reflects the smear live.
+        let visibilities = self.visibilities();
+        self.renderer.composite_layers_to_canvas(&visibilities)?;
+        self.rescope_composite()
     }
 
     /// Composite the in-flight stroke buffer into the active layer
@@ -240,6 +316,19 @@ impl Canvas {
         let Some(ctx) = self.current_stroke.take() else {
             return Ok(());
         };
+        // Smudge dabs already painted straight into the layer during the drag,
+        // so there's no stroke buffer to composite - just rebuild the canvas
+        // from the layer stack (folder-scoped below) and clear smudge state.
+        if self.is_smudge_stroke {
+            self.is_smudge_stroke = false;
+            self.smudge_prev_center = None;
+            let visibilities = self.visibilities();
+            self.renderer.composite_layers_to_canvas(&visibilities)?;
+            self.rescope_composite()?;
+            self.renderer.invalidate_preview_cache();
+            self.bump_version();
+            return Ok(());
+        }
         let linear = ctx.color.to_linear_rgb();
         let visibilities = self.visibilities();
         self.renderer
@@ -269,6 +358,11 @@ impl Canvas {
     /// Discard the in-flight stroke without compositing it.
     pub fn discard_stroke(&mut self) -> Result<(), RendererError> {
         self.current_stroke = None;
+        // Smudge already painted into the layer; there's nothing to discard
+        // from the (unused) stroke buffer, but clear the flag so a later
+        // non-smudge stroke isn't misrouted.
+        self.is_smudge_stroke = false;
+        self.smudge_prev_center = None;
         self.renderer.clear_stroke()?;
         self.renderer.set_stroke_erase(false);
         self.bump_version();
@@ -796,6 +890,20 @@ impl Canvas {
         self.renderer.read_layer_region_into(idx, x, y, w, h, out)
     }
 
+    /// Read a region of the pre-stroke smudge snapshot (the pristine layer
+    /// captured at `set_smudge_stroke`). Undo uses this for a smudge stroke's
+    /// before-state, since the layer itself was mutated live during the drag.
+    pub fn read_smudge_before_region_into(
+        &mut self,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        out: &mut Vec<u8>,
+    ) -> Result<(), RendererError> {
+        self.renderer.read_smudge_before_region_into(x, y, w, h, out)
+    }
+
     /// Tight integer AABB `(x, y, w, h)` of everything stamped since the
     /// last `begin_stroke`, clamped to the canvas. `None` if nothing was
     /// painted. Stays valid across `commit_stroke` (reset only by the next
@@ -1062,6 +1170,42 @@ impl Canvas {
             self.stamp(paint)?;
             return self.present();
         };
+        // Smudge paints straight into the layer, so there's no stroke-buffer
+        // preview. When the composite is the simple (no adjustment / no folder
+        // scope) path, do dabs + recomposite + present in ONE async submit
+        // (like the normal brush's fast path) so the input loop never stalls on
+        // a fence. Otherwise fall back to the straightforward per-op path.
+        if self.is_smudge_stroke {
+            let snapshot = self.layers.snapshot();
+            let has_adjustments = snapshot.iter().any(|l| l.kind.is_adjustment());
+            let scoped = self.folder_scoped_steps(&snapshot).is_some();
+            if has_adjustments || scoped {
+                self.stamp_smudge(paint)?;
+                self.bump_version();
+                return self.present();
+            }
+            let (dabs, prev) = {
+                let mut batch = SmudgeBatchStamp::new(self.smudge_prev_center);
+                paint(&mut batch);
+                batch.into_dabs()
+            };
+            self.smudge_prev_center = prev;
+            let mut paint_linear = [0.0f32; 4];
+            let rgb = ctx.color.to_linear_rgb();
+            paint_linear[..3].copy_from_slice(&rgb);
+            paint_linear[3] = 1.0;
+            let visibilities = self.visibilities();
+            self.renderer.smudge_stamp_present(
+                ctx.layer_idx,
+                paint_linear,
+                ctx.opacity,
+                &dabs,
+                &visibilities,
+            )?;
+            self.bump_version();
+            self.display_version = self.pixels_version;
+            return Ok(self.renderer.display_descriptor());
+        }
         // The fast single-submit preview can't run effect chains, so when an
         // effective adjustment above this layer would alter the stroke's result
         // fall back to the slower stamp + present (the adjusted preview path).
