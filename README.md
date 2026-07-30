@@ -35,7 +35,7 @@ for Linux and other Desktops.
   - [ ] Photoshop-like patch-tool
   - [ ] Professional color-correction tools
 - [ ] Linux Release
-  - [ ] Binaries and AppImage
+  - [x] Binaries and AppImage
   - [ ] ARM and Asahi Linux support
   - [ ] Flatpak file
   - [ ] FlatHub publish

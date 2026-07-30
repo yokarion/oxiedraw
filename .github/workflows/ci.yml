@@ -57,6 +57,8 @@ jobs:
 
   build:
     needs: [lint, test]
+    # Only build (and release) on v* tags; branch/PR runs stop at lint + test.
+    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/yokarion/rust-toolchain-container:latest
@@ -181,7 +183,6 @@ jobs:
           cat SHA256SUMS
 
       - name: Publish to GitHub Releases
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           name: ${{ github.ref_name }}
