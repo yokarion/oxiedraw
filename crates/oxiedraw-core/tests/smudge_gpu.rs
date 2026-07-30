@@ -2,6 +2,8 @@
 //! `cargo test -p oxiedraw-core --test smudge_gpu -- --ignored --nocapture`.
 
 #![allow(clippy::unwrap_used)]
+// Diagnostic prints for the --nocapture runs of these ignored GPU tests.
+#![allow(clippy::print_stdout)]
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
 use oxiedraw_core::canvas::Canvas;

@@ -236,10 +236,8 @@ impl Canvas {
         self.is_smudge_stroke = smudge;
         // Snapshot the layer so the smudge dabs can lerp from it (opacity
         // ceiling). Only meaningful once a stroke context (active layer) exists.
-        if smudge {
-            if let Some(ctx) = self.current_stroke {
-                self.renderer.begin_smudge_stroke(ctx.layer_idx)?;
-            }
+        if smudge && let Some(ctx) = self.current_stroke {
+            self.renderer.begin_smudge_stroke(ctx.layer_idx)?;
         }
         Ok(())
     }

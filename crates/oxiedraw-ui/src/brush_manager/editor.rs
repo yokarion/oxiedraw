@@ -652,14 +652,13 @@ pub(super) fn build(
 
 fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
     match family {
-        BrushFamily::SoftRound => 0,
+        // Smudge isn't a user-selectable family in the editor yet, so it shares
+        // the soft-round slot.
+        BrushFamily::SoftRound | BrushFamily::Smudge => 0,
         BrushFamily::Pixel => 1,
         // Image-tip brushes (built-in chalk) share the "Textured" slot in the
         // editor dropdown; the tip itself isn't user-editable yet.
         BrushFamily::Textured(_) | BrushFamily::ImageTip { .. } => 2,
-        // Smudge isn't a user-selectable family in the editor yet; show it in
-        // the soft-round slot.
-        BrushFamily::Smudge => 0,
     }
 }
 

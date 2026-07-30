@@ -3,6 +3,8 @@
 //! `cargo test -p oxiedraw-core --test brushes_gpu -- --ignored --nocapture`.
 
 #![allow(clippy::unwrap_used)]
+// Diagnostic prints for the --nocapture runs of these ignored GPU tests.
+#![allow(clippy::print_stdout)]
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
 use oxiedraw_core::canvas::Canvas;
@@ -26,8 +28,7 @@ fn select(brush: &BrushEngine, name: &str) {
         .borrow()
         .iter()
         .find(|p| p.name == name)
-        .map(|p| p.id)
-        .unwrap_or_else(|| panic!("preset {name} exists"));
+        .map_or_else(|| panic!("preset {name} exists"), |p| p.id);
     brush.active.set(id);
 }
 

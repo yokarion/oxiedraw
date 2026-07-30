@@ -1061,13 +1061,12 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
                 );
                 pan.set(new_pan);
                 zoom.set(new_zoom);
-                sync.commit();
             } else {
                 let new_pan = pan_increment(pan.get(), last.get(), offset);
                 last.set(offset);
                 pan.set(new_pan);
-                sync.commit();
             }
+            sync.commit();
             // The render pump (armed at drag-begin) re-presents every frame, so
             // just updating the transform here is enough - no per-event present.
         });

@@ -748,8 +748,8 @@ fn render_guide_texture(
         tw,
         th,
         alloc_us = t_alloc.as_micros() as u64,
-        draw_us = (t_draw - t_alloc).as_micros() as u64,
-        tex_us = (t_total - t_draw).as_micros() as u64,
+        draw_us = t_draw.saturating_sub(t_alloc).as_micros() as u64,
+        tex_us = t_total.saturating_sub(t_draw).as_micros() as u64,
         total_us = t_total.as_micros() as u64,
         "guide overlay re-render",
     );
@@ -2486,7 +2486,7 @@ mod imp {
                 // the view is rotated (blit invalid then) / the view has drifted
                 // absurdly far (a safety net so a very long drag still refreshes)
                 // / or the settle timer fired after motion stopped.
-                let need = cache.as_ref().map_or(true, |e| {
+                let need = cache.as_ref().is_none_or(|e| {
                     if e.key != key || rotation != 0.0 {
                         return true;
                     }
@@ -2683,6 +2683,9 @@ mod imp {
 
 #[cfg(test)]
 mod guide_perf_bench {
+    // Manual timing benchmarks: stdout is the result, and a panic on a failed
+    // cairo alloc is the intended outcome.
+    #![allow(clippy::print_stdout, clippy::unwrap_used)]
     use super::*;
     use oxiedraw_core::guides::{GuideConfig, GuideKind, VanishingPoint};
     use std::time::Instant;
@@ -2691,7 +2694,7 @@ mod guide_perf_bench {
     // separate the rasterization cost from the texture upload. Run with:
     //   cargo test -p oxiedraw-ui guide_perf -- --nocapture --ignored
     #[test]
-    #[ignore]
+    #[ignore = "manual perf benchmark; run with --nocapture"]
     fn perspective_draw_scaling() {
         let (w, h) = (1900i32, 1040i32);
         let accent = (0.5f32, 0.4, 0.9);
@@ -2726,7 +2729,7 @@ mod guide_perf_bench {
     }
 
     #[test]
-    #[ignore]
+    #[ignore = "manual perf benchmark; run with --nocapture"]
     fn isometric_draw_scaling() {
         let (w, h) = (1900i32, 1040i32);
         let accent = (0.5f32, 0.4, 0.9);

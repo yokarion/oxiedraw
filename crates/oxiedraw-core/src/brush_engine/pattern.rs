@@ -110,7 +110,9 @@ impl PatternData {
                     rgba.extend_from_slice(&[v, v, v, 0xFF]);
                 }
             }
-            other => return Err(format!("unsupported PNG color type {other:?}")),
+            other @ png::ColorType::Indexed => {
+                return Err(format!("unsupported PNG color type {other:?}"));
+            }
         }
         Ok((rgba, info.width, info.height))
     }

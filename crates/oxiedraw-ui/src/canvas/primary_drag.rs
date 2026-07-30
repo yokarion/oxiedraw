@@ -422,7 +422,9 @@ impl PrimaryDragHandler {
         *self.guide_snap.borrow_mut() = None;
         self.guide_snap_start.set(None);
         let cfg = self.guide.config.borrow();
-        let snaps = cfg.as_ref().is_some_and(|c| c.snaps_strokes());
+        let snaps = cfg
+            .as_ref()
+            .is_some_and(oxiedraw_core::guides::GuideConfig::snaps_strokes);
         tracing::info!(
             target: "guide_assist",
             has_cfg = cfg.is_some(),
@@ -449,12 +451,12 @@ impl PrimaryDragHandler {
         if raw.distance(start) < GUIDE_SNAP_LOCK_PX / self.zoom.get() {
             return raw;
         }
-        if let Some(cfg) = self.guide.config.borrow().as_ref() {
-            if let Some(lock) = assist_lock(cfg, start, raw) {
-                tracing::info!(target: "guide_assist", dir = ?lock.dir, "snap locked");
-                *self.guide_snap.borrow_mut() = Some(lock);
-                return lock.project(raw);
-            }
+        if let Some(cfg) = self.guide.config.borrow().as_ref()
+            && let Some(lock) = assist_lock(cfg, start, raw)
+        {
+            tracing::info!(target: "guide_assist", dir = ?lock.dir, "snap locked");
+            *self.guide_snap.borrow_mut() = Some(lock);
+            return lock.project(raw);
         }
         raw
     }
@@ -540,10 +542,8 @@ impl PrimaryDragHandler {
         // snapshots the pristine layer on the GPU (`smudge_before`); undo reads
         // just the dirty region back from it at pen-up, so there's no
         // full-canvas readback here at pen-down.
-        if smudge {
-            if let Err(e) = canvas.set_smudge_stroke(true) {
-                tracing::error!(error = %e, "set_smudge_stroke failed");
-            }
+        if smudge && let Err(e) = canvas.set_smudge_stroke(true) {
+            tracing::error!(error = %e, "set_smudge_stroke failed");
         }
         if let Err(e) = canvas.stamp(|target| {
             self.brush_engine.begin_stroke(sample, color, target);
