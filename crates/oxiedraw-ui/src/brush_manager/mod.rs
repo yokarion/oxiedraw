@@ -60,6 +60,9 @@ pub(crate) fn show(
     );
     let set_right = editor_handles.set_brush.clone();
     let focus_name = editor_handles.focus_name.clone();
+    let is_dirty = editor_handles.is_dirty.clone();
+    let do_save = editor_handles.save.clone();
+    let do_discard = editor_handles.discard.clone();
 
     // Left pane: brush list + setter callback for re-render.
     let (left_pane, rebuild_left) = build_left_pane(
@@ -71,6 +74,9 @@ pub(crate) fn show(
         focus_name.clone(),
         default_brush_name,
         toast_overlay.clone(),
+        is_dirty.clone(),
+        do_save.clone(),
+        do_discard.clone(),
     );
 
     let paned = gtk::Paned::builder()
@@ -134,9 +140,26 @@ pub(crate) fn show(
 
     {
         let brush_engine_for_close = brush_engine.clone();
-        win.connect_close_request(move |_| {
+        let is_dirty = is_dirty.clone();
+        let do_save = do_save.clone();
+        let do_discard = do_discard.clone();
+        win.connect_close_request(move |win| {
+            // Unsaved edits: prompt first. Save/Discard both clear the
+            // dirty flag, so the re-fired close then proceeds cleanly.
+            if is_dirty.get() {
+                let win_for_proceed = win.clone();
+                confirm_unsaved(
+                    win.upcast_ref(),
+                    &is_dirty,
+                    &do_save,
+                    &do_discard,
+                    move || win_for_proceed.close(),
+                    || {},
+                );
+                return gtk::glib::Propagation::Stop;
+            }
             brush_engine_for_close.disconnect_brushes_changed(listener_id);
-            relm4::gtk::glib::Propagation::Proceed
+            gtk::glib::Propagation::Proceed
         });
     }
 
@@ -147,6 +170,7 @@ pub(crate) fn show(
 // Left pane
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn build_left_pane(
     parent: gtk::Window,
     brush_engine: BrushEngine,
@@ -156,6 +180,9 @@ fn build_left_pane(
     focus_name: Rc<dyn Fn()>,
     default_brush_name: Rc<RefCell<Option<String>>>,
     toast_overlay: adw::ToastOverlay,
+    is_dirty: Rc<Cell<bool>>,
+    do_save: Rc<dyn Fn()>,
+    do_discard: Rc<dyn Fn()>,
 ) -> (gtk::Widget, Rc<dyn Fn()>) {
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -186,30 +213,46 @@ fn build_left_pane(
         let set_right = set_right.clone();
         let focus_name = focus_name.clone();
         let parent_for_btn = parent.clone();
+        let is_dirty = is_dirty.clone();
+        let do_save = do_save.clone();
+        let do_discard = do_discard.clone();
         add_button.connect_clicked(move |_| {
-            // `selected_name` must be set *before* `add_brush` runs  - 
-            // it fires the brushes-changed listener synchronously, and
-            // the listener re-selects by name. Setting it after would
-            // leave the list highlighting the previously-selected
-            // brush until the next watcher reload.
-            match create_new_brush(&brush_engine, &selected_id, &selected_name) {
-                Ok(new_id) => {
-                    let brushes = brush_engine.brushes.borrow();
-                    if let Some(p) = brushes.iter().find(|p| p.id == new_id) {
-                        set_right(Some(p));
+            // Creating a brush switches selection away from the current
+            // one, so guard unsaved edits first.
+            let create = {
+                let brush_engine = brush_engine.clone();
+                let selected_id = selected_id.clone();
+                let selected_name = selected_name.clone();
+                let set_right = set_right.clone();
+                let focus_name = focus_name.clone();
+                let parent_for_btn = parent_for_btn.clone();
+                move || {
+                    // `selected_name` must be set *before* `add_brush` runs -
+                    // it fires the brushes-changed listener synchronously, and
+                    // the listener re-selects by name. Setting it after would
+                    // leave the list highlighting the previously-selected
+                    // brush until the next watcher reload.
+                    match create_new_brush(&brush_engine, &selected_id, &selected_name) {
+                        Ok(new_id) => {
+                            let brushes = brush_engine.brushes.borrow();
+                            if let Some(p) = brushes.iter().find(|p| p.id == new_id) {
+                                set_right(Some(p));
+                            }
+                            drop(brushes);
+                            focus_name();
+                        }
+                        Err(e) => {
+                            tracing::warn!(%e, "failed to create new brush");
+                            show_simple_error(
+                                &parent_for_btn,
+                                "Couldn't create new brush",
+                                &e.to_string(),
+                            );
+                        }
                     }
-                    drop(brushes);
-                    focus_name();
                 }
-                Err(e) => {
-                    tracing::warn!(%e, "failed to create new brush");
-                    show_simple_error(
-                        &parent_for_btn,
-                        "Couldn't create new brush",
-                        &e.to_string(),
-                    );
-                }
-            }
+            };
+            confirm_unsaved(&parent_for_btn, &is_dirty, &do_save, &do_discard, create, || {});
         });
     }
     header.pack_end(&add_button);
@@ -303,17 +346,54 @@ fn build_left_pane(
         let selected_id = selected_id.clone();
         let selected_name = selected_name.clone();
         let set_right = set_right.clone();
-        listbox.connect_row_activated(move |_, row| {
-            if let Some((id, _)) = row_map.borrow().iter().find(|(_, r)| r == row) {
-                selected_id.set(Some(*id));
-                let brushes = brush_engine.brushes.borrow();
-                let preset = brushes.iter().find(|p| p.id == *id);
-                // Track the name too so the brushes-changed listener
-                // can re-select correctly after engine reload mints
-                // fresh ids.
-                *selected_name.borrow_mut() = preset.map(|p| p.name.clone());
-                set_right(preset);
+        let parent = parent.clone();
+        let is_dirty = is_dirty.clone();
+        let do_save = do_save.clone();
+        let do_discard = do_discard.clone();
+        listbox.connect_row_activated(move |listbox, row| {
+            let clicked_id = row_map
+                .borrow()
+                .iter()
+                .find(|(_, r)| r == row)
+                .map(|(id, _)| *id);
+            let Some(clicked_id) = clicked_id else { return };
+            // Re-activating the current row is a no-op (and mustn't prompt).
+            if selected_id.get() == Some(clicked_id) {
+                return;
             }
+
+            // Commit: actually switch the right pane to the clicked brush.
+            let commit = {
+                let brush_engine = brush_engine.clone();
+                let selected_id = selected_id.clone();
+                let selected_name = selected_name.clone();
+                let set_right = set_right.clone();
+                move || {
+                    selected_id.set(Some(clicked_id));
+                    let brushes = brush_engine.brushes.borrow();
+                    let preset = brushes.iter().find(|p| p.id == clicked_id);
+                    // Track the name too so the brushes-changed listener
+                    // can re-select correctly after engine reload mints
+                    // fresh ids.
+                    *selected_name.borrow_mut() = preset.map(|p| p.name.clone());
+                    set_right(preset);
+                }
+            };
+            // Cancel: bounce the selection highlight back to the brush
+            // we're staying on.
+            let on_cancel = {
+                let listbox = listbox.clone();
+                let row_map = row_map.clone();
+                let selected_id = selected_id.clone();
+                move || match selected_id
+                    .get()
+                    .and_then(|old| row_map.borrow().iter().find(|(id, _)| *id == old).cloned())
+                {
+                    Some((_, row)) => listbox.select_row(Some(&row)),
+                    None => listbox.unselect_all(),
+                }
+            };
+            confirm_unsaved(&parent, &is_dirty, &do_save, &do_discard, commit, on_cancel);
         });
     }
 
@@ -321,6 +401,49 @@ fn build_left_pane(
     register_window_actions(&parent, &brush_engine);
 
     (outer.upcast(), rebuild)
+}
+
+/// Guard an action against unsaved brush edits. If the editor isn't
+/// dirty, `proceed` runs immediately. Otherwise a modal asks Save /
+/// Discard / Cancel: Save persists then proceeds, Discard reverts then
+/// proceeds, Cancel runs `on_cancel` and leaves the edits intact.
+fn confirm_unsaved(
+    parent: &gtk::Window,
+    is_dirty: &Rc<Cell<bool>>,
+    do_save: &Rc<dyn Fn()>,
+    do_discard: &Rc<dyn Fn()>,
+    proceed: impl Fn() + 'static,
+    on_cancel: impl Fn() + 'static,
+) {
+    if !is_dirty.get() {
+        proceed();
+        return;
+    }
+    let dialog = gtk::AlertDialog::builder()
+        .message("Unsaved changes")
+        .detail("This brush has unsaved changes. Save them before continuing?")
+        .modal(true)
+        .build();
+    dialog.set_buttons(&["Cancel", "Discard", "Save"]);
+    dialog.set_default_button(2);
+    dialog.set_cancel_button(0);
+    let do_save = do_save.clone();
+    let do_discard = do_discard.clone();
+    dialog.choose(
+        Some(parent),
+        None::<&gtk::gio::Cancellable>,
+        move |res| match res {
+            Ok(2) => {
+                do_save();
+                proceed();
+            }
+            Ok(1) => {
+                do_discard();
+                proceed();
+            }
+            _ => on_cancel(),
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +482,7 @@ pub(super) fn confirm_and_delete(
     dialog.set_default_button(0);
     dialog.set_cancel_button(0);
     let path_for_cb = path.clone();
+    let brush_engine = brush_engine.clone();
     dialog.choose(
         Some(parent),
         None::<&gtk::gio::Cancellable>,
@@ -366,9 +490,14 @@ pub(super) fn confirm_and_delete(
             if result == Ok(1) {
                 if let Err(e) = std::fs::remove_file(&path_for_cb) {
                     tracing::warn!(?path_for_cb, %e, "failed to delete brush file");
-                } else {
-                    tracing::info!(?path_for_cb, "deleted brush");
+                    return;
                 }
+                tracing::info!(?path_for_cb, "deleted brush");
+                // Drop it from the in-memory list too - without this the
+                // deleted brush lingers as a ghost row (there's no file
+                // watcher to reload). This fires `brushes_changed`, so the
+                // manager rebuilds the list and re-selects another brush.
+                brush_engine.remove_brush(id);
             }
         },
     );

@@ -1,18 +1,17 @@
 //! Right-pane editor for the Manage Brushes window.
 //!
-//! Each field is bound to a widget that writes back into the in-memory
-//! `BrushPreset` and schedules a debounced disk save. The file watcher
-//! then fires a reload which our brushes-changed listener handles  - 
-//! `selected_name` is preserved so the user stays on the same brush
-//! across the reload.
+//! Each field is bound to a widget that writes its value into the
+//! in-memory `BrushPreset` and flags the editor dirty; nothing touches
+//! disk until the user clicks Save. Discard restores the brush from the
+//! `baseline` snapshot taken when it was selected (or last saved). The
+//! host guards brush-switches and window-close against unsaved edits.
 //!
 //! A `loading` flag suppresses `connect_value_changed` callbacks
 //! during `set_brush` so populating the widgets from a freshly
-//! selected brush doesn't trigger a phantom save.
+//! selected brush doesn't flag a phantom edit.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::time::Duration;
 
 use adw::prelude::*;
 use oxiedraw_core::brush_engine::{
@@ -27,15 +26,18 @@ use crate::brush_picker::shared as picker;
 use super::preview;
 
 /// Handles returned from `editor::build` so the host can drive the
-/// editor from outside (load a brush, focus the name field after
-/// creating a new one).
+/// editor from outside: load a brush, focus the name field after
+/// creating a new one, and mediate unsaved edits (dirty flag + explicit
+/// save/discard) when the host switches brushes or closes the window.
 pub(super) struct EditorHandles {
     pub set_brush: Rc<dyn Fn(Option<&BrushPreset>)>,
     pub focus_name: Rc<dyn Fn()>,
+    pub is_dirty: Rc<Cell<bool>>,
+    pub save: Rc<dyn Fn()>,
+    pub discard: Rc<dyn Fn()>,
 }
 
 const FALLBACK_ICON: &str = "oxiedraw-brush-symbolic";
-const SAVE_DEBOUNCE: Duration = Duration::from_millis(400);
 const TAU_F32: f32 = std::f32::consts::TAU;
 const DYN_SOURCES: &[(DynSource, &str)] = &[
     (DynSource::Pressure, "Pressure"),
@@ -93,37 +95,26 @@ pub(super) fn build(
     identity_group.add(&name_entry);
     body.append(&identity_group);
 
-    // -- Loading flag + debounced save state -----------------------------
+    // -- Loading flag + dirty / baseline state ---------------------------
     let loading = Rc::new(Cell::new(false));
-    let pending_save_timer: Rc<RefCell<Option<glib::SourceId>>> =
-        Rc::new(RefCell::new(None));
+    // True once the current brush has unsaved edits. `baseline` is the
+    // last-saved (or as-selected) snapshot, used to revert on Discard.
+    let dirty = Rc::new(Cell::new(false));
+    let baseline: Rc<RefCell<Option<BrushPreset>>> = Rc::new(RefCell::new(None));
 
-    let schedule_save: Rc<dyn Fn()> = {
-        let brush_engine = brush_engine.clone();
-        let selected_id = selected_id.clone();
-        let pending = pending_save_timer.clone();
-        let parent_for_save = parent.clone();
+    // Save / Discard action bar - revealed (with an animated height
+    // slide) only while there are unsaved edits. Built here so
+    // `mark_dirty` can reveal it; its click handlers are wired once the
+    // setter exists, further down.
+    let (save_bar, save_btn, discard_btn) = build_save_bar();
+
+    // Any edit flags dirty and slides the action bar in.
+    let mark_dirty: Rc<dyn Fn()> = {
+        let dirty = dirty.clone();
+        let save_bar = save_bar.clone();
         Rc::new(move || {
-            if let Some(prev) = pending.borrow_mut().take() {
-                prev.remove();
-            }
-            let brush_engine = brush_engine.clone();
-            let selected_id = selected_id.clone();
-            let parent = parent_for_save.clone();
-            let pending_inner = pending.clone();
-            let id = glib::timeout_add_local_once(SAVE_DEBOUNCE, move || {
-                pending_inner.borrow_mut().take();
-                if let Some(id) = selected_id.get()
-                    && let Err(e) = save_brush_to_disk(&brush_engine, id) {
-                        tracing::warn!(%e, "failed to save brush");
-                        super::show_simple_error(
-                            &parent,
-                            "Couldn't save brush",
-                            &e.to_string(),
-                        );
-                    }
-            });
-            *pending.borrow_mut() = Some(id);
+            dirty.set(true);
+            save_bar.set_reveal_child(true);
         })
     };
 
@@ -198,7 +189,7 @@ pub(super) fn build(
         let selected_id = selected_id.clone();
         let selected_name = selected_name.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         name_entry.connect_changed(move |entry| {
             if loading.get() {
                 return;
@@ -214,7 +205,7 @@ pub(super) fn build(
                 brush.name = new_name;
             }
             drop(brushes);
-            schedule_save();
+            mark_dirty();
         });
     }
 
@@ -223,7 +214,7 @@ pub(super) fn build(
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         let pattern_row = pattern_row.clone();
         let pattern_thumb = pattern_thumb.clone();
         let pattern_size_row = pattern_size_row.clone();
@@ -269,7 +260,7 @@ pub(super) fn build(
                 &pattern_strength_row,
                 &updated_family,
             );
-            schedule_save();
+            mark_dirty();
         });
     }
 
@@ -277,13 +268,13 @@ pub(super) fn build(
     {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         let parent = parent.clone();
         let pattern_thumb_for_btn = pattern_thumb.clone();
         pattern_btn.connect_clicked(move |_| {
             let Some(id) = selected_id.get() else { return };
             let brush_engine = brush_engine.clone();
-            let schedule_save = schedule_save.clone();
+            let mark_dirty = mark_dirty.clone();
             let pattern_thumb = pattern_thumb_for_btn.clone();
             let parent_for_cb = parent.clone();
             choose_pattern(&parent, move |result| {
@@ -299,7 +290,7 @@ pub(super) fn build(
                             brush.family = BrushFamily::Textured(rc.clone());
                         }
                         apply_pattern_thumb(&pattern_thumb, &rc);
-                        schedule_save();
+                        mark_dirty();
                     }
                     Err(Some(e)) => {
                         super::show_simple_error(
@@ -320,7 +311,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.default_size = v as f32,
     );
     wire_scale_to_field(
@@ -328,7 +319,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.default_opacity = v as f32,
     );
     wire_scale_to_field(
@@ -336,7 +327,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.spacing_ratio = v as f32,
     );
     wire_scale_to_field(
@@ -344,7 +335,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.stabilizer = v as f32,
     );
     wire_scale_to_field(
@@ -352,7 +343,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.speed_smoothing = v as f32,
     );
     wire_scale_to_field(
@@ -360,7 +351,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.hardness = v as f32,
     );
     wire_scale_to_field(
@@ -368,7 +359,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.texture_scale = v as f32,
     );
     wire_scale_to_field(
@@ -376,14 +367,14 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
         |b, v| b.texture_strength = v as f32,
     );
     {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         buildup_row.connect_active_notify(move |r| {
             if loading.get() {
                 return;
@@ -395,7 +386,7 @@ pub(super) fn build(
                 brush.buildup = v;
             }
             drop(brushes);
-            schedule_save();
+            mark_dirty();
         });
     }
 
@@ -408,7 +399,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
     );
     dyn_group.add(&size_dyn.row);
     let flow_dyn = build_dynamics_row(
@@ -418,7 +409,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
     );
     dyn_group.add(&flow_dyn.row);
     let rotation_dyn = build_dynamics_row(
@@ -428,7 +419,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
     );
     dyn_group.add(&rotation_dyn.row);
     let scatter_dyn = build_dynamics_row(
@@ -438,7 +429,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
     );
     dyn_group.add(&scatter_dyn.row);
     let spacing_dyn = build_dynamics_row(
@@ -448,7 +439,7 @@ pub(super) fn build(
         &brush_engine,
         &selected_id,
         &loading,
-        &schedule_save,
+        &mark_dirty,
     );
     dyn_group.add(&spacing_dyn.row);
     body.append(&dyn_group);
@@ -471,8 +462,11 @@ pub(super) fn build(
     preview_frame.set_margin_start(24);
     preview_frame.set_margin_end(24);
     preview_frame.set_margin_top(8);
-    preview_frame.set_margin_bottom(24);
+    preview_frame.set_margin_bottom(12);
     outer.append(&preview_frame);
+
+    // Save / Discard action bar sits at the very bottom, under the preview.
+    outer.append(&save_bar);
 
     // -- Setter: load a brush into all widgets ---------------------------
     let setter: Rc<dyn Fn(Option<&BrushPreset>)> = {
@@ -497,6 +491,9 @@ pub(super) fn build(
         let choose_btn = choose_btn.clone();
         let set_preview = set_preview.clone();
         let loading = loading.clone();
+        let dirty = dirty.clone();
+        let baseline = baseline.clone();
+        let save_bar = save_bar.clone();
         let size_dyn = size_dyn.clone();
         let flow_dyn = flow_dyn.clone();
         let rotation_dyn = rotation_dyn.clone();
@@ -505,6 +502,11 @@ pub(super) fn build(
         Rc::new(move |maybe: Option<&BrushPreset>| {
             // Suppress widget callbacks while we populate.
             loading.set(true);
+            // Loading a brush is the clean baseline for future edits:
+            // snapshot it and hide the (now irrelevant) save bar.
+            *baseline.borrow_mut() = maybe.cloned();
+            dirty.set(false);
+            save_bar.set_reveal_child(false);
             let enabled = maybe.is_some();
             delete_btn.set_sensitive(enabled);
             choose_btn.set_sensitive(enabled);
@@ -609,8 +611,8 @@ pub(super) fn build(
     }
 
     // After any widget edit, re-render the preview from the *current*
-    // in-memory brush state - so the user sees the change instantly,
-    // without waiting for the debounced save round-trip.
+    // in-memory brush state so the user sees the change instantly,
+    // independent of when it's saved to disk.
     let live_preview: Rc<dyn Fn()> = {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
@@ -644,10 +646,134 @@ pub(super) fn build(
         &live_preview,
     );
 
+    // -- Save: persist in-memory edits to disk ---------------------------
+    let do_save: Rc<dyn Fn()> = {
+        let brush_engine = brush_engine.clone();
+        let selected_id = selected_id.clone();
+        let parent = parent.clone();
+        let dirty = dirty.clone();
+        let baseline = baseline.clone();
+        let save_bar = save_bar.clone();
+        Rc::new(move || {
+            let Some(id) = selected_id.get() else { return };
+            match save_brush_to_disk(&brush_engine, id) {
+                Ok(()) => {
+                    // Re-snapshot the just-saved state (save may have
+                    // rewritten source_path / preview) as the new baseline.
+                    if let Some(p) = brush_engine.brushes.borrow().iter().find(|p| p.id == id) {
+                        *baseline.borrow_mut() = Some(p.clone());
+                    }
+                    dirty.set(false);
+                    save_bar.set_reveal_child(false);
+                }
+                Err(e) => {
+                    tracing::warn!(%e, "failed to save brush");
+                    super::show_simple_error(&parent, "Couldn't save brush", &e.to_string());
+                }
+            }
+        })
+    };
+
+    // -- Discard: revert in-memory brush to the saved baseline -----------
+    let do_discard: Rc<dyn Fn()> = {
+        let brush_engine = brush_engine.clone();
+        let selected_id = selected_id.clone();
+        let baseline = baseline.clone();
+        let setter = setter.clone();
+        Rc::new(move || {
+            let Some(id) = selected_id.get() else { return };
+            let base = baseline.borrow().clone();
+            let Some(base) = base else { return };
+            if let Some(b) = brush_engine.brushes.borrow_mut().iter_mut().find(|p| p.id == id) {
+                *b = base.clone();
+            }
+            // Repopulate the widgets from the restored brush; the setter
+            // re-snapshots the baseline and clears the dirty flag.
+            setter(Some(&base));
+        })
+    };
+
+    // Wire the action-bar buttons now that save/discard exist.
+    {
+        let do_save = do_save.clone();
+        save_btn.connect_clicked(move |_| do_save());
+    }
+    {
+        let do_discard = do_discard.clone();
+        discard_btn.connect_clicked(move |_| do_discard());
+    }
+
     (outer.upcast(), EditorHandles {
         set_brush: setter,
         focus_name,
+        is_dirty: dirty,
+        save: do_save,
+        discard: do_discard,
     })
+}
+
+/// Build the Save / Discard action bar. It lives inside a `gtk::Revealer`
+/// so showing/hiding it animates the row height (slide) rather than
+/// snapping, which reads as much smoother.
+fn build_save_bar() -> (gtk::Revealer, gtk::Button, gtk::Button) {
+    let bar = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .margin_start(24)
+        .margin_end(24)
+        .margin_top(0)
+        .margin_bottom(12)
+        .build();
+
+    // Small (non-pill) buttons matching the export dialog: Discard (red
+    // text, light-red fill) on the left, Save suggested on the right,
+    // pushed apart by a spacer.
+    ensure_discard_css();
+    let discard_btn = gtk::Button::with_label("Discard");
+    discard_btn.add_css_class("brush-discard-btn");
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let save_btn = gtk::Button::with_label("Save");
+    save_btn.add_css_class("suggested-action");
+    bar.append(&discard_btn);
+    bar.append(&spacer);
+    bar.append(&save_btn);
+
+    let revealer = gtk::Revealer::builder()
+        .transition_type(gtk::RevealerTransitionType::SlideUp)
+        .transition_duration(180)
+        .reveal_child(false)
+        .child(&bar)
+        .build();
+    (revealer, save_btn, discard_btn)
+}
+
+/// Red-on-light-red styling for the Discard button, installed once per
+/// process (GTK de-dupes the provider by priority + display).
+fn ensure_discard_css() {
+    use std::sync::OnceLock;
+    static LOADED: OnceLock<()> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(
+            ".brush-discard-btn {
+                color: #c01c28;
+                background-color: alpha(#c01c28, 0.15);
+            }
+            .brush-discard-btn:hover {
+                background-color: alpha(#c01c28, 0.25);
+            }
+            .brush-discard-btn:active {
+                background-color: alpha(#c01c28, 0.32);
+            }",
+        );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
 fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
@@ -770,13 +896,13 @@ fn wire_scale_to_field(
     brush_engine: &BrushEngine,
     selected_id: &Rc<Cell<Option<BrushPresetId>>>,
     loading: &Rc<Cell<bool>>,
-    schedule_save: &Rc<dyn Fn()>,
+    mark_dirty: &Rc<dyn Fn()>,
     apply: impl Fn(&mut BrushPreset, f64) + 'static,
 ) {
     let brush_engine = brush_engine.clone();
     let selected_id = selected_id.clone();
     let loading = loading.clone();
-    let schedule_save = schedule_save.clone();
+    let mark_dirty = mark_dirty.clone();
     scale.connect_value_changed(move |s| {
         if loading.get() {
             return;
@@ -788,7 +914,7 @@ fn wire_scale_to_field(
             apply(brush, v);
         }
         drop(brushes);
-        schedule_save();
+        mark_dirty();
     });
 }
 
@@ -901,7 +1027,7 @@ fn build_dynamics_row(
     brush_engine: &BrushEngine,
     selected_id: &Rc<Cell<Option<BrushPresetId>>>,
     loading: &Rc<Cell<bool>>,
-    schedule_save: &Rc<dyn Fn()>,
+    mark_dirty: &Rc<dyn Fn()>,
 ) -> DynamicsRowHandles {
     let row = adw::ExpanderRow::builder()
         .title(title)
@@ -968,7 +1094,7 @@ fn build_dynamics_row(
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         let handles_for_apply = handles.clone();
         handles.row.connect_enable_expansion_notify(move |row| {
             if loading.get() {
@@ -991,7 +1117,7 @@ fn build_dynamics_row(
                 *field.get_mut(&mut brush.dynamics) = None;
                 drop(brushes);
             }
-            schedule_save();
+            mark_dirty();
         });
     }
 
@@ -1000,7 +1126,7 @@ fn build_dynamics_row(
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         handles
             .source_dropdown
             .connect_selected_notify(move |d| {
@@ -1016,7 +1142,7 @@ fn build_dynamics_row(
                         m.source = *src;
                     }
                 drop(brushes);
-                schedule_save();
+                mark_dirty();
             });
     }
 
@@ -1028,7 +1154,7 @@ fn build_dynamics_row(
         brush_engine,
         selected_id,
         loading,
-        schedule_save,
+        mark_dirty,
     );
     wire_range_spin(
         &handles.max_spin,
@@ -1037,7 +1163,7 @@ fn build_dynamics_row(
         brush_engine,
         selected_id,
         loading,
-        schedule_save,
+        mark_dirty,
     );
 
     // -- Invert switch ---------------------------------------------------
@@ -1045,7 +1171,7 @@ fn build_dynamics_row(
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
-        let schedule_save = schedule_save.clone();
+        let mark_dirty = mark_dirty.clone();
         handles.invert_switch.connect_state_set(move |_, state| {
             if loading.get() {
                 return glib::Propagation::Proceed;
@@ -1057,7 +1183,7 @@ fn build_dynamics_row(
                         m.invert = state;
                     }
                 drop(brushes);
-                schedule_save();
+                mark_dirty();
             }
             glib::Propagation::Proceed
         });
@@ -1073,12 +1199,12 @@ fn wire_range_spin(
     brush_engine: &BrushEngine,
     selected_id: &Rc<Cell<Option<BrushPresetId>>>,
     loading: &Rc<Cell<bool>>,
-    schedule_save: &Rc<dyn Fn()>,
+    mark_dirty: &Rc<dyn Fn()>,
 ) {
     let brush_engine = brush_engine.clone();
     let selected_id = selected_id.clone();
     let loading = loading.clone();
-    let schedule_save = schedule_save.clone();
+    let mark_dirty = mark_dirty.clone();
     spin.connect_value_changed(move |s| {
         if loading.get() {
             return;
@@ -1098,7 +1224,7 @@ fn wire_range_spin(
                 }
             }
         drop(brushes);
-        schedule_save();
+        mark_dirty();
     });
 }
 

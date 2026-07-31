@@ -2,10 +2,12 @@
 //!
 //! Renders as a small icon button showing the active brush's custom
 //! icon (or a generic fallback when the brush is icon-less). Clicking
-//! opens a `gtk::Popover` containing a search entry, a three-dots
-//! `MenuButton` (with stub "Manage Brushes" action - wired in stage
-//! 7b), and a scrollable list of brushes. Each row shows the brush's
-//! icon, name, and a Cairo-drawn sample stroke.
+//! opens a `gtk::Popover` containing a search entry, a list/grid view
+//! toggle, a cog button that opens the Manage Brushes window
+//! (`app.brush-manager`), and a scrollable list or icon grid of brushes.
+//! Each list row shows the brush's icon, name, and a Cairo-drawn sample
+//! stroke; grid tiles are icon-only with a corner default-brush star.
+//! The chosen view mode is persisted in `AppSettings`.
 //!
 //! Wired into `tool_options_bar` as a replacement for the old
 //! `gtk::DropDown`. Listens on `BrushEngine::connect_brushes_changed`
@@ -27,6 +29,9 @@ use crate::settings::AppSettings;
 
 const POPOVER_MAX_HEIGHT: i32 = 800;
 const POPOVER_WIDTH: i32 = 360;
+/// Grid view packs 6 tiles per row, so it needs a wider popover than the
+/// list to keep each icon legibly sized.
+const GRID_POPOVER_WIDTH: i32 = 500;
 /// Outer button extent. GTK's default theme enforces a per-state
 /// `min-height` that overrides `height_request`; the matching value
 /// has to land on the inner `button` node via CSS (see `load_css_once`).
@@ -125,16 +130,40 @@ fn build_popover_content(
         .build();
     header.append(&search);
 
-    let menu_button = gtk::MenuButton::builder()
-        .icon_name("view-more-symbolic")
-        .has_frame(false)
+    // List / grid view toggle. Two linked toggles sharing a group so
+    // exactly one stays active.
+    let view_toggle = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
         .build();
-    let menu = build_menu();
-    menu_button.set_menu_model(Some(&menu));
-    header.append(&menu_button);
+    view_toggle.add_css_class("linked");
+    let list_toggle = gtk::ToggleButton::builder()
+        .icon_name("view-list-symbolic")
+        .tooltip_text("List view")
+        .build();
+    let grid_toggle = gtk::ToggleButton::builder()
+        .icon_name("view-grid-symbolic")
+        .tooltip_text("Grid view")
+        .build();
+    grid_toggle.set_group(Some(&list_toggle));
+    view_toggle.append(&list_toggle);
+    view_toggle.append(&grid_toggle);
+    header.append(&view_toggle);
+
+    // Cog: opens the Manage Brushes window directly (no intermediate menu).
+    let manage_button = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .has_frame(false)
+        .tooltip_text("Manage Brushes")
+        .action_name("app.brush-manager")
+        .build();
+    {
+        let popover = popover.clone();
+        manage_button.connect_clicked(move |_| popover.popdown());
+    }
+    header.append(&manage_button);
     outer.append(&header);
 
-    // ----- Scrollable brush list -----
+    // ----- Scrollable brush list / grid (swapped via a Stack) -----
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -146,13 +175,55 @@ fn build_popover_content(
         .selection_mode(gtk::SelectionMode::Single)
         .build();
     listbox.add_css_class("navigation-sidebar");
-    scrolled.set_child(Some(&listbox));
+    let flowbox = gtk::FlowBox::builder()
+        .selection_mode(gtk::SelectionMode::Single)
+        .homogeneous(true)
+        .min_children_per_line(6)
+        .max_children_per_line(6)
+        .row_spacing(6)
+        .column_spacing(6)
+        .valign(gtk::Align::Start)
+        .build();
+
+    let stack = gtk::Stack::new();
+    // Size to the visible view, not the tallest one - otherwise the grid
+    // inherits the (much taller) list's height and floats in empty space.
+    stack.set_vhomogeneous(false);
+    stack.set_hhomogeneous(false);
+    stack.add_named(&listbox, Some("list"));
+    stack.add_named(&flowbox, Some("grid"));
+    scrolled.set_child(Some(&stack));
     outer.append(&scrolled);
 
-    // Row storage: parallel Vec<(BrushPresetId, gtk::ListBoxRow)> so we
-    // can map row activation -> preset id and update selection on
-    // `active` changes.
+    // Restore the persisted view and sync the toggle buttons.
+    let grid_active = AppSettings::load().brush_picker_grid_view;
+    stack.set_visible_child_name(if grid_active { "grid" } else { "list" });
+    popover.set_width_request(if grid_active { GRID_POPOVER_WIDTH } else { POPOVER_WIDTH });
+    if grid_active {
+        grid_toggle.set_active(true);
+    } else {
+        list_toggle.set_active(true);
+    }
+    {
+        let stack = stack.clone();
+        let popover = popover.clone();
+        grid_toggle.connect_toggled(move |btn| {
+            let grid = btn.is_active();
+            stack.set_visible_child_name(if grid { "grid" } else { "list" });
+            popover.set_width_request(if grid { GRID_POPOVER_WIDTH } else { POPOVER_WIDTH });
+            let mut settings = AppSettings::load();
+            settings.brush_picker_grid_view = grid;
+            settings.save();
+        });
+    }
+
+    // Row/child storage: parallel maps so we can resolve an activation
+    // back to a preset id and drive selection on `active` changes. The
+    // star map holds both list and grid stars so a default change updates
+    // every visible star at once.
     let row_map: Rc<RefCell<Vec<(BrushPresetId, gtk::ListBoxRow)>>> =
+        Rc::new(RefCell::new(Vec::new()));
+    let flow_map: Rc<RefCell<Vec<(BrushPresetId, gtk::FlowBoxChild)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let star_map: Rc<RefCell<Vec<(BrushPresetId, gtk::Button)>>> =
         Rc::new(RefCell::new(Vec::new()));
@@ -160,7 +231,9 @@ fn build_popover_content(
     let rebuild = {
         let brush_engine = brush_engine.clone();
         let listbox = listbox.clone();
+        let flowbox = flowbox.clone();
         let row_map = row_map.clone();
+        let flow_map = flow_map.clone();
         let star_map = star_map.clone();
         let search = search.clone();
         let default_brush_name = default_brush_name.clone();
@@ -168,8 +241,10 @@ fn build_popover_content(
         Rc::new(move || {
             rebuild_rows(
                 &listbox,
+                &flowbox,
                 &brush_engine,
                 &row_map,
+                &flow_map,
                 &search.text(),
                 &star_map,
                 &default_brush_name,
@@ -212,19 +287,31 @@ fn build_popover_content(
         });
     }
 
+    // Grid tile activation -> same behaviour as a list row.
+    {
+        let brush_engine = brush_engine.clone();
+        let flow_map = flow_map.clone();
+        let popover = popover.clone();
+        let refresh_trigger = refresh_trigger.clone();
+        flowbox.connect_child_activated(move |_, child| {
+            if let Some((id, _)) = flow_map.borrow().iter().find(|(_, c)| c == child) {
+                brush_engine.active.set(*id);
+                refresh_trigger();
+                popover.popdown();
+            }
+        });
+    }
+
     outer
 }
 
-fn build_menu() -> gtk::gio::Menu {
-    let menu = gtk::gio::Menu::new();
-    menu.append(Some("Manage Brushes"), Some("app.brush-manager"));
-    menu
-}
-
+#[allow(clippy::too_many_arguments)]
 fn rebuild_rows(
     listbox: &gtk::ListBox,
+    flowbox: &gtk::FlowBox,
     brush_engine: &BrushEngine,
     row_map: &Rc<RefCell<Vec<(BrushPresetId, gtk::ListBoxRow)>>>,
+    flow_map: &Rc<RefCell<Vec<(BrushPresetId, gtk::FlowBoxChild)>>>,
     filter: &str,
     star_map: &Rc<RefCell<Vec<(BrushPresetId, gtk::Button)>>>,
     default_brush_name: &Rc<RefCell<Option<String>>>,
@@ -233,7 +320,11 @@ fn rebuild_rows(
     while let Some(child) = listbox.first_child() {
         listbox.remove(&child);
     }
+    while let Some(child) = flowbox.first_child() {
+        flowbox.remove(&child);
+    }
     row_map.borrow_mut().clear();
+    flow_map.borrow_mut().clear();
     star_map.borrow_mut().clear();
 
     let filter_lc = filter.trim().to_lowercase();
@@ -241,6 +332,7 @@ fn rebuild_rows(
     let def_name = default_brush_name.borrow().clone();
     let brushes = brush_engine.brushes.borrow();
     let mut selected_row: Option<gtk::ListBoxRow> = None;
+    let mut selected_child: Option<gtk::FlowBoxChild> = None;
 
     for preset in brushes.iter() {
         if !filter_lc.is_empty() && !preset.name.to_lowercase().contains(&filter_lc) {
@@ -262,7 +354,10 @@ fn rebuild_rows(
                 shared::update_star_icon(btn, *id == brush_id);
             }
         });
-        let (row, star_btn) = shared::build_list_row(preset, is_default, Some(on_set_default));
+
+        // List row.
+        let (row, star_btn) =
+            shared::build_list_row(preset, is_default, Some(on_set_default.clone()));
         if let Some(btn) = star_btn {
             star_map.borrow_mut().push((preset.id, btn));
         }
@@ -271,9 +366,21 @@ fn rebuild_rows(
             selected_row = Some(row.clone());
         }
         row_map.borrow_mut().push((preset.id, row));
+
+        // Grid tile.
+        let (child, grid_star) = shared::build_grid_item(preset, is_default, on_set_default);
+        star_map.borrow_mut().push((preset.id, grid_star));
+        flowbox.append(&child);
+        if preset.id == active_id {
+            selected_child = Some(child.clone());
+        }
+        flow_map.borrow_mut().push((preset.id, child));
     }
     if let Some(row) = selected_row {
         listbox.select_row(Some(&row));
+    }
+    if let Some(child) = selected_child {
+        flowbox.select_child(&child);
     }
 }
 

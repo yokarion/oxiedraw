@@ -122,6 +122,21 @@ impl BrushEngine {
         id
     }
 
+    /// Remove a single brush by id and notify listeners. Returns `true`
+    /// if a brush was actually removed. The active id is left untouched;
+    /// callers re-select after the resulting `brushes_changed`.
+    pub fn remove_brush(&self, id: BrushPresetId) -> bool {
+        let mut brushes = self.brushes.borrow_mut();
+        let before = brushes.len();
+        brushes.retain(|p| p.id != id);
+        let removed = brushes.len() != before;
+        drop(brushes);
+        if removed {
+            self.notify_brushes_changed();
+        }
+        removed
+    }
+
     /// Drop every loaded brush. Active id is not changed here - callers
     /// reload + re-select before the engine is queried again.
     pub fn clear_brushes(&self) {
