@@ -15,6 +15,7 @@ use relm4::gtk::prelude::*;
 use super::preview;
 
 const ROW_ICON_SIZE: i32 = 60;
+const GRID_ICON_SIZE: i32 = 72;
 
 /// Build a list row showing the brush's icon, name, and a cairo
 /// stroke preview. Suitable for both the popover and manager list.
@@ -74,6 +75,58 @@ pub(crate) fn build_list_row(
     (row, star_btn)
 }
 
+/// Build a grid tile showing just the brush icon, with a corner star
+/// overlay. The star stays hidden until the tile is hovered (then gray),
+/// except on the default brush where it is always shown filled yellow.
+///
+/// `on_set_default` fires when the star is clicked; the returned
+/// `gtk::Button` lets callers refresh the star later. The brush name is
+/// exposed as the tile tooltip since the tile itself is icon-only.
+pub(crate) fn build_grid_item(
+    preset: &BrushPreset,
+    is_default: bool,
+    on_set_default: Rc<dyn Fn()>,
+) -> (gtk::FlowBoxChild, gtk::Button) {
+    ensure_icon_css();
+    ensure_grid_star_css();
+
+    let overlay = gtk::Overlay::new();
+    overlay.add_css_class("brush-grid-tile");
+    overlay.set_tooltip_text(Some(&preset.name));
+
+    // A fixed pixel_size keeps the tile's natural height bounded (the source
+    // PNGs are 1024px, so a Picture would report a giant natural height and
+    // force the grid to always scroll). The icon still scales down crisply
+    // and stays square.
+    overlay.set_child(Some(&build_scaling_icon(preset)));
+
+    let star = gtk::Button::builder()
+        .has_frame(false)
+        .halign(gtk::Align::End)
+        .valign(gtk::Align::Start)
+        .tooltip_text("Default Brush")
+        .build();
+    star.add_css_class("brush-grid-star");
+    update_star_icon(&star, is_default);
+    star.connect_clicked(move |_| on_set_default());
+    overlay.add_overlay(&star);
+
+    let child = gtk::FlowBoxChild::new();
+    child.set_child(Some(&overlay));
+    (child, star)
+}
+
+/// Icon image for a grid tile, sized to `GRID_ICON_SIZE`. A fixed
+/// `pixel_size` gives the widget a bounded natural size so the grid fits
+/// its rows instead of inheriting the 1024px source resolution.
+fn build_scaling_icon(preset: &BrushPreset) -> gtk::Image {
+    let image = gtk::Image::builder().pixel_size(GRID_ICON_SIZE).build();
+    image.add_css_class("brush-row-icon");
+    image.set_overflow(gtk::Overflow::Hidden);
+    apply_icon_to_image(&image, preset, super::FALLBACK_ICON);
+    image
+}
+
 /// Set the star icon on the button based on whether the brush is default.
 pub(crate) fn update_star_icon(btn: &gtk::Button, is_default: bool) {
     if is_default {
@@ -94,6 +147,34 @@ fn ensure_star_css() {
             ".brush-star-btn { opacity: 0.4; }
              .brush-star-btn:hover { opacity: 1.0; }
              .brush-star-btn.starred { opacity: 1.0; color: #f5c518; }",
+        );
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
+}
+
+fn ensure_grid_star_css() {
+    use std::sync::OnceLock;
+    static LOADED: OnceLock<()> = OnceLock::new();
+    LOADED.get_or_init(|| {
+        let provider = gtk::CssProvider::new();
+        // Star hidden by default, revealed gray on tile hover. The
+        // default brush keeps it filled yellow and always visible - the
+        // extra `.starred` selectors outrank the hover rule so hovering
+        // the default tile doesn't dim its star.
+        provider.load_from_string(
+            ".brush-grid-star { opacity: 0; min-width: 0; min-height: 0; padding: 2px; }
+             .brush-grid-tile:hover .brush-grid-star { opacity: 1.0; color: #9a9a9a; }
+             .brush-grid-star.starred,
+             .brush-grid-tile:hover .brush-grid-star.starred {
+                opacity: 1.0;
+                color: #f5c518;
+            }",
         );
         if let Some(display) = gtk::gdk::Display::default() {
             gtk::style_context_add_provider_for_display(

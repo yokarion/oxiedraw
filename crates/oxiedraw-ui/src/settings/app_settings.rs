@@ -30,6 +30,9 @@ pub(crate) struct AppSettings {
     /// "Ink Pen" -> "Default Round" -> first brush if not found.
     #[serde(default)]
     pub(crate) default_brush_name: Option<String>,
+    /// Show the brush picker as an icon grid instead of the default list.
+    #[serde(default)]
+    pub(crate) brush_picker_grid_view: bool,
 }
 
 /// Project saving: rolling numbered backups and background autosave.
@@ -190,6 +193,7 @@ impl Default for AppSettings {
             save: SaveSettings::default(),
             rotation_snap_deg: default_rotation_snap_deg(),
             default_brush_name: Some("Ink Pen".to_string()),
+            brush_picker_grid_view: false,
         }
     }
 }
