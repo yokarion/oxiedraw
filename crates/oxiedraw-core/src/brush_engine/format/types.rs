@@ -18,7 +18,7 @@ pub(super) const KIND: &str = "brush";
 /// whenever a builtin factory changes in a way that should reach existing
 /// installs (tuned spacing, new grain, etc.) without a schema change.
 /// `seed_missing` re-writes any builtin whose on-disk revision is older.
-pub const BUILTIN_REVISION: u32 = 8;
+pub const BUILTIN_REVISION: u32 = 11;
 
 /// `manifest.json` - fast metadata read for the brush picker so we can
 /// list brushes without fully deserialising `brush.json`.

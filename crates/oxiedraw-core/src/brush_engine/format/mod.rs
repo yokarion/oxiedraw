@@ -198,4 +198,30 @@ mod tests {
         assert!(restored.dynamics.color_rate.is_some());
         assert!(restored.dynamics.size.is_some());
     }
+
+    #[test]
+    fn round_trip_charcoal_pencil_texture_and_dynamics() {
+        // Charcoal Pencil is a Textured brush carrying the real dotted-paper
+        // grain baked from a bundled PNG - exercises the full-size texture
+        // round-tripping plus its pressure->size/flow/scatter dynamics.
+        let preset = BrushPreset::charcoal_pencil(BrushPresetId(0));
+        let path = temp_path("charcoal");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(7), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            restored.texturing_mode,
+            super::super::preset::TexturingMode::Multiply
+        );
+        let BrushFamily::Textured(grain) = restored.family else {
+            panic!("expected textured")
+        };
+        assert_eq!(grain.width, 512);
+        assert_eq!(grain.height, 512);
+        assert!(restored.dynamics.size.is_some());
+        assert!(restored.dynamics.flow.is_some());
+        assert!(restored.dynamics.scatter.is_some());
+    }
 }
