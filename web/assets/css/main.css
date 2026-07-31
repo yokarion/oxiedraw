@@ -1,0 +1,114 @@
+/* libadwaita-inspired theme for the OxieDraw docs.
+   Overrides Nuxt UI v4 design tokens; html.dark/.light beat the theme's own rules. */
+
+/* Corner radius: 6px */
+:root {
+  --ui-radius: 0.375rem;
+}
+
+/* Accent - libadwaita blue: #78AEED (dark), #1C71D8 (light) */
+:root,
+html.dark {
+  --ui-primary: #78aeed;
+  --ui-color-primary-400: #93c0f1;
+  --ui-color-primary-500: #78aeed;
+  --ui-color-primary-600: #5c9be9;
+  --ui-color-primary-700: #3584e4;
+}
+
+html.light {
+  --ui-primary: #1c71d8;
+  --ui-color-primary-400: #3584e4;
+  --ui-color-primary-500: #1c71d8;
+  --ui-color-primary-600: #1a5fb4;
+  --ui-color-primary-700: #15539e;
+}
+
+/* Dark surfaces, borders and text to match libadwaita */
+html.dark {
+  --ui-bg: #242424;
+  --ui-bg-muted: #1e1e1e;
+  --ui-bg-elevated: #303030;
+  --ui-bg-accented: #38383c; /* button */
+  --ui-border: #4a4a4a;
+  --ui-border-muted: #3a3a3a;
+  --ui-border-accented: #4a4a4a;
+  --ui-text: #ffffff;
+  --ui-text-highlighted: #ffffff;
+  --ui-text-toned: #e6e6e6;
+  --ui-text-muted: #b7b7b7;
+  --ui-text-dimmed: #8f8f8f;
+}
+
+/* Accent (primary) buttons: white label, solid hover color (no opacity fade).
+   Use [class~=] so only the solid `bg-primary` token matches - not tinted
+   variants like `bg-primary/10` used by active nav links. */
+html [class~="bg-primary"] {
+  color: #ffffff;
+}
+html.dark [class~="bg-primary"]:hover {
+  background-color: #3584e4;
+}
+html.light [class~="bg-primary"]:hover {
+  background-color: #1a5fb4;
+}
+
+/* Selected article in the left nav: solid accent background, white text. */
+aside[data-slot="left"] a[data-slot="link"][class~="text-primary"] {
+  background-color: var(--ui-primary);
+  border-radius: var(--ui-radius);
+  color: #ffffff;
+}
+
+/* Buttons carry no border/ring (focus-visible outline is separate and kept). */
+:is(button, a[role="button"]) {
+  border-width: 0 !important;
+  box-shadow: none !important;
+}
+
+/* Approximate libadwaita press feedback on buttons, excluding the accent-filled
+   ones. Use [class~=] (exact token) so neutral buttons that merely carry a
+   primary-derived utility (e.g. focus outline-primary) are still matched. */
+:is(button, a[role="button"]):not([class~="bg-primary"]):active {
+  background-color: #646467;
+  color: #ffffff;
+}
+
+/* Header: solid, no frosted-glass / backdrop blur. */
+header[data-slot="root"] {
+  background-color: var(--ui-bg) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+/* Landing hero: the banner as a dimmed background image. */
+.oxie-hero {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  border-bottom: 1px solid var(--ui-border);
+}
+
+.oxie-hero::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -2;
+  background: url("../banner.avif") center / cover no-repeat;
+}
+
+/* Flat dim over the banner (no gradient). */
+.oxie-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-color: rgba(36, 36, 36, 0.6);
+}
+
+/* Hero title + description: white with a shadow for legibility over the banner.
+   PageHero renders the description as a text-muted div, so target its slot too. */
+.oxie-hero :is(h1, h2, p, [data-slot="title"], [data-slot="description"]) {
+  color: #ffffff;
+  text-shadow: 0 2px 8px rgba(0, 0, 0, 0.55);
+}

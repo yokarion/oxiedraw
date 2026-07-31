@@ -1,0 +1,63 @@
+name: Web Docs
+
+# Build the Docus site and deploy it to GitHub Pages (oxiedraw.yokarion.com).
+# The rustdoc API site is built and deployed separately (see rustdoc.yml).
+on:
+  push:
+    branches: [master]
+    paths:
+      - "docs/**"
+      - "web/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Allow the workflow to publish to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One in-flight deploy at a time; let a running one finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # Served at the custom-domain root, so no base path. Static output for Pages.
+      NITRO_PRESET: github_pages
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: yarn
+          cache-dependency-path: web/yarn.lock
+
+      - name: Install web dependencies
+        working-directory: web
+        run: yarn install --frozen-lockfile
+
+      - name: Generate static site
+        working-directory: web
+        run: yarn generate
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: web/.output/public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

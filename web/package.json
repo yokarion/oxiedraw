@@ -1,0 +1,18 @@
+{
+  "name": "oxiedraw-web",
+  "private": true,
+  "packageManager": "yarn@1.22.22",
+  "scripts": {
+    "link:content": "node scripts/link-content.mjs",
+    "dev": "node scripts/link-content.mjs && nuxt dev",
+    "build": "node scripts/link-content.mjs && nuxt build",
+    "generate": "node scripts/link-content.mjs && nuxt generate",
+    "preview": "nuxt preview",
+    "postinstall": "node scripts/link-content.mjs && nuxt prepare"
+  },
+  "dependencies": {
+    "docus": "5.12.3",
+    "better-sqlite3": "^12.11.1",
+    "nuxt": "^4.4.8"
+  }
+}

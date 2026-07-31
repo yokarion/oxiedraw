@@ -1,0 +1,5 @@
+# Docus / Nuxt Content pages use MDC syntax (#slot markers, ::component blocks,
+# tight --- prop fences) that standard markdown formatters rewrite and break.
+# Keep the docs content out of the formatter.
+docs/
+web/content/

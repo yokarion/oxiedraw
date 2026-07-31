@@ -1,87 +1,79 @@
+<div align="center">
+
+<img src="data/splash/banner.png" alt="OxieDraw" width="820">
+
 # OxieDraw
 
-A drawing app, with targeting performance, simplicity and great user experience.
-The idea of the project to make a competitor to ProCreate on IPad, but
-for Linux and other Desktops.
+**A fast, clean drawing app for Linux and other desktops.**<br>
+An easy drawing experience - GPU-accelerated, and built in Rust.
 
-![OxieDraw banner](data/splash/banner.png)
+<p>
+  <a href="https://github.com/yokarion/oxiedraw/actions/workflows/ci.yml"><img src="https://github.com/yokarion/oxiedraw/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/license-GPLv3-3584e4" alt="License: GPLv3">
+  <img src="https://img.shields.io/badge/built%20with-Rust-000000?logo=rust&logoColor=white" alt="Built with Rust">
+  <img src="https://img.shields.io/badge/GTK4-libadwaita-3584e4?logo=gnome&logoColor=white" alt="GTK4 + libadwaita">
+  <img src="https://img.shields.io/badge/Vulkan-ash-a41e22?logo=vulkan&logoColor=white" alt="Vulkan (ash)">
+  <img src="https://img.shields.io/badge/platform-Linux-333333?logo=linux&logoColor=white" alt="Platform: Linux">
+</p>
 
-## Roadmap
+<p>
+  <a href="https://oxiedraw.yokarion.com"><b>Documentation</b></a> &nbsp;-&nbsp;
+  <a href="https://oxiedraw.yokarion.com/getting-started/download"><b>Download</b></a> &nbsp;-&nbsp;
+  <a href="https://oxiedraw.yokarion.com/getting-started/roadmap"><b>Roadmap</b></a> &nbsp;-&nbsp;
+  <a href="https://oxiedraw.yokarion.com/development/overview"><b>Development</b></a>
+</p>
 
-- [x] Basic pen and mouse drawing
-- [x] Layers
-- [x] Basic Raster Filters
-- [x] More Drawing tools
-  - [x] Shapes
-  - [x] Selections
-  - [x] Masks
-  - [x] Gestures (like in ProCreate)
-- [x] Adjustment layers
-  - [x] Stroke
-  - [x] Blur
-  - [x] Hue/Saturation/Brightness
-- [ ] Advanced brush engine
-  - [x] Parameters-driven brushes
-  - [x] Patterns
-  - [x] _realistic_ brush
-  - [ ] custom shader/code driven brush
-- [x] Text support
-- [ ] Vector support
-  - [ ] Vector import
-  - [ ] Vector basic transform
-  - [ ] Vector editing transform
-- [ ] Advanced image tools
-  - [ ] Object extraction
-  - [ ] Photoshop-like patch-tool
-  - [ ] Professional color-correction tools
-- [ ] Linux Release
-  - [x] Binaries and AppImage
-  - [ ] ARM and Asahi Linux support
-  - [ ] Flatpak file
-  - [ ] FlatHub publish
-- [ ] Windows Release
-- [ ] MacOs Release
+</div>
+
+---
+
+## Overview
+
+OxieDraw targets performance, simplicity and a great user experience. The idea is
+a real competitor to flagship proprietary apps. Linux artists deserve better
+open-source tools. Just as comfortable with a stylus, mouse or trackpad.
+
+## Highlights
+
+- **GPU-accelerated** - a Vulkan (ash) pipeline keeps strokes low-latency even on large canvases and integrated GPUs.
+- **Layers, groups and blend modes** - a full layer stack composited on the GPU.
+- **Non-destructive adjustments** - Hue/Saturation, Blur and Stroke with painted masks.
+- **Advanced brush engine** - parameter-driven brushes, textured grain, and a Krita-derived realistic brush.
+- **Text and typography** - a Figma-like text tool with per-range styling and embedded fonts.
+- **Selections, masks and guides** - shapes, gestures and ProCreate-style symmetry.
+
+See the [Roadmap](https://oxiedraw.yokarion.com/getting-started/roadmap) for what
+is done and planned (source: [docs/1.getting-started/3.roadmap.md](docs/1.getting-started/3.roadmap.md)).
 
 ## Agenda
 
-- Simple & Clean UI without reducing functionality
-- Proper Touchscreen support
-- Should run on as many platforms as possible, without functionality deviations
-- Licensing
-  - This code has GPLv3 license
+- Simple and clean UI without reducing functionality
+- Proper touchscreen support
+- Runs on as many platforms as possible, without functionality deviations
+- Licensed under GPLv3
 
 ## Stack
 
-- Rust
-- GTK + LibAdwaita (relm4)
-- Vulkan (ash)
+| Layer     | Technology            |
+| --------- | --------------------- |
+| App       | **Rust**              |
+| UI        | **GTK4 + libadwaita** |
+| Rendering | **Vulkan** (ash)      |
 
-## LLMs and AI usage (read carefully before spamming @Claude or whatever)
+## Development
 
-While I'm personally not a fan of using LLMs and AI, I think it
-greatly accelerates development of project, especially in
-refactoring and atomic parts.
+Building from source, the project layout, and the contribution rules live in the
+[Development guide](https://oxiedraw.yokarion.com/development/overview)
+(source: [docs/4.development/](docs/4.development/)).
 
-However, it doesn't mean that you can just give an LLM
-full control and ask to do features for you. So in this case,
-it's strictly forbid using LLM Agents for automated contributions
-in the means of "@Gok, Implement me X feature"
+## LLMs and AI usage
 
-### Not OKs
+LLMs are fine for small, scoped, fully-reviewed changes - but automated
+"implement feature X for me" agent contributions are not, and AI generative-image
+features are out of scope for this project. Read the full policy before
+contributing: [AI & LLM usage](https://oxiedraw.yokarion.com/development/ai-and-llm-usage)
+(source: [docs/4.development/2.ai-and-llm-usage.md](docs/4.development/2.ai-and-llm-usage.md)).
 
-- You ask AI to complete the process from start to finish
-- You don't review nor test the result and just open PR for it
-- You should **never add AI Generative Image** functionality to this project.
-  This is a drawing app, not a midjourney
-- You reply with an AI-Generated reply
+## License
 
-### OKs
-
-- You ask AI to "implement function A that has
-  input A, B, C and outputs D by these specific set of rules" (at the
-  end of the day, writing code is not the useful job,
-  useful job is making the final product)
-- You review each line of the LLM output and fix it yourself if needed.
-- You have full responsibility of the code that an LLM made for you and
-  you are OK to deal with it, even if you will be
-  asked to fix a bug, that an LLM can't fix.
+OxieDraw is licensed under the [GNU General Public License v3.0](LICENSE).
