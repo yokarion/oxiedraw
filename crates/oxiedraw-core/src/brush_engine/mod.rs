@@ -99,6 +99,7 @@ impl BrushEngine {
         engine.add_brush(BrushPreset::scatter_dot(placeholder));
         engine.add_brush(BrushPreset::speed_brush(placeholder));
         engine.add_brush(BrushPreset::chalk(placeholder));
+        engine.add_brush(BrushPreset::charcoal_pencil(placeholder));
         engine.add_brush(BrushPreset::comics(placeholder));
         engine.add_brush(BrushPreset::real_brush(placeholder));
         engine.active.set(default_id);

@@ -86,6 +86,10 @@ const ICON_REAL_BRUSH: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/icons/builtin-brush-icons/real_brush.png"
 ));
+const ICON_CHARCOAL_PENCIL: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/icons/builtin-brush-icons/charcoal_pencil.png"
+));
 
 // Predefined brush-tip + texture images extracted from Krita's default
 // resource bundle (`Krita_4_Default_Resources.bundle`), converted to plain
@@ -378,6 +382,102 @@ impl BrushPreset {
                 ..Dynamics::default()
             },
             icon: Some(ICON_CHALK.to_vec()),
+            preview: None,
+            source_path: None,
+        }
+    }
+
+    /// Charcoal Pencil, matching Krita's `h) Charcoal_Pencil_Thin`: a soft
+    /// (gaussian) round tip modulated by the `10_drawed_dotted` paper texture
+    /// sampled in canvas space (MULTIPLY), giving the broken, grainy pencil
+    /// line. Pressure drives size (Krita curve 0.498..1.0) and coverage (the
+    /// opacity curve, mapped to per-dab flow), and light pressure scatters the
+    /// dabs a little so a soft touch breaks up while a firm one stays solid.
+    /// Krita values: tip diameter 6, texture scale 0.35, brightness 0,
+    /// contrast 1, invert on, strength 1, scatter 0.09.
+    pub fn charcoal_pencil(id: BrushPresetId) -> Self {
+        let grain = Rc::new(
+            PatternData::texture_from_png_bytes(TEXTURE_DRAWED_DOTTED, 0.0, 1.0, true)
+                .expect("built-in texture decodes"),
+        );
+        Self {
+            id,
+            name: "Charcoal Pencil".into(),
+            family: BrushFamily::Textured(grain),
+            // Thin pencil - clearly the "thin" charcoal against the fatter
+            // media brushes, while wide enough for the paper tooth to read.
+            default_size: 24.0,
+            default_opacity: 1.0,
+            spacing_ratio: 0.1,
+            stabilizer: 0.0,
+            speed_smoothing: 0.0,
+            buildup: false,
+            // Fairly crisp tip so the paper tooth reads as distinct grains
+            // (soft touch) and a dry, textured edge (firm) rather than a fuzzy
+            // grey band. The texture supplies the break-up, not the tip.
+            hardness: 0.85,
+            tip: TipShape::Round,
+            // Krita texture scale 0.35 on the 512px pattern -> canvas px tile.
+            texture_scale: 180.0,
+            texture_strength: 1.0,
+            texturing_mode: TexturingMode::Multiply,
+            dynamics: Dynamics {
+                // Pressure -> size: the tip stays a near-zero hairline across
+                // the whole 0..30% range, then snaps up to full radius just
+                // past 30% and holds flat. So light pressure gives a fine
+                // grainy tail and only a firm press opens the tip up.
+                size: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::from_points(vec![
+                        (0.0, 0.02),
+                        (0.3, 0.06),
+                        (0.45, 1.0),
+                        (1.0, 1.0),
+                    ])
+                    .expect("size curve valid"),
+                    range: (0.0, 1.0),
+                    invert: false,
+                }),
+                // Krita's opacity-vs-pressure curve, mapped to per-dab flow so
+                // coverage ramps up with pressure (soft at a light touch,
+                // solid when pressed).
+                flow: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::from_points(vec![
+                        (0.0, 0.0),
+                        (0.128_414, 0.100_402),
+                        (0.473_896, 0.710_843),
+                        (1.0, 1.0),
+                    ])
+                    .expect("opacity curve valid"),
+                    range: (0.0, 1.0),
+                    invert: false,
+                }),
+                // Scatter 0.09 x diameter at a light touch, fading to almost
+                // nothing when pressed (Krita curve 1 -> 0.1135). Absolute px
+                // tuned to the default diameter.
+                scatter: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::from_points(vec![(0.0, 1.0), (1.0, 0.113_537)])
+                        .expect("scatter curve valid"),
+                    range: (0.0, 2.2),
+                    invert: false,
+                }),
+                // The charcoal character: texture strength falls from 1 at a
+                // light touch to 0 when pressed (Krita's `Texture/Strength`
+                // sensor curve 0,1 -> 1,0). So a light stroke is broken/grainy
+                // and a firm stroke lays a solid, dark line - not the flat
+                // grey grain the constant strength gave at every pressure.
+                texture_strength: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::from_points(vec![(0.0, 1.0), (1.0, 0.0)])
+                        .expect("texture strength curve valid"),
+                    range: (0.0, 1.0),
+                    invert: false,
+                }),
+                ..Dynamics::default()
+            },
+            icon: Some(ICON_CHARCOAL_PENCIL.to_vec()),
             preview: None,
             source_path: None,
         }

@@ -252,6 +252,12 @@ pub struct Dynamics {
     /// guarantees overlapping dabs.
     #[serde(default)]
     pub spacing: Option<Mapping>,
+    /// Per-dab override of the preset's static `texture_strength`, `0..=1`.
+    /// Textured/image-tip families: how strongly the canvas grain gates
+    /// coverage. Krita's charcoal pencil drives this down with pressure so a
+    /// light touch reads grainy/broken and a firm press lays a solid line.
+    #[serde(default)]
+    pub texture_strength: Option<Mapping>,
     /// Smudge family: colour-pickup rate, `0..=1`.
     #[serde(default)]
     pub smudge_rate: Option<Mapping>,
@@ -267,6 +273,7 @@ impl Dynamics {
             || self.rotation.is_some()
             || self.scatter.is_some()
             || self.spacing.is_some()
+            || self.texture_strength.is_some()
             || self.smudge_rate.is_some()
             || self.color_rate.is_some()
     }
@@ -299,6 +306,9 @@ pub fn evaluate(
         let (rx, ry) = scatter_seed;
         dab.center.x += rx.mul_add(2.0, -1.0) * radius;
         dab.center.y += ry.mul_add(2.0, -1.0) * radius;
+    }
+    if let Some(m) = &dynamics.texture_strength {
+        dab.texture_strength = m.apply(input).clamp(0.0, 1.0);
     }
     if let Some(m) = &dynamics.smudge_rate {
         dab.smudge_rate = m.apply(input).clamp(0.0, 1.0);
