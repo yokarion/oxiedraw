@@ -422,16 +422,15 @@ impl BrushPreset {
             texture_strength: 1.0,
             texturing_mode: TexturingMode::Multiply,
             dynamics: Dynamics {
-                // Pressure -> size: the tip stays a near-zero hairline across
-                // the whole 0..30% range, then snaps up to full radius just
-                // past 30% and holds flat. So light pressure gives a fine
-                // grainy tail and only a firm press opens the tip up.
+                // Pressure -> size: the tip ramps from a near-zero hairline at
+                // no pressure up to full radius at 80% pressure, then holds flat.
+                // So light pressure gives a fine grainy tail and the tip opens
+                // up smoothly as you press harder.
                 size: Some(Mapping {
                     source: DynSource::Pressure,
                     curve: Curve::from_points(vec![
                         (0.0, 0.02),
-                        (0.3, 0.06),
-                        (0.45, 1.0),
+                        (0.8, 1.0),
                         (1.0, 1.0),
                     ])
                     .expect("size curve valid"),
