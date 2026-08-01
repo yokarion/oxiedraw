@@ -9,7 +9,7 @@ use std::collections::VecDeque;
 
 use serde::{Deserialize, Serialize};
 
-use super::action::{Direction, HistoryAction};
+use super::action::{Direction, HistoryAction, LayerExtension};
 use crate::canvas::Canvas;
 use crate::components::ComponentLibrary;
 use crate::document::{BlendMode, ComponentInstance, LayerKind};
@@ -132,6 +132,24 @@ impl HistoryStack {
         self.redo.clear();
     }
 
+    /// Off-canvas extension state each transformed layer should hold after the
+    /// next `undo` (empty if none). Lets the UI reconcile its extension map in
+    /// lock-step with the undo so redo can restore it too.
+    #[must_use]
+    pub fn undo_ext_reconcile(&self) -> Vec<(String, Option<Option<LayerExtension>>)> {
+        self.undo
+            .back()
+            .map_or_else(Vec::new, |e| e.action.transform_ext_reconcile(Direction::Backward))
+    }
+
+    /// As [`Self::undo_ext_reconcile`] for the next `redo`.
+    #[must_use]
+    pub fn redo_ext_reconcile(&self) -> Vec<(String, Option<Option<LayerExtension>>)> {
+        self.redo
+            .last()
+            .map_or_else(Vec::new, |e| e.action.transform_ext_reconcile(Direction::Forward))
+    }
+
     // Test-only helpers for exercising the undo/redo wiring directly.
     #[cfg(test)]
     pub(super) const fn entries(&self) -> &VecDeque<HistoryEntry> {
@@ -172,7 +190,7 @@ fn apply_direction(
         | HistoryAction::Shape { layer_id, patch }
         | HistoryAction::Gradient { layer_id, patch }
         | HistoryAction::Clear { layer_id, patch }
-        | HistoryAction::Transform { layer_id, patch }
+        | HistoryAction::Transform { layer_id, patch, .. }
         | HistoryAction::Filter { layer_id, patch } => {
             if let Some(idx) = find_layer_idx(canvas, layer_id) {
                 patch.apply(canvas, idx, direction)?;

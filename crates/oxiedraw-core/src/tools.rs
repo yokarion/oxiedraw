@@ -222,43 +222,71 @@ pub enum TransformHandle {
     BottomRight,
 }
 
+/// How a single transform target is committed. `Raster` bakes the warped
+/// pixels; `Text`/`Component` re-render crisply at the remapped geometry.
+#[derive(Debug, Clone)]
+pub enum TargetKind {
+    Raster,
+    /// `orig_geom` is the layer's box rect (in the space `orig_bounds` lives in)
+    /// captured at start; the committed box is `orig_geom` remapped through the
+    /// shared `original_rect -> rect` transform.
+    Text {
+        layer_id: String,
+        orig_geom: TransformRect,
+    },
+    /// `orig_geom` is the instance placement rect captured at start.
+    Component {
+        component_id: String,
+        orig_geom: TransformRect,
+    },
+}
+
+/// One layer being transformed. All targets share the transform's
+/// `original_rect` (union of every target's `orig_bounds`) and live `rect`, so
+/// a single drag moves them rigidly together.
+#[derive(Clone)]
+pub struct TransformTarget {
+    /// Index of the layer in the canvas stack.
+    pub layer_idx: usize,
+    /// Upright source pixels captured at start (canvas-sized for the multi path;
+    /// the special source - local text render, master, selection crop, extension
+    /// merge - for a lone target).
+    pub pixels: Vec<u8>,
+    /// Pixel dimensions of `pixels`.
+    pub src_dims: (u32, u32),
+    /// `(offset_x, offset_y)` when `pixels` came from an off-canvas
+    /// `LayerExtension`, so cancel can reconstruct it.
+    pub src_offset: Option<(i32, i32)>,
+    /// This target's own tight content bounds, in `pixels` space. The union of
+    /// every target's bounds becomes the shared `original_rect`.
+    pub orig_bounds: TransformRect,
+    /// True when this target is a pasted external image (cancel removes the layer).
+    pub is_paste: bool,
+    /// Canvas-sized layer pixels as they were before the transform began, used as
+    /// the cancel-restore and undo "before" state. `Some` only for a selection
+    /// lift, where `pixels` holds just the lifted selection (not the whole layer)
+    /// so it can't stand in as the before-state. `None` = use `pixels`.
+    pub history_before: Option<Vec<u8>>,
+    /// The layer's off-canvas extension consumed at seed (folded into `pixels`),
+    /// so commit can record it as the undo "before" extension state. `None` for
+    /// layers that had no extension.
+    pub orig_extension: Option<crate::history::LayerExtension>,
+    pub kind: TargetKind,
+}
+
 pub struct TransformState {
     pub rect: Rc<Cell<Option<TransformRect>>>,
-    /// The bounding-box rect captured when the transform was activated.
-    /// Used as the "source" rect for the pixel remap on apply.
+    /// The bounding-box rect captured when the transform was activated (the
+    /// union of every target's `orig_bounds`). Source rect for the pixel remap.
     pub original_rect: Rc<Cell<Option<TransformRect>>>,
     pub filter: Rc<Cell<TransformFilter>>,
-    /// Original pixels of the active layer captured when the tool was activated.
-    /// For a normal transform this is canvas-sized; for a paste-via-transform it
-    /// is the full source image (which may be larger or smaller than the canvas).
-    pub original_pixels: Rc<RefCell<Option<Vec<u8>>>>,
-    /// Index of the layer that was active when the transform started.
-    pub original_layer_idx: Rc<Cell<Option<usize>>>,
-    /// Pixel dimensions of `original_pixels`. `None` means canvas-sized (normal
-    /// transform); `Some((w, h))` means a paste-via-transform with a different size.
-    pub original_src_dims: Rc<Cell<Option<(u32, u32)>>>,
+    /// The layers being transformed together. Length 1 is the ordinary
+    /// single-layer transform; length >1 is a multi-selection or a group.
+    pub targets: Rc<RefCell<Vec<TransformTarget>>>,
     /// Set to `true` before calling `set_active_tool(Transform)` from the paste
     /// path. The activation handler checks this flag and skips the normal
     /// "read layer + clear" initialisation, using the pre-loaded state instead.
     pub pre_seeded: Rc<Cell<bool>>,
-    /// True when the transform was initiated by pasting an external image (a new
-    /// transparent layer was added). Cancel must remove that layer instead of
-    /// restoring pixels.
-    pub is_paste: Rc<Cell<bool>>,
-    /// When the transform was loaded from a `LayerExtension` (off-canvas data),
-    /// this holds `(offset_x, offset_y)` in canvas coordinates so that cancel
-    /// can reconstruct and re-store the extension.
-    pub original_src_offset: Rc<Cell<Option<(i32, i32)>>>,
-    /// Set when transforming a component instance: `(component_id, original
-    /// placement-as-rect)`. The source is the component master, so apply
-    /// re-renders crisply at the new rect and updates the layer's placement
-    /// instead of baking the (downscaled) slot pixels.
-    pub component: Rc<RefCell<Option<(String, TransformRect)>>>,
-    /// Set when transforming a text layer: `(layer_id, original box-as-rect)`.
-    /// The source is the text rendered in its local frame, so apply re-renders
-    /// crisply at the new box and updates the layer's `Text` box geometry
-    /// instead of baking rotated/scaled pixels.
-    pub text: Rc<RefCell<Option<(String, TransformRect)>>>,
     changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
 }
 
@@ -267,6 +295,7 @@ impl std::fmt::Debug for TransformState {
         f.debug_struct("TransformState")
             .field("rect", &self.rect.get())
             .field("filter", &self.filter.get())
+            .field("targets", &self.targets.borrow().len())
             .finish_non_exhaustive()
     }
 }
@@ -277,14 +306,8 @@ impl Clone for TransformState {
             rect: Rc::clone(&self.rect),
             original_rect: Rc::clone(&self.original_rect),
             filter: Rc::clone(&self.filter),
-            original_pixels: Rc::clone(&self.original_pixels),
-            original_layer_idx: Rc::clone(&self.original_layer_idx),
-            original_src_dims: Rc::clone(&self.original_src_dims),
+            targets: Rc::clone(&self.targets),
             pre_seeded: Rc::clone(&self.pre_seeded),
-            is_paste: Rc::clone(&self.is_paste),
-            original_src_offset: Rc::clone(&self.original_src_offset),
-            component: Rc::clone(&self.component),
-            text: Rc::clone(&self.text),
             changed: Rc::clone(&self.changed),
         }
     }
@@ -296,14 +319,8 @@ impl TransformState {
             rect: Rc::new(Cell::new(None)),
             original_rect: Rc::new(Cell::new(None)),
             filter: Rc::new(Cell::new(TransformFilter::Bilinear)),
-            original_pixels: Rc::new(RefCell::new(None)),
-            original_layer_idx: Rc::new(Cell::new(None)),
-            original_src_dims: Rc::new(Cell::new(None)),
+            targets: Rc::new(RefCell::new(Vec::new())),
             pre_seeded: Rc::new(Cell::new(false)),
-            is_paste: Rc::new(Cell::new(false)),
-            original_src_offset: Rc::new(Cell::new(None)),
-            component: Rc::new(RefCell::new(None)),
-            text: Rc::new(RefCell::new(None)),
             changed: Rc::new(RefCell::new(Vec::new())),
         }
     }
@@ -318,18 +335,24 @@ impl TransformState {
         self.changed.borrow_mut().push(cb);
     }
 
-    /// Clear all transform state (pixels, layer index, rects).
+    /// Number of layers in the active transform.
+    #[must_use]
+    pub fn target_count(&self) -> usize {
+        self.targets.borrow().len()
+    }
+
+    /// Whether a transform is active (has at least one target).
+    #[must_use]
+    pub fn has_targets(&self) -> bool {
+        !self.targets.borrow().is_empty()
+    }
+
+    /// Clear all transform state (targets, rects).
     pub fn clear(&self) {
-        *self.original_pixels.borrow_mut() = None;
-        self.original_layer_idx.set(None);
+        self.targets.borrow_mut().clear();
         self.rect.set(None);
         self.original_rect.set(None);
-        self.original_src_dims.set(None);
-        self.original_src_offset.set(None);
         self.pre_seeded.set(false);
-        self.is_paste.set(false);
-        *self.component.borrow_mut() = None;
-        *self.text.borrow_mut() = None;
     }
 }
 

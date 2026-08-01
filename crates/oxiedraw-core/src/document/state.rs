@@ -11,6 +11,10 @@ use super::{BlendMode, Layer, LayerKind};
 pub struct LayerState {
     layers: Rc<RefCell<Vec<Layer>>>,
     active: Rc<Cell<Option<usize>>>,
+    /// Multi-selected leaf layer ids, in tree order. Mirrored from the layers
+    /// panel so tools (e.g. Transform) can act on the whole selection, not just
+    /// `active`. Empty means "no multi-selection; fall back to `active`".
+    selected_leaves: Rc<RefCell<Vec<String>>>,
 }
 
 impl LayerState {
@@ -19,6 +23,7 @@ impl LayerState {
         Self {
             layers: Rc::new(RefCell::new(Vec::new())),
             active: Rc::new(Cell::new(None)),
+            selected_leaves: Rc::new(RefCell::new(Vec::new())),
         }
     }
 
@@ -53,6 +58,18 @@ impl LayerState {
         self.active.set(Some(index));
     }
 
+    /// The multi-selected leaf layer ids (tree order). Empty when there is no
+    /// multi-selection - callers then fall back to [`Self::active`].
+    pub fn selected_leaves(&self) -> Vec<String> {
+        self.selected_leaves.borrow().clone()
+    }
+
+    /// Mirror the layers-panel selection (leaf ids, tree order) so tools can
+    /// read the whole selection.
+    pub fn set_selected_leaves(&self, ids: Vec<String>) {
+        *self.selected_leaves.borrow_mut() = ids;
+    }
+
     /// Remove the layer at `index`. Active selection shifts to keep the same logical layer selected.
     pub fn remove(&self, index: usize) {
         let mut layers = self.layers.borrow_mut();
@@ -79,6 +96,7 @@ impl LayerState {
     pub fn clear(&self) {
         self.layers.borrow_mut().clear();
         self.active.set(None);
+        self.selected_leaves.borrow_mut().clear();
     }
 
     pub(crate) fn add_full(&self, id: String, name: impl Into<String>, visible: bool) -> usize {

@@ -18,20 +18,29 @@ use super::super::resources::{Buffer, Image};
 use super::{CANVAS_BYTES_PER_PIXEL, CANVAS_FORMAT, VulkanRenderer, full_image_barrier};
 use crate::document::CompositeStep;
 
-/// Reusable GPU resources for one transform-preview session.
-pub(in crate::renderer) struct TransformPreview {
+/// GPU resources for one transformed layer within a preview session.
+pub(in crate::renderer) struct PreviewLayer {
     /// Upright source pixels (the layer/master being transformed).
     src: Image,
     /// Canvas-sized warp output, sampled by the blend pass.
     warped: Image,
     warped_framebuffer: vk::Framebuffer,
-    descriptor_pool: vk::DescriptorPool,
     /// Transform-pipeline set sampling `src`.
     src_set: vk::DescriptorSet,
     /// Layer-composite-layout set sampling `warped` (the blend pass's src).
     warped_set: vk::DescriptorSet,
-    /// Layer the transform targets (its slot supplies the blend mode + opacity).
+    /// Layer this warped source targets (its slot supplies blend mode + opacity).
     target_idx: usize,
+}
+
+/// Reusable GPU resources for one transform-preview session. Holds one
+/// [`PreviewLayer`] per transformed layer; all share the same affine `push`
+/// (a single drag moves every target rigidly together).
+pub(in crate::renderer) struct TransformPreview {
+    layers: Vec<PreviewLayer>,
+    descriptor_pool: vk::DescriptorPool,
+    /// Lowest target slot index; the strictly-below stack is cacheable up to it.
+    lowest_target: usize,
     /// 2x3 inverse affine (canvas-output UV -> source UV) for the current rect.
     push: [f32; 8],
 }
@@ -43,104 +52,138 @@ impl VulkanRenderer {
         self.transform_preview.is_some()
     }
 
-    /// The layer the active transform preview targets, if any.
+    /// Number of layers the active transform preview targets (0 when none).
     #[must_use]
-    pub fn transform_preview_target(&self) -> Option<usize> {
-        self.transform_preview.as_ref().map(|tp| tp.target_idx)
+    pub fn transform_preview_target_count(&self) -> usize {
+        self.transform_preview.as_ref().map_or(0, |tp| tp.layers.len())
     }
 
-    /// Begin a transform-preview session: upload `source_pixels` and allocate
-    /// the reusable warp/blend resources. The caller has already cleared the
-    /// target layer and composited the below-stack into the canvas.
+    /// The slot index of the `i`-th transform-preview target, if in range. Paired
+    /// with [`Self::transform_preview_target_count`] to test the targets without
+    /// allocating a `Vec` each present frame.
+    #[must_use]
+    pub fn transform_preview_target_at(&self, i: usize) -> Option<usize> {
+        self.transform_preview
+            .as_ref()
+            .and_then(|tp| tp.layers.get(i))
+            .map(|l| l.target_idx)
+    }
+
+    /// Begin a transform-preview session for one or more layers: upload each
+    /// source and allocate the reusable warp/blend resources. The caller has
+    /// already cleared every target layer and composited the below-stack.
     pub fn begin_transform_preview_gpu(
         &mut self,
-        target_idx: usize,
-        source_pixels: &[u8],
-        src_w: u32,
-        src_h: u32,
+        sources: &[(usize, &[u8], u32, u32)],
     ) -> Result<(), RendererError> {
         self.clear_transform_preview_gpu();
-        if target_idx >= self.layer_stack.slots.len() || src_w == 0 || src_h == 0 {
+        if sources.is_empty() {
             return Err(RendererError::LayerIndexOutOfRange);
+        }
+        for &(target_idx, _, w, h) in sources {
+            if target_idx >= self.layer_stack.slots.len() || w == 0 || h == 0 {
+                return Err(RendererError::LayerIndexOutOfRange);
+            }
         }
         // The shared below-stack cache may hold a prior stroke's target; force a
         // rebuild for this transform's below-stack on the first frame.
         self.preview_cache_valid = false;
         self.scoped_cache_valid = false;
 
-        let src_extent = vk::Extent2D {
-            width: src_w,
-            height: src_h,
-        };
-        let src = Image::new_2d(
-            &self.device,
-            &mut self.allocator,
-            "transform-preview-src",
-            CANVAS_FORMAT,
-            src_extent,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-        )?;
+        let n = sources.len() as u32;
+        let sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 2 * n,
+        }];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&sizes)
+            .max_sets(2 * n);
+        let descriptor_pool = unsafe { self.device.create_descriptor_pool(&pool_info, None)? };
         let canvas_extent = self.canvas_extent_2d();
-        let warped = Image::new_2d(
-            &self.device,
-            &mut self.allocator,
-            "transform-preview-warped",
-            CANVAS_FORMAT,
-            canvas_extent,
-            vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-        )?;
-        let warped_framebuffer = super::create_framebuffer_for_view(
-            &self.device,
-            self.canvas_target.render_pass,
-            canvas_extent,
-            warped.view,
-        )?;
 
-        let (descriptor_pool, src_set, warped_set) = self.alloc_transform_preview_sets(
-            src.view,
-            warped.view,
-        )?;
+        let mut layers = Vec::with_capacity(sources.len());
+        for &(target_idx, pixels, width, height) in sources {
+            let src_extent = vk::Extent2D { width, height };
+            let src = Image::new_2d(
+                &self.device,
+                &mut self.allocator,
+                "transform-preview-src",
+                CANVAS_FORMAT,
+                src_extent,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            let warped = Image::new_2d(
+                &self.device,
+                &mut self.allocator,
+                "transform-preview-warped",
+                CANVAS_FORMAT,
+                canvas_extent,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+            )?;
+            let warped_framebuffer = super::create_framebuffer_for_view(
+                &self.device,
+                self.canvas_target.render_pass,
+                canvas_extent,
+                warped.view,
+            )?;
+            let src_set = self.alloc_one_sampler_set(
+                descriptor_pool,
+                self.transform_pipeline.descriptor_set_layout,
+                src.view,
+                self.transform_pipeline.sampler,
+            )?;
+            let warped_set = self.alloc_one_sampler_set(
+                descriptor_pool,
+                self.layer_composite_pipeline.descriptor_set_layout,
+                warped.view,
+                self.layer_composite_pipeline.sampler,
+            )?;
+            let layer = PreviewLayer {
+                src,
+                warped,
+                warped_framebuffer,
+                src_set,
+                warped_set,
+                target_idx,
+            };
+            self.upload_transform_preview_src(&layer, pixels, width, height)?;
+            // Resting layout for this warp target.
+            let warped_handle = layer.warped.handle;
+            self.record_and_submit(|this| {
+                unsafe {
+                    this.device.cmd_pipeline_barrier(
+                        this.command_buffer,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[full_image_barrier(
+                            warped_handle,
+                            vk::ImageLayout::UNDEFINED,
+                            vk::ImageLayout::GENERAL,
+                        )],
+                    );
+                }
+                Ok(())
+            })?;
+            layers.push(layer);
+        }
 
-        let preview = TransformPreview {
-            src,
-            warped,
-            warped_framebuffer,
+        let lowest_target = layers.iter().map(|l| l.target_idx).min().unwrap_or(0);
+        self.transform_preview = Some(TransformPreview {
+            layers,
             descriptor_pool,
-            src_set,
-            warped_set,
-            target_idx,
+            lowest_target,
             // Identity-ish until the first rect arrives; never rendered before.
             push: [0.0; 8],
-        };
-
-        self.upload_transform_preview_src(&preview, source_pixels, src_w, src_h)?;
-        // Resting layout for the warp target.
-        self.record_and_submit(|this| {
-            unsafe {
-                this.device.cmd_pipeline_barrier(
-                    this.command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::ALL_COMMANDS,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[full_image_barrier(
-                        preview.warped.handle,
-                        vk::ImageLayout::UNDEFINED,
-                        vk::ImageLayout::GENERAL,
-                    )],
-                );
-            }
-            Ok(())
-        })?;
-
-        self.transform_preview = Some(preview);
+        });
         Ok(())
     }
 
-    /// Update the affine for the current drag frame.
+    /// Update the affine for the current drag frame (shared by all targets).
     pub fn set_transform_preview_push(&mut self, push: [f32; 8]) {
         if let Some(tp) = self.transform_preview.as_mut() {
             tp.push = push;
@@ -154,10 +197,12 @@ impl VulkanRenderer {
         };
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_framebuffer(tp.warped_framebuffer, None);
+            for layer in tp.layers {
+                self.device.destroy_framebuffer(layer.warped_framebuffer, None);
+                layer.src.destroy(&self.device, &mut self.allocator);
+                layer.warped.destroy(&self.device, &mut self.allocator);
+            }
             self.device.destroy_descriptor_pool(tp.descriptor_pool, None);
-            tp.src.destroy(&self.device, &mut self.allocator);
-            tp.warped.destroy(&self.device, &mut self.allocator);
         }
     }
 
@@ -172,29 +217,38 @@ impl VulkanRenderer {
         let Some(tp) = self.transform_preview.as_ref() else {
             return Ok(());
         };
-        let target = tp.target_idx;
         let push = tp.push;
-        let warped_fb = tp.warped_framebuffer;
-        let warped_img = tp.warped.handle;
-        let src_set = tp.src_set;
-        let warped_set = tp.warped_set;
-        let (mode, opacity) = self.layer_stack.blend(target);
-        let target_visible = visibilities.get(target).copied().unwrap_or(false);
+        let lowest = tp.lowest_target;
+        // (target_idx, warped_fb, warped_img, src_set, warped_set, mode, opacity)
+        let mut warps = Vec::with_capacity(tp.layers.len());
+        for layer in &tp.layers {
+            let (mode, opacity) = self.layer_stack.blend(layer.target_idx);
+            warps.push((
+                layer.target_idx,
+                layer.warped_framebuffer,
+                layer.warped.handle,
+                layer.src_set,
+                layer.warped_set,
+                mode,
+                opacity,
+            ));
+        }
         // From the layer stack (never the canvas image, which other work may
-        // have changed mid-drag). The strictly-below stack is cached in
-        // `preview_below` and rebuilt only when invalid (see begin), so the hot
-        // path is warp + copy + blend target + the (few) layers above.
+        // have changed mid-drag). The strictly-below stack (below the lowest
+        // target) is cached in `preview_below` and rebuilt only when invalid.
         let visible = self.visible_layer_indices(visibilities);
 
         self.record_and_submit(|this| {
-            // 1. Warp the source into the canvas-sized scratch (replace blend).
-            this.cmd_transform_warp(warped_fb, src_set, push);
-            this.barrier(warped_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            // 2. Cache the layers strictly below the target, in z-order.
+            // 1. Warp each source into its canvas-sized scratch (replace blend).
+            for &(_, fb, img, src_set, _, _, _) in &warps {
+                this.cmd_transform_warp(fb, src_set, push);
+                this.barrier(img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            }
+            // 2. Cache the layers strictly below the lowest target, in z-order.
             if !this.preview_cache_valid {
                 this.cmd_clear_image(this.preview_below.handle, [0.0, 0.0, 0.0, 0.0]);
                 for &idx in &visible {
-                    if idx >= target {
+                    if idx >= lowest {
                         break;
                     }
                     this.preview_compose_layer(
@@ -207,22 +261,29 @@ impl VulkanRenderer {
             }
             // 3. preview := cached below stack.
             this.cmd_copy_image_full(this.preview_below.handle, this.preview.handle);
-            // 4. Blend the warped target over the below stack at its mode/opacity.
-            if target_visible {
-                this.cmd_compose_layer_blended(
-                    this.preview.handle,
-                    this.preview_framebuffer,
-                    warped_set,
-                    mode,
-                    opacity,
-                );
-            }
-            // 5. Layers above the target, in z-order.
+            // 4. From the lowest target up, in z-order: for a transformed layer,
+            //    compose its stored image first (the pixels left behind - e.g. the
+            //    unselected part of a selection-lift; transparent no-op for a
+            //    normally-cleared whole-layer transform), then blend the warped
+            //    source over it. Compose every other layer normally.
             for &idx in &visible {
-                if idx <= target {
+                if idx < lowest {
                     continue;
                 }
                 this.preview_compose_layer(this.preview.handle, this.preview_framebuffer, idx);
+                // A transformed layer (in the visible walk, so its slot is
+                // visible): blend its warped source over the stored pixels.
+                if let Some(&(_, _, _, _, warped_set, mode, opacity)) =
+                    warps.iter().find(|w| w.0 == idx)
+                {
+                    this.cmd_compose_layer_blended(
+                        this.preview.handle,
+                        this.preview_framebuffer,
+                        warped_set,
+                        mode,
+                        opacity,
+                    );
+                }
             }
             Ok(())
         })
@@ -241,27 +302,32 @@ impl VulkanRenderer {
         let Some(tp) = self.transform_preview.as_ref() else {
             return Ok(());
         };
-        let target_idx = tp.target_idx;
-        let warped_fb = tp.warped_framebuffer;
-        let warped_img = tp.warped.handle;
-        let src_set = tp.src_set;
-        let warped_set = tp.warped_set;
         let push = tp.push;
-        let (mode, opacity) = self.layer_stack.blend(target_idx);
-        let visible = visibilities.get(target_idx).copied().unwrap_or(false);
-        // Warp the source into the scratch up front; the walk then composes it.
+        // Warp every target's source up front, then build the scoped composite
+        // with each target's warped layer spliced in at its place in the tree so
+        // adjustments (incl. folder-scoped) apply live over the transform.
+        let mut warps = Vec::with_capacity(tp.layers.len());
+        for layer in &tp.layers {
+            let (mode, opacity) = self.layer_stack.blend(layer.target_idx);
+            let visible = visibilities.get(layer.target_idx).copied().unwrap_or(false);
+            warps.push((
+                layer.target_idx,
+                layer.warped_framebuffer,
+                layer.warped.handle,
+                layer.src_set,
+                super::adjust_ops::PreviewTarget::Warp { set: layer.warped_set, mode, opacity, visible },
+            ));
+        }
         self.record_and_submit(|this| {
-            this.cmd_transform_warp(warped_fb, src_set, push);
-            this.barrier(warped_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            for &(_, fb, img, src_set, _) in &warps {
+                this.cmd_transform_warp(fb, src_set, push);
+                this.barrier(img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            }
             Ok(())
         })?;
-        let target = super::adjust_ops::PreviewTarget::Warp {
-            set: warped_set,
-            mode,
-            opacity,
-            visible,
-        };
-        self.build_preview_scoped(steps, target_idx, target)
+        let targets: Vec<(usize, super::adjust_ops::PreviewTarget)> =
+            warps.iter().map(|&(idx, _, _, _, target)| (idx, target)).collect();
+        self.build_preview_scoped_multi(steps, &targets)
     }
 
     /// As [`Self::render_transform_preview_scoped`] but reads the preview back
@@ -327,37 +393,6 @@ impl VulkanRenderer {
         self.cmd_end_fullscreen_pass();
     }
 
-    /// Allocate the descriptor pool + the source (transform-layout) and warped
-    /// (layer-composite-layout) sets for a transform-preview session.
-    fn alloc_transform_preview_sets(
-        &self,
-        src_view: vk::ImageView,
-        warped_view: vk::ImageView,
-    ) -> Result<(vk::DescriptorPool, vk::DescriptorSet, vk::DescriptorSet), RendererError> {
-        let sizes = [vk::DescriptorPoolSize {
-            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-            descriptor_count: 2,
-        }];
-        let pool_info = vk::DescriptorPoolCreateInfo::default()
-            .pool_sizes(&sizes)
-            .max_sets(2);
-        let pool = unsafe { self.device.create_descriptor_pool(&pool_info, None)? };
-
-        let src_set = self.alloc_one_sampler_set(
-            pool,
-            self.transform_pipeline.descriptor_set_layout,
-            src_view,
-            self.transform_pipeline.sampler,
-        )?;
-        let warped_set = self.alloc_one_sampler_set(
-            pool,
-            self.layer_composite_pipeline.descriptor_set_layout,
-            warped_view,
-            self.layer_composite_pipeline.sampler,
-        )?;
-        Ok((pool, src_set, warped_set))
-    }
-
     fn alloc_one_sampler_set(
         &self,
         pool: vk::DescriptorPool,
@@ -386,7 +421,7 @@ impl VulkanRenderer {
     /// Upload the source pixels into the preview's source image (one-time).
     fn upload_transform_preview_src(
         &mut self,
-        preview: &TransformPreview,
+        preview: &PreviewLayer,
         pixels: &[u8],
         src_w: u32,
         src_h: u32,

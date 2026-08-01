@@ -79,10 +79,18 @@ struct GroupSpan {
 /// target when the target's `Layer` step falls between its `EnterGroup` and
 /// `ExitGroup`. Folders are numbered in pre-order so the numbering is stable for
 /// a fixed step stream (which holds for the duration of one stroke).
-fn scoped_group_spans(steps: &[CompositeStep], target_idx: usize) -> Vec<Option<GroupSpan>> {
-    let target_step = steps
+fn scoped_group_spans(
+    steps: &[CompositeStep],
+    is_target: impl Fn(usize) -> bool,
+) -> Vec<Option<GroupSpan>> {
+    let target_steps: Vec<usize> = steps
         .iter()
-        .position(|s| matches!(s, CompositeStep::Layer(i) if *i == target_idx));
+        .enumerate()
+        .filter_map(|(i, s)| match s {
+            CompositeStep::Layer(idx) if is_target(*idx) => Some(i),
+            _ => None,
+        })
+        .collect();
     let mut spans = vec![None; steps.len()];
     let mut open: Vec<(usize, usize)> = Vec::new(); // (enter index, ordinal)
     let mut next_ordinal = 0usize;
@@ -94,7 +102,7 @@ fn scoped_group_spans(steps: &[CompositeStep], target_idx: usize) -> Vec<Option<
             }
             CompositeStep::ExitGroup => {
                 if let Some((enter, ordinal)) = open.pop() {
-                    let contains_target = target_step.is_some_and(|t| t > enter && t < i);
+                    let contains_target = target_steps.iter().any(|&t| t > enter && t < i);
                     spans[enter] = Some(GroupSpan {
                         ordinal,
                         exit: i,
@@ -342,8 +350,22 @@ impl VulkanRenderer {
         target_idx: usize,
         target: PreviewTarget,
     ) -> Result<(), RendererError> {
+        self.build_preview_scoped_multi(steps, &[(target_idx, target)])
+    }
+
+    /// As [`Self::build_preview_scoped`] but with several in-flight targets (the
+    /// multi-layer transform): each `Layer` step matching a target composes its
+    /// warped/stroked content; folders containing any target are not cached.
+    pub(super) fn build_preview_scoped_multi(
+        &mut self,
+        steps: &[CompositeStep],
+        targets: &[(usize, PreviewTarget)],
+    ) -> Result<(), RendererError> {
         self.clip = None;
-        let spans = scoped_group_spans(steps, target_idx);
+        // Target counts are tiny (1 for strokes/gradients/filters, a handful for
+        // groups), so a linear scan beats a per-frame HashMap allocation.
+        let find_target = |idx: usize| targets.iter().find(|(t, _)| *t == idx).map(|(_, t)| *t);
+        let spans = scoped_group_spans(steps, |idx| find_target(idx).is_some());
         let root = self.preview_accumulator();
         self.record_and_submit(|this| {
             this.cmd_clear_image(root.image, [0.0, 0.0, 0.0, 0.0]);
@@ -365,9 +387,9 @@ impl VulkanRenderer {
             match steps[i] {
                 CompositeStep::Layer(idx) => {
                     let acc = frames.last().expect("non-empty accumulator stack").acc;
-                    if idx == target_idx {
+                    if let Some(target) = find_target(idx) {
                         self.record_and_submit(|this| {
-                            this.cmd_compose_preview_target(acc, target_idx, target);
+                            this.cmd_compose_preview_target(acc, idx, target);
                             Ok(())
                         })?;
                     } else if self.layer_stack.slots[idx].adjustment.is_some() {
@@ -499,6 +521,13 @@ impl VulkanRenderer {
                 );
             }
             PreviewTarget::Warp { set, mode, opacity, visible } => {
+                // Compose the layer's stored pixels first (the part left behind -
+                // e.g. the unselected region of a selection-lift; transparent
+                // no-op for a normally-cleared whole-layer transform), then the
+                // warped source over it.
+                let (lmode, lopacity) = self.layer_stack.blend(target_idx);
+                let lset = self.layer_stack.slots[target_idx].descriptor_set;
+                self.cmd_compose_layer_blended(acc.image, acc.framebuffer, lset, lmode, lopacity);
                 if visible {
                     self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
                 }
