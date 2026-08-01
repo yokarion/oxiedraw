@@ -891,7 +891,7 @@ fn transform_preview_respects_folder_scope() {
     // Start an identity transform on the target (warped == source).
     canvas.layers().set_active(Some(target));
     canvas
-        .begin_transform_preview_gpu(target, &left_half_red(size), 64, 64)
+        .begin_transform_preview_gpu(&[(target, &left_half_red(size), 64, 64)])
         .unwrap();
     let rect = TransformRect { cx: 32.0, cy: 32.0, w: 64.0, h: 64.0, angle: 0.0 };
     canvas.set_transform_preview(rect, rect, 64, 64);
@@ -942,7 +942,7 @@ fn transform_preview_applies_flat_adjustment() {
 
     canvas.layers().set_active(Some(target));
     canvas
-        .begin_transform_preview_gpu(target, &solid(size, 0, 0, 255), 64, 64)
+        .begin_transform_preview_gpu(&[(target, &solid(size, 0, 0, 255), 64, 64)])
         .unwrap();
     let rect = TransformRect { cx: 32.0, cy: 32.0, w: 64.0, h: 64.0, angle: 0.0 };
     canvas.set_transform_preview(rect, rect, 64, 64);
@@ -951,6 +951,51 @@ fn transform_preview_applies_flat_adjustment() {
     assert!(
         out[0] <= 6 && out[1] <= 6 && out[2] <= 6,
         "flat adjustment must blacken the transformed layer, got B{} G{} R{}",
+        out[0], out[1], out[2]
+    );
+}
+
+/// A multi-layer (group) transform must also run the adjustment chain live: an
+/// adjustment above two transformed layers adjusts the whole warped stack.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_applies_adjustment_multi_target() {
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("a", &solid(size, 0, 0, 255))
+        .unwrap();
+    let b = canvas
+        .add_layer_with_pixels("b", &solid(size, 0, 0, 255))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    // Transform both content layers together (identity), adjustment above both.
+    canvas
+        .begin_transform_preview_gpu(&[
+            (a, &solid(size, 0, 0, 255), 64, 64),
+            (b, &solid(size, 0, 0, 255), 64, 64),
+        ])
+        .unwrap();
+    let rect = TransformRect { cx: 32.0, cy: 32.0, w: 64.0, h: 64.0, angle: 0.0 };
+    canvas.set_transform_preview(rect, rect, 64, 64);
+
+    let out = canvas.read_transform_preview().unwrap();
+    assert!(
+        out[0] <= 6 && out[1] <= 6 && out[2] <= 6,
+        "adjustment must blacken the multi-target transform, got B{} G{} R{}",
         out[0], out[1], out[2]
     );
 }

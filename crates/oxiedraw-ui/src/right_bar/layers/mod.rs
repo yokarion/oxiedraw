@@ -5,7 +5,7 @@
 mod actions;
 mod thumbnail;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::f64::consts::TAU;
 use std::rc::Rc;
@@ -207,6 +207,10 @@ pub(super) struct Ui {
     // would cancel an in-progress stylus reorder). `value` is the content pixel
     // at the top of the viewport.
     pub(super) vadj: gtk::Adjustment,
+    // Cheap hash of the last selection (active, active_group, multi_selected)
+    // mirrored into LayerState, so the per-draw sync can skip the work when
+    // nothing changed. A drag-reorder resets it via `invalidate_selection_sync`.
+    synced_selection_sig: Rc<Cell<Option<u64>>>,
 }
 
 impl Ui {
@@ -229,7 +233,26 @@ impl Ui {
             mask_view: Rc::new(RefCell::new(None)),
             hover: Rc::new(RefCell::new(None)),
             vadj: gtk::Adjustment::new(0.0, 0.0, 0.0, SLOT_HEIGHT, 0.0, 0.0),
+            synced_selection_sig: Rc::new(Cell::new(None)),
         }
+    }
+
+    /// Cheap allocation-free hash of the raw selection inputs, for the per-draw
+    /// sync guard. `multi_selected` is a set, so its ids are folded in with XOR
+    /// (order-independent) plus the count.
+    fn selection_sig(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.state.active().hash(&mut h);
+        self.active_group.borrow().hash(&mut h);
+        let mut acc = h.finish();
+        let ms = self.multi_selected.borrow();
+        for id in ms.iter() {
+            let mut ih = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut ih);
+            acc ^= ih.finish();
+        }
+        acc.wrapping_add(ms.len() as u64)
     }
 
     /// Content pixel currently at the top of the viewport.
@@ -239,6 +262,10 @@ impl Ui {
 
     /// Reload the blend-mode/opacity controls from the current selection.
     fn sync_blend_controls(&self) {
+        // Selection (or the tree, via `refresh`) just changed at every caller of
+        // this - force the shared selection mirror fresh now (not only on the next
+        // panel redraw) so a tool switch right after a multi-select sees it.
+        self.sync_selection_to_state_forced();
         let cb = self.blend_sync.borrow().clone();
         if let Some(cb) = cb {
             cb();
@@ -296,6 +323,69 @@ impl Ui {
                 }
         }
         ordered
+    }
+
+    // All selected leaf ids in tree order, INCLUDING leaves inside collapsed
+    // groups (selected_layer_ids_in_order only walks expanded rows). Mirrored
+    // into LayerState so tools (Transform) act on the whole selection.
+    pub(super) fn selected_leaf_ids_all(&self) -> Vec<String> {
+        let snapshot = self.state.snapshot();
+        let tree = self.tree.borrow();
+        let snap_ids: HashSet<&str> = snapshot.iter().map(|l| l.id.as_str()).collect();
+        let mut wanted: HashSet<String> = HashSet::new();
+        for id in self.multi_selected.borrow().iter() {
+            if snap_ids.contains(id.as_str()) {
+                wanted.insert(id.clone());
+            } else {
+                for leaf in group_leaf_ids(&tree, id) {
+                    wanted.insert(leaf);
+                }
+            }
+        }
+        if let Some(id) = self.active_id() {
+            wanted.insert(id);
+        }
+        if let Some(gid) = self.active_group.borrow().as_ref() {
+            for leaf in group_leaf_ids(&tree, gid) {
+                wanted.insert(leaf);
+            }
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        leaf_ids_top_first(&tree)
+            .into_iter()
+            .filter(|id| wanted.contains(id))
+            .collect()
+    }
+
+    // Mirror the current selection into shared LayerState so tools can read the
+    // whole selection, not just the active layer. Guarded on a cheap signature so
+    // the per-draw call is a no-op when the selection hasn't changed; use
+    // `sync_selection_to_state_forced` after a tree change (same raw selection,
+    // different leaves).
+    pub(super) fn sync_selection_to_state(&self) {
+        let sig = self.selection_sig();
+        if self.synced_selection_sig.get() == Some(sig) {
+            return;
+        }
+        self.state.set_selected_leaves(self.selected_leaf_ids_all());
+        self.synced_selection_sig.set(Some(sig));
+    }
+
+    // Mirror the selection unconditionally (the raw-selection signature can be
+    // unchanged while the resolved leaves differ, e.g. after a group edit).
+    pub(super) fn sync_selection_to_state_forced(&self) {
+        self.state.set_selected_leaves(self.selected_leaf_ids_all());
+        self.synced_selection_sig.set(Some(self.selection_sig()));
+    }
+
+    // Invalidate the sync guard so the next `sync_selection_to_state` resyncs
+    // once. Call after a tree edit that changes group membership without changing
+    // the raw selection (a drag-reorder), whose resolved leaves the signature
+    // can't otherwise detect.
+    pub(super) fn invalidate_selection_sync(&self) {
+        self.synced_selection_sig.set(None);
     }
 
     // Top-level selected nodes (layers and whole subgroups) in tree order, for
@@ -1936,6 +2026,9 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
     let ui = ui.clone();
     area.set_draw_func(move |widget, ctx, width_px, _h| {
         let palette = Palette::resolve(widget);
+        // Keep the shared selection mirror fresh for tools (e.g. Transform);
+        // any selection change queues a redraw, so this always runs after it.
+        ui.sync_selection_to_state();
         let snapshot = ui.state.snapshot();
         let drag = ui.drag.borrow().clone();
         let active_id = ui.active_id();
@@ -3023,6 +3116,9 @@ fn install_list_input(
                                 tree_after,
                             );
 
+                            // Group membership may have changed without touching
+                            // the raw selection; force the next sync to re-resolve.
+                            ui.invalidate_selection_sync();
                             sync_height(&area_w, &ui);
                             redraw.request();
                         }

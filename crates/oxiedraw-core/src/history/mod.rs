@@ -19,7 +19,9 @@ mod stack;
 #[allow(clippy::unwrap_used)]
 mod apply_tests;
 
-pub use action::{CropLayer, Direction, FoldedLayer, HistoryAction, SelectionSnapshot};
+pub use action::{
+    CropLayer, Direction, FoldedLayer, HistoryAction, LayerExtension, SelectionSnapshot,
+};
 pub use snapshot::{LayerPatch, PatchBounds};
 pub use stack::{DEFAULT_CAPACITY, HistoryConfig, HistoryEntry, HistoryStack};
 

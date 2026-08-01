@@ -70,10 +70,19 @@ pub enum HistoryAction {
         layer_id: String,
         patch: LayerPatch,
     },
-    /// Transform apply - pixels remapped into a single layer.
+    /// Transform apply - pixels remapped into a single layer. `ext_before`/
+    /// `ext_after` carry the layer's off-canvas extension state so undo/redo can
+    /// reconcile the UI's (session-only) extension map: outer `None` means "this
+    /// transform doesn't own the extension" (a selection lift), `Some(None)`
+    /// means "no extension", `Some(Some(e))` means that extension. Session-only
+    /// (not persisted; a loaded transform reconciles to "untouched").
     Transform {
         layer_id: String,
         patch: LayerPatch,
+        #[serde(skip)]
+        ext_before: Option<Option<LayerExtension>>,
+        #[serde(skip)]
+        ext_after: Option<Option<LayerExtension>>,
     },
     /// Filter apply (HSV / invert / blur / sharpen) on a single layer. Patch
     /// carries the before+after BGRA8 of the changed region. Multi-layer
@@ -245,6 +254,20 @@ pub enum HistoryAction {
     },
 }
 
+/// Off-canvas pixel data a transform stashed beyond the canvas (the UI's
+/// extension map keys these by layer id). Carried session-only in
+/// [`HistoryAction::Transform`] so undo/redo restore it. `pixels` is `Rc`-shared
+/// so the live map and the undo/redo snapshots alias one buffer (cloning an
+/// extension is a refcount bump, not a pixel copy).
+#[derive(Debug, Clone)]
+pub struct LayerExtension {
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub pixels: std::rc::Rc<Vec<u8>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FoldedLayer {
     pub idx: usize,
@@ -279,6 +302,42 @@ const fn default_blend() -> BlendMode {
 }
 
 impl HistoryAction {
+    /// The off-canvas extension state each transformed layer should hold after
+    /// applying this action in `direction` (recursing into `Batch`), so the UI
+    /// can reconcile its extension map with undo/redo. Each entry's outer `None`
+    /// means "leave this layer's extension untouched".
+    #[must_use]
+    pub fn transform_ext_reconcile(
+        &self,
+        direction: Direction,
+    ) -> Vec<(String, Option<Option<LayerExtension>>)> {
+        let mut out = Vec::new();
+        self.collect_transform_ext_reconcile(direction, &mut out);
+        out
+    }
+
+    fn collect_transform_ext_reconcile(
+        &self,
+        direction: Direction,
+        out: &mut Vec<(String, Option<Option<LayerExtension>>)>,
+    ) {
+        match self {
+            Self::Transform { layer_id, ext_before, ext_after, .. } => {
+                let ext = match direction {
+                    Direction::Backward => ext_before,
+                    Direction::Forward => ext_after,
+                };
+                out.push((layer_id.clone(), ext.clone()));
+            }
+            Self::Batch { actions, .. } => {
+                for a in actions {
+                    a.collect_transform_ext_reconcile(direction, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Short label for UI display (menu hint, tooltip).
     pub fn label(&self) -> &str {
         match self {

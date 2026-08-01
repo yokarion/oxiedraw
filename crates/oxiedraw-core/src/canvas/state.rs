@@ -73,6 +73,10 @@ pub struct Canvas {
     /// Previous smudge dab centre, so each dab's drag vector can be computed.
     /// Reset at stroke start.
     smudge_prev_center: Option<[f32; 2]>,
+    /// When true, [`Self::recomposite_canvas`] skips the (expensive) GPU
+    /// composite so a batch of layer edits can recomposite once at the end
+    /// instead of per edit. See [`Self::defer_recomposite`].
+    defer_recomposite: bool,
 }
 
 impl Canvas {
@@ -104,6 +108,7 @@ impl Canvas {
             active_symmetry: None,
             is_smudge_stroke: false,
             smudge_prev_center: None,
+            defer_recomposite: false,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -626,7 +631,32 @@ impl Canvas {
 
     /// Re-composite the canvas image from the current layer state.
     /// Called automatically after any layer-affecting mutation.
+    /// Suspend/resume the GPU recomposite that layer edits normally trigger.
+    /// Wrap a batch of edits (e.g. committing a multi-layer transform) in
+    /// `defer_recomposite(true) ... defer_recomposite(false); recomposite()?` so
+    /// the canvas is composited once instead of once per edit.
+    pub fn defer_recomposite(&mut self, on: bool) {
+        self.defer_recomposite = on;
+    }
+
+    /// Force a canvas recomposite now, ignoring the defer flag. Pairs with
+    /// [`Self::defer_recomposite`] to flush a deferred batch.
+    pub fn recomposite(&mut self) -> Result<(), RendererError> {
+        let was_deferred = self.defer_recomposite;
+        self.defer_recomposite = false;
+        let r = self.recomposite_canvas();
+        self.defer_recomposite = was_deferred;
+        r
+    }
+
     fn recomposite_canvas(&mut self) -> Result<(), RendererError> {
+        // Batched edits skip the composite; the caller flushes once via
+        // `recomposite()`. Preview-cache invalidation still matters so it isn't
+        // reused stale after the batch.
+        if self.defer_recomposite {
+            self.renderer.invalidate_preview_cache();
+            return Ok(());
+        }
         let snapshot = self.layers.snapshot();
         let visibilities: Vec<bool> = snapshot.iter().map(|l| l.visible).collect();
         // Folder-scoped path only when there are adjustments to clip AND the
@@ -984,8 +1014,13 @@ impl Canvas {
                 // target (the warped layer must preview adjusted) or below it (the
                 // fast path skips adjustment slots, so it would drop the effect on
                 // the static layers under the one being transformed).
-                let target = self.renderer.transform_preview_target();
-                if target.is_some_and(|t| self.effective_adjustment_excluding(t)) {
+                let n = self.renderer.transform_preview_target_count();
+                let needs_scoped = (0..n).any(|i| {
+                    self.renderer
+                        .transform_preview_target_at(i)
+                        .is_some_and(|t| self.effective_adjustment_excluding(t))
+                });
+                if needs_scoped {
                     let snapshot = self.layers.snapshot();
                     let steps = self.preview_steps(&snapshot);
                     self.renderer.render_transform_preview_scoped(&steps, &visibilities)?;
@@ -1794,19 +1829,15 @@ impl Canvas {
         Ok((pixels, ext_x, ext_y, out_w, out_h))
     }
 
-    /// Start the live GPU transform preview for `layer_idx`. `source_pixels`
-    /// are the upright `src_w x src_h` pixels being transformed (already lifted
-    /// out of the layer, which the caller has cleared). The caller then drives
-    /// it per drag-frame with [`Self::set_transform_preview`].
+    /// Start the live GPU transform preview for one or more layers. Each source
+    /// is `(layer_idx, upright pixels, src_w, src_h)`, already lifted out of the
+    /// (cleared) layer. All targets share one affine, driven per drag-frame with
+    /// [`Self::set_transform_preview`].
     pub fn begin_transform_preview_gpu(
         &mut self,
-        layer_idx: usize,
-        source_pixels: &[u8],
-        src_w: u32,
-        src_h: u32,
+        sources: &[(usize, &[u8], u32, u32)],
     ) -> Result<(), RendererError> {
-        self.renderer
-            .begin_transform_preview_gpu(layer_idx, source_pixels, src_w, src_h)?;
+        self.renderer.begin_transform_preview_gpu(sources)?;
         self.bump_version();
         Ok(())
     }
@@ -1845,8 +1876,13 @@ impl Canvas {
     /// test helper; the interactive path presents it instead.
     pub fn read_transform_preview(&mut self) -> Result<Vec<u8>, RendererError> {
         let visibilities = self.visibilities();
-        let target = self.renderer.transform_preview_target();
-        if target.is_some_and(|t| self.effective_adjustment_above(t)) {
+        let n = self.renderer.transform_preview_target_count();
+        let needs_scoped = (0..n).any(|i| {
+            self.renderer
+                .transform_preview_target_at(i)
+                .is_some_and(|t| self.effective_adjustment_above(t))
+        });
+        if needs_scoped {
             let snapshot = self.layers.snapshot();
             let steps = self.preview_steps(&snapshot);
             self.renderer.read_transform_preview_scoped(&steps, &visibilities)

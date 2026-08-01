@@ -19,8 +19,8 @@ use oxiedraw_core::shape_correction::{ShapeKind, detect_correction};
 use oxiedraw_core::text::{ResizeMode, TextBox};
 use oxiedraw_core::tools::{
     CropHandle, CropRect, CropState, FillState, FillTool, GradientState, PendingMarquee,
-    SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, Tool, ToolState,
-    TransformFilter, TransformHandle, TransformState,
+    SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, TargetKind, Tool,
+    ToolState, TransformFilter, TransformHandle, TransformState,
 };
 use oxiedraw_utils::geometry::{Point, Size, TransformRect};
 use relm4::gtk;
@@ -972,7 +972,10 @@ impl PrimaryDragHandler {
         self.ensure_transform_gpu_preview();
         // Text: re-render the warp source as the box grows to keep it crisp.
         self.refresh_text_transform_source(rect);
-        if let Some((sw, sh)) = self.transform.original_src_dims.get()
+        // All targets share one affine; multi targets are canvas-sized, so the
+        // first target's source dims drive the shared push.
+        let dims = self.transform.targets.borrow().first().map(|t| t.src_dims);
+        if let Some((sw, sh)) = dims
             && let Some(orig) = self.transform.original_rect.get()
         {
             let mut canvas = self.canvas.borrow_mut();
@@ -983,19 +986,21 @@ impl PrimaryDragHandler {
         }
     }
 
-    /// Re-render a text layer's warp source at the current visible resolution
-    /// once the box grows past it, so scaling stays crisp during the drag. Only
-    /// growth triggers this (downscaling a crisp source is already sharp); the
-    /// headroom keeps small further growth from re-rendering every frame.
+    /// Re-render a lone text layer's warp source at the current visible
+    /// resolution once the box grows past it, so scaling stays crisp during the
+    /// drag. Only the single-target case: a text layer inside a multi-selection
+    /// warps its canvas pixels and re-renders crisply only at commit.
     fn refresh_text_transform_source(&self, rect: TransformRect) {
-        if self.transform.text.borrow().is_none() {
-            return;
-        }
-        let Some(idx) = self.transform.original_layer_idx.get() else {
-            return;
-        };
-        let Some((src_w, src_h)) = self.transform.original_src_dims.get() else {
-            return;
+        let (idx, src_w, src_h) = {
+            let targets = self.transform.targets.borrow();
+            if targets.len() != 1 {
+                return;
+            }
+            let t = &targets[0];
+            if !matches!(t.kind, TargetKind::Text { .. }) {
+                return;
+            }
+            (t.layer_idx, t.src_dims.0, t.src_dims.1)
         };
         #[allow(clippy::cast_precision_loss)]
         let (src_w_f, src_h_f) = (src_w as f32, src_h as f32);
@@ -1020,40 +1025,41 @@ impl PrimaryDragHandler {
         let orig_full = TransformRect::new(sw as f32 / 2.0, sh as f32 / 2.0, sw as f32, sh as f32, 0.0);
         {
             let mut canvas = self.canvas.borrow_mut();
-            if canvas.begin_transform_preview_gpu(idx, &pixels, sw, sh).is_err() {
+            if canvas.begin_transform_preview_gpu(&[(idx, &pixels, sw, sh)]).is_err() {
                 return;
             }
         }
         self.paintable.set_transform_gpu_preview(true);
         self.paintable.set_transform_source(Some(&pixels), sw, sh, Some(orig_full));
-        self.transform.original_src_dims.set(Some((sw, sh)));
         self.transform.original_rect.set(Some(orig_full));
-        *self.transform.original_pixels.borrow_mut() = Some(pixels);
+        if let Some(t) = self.transform.targets.borrow_mut().get_mut(0) {
+            t.src_dims = (sw, sh);
+            t.orig_bounds = orig_full;
+            t.pixels = pixels;
+        }
     }
 
-    /// Begin the live GPU transform preview if it isn't already running. Reads
-    /// the source pixels + dims the active transform captured.
+    /// Begin the live GPU transform preview if it isn't already running, from the
+    /// captured targets. Falls back to the GSK overlay on a dims/pixels mismatch.
     fn ensure_transform_gpu_preview(&self) {
         let mut canvas = self.canvas.borrow_mut();
         if canvas.transform_preview_active() {
             return;
         }
-        let Some(idx) = self.transform.original_layer_idx.get() else {
-            return;
-        };
-        let Some((w, h)) = self.transform.original_src_dims.get() else {
-            return;
-        };
-        let pixels = self.transform.original_pixels.borrow().clone();
-        let Some(pixels) = pixels else {
-            return;
-        };
-        // Guard against a dims/pixels mismatch uploading garbage; fall back to
-        // the GSK overlay if they disagree.
-        if pixels.len() != (w as usize) * (h as usize) * 4 {
+        let targets = self.transform.targets.borrow();
+        if targets.is_empty() {
             return;
         }
-        match canvas.begin_transform_preview_gpu(idx, &pixels, w, h) {
+        let mut sources: Vec<(usize, &[u8], u32, u32)> = Vec::with_capacity(targets.len());
+        for t in targets.iter() {
+            let (w, h) = t.src_dims;
+            // Guard against a dims/pixels mismatch uploading garbage.
+            if t.pixels.len() != (w as usize) * (h as usize) * 4 {
+                return;
+            }
+            sources.push((t.layer_idx, t.pixels.as_slice(), w, h));
+        }
+        match canvas.begin_transform_preview_gpu(&sources) {
             Ok(()) => self.paintable.set_transform_gpu_preview(true),
             Err(e) => tracing::error!(error = %e, "begin_transform_preview_gpu failed"),
         }

@@ -51,6 +51,65 @@ fn paint(c: &mut Canvas, idx: usize, color: [f32; 4]) -> Vec<u8> {
 // Pixel patch variants: Stroke / Fill / Clear / Transform share one apply path
 // ---------------------------------------------------------------------------
 
+// `transform_ext_reconcile` maps undo/redo direction to each transformed layer's
+// before/after off-canvas extension state, recursing into batches. No GPU needed.
+#[test]
+fn transform_ext_reconcile_maps_direction_to_before_after() {
+    use crate::history::{Direction, LayerExtension};
+
+    let patch = || LayerPatch::from_full_diff(&[0, 0, 0, 0], &[0, 0, 0, 255], 1, 1).unwrap();
+    let ext = LayerExtension {
+        offset_x: -1,
+        offset_y: 0,
+        width: 2,
+        height: 2,
+        pixels: std::rc::Rc::new(vec![0; 16]),
+    };
+    let t = HistoryAction::Transform {
+        layer_id: "L".into(),
+        patch: patch(),
+        ext_before: Some(None),             // no extension before the transform
+        ext_after: Some(Some(ext.clone())), // an extension after
+    };
+    // Undo restores the before state; redo the after.
+    let undo = t.transform_ext_reconcile(Direction::Backward);
+    assert_eq!(undo.len(), 1);
+    assert_eq!(undo[0].0, "L");
+    assert!(matches!(undo[0].1, Some(None)), "undo -> no extension");
+    let redo = t.transform_ext_reconcile(Direction::Forward);
+    assert!(matches!(redo[0].1, Some(Some(_))), "redo -> extension restored");
+
+    // Non-transform reports nothing; a batch collects its transforms in order.
+    assert!(
+        HistoryAction::LayerReorder { from: 0, to: 1 }
+            .transform_ext_reconcile(Direction::Backward)
+            .is_empty()
+    );
+    let batch = HistoryAction::Batch {
+        label: "Transform".into(),
+        actions: vec![
+            // A selection-lift transform doesn't own the extension (outer None).
+            HistoryAction::Transform {
+                layer_id: "A".into(),
+                patch: patch(),
+                ext_before: None,
+                ext_after: None,
+            },
+            HistoryAction::LayerReorder { from: 0, to: 1 },
+            HistoryAction::Transform {
+                layer_id: "B".into(),
+                patch: patch(),
+                ext_before: Some(None),
+                ext_after: Some(None),
+            },
+        ],
+    };
+    let recon = batch.transform_ext_reconcile(Direction::Forward);
+    let ids: Vec<&str> = recon.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, vec!["A", "B"]);
+    assert!(recon[0].1.is_none(), "selection-lift transform leaves the extension untouched");
+}
+
 /// Helper: round-trip a single `{layer_id, patch}` action built from a
 /// transparent -> red diff on layer 0.
 fn patch_round_trip(make: impl Fn(String, LayerPatch) -> HistoryAction) {
@@ -93,7 +152,12 @@ fn clear_round_trip() {
 #[test]
 #[ignore = "requires vulkan loader and device"]
 fn transform_round_trip() {
-    patch_round_trip(|layer_id, patch| HistoryAction::Transform { layer_id, patch });
+    patch_round_trip(|layer_id, patch| HistoryAction::Transform {
+        layer_id,
+        patch,
+        ext_before: None,
+        ext_after: None,
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -248,7 +312,7 @@ fn transform_preview_identity_matches_committed_blend() {
     c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
     let mut above = Vec::new();
     c.begin_transform_preview(top, &mut above).expect("begin preview base");
-    c.begin_transform_preview_gpu(top, &src, W, H).expect("begin gpu preview");
+    c.begin_transform_preview_gpu(&[(top, &src, W, H)]).expect("begin gpu preview");
     #[allow(clippy::cast_precision_loss)]
     let rect = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
     c.set_transform_preview(rect, rect, W, H);
@@ -292,7 +356,7 @@ fn transform_preview_keeps_layers_below() {
     c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
     let mut above = Vec::new();
     c.begin_transform_preview(top, &mut above).expect("begin base");
-    c.begin_transform_preview_gpu(top, &src, W, H).expect("begin gpu");
+    c.begin_transform_preview_gpu(&[(top, &src, W, H)]).expect("begin gpu");
     #[allow(clippy::cast_precision_loss)]
     let orig = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
     #[allow(clippy::cast_precision_loss)]
@@ -337,7 +401,7 @@ fn transform_preview_partial_layer_tight_bounds() {
     c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
     let mut above = Vec::new();
     c.begin_transform_preview(top, &mut above).expect("begin base");
-    c.begin_transform_preview_gpu(top, &src, W, H).expect("begin gpu");
+    c.begin_transform_preview_gpu(&[(top, &src, W, H)]).expect("begin gpu");
     c.set_transform_preview(orig, orig, W, H);
 
     let preview = c.read_transform_preview().expect("read preview");
@@ -346,6 +410,230 @@ fn transform_preview_partial_layer_tight_bounds() {
         "identity preview of a partial layer must equal the committed canvas"
     );
     c.clear_transform_preview();
+}
+
+// Deferring the recomposite over a batch of layer edits and flushing once must
+// yield the same canvas as compositing eagerly after each edit.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn deferred_recomposite_matches_eager() {
+    use crate::document::BlendMode;
+
+    let mut eager = canvas();
+    let et = eager.add_layer("Top").expect("add");
+    eager.set_layer_blend(et, BlendMode::Normal, 0.5).expect("blend");
+    eager.clear_layer_at(0, [0.9, 0.1, 0.1, 1.0]).expect("bottom");
+    eager.clear_layer_at(et, [0.1, 0.1, 0.9, 1.0]).expect("top");
+    let eager_px = eager.read_pixels().expect("eager");
+
+    let mut deferred = canvas();
+    let dt = deferred.add_layer("Top").expect("add");
+    deferred.set_layer_blend(dt, BlendMode::Normal, 0.5).expect("blend");
+    deferred.defer_recomposite(true);
+    deferred.clear_layer_at(0, [0.9, 0.1, 0.1, 1.0]).expect("bottom");
+    deferred.clear_layer_at(dt, [0.1, 0.1, 0.9, 1.0]).expect("top");
+    deferred.defer_recomposite(false);
+    deferred.recomposite().expect("flush");
+    let deferred_px = deferred.read_pixels().expect("deferred");
+
+    assert_eq!(eager_px, deferred_px, "one flush must match per-edit compositing");
+}
+
+// Multi-layer transform: two layers warped together at identity must composite
+// to the same pixels as the committed canvas (the N-target preview walk keeps
+// every target in its z-slot).
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_multi_target_identity_matches_committed() {
+    use crate::document::BlendMode;
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let mut c = canvas();
+    paint(&mut c, 0, [0.9, 0.1, 0.1, 1.0]); // bottom: red, fills canvas
+    let top = c.add_layer("Top").expect("add");
+    // Top: a green square in one quadrant, transparent elsewhere.
+    let mut top_px = vec![0u8; (W * H * 4) as usize];
+    for y in 0..H / 2 {
+        for x in 0..W / 2 {
+            let pi = ((y * W + x) * 4) as usize;
+            top_px[pi + 1] = 255; // G
+            top_px[pi + 3] = 255; // A
+        }
+    }
+    c.restore_layer(top, &top_px).expect("write top");
+    c.set_layer_blend(top, BlendMode::Normal, 1.0).expect("normal");
+    let committed = c.read_pixels().expect("committed");
+
+    let src0 = c.read_layer(0).expect("read 0");
+    let src1 = c.read_layer(top).expect("read top");
+    c.clear_layer_at(0, [0.0, 0.0, 0.0, 0.0]).expect("clear 0");
+    c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
+    c.begin_transform_preview_gpu(&[(0, &src0, W, H), (top, &src1, W, H)])
+        .expect("begin gpu multi");
+    #[allow(clippy::cast_precision_loss)]
+    let rect = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
+    c.set_transform_preview(rect, rect, W, H);
+
+    let preview = c.read_transform_preview().expect("read preview");
+    assert_eq!(
+        preview, committed,
+        "identity multi-target preview must equal the committed canvas"
+    );
+    c.clear_transform_preview();
+}
+
+// Multi-layer transform: translating the shared box moves every target together;
+// with both layers moved off-canvas and nothing left behind, the centre is clear.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_multi_target_moves_all() {
+    use crate::document::BlendMode;
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let mut c = canvas();
+    paint(&mut c, 0, [0.9, 0.1, 0.1, 1.0]); // bottom: red, fills canvas
+    let top = c.add_layer("Top").expect("add");
+    paint(&mut c, top, [0.1, 0.1, 0.9, 1.0]); // top: blue, fills canvas
+    c.set_layer_blend(top, BlendMode::Normal, 1.0).expect("normal");
+
+    let src0 = c.read_layer(0).expect("read 0");
+    let src1 = c.read_layer(top).expect("read top");
+    c.clear_layer_at(0, [0.0, 0.0, 0.0, 0.0]).expect("clear 0");
+    c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
+    c.begin_transform_preview_gpu(&[(0, &src0, W, H), (top, &src1, W, H)])
+        .expect("begin gpu multi");
+    #[allow(clippy::cast_precision_loss)]
+    let orig = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
+    #[allow(clippy::cast_precision_loss)]
+    let moved = TransformRect::new(W as f32 * 4.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
+    c.set_transform_preview(orig, moved, W, H);
+
+    let preview = c.read_transform_preview().expect("read preview");
+    let i = ((H / 2 * W + W / 2) * 4) as usize;
+    assert_eq!(
+        preview[i + 3],
+        0,
+        "both layers moved away - centre must be transparent, not left behind"
+    );
+    c.clear_transform_preview();
+}
+
+// Selection-transform: lifting a selection leaves the unselected pixels on the
+// layer. Both the live preview and the committed apply must keep those
+// unselected pixels visible (bug: they vanished during/after transform).
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn selection_transform_keeps_unselected_pixels() {
+    use crate::selection::{RectShape, SelectionShape};
+    use crate::tools::SelectionMode;
+
+    let mut c = canvas();
+    let full = paint(&mut c, 0, [0.9, 0.1, 0.1, 1.0]); // layer 0: red everywhere
+
+    // Select the left half and lift it (extract writes the right half back).
+    c.apply_selection_shape(
+        &SelectionShape::Rect(RectShape { x: 0.0, y: 0.0, w: (W / 2) as f32, h: H as f32 }),
+        SelectionMode::Replace,
+    )
+    .expect("select left half");
+    let (masked, mw, mh) = c
+        .extract_selection_pixels(0)
+        .expect("extract")
+        .expect("some selection");
+    assert_eq!((mw, mh), (W, H));
+
+    // The layer now holds only the unselected right half.
+    let remaining = c.read_layer(0).expect("remaining");
+    let left_i = ((H / 2 * W + 1) * 4) as usize; // a left-half pixel
+    let right_i = ((H / 2 * W + (W - 2)) * 4) as usize; // a right-half pixel
+    assert_eq!(remaining[left_i + 3], 0, "left half lifted off the layer");
+    assert_ne!(remaining[right_i + 3], 0, "right half stays on the layer");
+
+    // Live preview at identity must show the full red canvas again (remaining
+    // right half + warped-in-place left half), not just the moving selection.
+    let orig = non_empty_bounds_of(&masked);
+    c.begin_transform_preview_gpu(&[(0, &masked, W, H)]).expect("begin gpu");
+    c.set_transform_preview(orig, orig, W, H);
+    let preview = c.read_transform_preview().expect("read preview");
+    assert_eq!(
+        preview[left_i + 3], 255,
+        "preview must keep the unselected right half AND the in-place selection"
+    );
+    assert_eq!(&preview, &full, "identity selection preview == full canvas");
+    c.clear_transform_preview();
+
+    // Commit the identity transform: the layer must be whole red again.
+    c.apply_layer_transform_gpu(0, &masked, W, H, orig, orig).expect("apply");
+    let after = c.read_layer(0).expect("after apply");
+    assert_eq!(after[right_i + 3], 255, "unselected half survives apply");
+    assert_eq!(after[left_i + 3], 255, "selected half committed back");
+}
+
+// Undo of a selection-transform must restore the WHOLE original layer, not just
+// the lifted selection (bug: the undo "before" was the masked selection, so undo
+// dropped the unselected part). The correct before-state is the full pre-lift
+// layer, which the UI now stashes in `TransformTarget::history_before`.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn selection_transform_undo_restores_full_layer() {
+    use crate::selection::{RectShape, SelectionShape};
+    use crate::tools::SelectionMode;
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let mut c = canvas();
+    let mut s = stack();
+    let id = layer_id(&c, 0);
+    let full = paint(&mut c, 0, [0.9, 0.1, 0.1, 1.0]); // full red
+
+    // Lift the left half and translate it to the right half's position.
+    c.apply_selection_shape(
+        &SelectionShape::Rect(RectShape { x: 0.0, y: 0.0, w: (W / 2) as f32, h: H as f32 }),
+        SelectionMode::Replace,
+    )
+    .expect("select");
+    let (masked, _, _) = c.extract_selection_pixels(0).expect("extract").expect("some");
+    let orig = non_empty_bounds_of(&masked);
+    let moved = TransformRect::new(orig.cx + (W / 2) as f32, orig.cy, orig.w, orig.h, 0.0);
+    c.apply_layer_transform_gpu(0, &masked, W, H, orig, moved).expect("apply");
+    let after = c.read_layer(0).expect("after");
+    assert_ne!(after, full, "a real move changes the layer");
+
+    // Record with the correct before-state (the full pre-lift layer).
+    let patch = LayerPatch::from_full_diff(&full, &after, W, H).expect("non-empty patch");
+    s.record(HistoryAction::Transform { layer_id: id, patch, ext_before: None, ext_after: None });
+
+    s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
+    assert_eq!(
+        c.read_layer(0).expect("after undo"),
+        full,
+        "undo restores the whole original layer, unselected part included"
+    );
+    s.redo(&mut c, &mut ComponentLibrary::new()).expect("redo");
+    assert_eq!(c.read_layer(0).expect("after redo"), after, "redo reapplies the move");
+}
+
+fn non_empty_bounds_of(px: &[u8]) -> oxiedraw_utils::geometry::TransformRect {
+    // Tight bounds of non-transparent pixels (mirrors the UI's non_empty_bounds).
+    let (mut minx, mut miny, mut maxx, mut maxy) = (W, H, 0u32, 0u32);
+    let mut found = false;
+    for y in 0..H {
+        for x in 0..W {
+            if px[((y * W + x) * 4 + 3) as usize] > 0 {
+                minx = minx.min(x);
+                miny = miny.min(y);
+                maxx = maxx.max(x);
+                maxy = maxy.max(y);
+                found = true;
+            }
+        }
+    }
+    #[allow(clippy::cast_precision_loss)]
+    if found {
+        let (bw, bh) = ((maxx - minx + 1) as f32, (maxy - miny + 1) as f32);
+        oxiedraw_utils::geometry::TransformRect::new(minx as f32 + bw / 2.0, miny as f32 + bh / 2.0, bw, bh, 0.0)
+    } else {
+        oxiedraw_utils::geometry::TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0)
+    }
 }
 
 #[test]
@@ -364,7 +652,7 @@ fn transform_preview_bottom_layer_visible() {
     c.clear_layer_at(0, [0.0, 0.0, 0.0, 0.0]).expect("clear");
     let mut above = Vec::new();
     c.begin_transform_preview(0, &mut above).expect("begin base");
-    c.begin_transform_preview_gpu(0, &src, W, H).expect("begin gpu");
+    c.begin_transform_preview_gpu(&[(0, &src, W, H)]).expect("begin gpu");
     #[allow(clippy::cast_precision_loss)]
     let rect = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
     c.set_transform_preview(rect, rect, W, H); // identity (at rest)
@@ -409,7 +697,7 @@ fn transform_preview_warped_layer_moves() {
     c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
     let mut above = Vec::new();
     c.begin_transform_preview(top, &mut above).expect("begin base");
-    c.begin_transform_preview_gpu(top, &src, W, H).expect("begin gpu");
+    c.begin_transform_preview_gpu(&[(top, &src, W, H)]).expect("begin gpu");
     // Tight bounds of the block (a 4x4 box centred at (2,2)), translated +6 in x.
     let orig = TransformRect::new(2.0, 2.0, 4.0, 4.0, 0.0);
     let moved = TransformRect::new(8.0, 2.0, 4.0, 4.0, 0.0);
