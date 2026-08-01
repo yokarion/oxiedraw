@@ -297,6 +297,49 @@ impl Ui {
         }
         ordered
     }
+
+    // Top-level selected nodes (layers and whole subgroups) in tree order, for
+    // grouping. Unlike selected_layer_ids_in_order, a selected subgroup stays
+    // intact rather than being flattened to its leaves, so grouping a mix of
+    // groups and layers preserves the subgroups.
+    pub(super) fn selected_nodes_for_grouping(&self) -> Vec<String> {
+        let tree = self.tree.borrow();
+        let mut wanted: HashSet<String> = self.multi_selected.borrow().clone();
+        if let Some(id) = self.active_id() {
+            wanted.insert(id);
+        }
+        if let Some(gid) = self.active_group.borrow().as_ref() {
+            wanted.insert(gid.clone());
+        }
+        if wanted.is_empty() {
+            return Vec::new();
+        }
+        let mut ordered = Vec::new();
+        collect_top_selected(&tree, &wanted, &mut ordered);
+        ordered
+    }
+}
+
+// Walk the tree; record a selected node's id and skip its subtree (so a nested
+// selection inside an already-selected group is not double-counted), otherwise
+// descend into unselected groups. Order follows the stored canvas order.
+fn collect_top_selected(nodes: &[LayerNode], wanted: &HashSet<String>, out: &mut Vec<String>) {
+    for n in nodes {
+        match n {
+            LayerNode::Layer(id) => {
+                if wanted.contains(id) {
+                    out.push(id.clone());
+                }
+            }
+            LayerNode::Group(g) => {
+                if wanted.contains(&g.id) {
+                    out.push(g.id.clone());
+                } else {
+                    collect_top_selected(&g.children, wanted, out);
+                }
+            }
+        }
+    }
 }
 
 // --- Tree utilities ---
@@ -3813,5 +3856,77 @@ mod tests {
         let (parent, idx) = resolve_insert_target(&rows, 2);
         assert_eq!(parent, Some("g1".to_owned()));
         assert_eq!(idx, 0);
+    }
+
+    fn ui_group(id: &str, children: Vec<LayerNode>) -> LayerNode {
+        LayerNode::Group(GroupData {
+            id: id.to_string(),
+            name: id.to_string(),
+            expanded: true,
+            visible: true,
+            children,
+            masked_leaves: HashSet::new(),
+        })
+    }
+
+    #[test]
+    fn collect_top_selected_keeps_subgroups_intact() {
+        // Root has: layer "a", subgroup "g" {c, d}, layer "b". User selected the
+        // subgroup and both loose layers - all at root depth.
+        let tree = vec![
+            LayerNode::Layer("a".into()),
+            ui_group("g", vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())]),
+            LayerNode::Layer("b".into()),
+        ];
+        let wanted: HashSet<String> =
+            ["a".to_string(), "g".to_string(), "b".to_string()].into_iter().collect();
+        let mut out = Vec::new();
+        collect_top_selected(&tree, &wanted, &mut out);
+        // The group id survives instead of being flattened to c, d.
+        assert_eq!(out, vec!["a".to_string(), "g".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn collect_top_selected_skips_nested_selection_under_selected_group() {
+        // Both the group and a child are selected; the child must not be
+        // double-counted or pulled out of the group.
+        let tree = vec![ui_group(
+            "g",
+            vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())],
+        )];
+        let wanted: HashSet<String> =
+            ["g".to_string(), "c".to_string()].into_iter().collect();
+        let mut out = Vec::new();
+        collect_top_selected(&tree, &wanted, &mut out);
+        assert_eq!(out, vec!["g".to_string()]);
+    }
+
+    #[test]
+    fn group_nodes_wraps_subgroup_intact() {
+        // Tree (top-first): layer "a", subgroup "g"{c, d}, layer "b". Grouping
+        // the subgroup together with the two loose layers must keep "g" a group,
+        // not flatten it to c/d, and preserve child order.
+        let mut tree = vec![
+            LayerNode::Layer("a".into()),
+            ui_group("g", vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())]),
+            LayerNode::Layer("b".into()),
+        ];
+        group_nodes(&mut tree, &["a".into(), "g".into(), "b".into()], "Wrap");
+
+        assert_eq!(tree.len(), 1, "all selected nodes collapse into one new group");
+        let LayerNode::Group(outer) = &tree[0] else {
+            panic!("expected a group at root");
+        };
+        assert_eq!(outer.name, "Wrap");
+        assert_eq!(outer.children.len(), 3);
+        assert!(matches!(&outer.children[0], LayerNode::Layer(id) if id == "a"));
+        let LayerNode::Group(inner) = &outer.children[1] else {
+            panic!("subgroup g should survive as a group, not be flattened");
+        };
+        assert_eq!(inner.id, "g");
+        assert_eq!(inner.children.len(), 2);
+        assert!(matches!(&inner.children[0], LayerNode::Layer(id) if id == "c"));
+        assert!(matches!(&inner.children[1], LayerNode::Layer(id) if id == "d"));
+        assert!(matches!(&outer.children[2], LayerNode::Layer(id) if id == "b"));
     }
 }
