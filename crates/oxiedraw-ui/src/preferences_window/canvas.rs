@@ -48,10 +48,12 @@ pub(super) fn build_canvas_page(
     // Sub-rows: per-shape toggles
     let line_row = adw::SwitchRow::new();
     line_row.set_title("Correct lines");
+    line_row.set_subtitle("Straighten near-straight strokes, smooth curved ones");
     line_row.set_active(sc.correct_line);
 
     let circle_row = adw::SwitchRow::new();
-    circle_row.set_title("Correct circles");
+    circle_row.set_title("Correct circles and ovals");
+    circle_row.set_subtitle("Snap round strokes; smooth intentional distortions");
     circle_row.set_active(sc.correct_circle);
 
     let rect_row = adw::SwitchRow::new();

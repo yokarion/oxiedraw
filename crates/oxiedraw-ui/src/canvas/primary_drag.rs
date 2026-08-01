@@ -15,14 +15,14 @@ use oxiedraw_core::guides::{
 };
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
-use oxiedraw_core::shape_correction::{CorrectedShape, corrected_samples, detect_shape};
+use oxiedraw_core::shape_correction::{ShapeKind, detect_correction};
 use oxiedraw_core::text::{ResizeMode, TextBox};
 use oxiedraw_core::tools::{
     CropHandle, CropRect, CropState, FillState, FillTool, GradientState, PendingMarquee,
     SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, Tool, ToolState,
     TransformFilter, TransformHandle, TransformState,
 };
-use oxiedraw_utils::geometry::{Point, Size, TransformRect, morph_path};
+use oxiedraw_utils::geometry::{Point, Size, TransformRect};
 use relm4::gtk;
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
@@ -766,15 +766,15 @@ impl PrimaryDragHandler {
                 // only fires after `trigger_delay_ms` of no new samples).
                 let samples = stroke_points.borrow().clone();
                 let positions: Vec<Point> = samples.iter().map(|s| s.position).collect();
-                let Some(shape) = detect_shape(&positions) else {
+                let Some(correction) = detect_correction(&positions) else {
                     return glib::ControlFlow::Break;
                 };
 
                 // Discard if the detected shape type is disabled.
-                let shape_enabled = match &shape {
-                    CorrectedShape::Line { .. } => sc.correct_line,
-                    CorrectedShape::Circle { .. } => sc.correct_circle,
-                    CorrectedShape::Rectangle { .. } => sc.correct_rectangle,
+                let shape_enabled = match correction.kind {
+                    ShapeKind::Line => sc.correct_line,
+                    ShapeKind::Ellipse => sc.correct_circle,
+                    ShapeKind::Rectangle => sc.correct_rectangle,
                 };
                 if !shape_enabled {
                     return glib::ControlFlow::Break;
@@ -791,16 +791,15 @@ impl PrimaryDragHandler {
                     }
                 }
 
-                // Keep the original sample stream (count, timing, pen
-                // dynamics) and only move each sample onto the corrected
-                // shape at its matching arc-length position. This preserves
-                // the temporal density the brush engine relies on for smooth
-                // speed/pressure, so the corrected stroke isn't lumpy.
-                let corrected_geo = corrected_samples(&shape);
-                if corrected_geo.is_empty() {
+                // The correction target is already aligned 1:1 with the input
+                // samples, so the original sample stream (count, timing, pen
+                // dynamics) stays intact - each sample just moves onto its
+                // corrected position. This preserves the temporal density the
+                // brush engine relies on for smooth speed/pressure.
+                let corrected_pts = correction.target;
+                if corrected_pts.len() != positions.len() {
                     return glib::ControlFlow::Break;
                 }
-                let corrected_pts = morph_path(&positions, &corrected_geo);
 
                 // Stash the final corrected geometry so a pen-up or an
                 // undo/redo can land the shape immediately instead of waiting
