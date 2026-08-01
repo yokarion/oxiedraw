@@ -169,7 +169,7 @@ pub(super) fn install_layer_actions(
         let history = Rc::clone(history);
         let action = gio::SimpleAction::new("layer-group", None);
         action.connect_activate(move |_, _| {
-            let ids = ui.selected_layer_ids_in_order();
+            let ids = ui.selected_nodes_for_grouping();
             if ids.is_empty() {
                 return;
             }
