@@ -159,6 +159,7 @@ pub(crate) struct Viewport {
     /// the in-flight stroke is committed and recorded before history mutates,
     /// keeping the canvas and the undo stack in sync.
     flush_correction: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    fill_drag: Rc<RefCell<Option<Box<dyn Fn(f64, bool)>>>>,
     render_pump: RenderPump,
 }
 
@@ -180,6 +181,12 @@ pub(crate) struct RenderPump {
     picture: Rc<RefCell<Option<gtk::Picture>>>,
     active: Rc<Cell<u32>>,
     installed: Rc<Cell<bool>>,
+    /// Run at the top of every tick, before the present decision, so an
+    /// animation can advance canvas state and have this frame carry it.
+    /// This is the only safe way to animate the canvas during a drag: a
+    /// timer presenting between input events starves a tablet's event
+    /// stream until the compositer decides the pen lifted.
+    on_tick: Rc<RefCell<Option<Box<dyn Fn()>>>>,
 }
 
 impl RenderPump {
@@ -194,7 +201,13 @@ impl RenderPump {
             picture,
             active: Rc::new(Cell::new(0)),
             installed: Rc::new(Cell::new(false)),
+            on_tick: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Cloneable slot for the per-frame callback described on `on_tick`.
+    pub(crate) fn tick_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
+        Rc::clone(&self.on_tick)
     }
 
     /// Begin (or join) an interaction: ensure the per-frame present tick runs.
@@ -213,6 +226,14 @@ impl RenderPump {
                 me.installed.set(false);
                 return gtk::glib::ControlFlow::Break;
             }
+            // Advance any canvas animation first, so whatever it changed
+            // rides out on this frame's present rather than needing one
+            // of its own.
+            let tick = me.on_tick.borrow();
+            if let Some(cb) = tick.as_ref() {
+                cb();
+            }
+            drop(tick);
             let changed = me.canvas.borrow().present_would_redraw();
             if changed {
                 present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
@@ -379,6 +400,7 @@ impl Viewport {
             canvas_size: Rc::new(Cell::new(canvas_size)),
             picture,
             flush_correction: Rc::new(RefCell::new(None)),
+            fill_drag: Rc::new(RefCell::new(None)),
             render_pump,
         }
     }
@@ -395,6 +417,17 @@ impl Viewport {
     /// gesture internals.
     pub(crate) fn flush_correction_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
         Rc::clone(&self.flush_correction)
+    }
+
+    /// Cloneable slot the fill handler installs its "the pointer is at
+    /// this widget x, button down or not" callback into.
+    ///
+    /// Fed from the motion controller because the drag gesture is not
+    /// trustworthy here: tablets end it while the pen is still on the
+    /// glass, and the motion stream keeps running long after. The button
+    /// flag is what actually ends a fill.
+    pub(crate) fn fill_drag_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn(f64, bool)>>>> {
+        Rc::clone(&self.fill_drag)
     }
 
     /// Commit + record any in-flight shape-correction stroke. No-op when
@@ -697,6 +730,7 @@ fn install_motion(
     let colors = colors.clone();
     let area_c = area.clone();
     let text_edit = text_edit.clone();
+    let fill_drag = viewport.fill_drag_handle();
 
     // Per-pointer history used to feed dynamics for the cursor preview:
     // - position + timestamp drive `speed`
@@ -822,6 +856,24 @@ fn install_motion(
                     settings: gradient.resolve(&colors),
                 }));
             }
+            Tool::Fill(FillTool::Bucket) => {
+                area_c.set_cursor_from_name(None);
+                paintable.set_brush_cursor(None, Point::ZERO);
+                paintable.set_color_picker(None);
+                // A fill in progress reads its threshold off sideways
+                // movement, and ends when the button actually comes up.
+                // Neither can come from the drag gesture: a tablet ends
+                // that gesture with the pen still down, while this
+                // controller (where the brush reads pen pressure) keeps
+                // streaming the truth. The position is absolute, so an
+                // event the gesture also delivered is a no-op here.
+                let held = ctrl
+                    .current_event_state()
+                    .contains(gdk::ModifierType::BUTTON1_MASK);
+                if let Some(on_move) = fill_drag.borrow().as_ref() {
+                    on_move(x, held);
+                }
+            }
             _ => {
                 area_c.set_cursor_from_name(None);
                 paintable.set_brush_cursor(None, Point::ZERO);
@@ -834,10 +886,28 @@ fn install_motion(
     // doesn't linger frozen at the last hover position.
     {
         let paintable = viewport.paintable.clone();
-        motion.connect_leave(move |_| {
+        let fill_drag = viewport.fill_drag_handle();
+        motion.connect_leave(move |ctrl| {
             paintable.set_brush_cursor(None, Point::ZERO);
             paintable.set_color_picker(None);
             paintable.set_gradient_cursor(None);
+            // Releasing outside the window ends the grab without ever
+            // delivering the button-up motion a fill gesture waits for,
+            // which would leave it committed but unrecorded. The leave
+            // that follows the grab ending closes it out instead.
+            //
+            // Only once the button is genuinely up: a leave *during* a
+            // drag (the pointer crossing out while held) must not cut
+            // the gesture short.
+            let held = ctrl
+                .current_event_state()
+                .contains(gdk::ModifierType::BUTTON1_MASK);
+            if held {
+                return;
+            }
+            if let Some(on_move) = fill_drag.borrow().as_ref() {
+                on_move(0.0, false);
+            }
         });
     }
 

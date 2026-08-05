@@ -1,20 +1,20 @@
-//! Fill-overlay GPU resources: a canvas-sized R8 distance mask plus
-//! the fullscreen pipeline that overlays the fill colour onto the
-//! preview image, clipped to a sweeping reveal radius.
+//! Fill-overlay GPU resources: a canvas-sized R8G8 distance/share mask
+//! plus the fullscreen pipelines that hide the not-yet-revealed part of
+//! an already-committed fill.
 //!
 //! The mask is uploaded **once** at the start of an animation; per
 //! frame only a single push float (`reveal`) changes. The fragment
-//! shader discards pixels outside the fill region or beyond the
-//! current radius, so per-frame cost stays flat regardless of canvas
-//! size.
+//! shader discards pixels outside the fill region or already inside
+//! the current radius, so per-frame cost stays flat regardless of
+//! canvas size.
 
 use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
 
 use super::RendererError;
 use super::pass::{
-    FullscreenPass, allocate_sampler_set, nearest_clamp_sampler, over_blend, pipeline_layout,
-    sampler_descriptor_pool, sampler_set_layout,
+    FullscreenPass, allocate_sampler_set, dst_out_blend, nearest_clamp_sampler, over_blend,
+    pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
 };
 use super::resources::Image;
 
@@ -27,8 +27,9 @@ const FILL_OVERLAY_FRAG_SPV: &[u8] =
 pub(super) const FILL_OVERLAY_PUSH_BYTES: u32 = 20;
 
 pub(super) struct FillOverlayResources {
-    /// Canvas-sized `R8_UNORM` distance mask. Uploaded by
-    /// `write_fill_mask`; read by the `fill_overlay` shader.
+    /// Canvas-sized `R8G8_UNORM` mask: R is the normalised distance
+    /// from the seed, G the per-pixel coverage. Uploaded by
+    /// `upload_fill_mask`; read by the `fill_overlay` shader.
     pub mask: Image,
 
     pub sampler: vk::Sampler,
@@ -37,7 +38,13 @@ pub(super) struct FillOverlayResources {
     pub descriptor_set: vk::DescriptorSet,
 
     pub layout: vk::PipelineLayout,
+    /// Paints the seed colour back over the un-revealed pixels - undoes
+    /// a fill that replaced the region.
     pub pipeline: vk::Pipeline,
+    /// Takes the fill's share back out of the un-revealed pixels -
+    /// undoes a fill that went in underneath, leaving what was on top
+    /// of it in place.
+    pub pipeline_behind: vk::Pipeline,
 }
 
 impl FillOverlayResources {
@@ -54,7 +61,7 @@ impl FillOverlayResources {
             device,
             allocator,
             "fill-overlay-mask",
-            vk::Format::R8_UNORM,
+            vk::Format::R8G8_UNORM,
             canvas_extent,
             usage,
             vk::ImageAspectFlags::COLOR,
@@ -71,15 +78,22 @@ impl FillOverlayResources {
             sampler,
         )?;
         let layout = pipeline_layout(device, descriptor_set_layout, FILL_OVERLAY_PUSH_BYTES)?;
-        // Premultiplied OVER - same as the brush/composite pipeline, so
-        // the fill colour layers cleanly on top of whatever the preview
-        // image already shows for that pixel.
+        // Premultiplied OVER - the un-revealed pixels get the seed
+        // colour painted back on top of the committed fill.
         let pipeline = FullscreenPass {
             vert_spv: COMPOSITE_VERT_SPV,
             frag_spv: FILL_OVERLAY_FRAG_SPV,
             render_pass: canvas_render_pass,
             layout,
             blend: over_blend(),
+        }
+        .build(device)?;
+        let pipeline_behind = FullscreenPass {
+            vert_spv: COMPOSITE_VERT_SPV,
+            frag_spv: FILL_OVERLAY_FRAG_SPV,
+            render_pass: canvas_render_pass,
+            layout,
+            blend: dst_out_blend(),
         }
         .build(device)?;
 
@@ -91,6 +105,7 @@ impl FillOverlayResources {
             descriptor_set,
             layout,
             pipeline,
+            pipeline_behind,
         })
     }
 
@@ -99,6 +114,7 @@ impl FillOverlayResources {
     pub(super) unsafe fn destroy(self, device: &Device, allocator: &mut Allocator) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.pipeline_behind, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
