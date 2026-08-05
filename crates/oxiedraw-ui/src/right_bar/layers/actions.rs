@@ -18,7 +18,7 @@ use relm4::gtk::prelude::*;
 
 use crate::canvas::RedrawHandle;
 use crate::clipboard::LayerClipboard;
-use crate::toaster::Toaster;
+use crate::toaster::{PendingToast, Toaster};
 
 use super::{
     GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
@@ -668,8 +668,8 @@ pub(super) fn layer_copy(
 /// - Toast behavior: a 500 ms one-shot timer runs concurrently with step 2. If
 ///   the background thread finishes before 500 ms, the done flag is set and the
 ///   timer callback skips the toast. If 500 ms elapses first, a persistent
-///   high-priority toast with a spinner appears. The idle poller sets the done
-///   flag and dismisses the toast when the result arrives.
+///   on-canvas toast appears. The idle poller sets the done flag and dismisses
+///   the toast when the result arrives.
 /// - Shows "External image pasted!" on success or an error description on failure.
 pub(super) fn layer_paste(
     area: &gtk::DrawingArea,
@@ -747,38 +747,16 @@ pub(super) fn layer_paste(
 
             // 500 ms grace period: only show a "Pasting..." toast if it takes long.
             let done = Rc::new(Cell::new(false));
-            let pending_toast: Rc<RefCell<Option<adw::Toast>>> = Rc::new(RefCell::new(None));
-            let pending_css: Rc<RefCell<Option<gtk::CssProvider>>> = Rc::new(RefCell::new(None));
+            let pending_toast: Rc<RefCell<Option<PendingToast>>> = Rc::new(RefCell::new(None));
             {
                 let done_c = Rc::clone(&done);
                 let toaster_c = toaster.clone();
                 let pending_c = Rc::clone(&pending_toast);
-                let css_c = Rc::clone(&pending_css);
                 glib::timeout_add_local_once(Duration::from_millis(500), move || {
                     if done_c.get() {
                         return;
                     }
-                    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-                    let spinner = gtk::Spinner::new();
-                    spinner.start();
-                    let label = gtk::Label::new(Some("Pasting image..."));
-                    row.append(&spinner);
-                    row.append(&label);
-                    if let Some(t) = toaster_c.pending("") {
-                        t.set_custom_title(Some(&row));
-                        t.set_priority(adw::ToastPriority::High);
-                        *pending_c.borrow_mut() = Some(t);
-                    }
-                    if let Some(display) = gdk::Display::default() {
-                        let provider = gtk::CssProvider::new();
-                        provider.load_from_string("toast button.close { display: none; }");
-                        gtk::style_context_add_provider_for_display(
-                            &display,
-                            &provider,
-                            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-                        );
-                        *css_c.borrow_mut() = Some(provider);
-                    }
+                    *pending_c.borrow_mut() = Some(toaster_c.pending("Pasting image..."));
                 });
             }
 
@@ -812,10 +790,6 @@ pub(super) fn layer_paste(
                 if let Some(t) = pending_toast.borrow_mut().take() {
                     t.dismiss();
                 }
-                if let Some(provider) = pending_css.borrow_mut().take()
-                    && let Some(display) = gdk::Display::default() {
-                        gtk::style_context_remove_provider_for_display(&display, &provider);
-                    }
 
                 match result {
                     Ok((pixels, src_w, src_h)) => {
