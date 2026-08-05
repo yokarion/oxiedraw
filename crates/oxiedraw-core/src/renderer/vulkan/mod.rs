@@ -285,6 +285,11 @@ pub struct VulkanRenderer {
     /// Layer index the fill is being applied to (used to splice the
     /// overlay in at the right z-order during the preview composite).
     pub(super) fill_layer_idx: usize,
+    /// True when the fill went underneath the layer's existing pixels
+    /// rather than over them, so hiding it during the reveal means
+    /// taking its share back out (DST_OUT) rather than painting the seed
+    /// colour over it.
+    pub(super) fill_behind: bool,
 
     pub(super) shape_overlay: ManuallyDrop<ShapeOverlayResources>,
     /// True while a shape drag is in flight. Gates the preview path so
@@ -643,6 +648,7 @@ impl VulkanRenderer {
             fill_reveal: 0.0,
             fill_color_premul: [0.0; 4],
             fill_layer_idx: 0,
+            fill_behind: false,
             shape_overlay: ManuallyDrop::new(shape_overlay),
             shape_active: false,
             shape_layer_idx: 0,

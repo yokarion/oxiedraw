@@ -28,4 +28,6 @@ pub enum RendererError {
     TransformTooLarge { requested: u32, limit: u32 },
     #[error("pattern atlas is full")]
     PatternAtlasFull,
+    #[error("fill overlay mask is smaller than the canvas")]
+    FillMaskTooSmall,
 }

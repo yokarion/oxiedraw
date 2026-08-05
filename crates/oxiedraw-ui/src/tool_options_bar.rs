@@ -41,7 +41,7 @@ const STACK_TEXT: &str = "text";
 const STACK_GUIDE: &str = "guide";
 const STACK_NONE: &str = "none";
 
-const TOLERANCE_SLIDER_WIDTH: i32 = 160;
+const TOLERANCE_SLIDER_WIDTH: i32 = 320;
 
 /// Tool properties bar shown above the canvas.
 ///
@@ -583,6 +583,29 @@ fn build_fill_page(fill: &FillState) -> gtk::Box {
         },
     );
     row.append(&slider);
+
+    // Dragging sideways during a fill adjusts the same threshold; let it
+    // move the slider so the two never show different numbers.
+    {
+        let scale = slider.clone();
+        *fill.tolerance_display.borrow_mut() = Some(Box::new(move |value: u8| {
+            scale.set_value(f64::from(value));
+        }));
+    }
+
+    // What makes fills meet anti-aliased line art cleanly. No radius or
+    // feather to go with it - the edge pass reads the outline itself.
+    let auto_edge = fill.auto_edge.clone();
+    let auto_check = gtk::CheckButton::builder()
+        .label("Smart Edges")
+        .tooltip_text(
+            "Carry the fill across anti-aliased outlines and keep their edge blending intact",
+        )
+        .active(auto_edge.get())
+        .valign(gtk::Align::Center)
+        .build();
+    auto_check.connect_toggled(move |c| auto_edge.set(c.is_active()));
+    row.append(&auto_check);
 
     // Sample the composite of all visible layers instead of just the
     // active one when deciding which pixels to fill.

@@ -1448,30 +1448,65 @@ impl Canvas {
     // Bucket-fill GPU overlay
     // ----------------------------------------------------------------
 
-    /// Begin a bucket-fill animation. Uploads the R8 distance mask
-    /// produced by `flood_fill` to the overlay image (one-shot
-    /// transfer, big on huge canvases) and arms the overlay path so
-    /// subsequent `present()` calls render the canvas + fill colour
-    /// clipped to the reveal radius. Bump `pixels_version` so the next
-    /// present is non-trivial.
+    /// Read the composite of every visible layer *above* `target_idx`
+    /// as BGRA8. The fill tool uses it to tell whether the line art
+    /// bounding a region sits on top of the layer being filled (so the
+    /// fill can go in solid underneath it) or below it (so the fill has
+    /// to carry the soft edge itself).
+    pub fn read_layers_above(&mut self, target_idx: usize) -> Result<Vec<u8>, RendererError> {
+        let visibilities = self.visibilities();
+        let mut out = Vec::new();
+        self.renderer
+            .read_layers_above(&visibilities, target_idx, &mut out)?;
+        Ok(out)
+    }
+
+    /// Write the finished fill into its layer. The pixels land - and
+    /// the caller records history - before any animation runs, so the
+    /// canvas and the undo stack never disagree about whether a fill
+    /// happened.
+    pub fn commit_fill(&mut self, layer_idx: usize, pixels: &[u8]) -> Result<(), RendererError> {
+        self.renderer.write_layer(layer_idx, pixels)?;
+        self.normalize_adjustment_slot(layer_idx)?;
+        self.recomposite_canvas()?;
+        Ok(())
+    }
+
+    /// Arm the reveal animation for a fill that is already committed.
+    /// Uploads the distance + share mask (one-shot transfer, big on huge
+    /// canvases) and arms the overlay path so subsequent `present()`
+    /// calls hide the part of the fill the sweep has not reached yet.
+    /// Bump `pixels_version` so the next present is non-trivial.
     pub fn begin_fill_overlay(
         &mut self,
         layer_idx: usize,
-        distance_mask: &[u8],
-        color: Color,
+        result: &crate::canvas::fill::FillResult,
     ) -> Result<(), RendererError> {
-        // Adjustment masks are grayscale: match the committed (normalized) result.
-        let color = if self.layers.kind(layer_idx).is_some_and(|k| k.is_adjustment()) {
-            color.to_grayscale()
-        } else {
-            color
+        use crate::canvas::fill::FillPaint;
+        // A fill that replaced the region is hidden by painting the seed
+        // colour back over it; one that went in underneath is hidden by
+        // taking its share out again, so it needs no colour.
+        let (color_premul, behind) = match result.paint {
+            FillPaint::Behind => ([0.0, 0.0, 0.0, 1.0], true),
+            FillPaint::Over { seed } => {
+                let lin = |c: u8| oxiedraw_utils::color::srgb_to_linear(c);
+                // Layer bytes are premultiplied sRGB; decoding each
+                // channel is what the sampler would do anyway.
+                (
+                    [
+                        lin(seed[2]),
+                        lin(seed[1]),
+                        lin(seed[0]),
+                        f32::from(seed[3]) / 255.0,
+                    ],
+                    false,
+                )
+            }
         };
-        let linear = color.to_linear_rgb();
-        // Premultiplied with alpha = 1.0 since bucket fill is opaque;
-        // the OVER blend on the overlay pipeline matches this.
-        let color_premul = [linear[0], linear[1], linear[2], 1.0];
-        self.renderer.upload_fill_mask(distance_mask)?;
-        self.renderer.begin_fill_overlay(layer_idx, color_premul)?;
+        self.renderer
+            .upload_fill_mask(&result.distance_mask, &result.coverage)?;
+        self.renderer
+            .begin_fill_overlay(layer_idx, color_premul, behind)?;
         self.bump_version();
         Ok(())
     }
@@ -1489,21 +1524,9 @@ impl Canvas {
         self.renderer.fill_active()
     }
 
-    /// Commit the final filled pixels to the target layer and clear
-    /// the overlay. Returns the layer back to normal composition.
-    pub fn commit_fill_overlay(
-        &mut self,
-        layer_idx: usize,
-        pixels: &[u8],
-    ) -> Result<(), RendererError> {
-        self.renderer.write_layer(layer_idx, pixels)?;
-        self.renderer.clear_fill_overlay();
-        self.normalize_adjustment_slot(layer_idx)?;
-        self.recomposite_canvas()?;
-        Ok(())
-    }
-
-    /// Cancel an in-flight fill overlay without committing anything.
+    /// Drop the reveal overlay. The layer already holds the fill, so
+    /// this only ever affects what is on screen - it is both the normal
+    /// end of the animation and the way to cut it short.
     pub const fn cancel_fill_overlay(&mut self) {
         self.renderer.clear_fill_overlay();
         self.bump_version();

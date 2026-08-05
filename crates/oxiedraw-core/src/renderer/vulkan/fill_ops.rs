@@ -8,18 +8,34 @@ use super::super::fill_overlay::FILL_OVERLAY_PUSH_BYTES;
 use super::VulkanRenderer;
 
 impl VulkanRenderer {
-    /// Upload the R8 distance mask produced by `flood_fill` into the
-    /// canvas-sized overlay image. Called once at the start of a fill
-    /// animation; the per-frame timer afterwards only updates the
-    /// reveal push constant.
-    pub fn upload_fill_mask(&mut self, mask: &[u8]) -> Result<(), RendererError> {
+    /// Upload the distance + coverage planes produced by `flood_fill`
+    /// into the canvas-sized R8G8 overlay image, interleaved. Called
+    /// once at the start of a fill animation; the per-frame timer
+    /// afterwards only updates the reveal push constant.
+    pub fn upload_fill_mask(
+        &mut self,
+        distance: &[u8],
+        coverage: &[u8],
+    ) -> Result<(), RendererError> {
+        // A short mask would leave the image holding the previous fill's
+        // contents for the pixels it didn't cover, and the overlay would
+        // animate that instead. Refuse rather than show the wrong shape:
+        // a `FillResult` computed without `reveal_order` has no mask at
+        // all and has no business driving the animation.
+        let wanted = (self.canvas.extent.width as usize) * (self.canvas.extent.height as usize);
+        if distance.len() < wanted || coverage.len() < wanted {
+            return Err(RendererError::FillMaskTooSmall);
+        }
         {
             let staging = self
                 .staging
                 .mapped_mut()
                 .ok_or(RendererError::StagingNotMapped)?;
-            let copy_len = mask.len().min(staging.len());
-            staging[..copy_len].copy_from_slice(&mask[..copy_len]);
+            let pixels = wanted.min(staging.len() / 2);
+            for (i, texel) in staging[..pixels * 2].chunks_exact_mut(2).enumerate() {
+                texel[0] = distance[i];
+                texel[1] = coverage[i];
+            }
         }
         let image = self.fill_overlay.mask.handle;
         let extent = self.canvas.extent;
@@ -33,6 +49,7 @@ impl VulkanRenderer {
         &mut self,
         layer_idx: usize,
         color_premul: [f32; 4],
+        behind: bool,
     ) -> Result<(), RendererError> {
         if layer_idx >= self.layer_stack.slots.len() {
             return Err(RendererError::LayerIndexOutOfRange);
@@ -41,6 +58,7 @@ impl VulkanRenderer {
         self.fill_reveal = 0.0;
         self.fill_color_premul = color_premul;
         self.fill_layer_idx = layer_idx;
+        self.fill_behind = behind;
         Ok(())
     }
 
@@ -116,7 +134,11 @@ impl VulkanRenderer {
         reveal: f32,
     ) {
         let render_pass = self.canvas_target.render_pass;
-        let pipeline = self.fill_overlay.pipeline;
+        let pipeline = if self.fill_behind {
+            self.fill_overlay.pipeline_behind
+        } else {
+            self.fill_overlay.pipeline
+        };
         let layout = self.fill_overlay.layout;
         let descriptor_set = self.fill_overlay.descriptor_set;
         // Match the shader's std430-like push block: vec4 color then

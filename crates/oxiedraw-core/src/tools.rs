@@ -502,25 +502,62 @@ impl SelectionTool {
 
 /// State for the Fill tool (currently only the bucket variant has settings).
 ///
-/// `tolerance` is the maximum per-channel-style difference (squared-sum
-/// across BGRA) between a candidate pixel and the seed pixel for the
-/// bucket flood-fill to include it. Stored as 0..=255 where 0 = exact
-/// match only and 255 = match anything within the connected region.
+/// `tolerance` is the maximum colour difference (0..=255, RMS across
+/// BGRA) between a candidate pixel and the seed pixel for the bucket
+/// flood-fill to include it. 0 = exact match only.
+///
+/// `auto_edge` carries the fill across an anti-aliased boundary and
+/// paints it in a way that preserves the boundary's own blending, with
+/// nothing to tune.
 ///
 /// `sample_all_layers` makes the flood-fill seed/match against the
 /// composited image of every visible layer instead of just the active
 /// one; the fill itself is still painted into the active layer.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FillState {
     pub tolerance: Rc<Cell<u8>>,
+    /// Installed by the tool options bar so the tolerance slider follows
+    /// along when a fill drag adjusts the threshold on canvas.
+    pub tolerance_display: Rc<RefCell<Option<Box<dyn Fn(u8)>>>>,
+    pub auto_edge: Rc<Cell<bool>>,
     pub sample_all_layers: Rc<Cell<bool>>,
+}
+
+impl std::fmt::Debug for FillState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FillState")
+            .field("tolerance", &self.tolerance.get())
+            .field("auto_edge", &self.auto_edge.get())
+            .field("sample_all_layers", &self.sample_all_layers.get())
+            .finish_non_exhaustive()
+    }
 }
 
 impl FillState {
     pub fn new() -> Self {
+        let defaults = crate::canvas::fill::FillOptions::default();
         Self {
-            tolerance: Rc::new(Cell::new(16)),
+            tolerance: Rc::new(Cell::new(defaults.tolerance)),
+            tolerance_display: Rc::new(RefCell::new(None)),
+            auto_edge: Rc::new(Cell::new(defaults.auto_edge)),
             sample_all_layers: Rc::new(Cell::new(false)),
+        }
+    }
+
+    /// Set the threshold and push it to the slider, if one is showing.
+    pub fn set_tolerance(&self, value: u8) {
+        self.tolerance.set(value);
+        if let Some(show) = self.tolerance_display.borrow().as_ref() {
+            show(value);
+        }
+    }
+
+    /// Snapshot the tool's knobs as flood-fill options.
+    pub fn options(&self) -> crate::canvas::fill::FillOptions {
+        crate::canvas::fill::FillOptions {
+            tolerance: self.tolerance.get(),
+            auto_edge: self.auto_edge.get(),
+            ..crate::canvas::fill::FillOptions::default()
         }
     }
 }

@@ -4,10 +4,11 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::canvas::fill::{FillResult, flood_fill, paint_indices};
+use oxiedraw_core::canvas::fill::{FillOptions, FillResult, FillSource, flood_fill, paint_fill};
 use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::document::LayerKind;
 use oxiedraw_core::guides::{
@@ -30,7 +31,7 @@ use relm4::gtk::prelude::*;
 use crate::canvas_paintable::CanvasPaintable;
 use crate::settings::{AppSettings, ShapeCorrectionSettings};
 
-use super::Viewport;
+use super::{RenderPump, Viewport};
 use super::{
     BUTTON_PRIMARY, crop_geom, present_into_paintable, sample_from,
     transform_geometry, widget_to_canvas,
@@ -131,9 +132,16 @@ pub(super) struct PrimaryDragHandler {
     selection_drag_start: Rc<Cell<Point>>,
     // -- fill -------------------------------------------------------------
     fill: FillState,
-    /// Active fill-animation timer, if any. Cancelled whenever a new
-    /// fill begins so back-to-back clicks don't fight over the layer.
-    fill_anim: Rc<RefCell<Option<glib::SourceId>>>,
+    /// When the reveal sweep started, if one is running. Driven by the
+    /// render pump's frame clock, not a timer, and deliberately outside
+    /// the session so a gesture ending mid-sweep can't strand it.
+    fill_reveal: Rc<Cell<Option<std::time::Instant>>>,
+    /// Ticks once per fill gesture; see [`FillSession::generation`].
+    fill_generation: Rc<Cell<u64>>,
+    render_pump: RenderPump,
+    /// The fill gesture in progress: alive from press to release so a
+    /// sideways drag can re-run it at a new threshold.
+    fill_session: Rc<RefCell<Option<FillSession>>>,
     // -- shapes -----------------------------------------------------------
     shape: ShapeState,
     shape_drag_start: Rc<Cell<Point>>,
@@ -231,6 +239,12 @@ impl PrimaryDragHandler {
     }
 
     fn on_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
+        // A fill gesture ends on the button coming up, which normally
+        // arrives as a motion event - but a release outside the window
+        // never delivers one, leaving the fill committed and unrecorded.
+        // Closing it out before any other gesture records anything keeps
+        // it in the right place on the undo stack.
+        self.finalize_pending_fill();
         // Raster tools are rejected on component layers - those are pre-rendered
         // and only editable by opening the component.
         let raster_tool = matches!(
@@ -254,9 +268,11 @@ impl PrimaryDragHandler {
             Tool::Crop => self.crop_begin(x, y),
             Tool::Transform => self.transform_begin(x, y),
             Tool::Selection(s) => self.selection_begin(gesture, s, x, y),
+            // The sequence is claimed, not denied: holding after the drop
+            // and dragging sideways adjusts the threshold.
             Tool::Fill(FillTool::Bucket) => {
+                tracing::debug!(source = ?event_source(gesture), "fill: drag begin");
                 self.fill_begin(x, y);
-                gesture.set_state(gtk::EventSequenceState::Denied);
             }
             Tool::Fill(FillTool::Gradient) => self.gradient_begin(x, y),
             Tool::Shapes(kind) => self.shape_begin(kind, x, y),
@@ -277,6 +293,7 @@ impl PrimaryDragHandler {
             Tool::Transform => self.transform_update(gesture, dx, dy),
             Tool::Selection(s) => self.selection_update(gesture, s, dx, dy),
             Tool::Shapes(kind) => self.shape_update(gesture, kind, dx, dy),
+            Tool::Fill(FillTool::Bucket) => self.fill_update(dx),
             Tool::Fill(FillTool::Gradient) => self.gradient_update(gesture, dx, dy),
             Tool::ColorPicker => self.color_pick_update(),
             Tool::Text => self.text_update(gesture, dx, dy),
@@ -285,12 +302,29 @@ impl PrimaryDragHandler {
         }
     }
 
-    fn on_end(&self) {
+    fn on_end(&self, gesture: &gtk::GestureDrag) {
         match self.tools.active.get() {
             Tool::Brush => self.brush_end(),
             Tool::Crop => self.crop_end(),
             Tool::Selection(s) => self.selection_end(s),
             Tool::Shapes(kind) => self.shape_end(kind),
+            Tool::Fill(FillTool::Bucket) => {
+                // Tablets end this gesture with the pen still on the
+                // glass. Ending the fill here would cut the threshold
+                // drag off mid-gesture, so leave it to the button: the
+                // motion controller closes it out when that comes up.
+                let held = gesture
+                    .current_event_state()
+                    .contains(gtk::gdk::ModifierType::BUTTON1_MASK);
+                tracing::debug!(
+                    held,
+                    live = self.fill_session.borrow().is_some(),
+                    "fill: drag end",
+                );
+                if !held {
+                    self.fill_end();
+                }
+            }
             Tool::Fill(FillTool::Gradient) => self.gradient_end(),
             Tool::Text => self.text_end(),
             Tool::DrawingGuide => self.guide_end(),
@@ -1259,15 +1293,19 @@ impl PrimaryDragHandler {
 
     // -- fill -------------------------------------------------------------
 
-    /// Click handler for the Bucket Fill tool. Reads the active layer,
-    /// runs a flood fill from the clicked pixel, then animates the
-    /// result outward from the seed like spilled paint.
+    /// Press handler for the Bucket Fill tool. Reads the active layer,
+    /// runs a flood fill from the clicked pixel, commits it, then sweeps
+    /// it into view from the seed like spilled paint.
+    ///
+    /// The buffers it collects stay alive for as long as the pointer is
+    /// down: keep holding and drag sideways and the fill is recomputed
+    /// at a new threshold, always from these pristine pixels.
     fn fill_begin(&self, x: f64, y: f64) {
-        // Cancel any in-flight fill animation before starting a new one
-        // so back-to-back clicks don't both write to the layer.
-        if let Some(src) = self.fill_anim.borrow_mut().take() {
-            src.remove();
-        }
+        // Only the previous *animation* is dropped. Its pixels are
+        // already committed, so a fast second click can never take the
+        // first fill down with it.
+        // Any previous gesture was already closed out by `on_begin`.
+        self.end_fill_animation();
 
         let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         #[allow(clippy::cast_possible_truncation)]
@@ -1280,7 +1318,7 @@ impl PrimaryDragHandler {
         }
 
         let sample_all_layers = self.fill.sample_all_layers.get();
-        let (layer_idx, original, fill_source, layer_id, selection_mask) = {
+        let (layer_idx, original, fill_source, occluders, layer_id, selection_mask) = {
             let mut canvas = self.canvas.borrow_mut();
             let Some(idx) = canvas.layers().active() else {
                 return;
@@ -1301,20 +1339,31 @@ impl PrimaryDragHandler {
             };
             // When sampling all layers, the flood fill seeds/matches against
             // the composited canvas; the fill still paints into the active
-            // layer, so we read that separately as the paint target.
-            let source = if sample_all_layers {
-                match canvas.read_pixels() {
-                    Ok(px) => Some(px),
+            // layer, so we read that separately as the paint target. The
+            // layers above it decide how the edge pixels are weighted -
+            // line art on top blends the fill for us, line art below does
+            // not - so read those too.
+            let (source, above) = if sample_all_layers {
+                let composite = match canvas.read_pixels() {
+                    Ok(px) => px,
                     Err(e) => {
                         tracing::error!(error = %e, "fill: read_pixels failed");
                         return;
                     }
-                }
+                };
+                let above = match canvas.read_layers_above(idx) {
+                    Ok(px) => Some(px),
+                    Err(e) => {
+                        tracing::error!(error = %e, "fill: read_layers_above failed");
+                        None
+                    }
+                };
+                (Some(composite), above)
             } else {
-                None
+                (None, None)
             };
             match canvas.read_layer(idx) {
-                Ok(px) => (idx, px, source, id, mask),
+                Ok(px) => (idx, px, source, above, id, mask),
                 Err(e) => {
                     tracing::error!(error = %e, "fill: read_layer failed");
                     return;
@@ -1322,105 +1371,141 @@ impl PrimaryDragHandler {
             }
         };
 
-        let tolerance = self.fill.tolerance.get();
         let primary = self.colors.current();
-        let color_bgr = [primary.b, primary.g, primary.r];
-        let w = cs.width;
-        let h = cs.height;
-
-        // Run the BFS on a background thread so the UI stays
-        // responsive while the flood fill computes - at 8k canvas
-        // this is the difference between a 1.5s freeze and a
-        // smooth-but-pending click. The worker owns the pixel
-        // buffer during BFS and ships it back via the channel so
-        // we never clone the 256MB buffer.
-        let (tx, rx) = std::sync::mpsc::channel::<(Vec<u8>, Option<FillResult>)>();
-        let primary_color = primary;
-        std::thread::spawn(move || {
-            // Seed/match against the composite when sampling all layers,
-            // but always hand back the active-layer buffer as the paint
-            // target so the downstream commit writes the right layer.
-            let bfs_source = fill_source.as_deref().unwrap_or(&original);
-            let result = flood_fill(bfs_source, w, h, sx, sy, tolerance, selection_mask.as_deref());
-            let _ = tx.send((original, result));
+        let tolerance = self.fill.tolerance.get();
+        let generation = self.fill_generation.get().wrapping_add(1);
+        self.fill_generation.set(generation);
+        *self.fill_session.borrow_mut() = Some(FillSession {
+            generation,
+            layer_idx,
+            layer_id,
+            before: Arc::new(original),
+            sample: fill_source.map(Arc::new),
+            occluders: occluders.map(Arc::new),
+            mask: selection_mask.map(Arc::new),
+            seed: (sx, sy),
+            size: (cs.width, cs.height),
+            color_bgr: [primary.b, primary.g, primary.r],
+            auto_edge: self.fill.auto_edge.get(),
+            origin_x: x,
+            base_tolerance: tolerance,
+            tolerance,
+            current: None,
+            in_flight: false,
+            restart: false,
+            released: false,
+            animate: true,
         });
+        fill_request(&self.fill_ctx());
+    }
 
-        let canvas_for_poll = Rc::clone(&self.canvas);
-        let paintable_for_poll = self.paintable.clone();
-        let area_for_poll = self.area.clone();
-        let anim_for_poll = Rc::clone(&self.fill_anim);
-        let tools_for_poll = self.tools.clone();
-        let history_for_poll = Rc::clone(&self.history);
-        let layer_id_for_poll = layer_id.clone();
-        let poll_src = glib::timeout_add_local(
-            std::time::Duration::from_millis(16),
-            move || match rx.try_recv() {
-                Ok((pixels, opt_result)) => {
-                    // If the user has switched tools while the BFS
-                    // worker was running, abort silently - they're
-                    // no longer expecting a fill to land.
-                    if !matches!(tools_for_poll.active.get(), Tool::Fill(FillTool::Bucket)) {
-                        *anim_for_poll.borrow_mut() = None;
-                        let _ = pixels;
-                        let _ = opt_result;
-                        return glib::ControlFlow::Break;
-                    }
-                    // Worker handed us its buffer + the BFS result.
-                    // Clear the poll handle here so the animation
-                    // installer can replace it with the animation
-                    // timer below.
-                    *anim_for_poll.borrow_mut() = None;
-                    let Some(result) = opt_result else {
-                        return glib::ControlFlow::Break;
-                    };
-                    if result.sorted_indices.is_empty() {
-                        return glib::ControlFlow::Break;
-                    }
-                    if result.sorted_indices.len() == 1 {
-                        let before_buf = pixels.clone();
-                        let mut buffer = pixels;
-                        paint_indices(&mut buffer, &result.sorted_indices, color_bgr);
-                        let mut c = canvas_for_poll.borrow_mut();
-                        if let Err(e) = c.restore_layer(layer_idx, &buffer) {
-                            tracing::error!(error = %e, "fill: restore_layer failed");
-                        }
-                        drop(c);
-                        let cs = canvas_for_poll.borrow().size();
-                        if let Some(patch) = LayerPatch::from_full_diff(
-                            &before_buf, &buffer, cs.width, cs.height,
-                        ) {
-                            history_for_poll.borrow_mut().record(HistoryAction::Fill {
-                                layer_id: layer_id_for_poll.clone(),
-                                patch,
-                            });
-                        }
-                        present_into_paintable(
-                            &mut canvas_for_poll.borrow_mut(),
-                            &paintable_for_poll,
-                            &area_for_poll,
-                        );
-                        return glib::ControlFlow::Break;
-                    }
-                    start_fill_animation(
-                        Rc::clone(&canvas_for_poll),
-                        paintable_for_poll.clone(),
-                        area_for_poll.clone(),
-                        layer_idx,
-                        pixels,
-                        result,
-                        color_bgr,
-                        primary_color,
-                        Rc::clone(&anim_for_poll),
-                        Rc::clone(&history_for_poll),
-                        layer_id_for_poll.clone(),
-                    );
-                    glib::ControlFlow::Break
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
-            },
-        );
-        *self.fill_anim.borrow_mut() = Some(poll_src);
+    /// The motion controller's view of the drag: an absolute widget
+    /// position plus whether the button is still down.
+    ///
+    /// This is what actually drives and ends a fill gesture. The drag
+    /// gesture can report its end while a pen is still on the tablet,
+    /// and everything after that would otherwise be ignored - the fill
+    /// would adjust for a moment and then go dead under the user's hand.
+    fn fill_update_at(&self, x: f64, held: bool) {
+        let origin = self.fill_session.borrow().as_ref().map(|s| s.origin_x);
+        let Some(origin) = origin else {
+            return;
+        };
+        if held {
+            self.fill_update(x - origin);
+        } else {
+            tracing::debug!("fill: button released, ending gesture");
+            self.fill_end();
+        }
+    }
+
+    /// Drag handler: the pointer is still down after the drop, so
+    /// sideways movement is a threshold adjustment. Right fills more,
+    /// left fills less - the fill is recomputed and replaced in place.
+    fn fill_update(&self, dx: f64) {
+        // A tap is never perfectly still; nothing happens until the
+        // pointer has clearly set off sideways.
+        let travel = dx.abs() - TOLERANCE_DRAG_DEAD_ZONE_PX;
+        if travel <= 0.0 {
+            return;
+        }
+        let shift = travel.copysign(dx) * (255.0 / TOLERANCE_DRAG_RANGE_PX);
+
+        let Some((tolerance, was_percent)) = ({
+            let mut guard = self.fill_session.borrow_mut();
+            let Some(s) = guard.as_mut() else {
+                return;
+            };
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let next = (f64::from(s.base_tolerance) + shift).round().clamp(0.0, 255.0) as u8;
+            (next != s.tolerance).then(|| {
+                let was = percent(s.tolerance);
+                s.tolerance = next;
+                // Adjusting is a live edit - no point sweeping it in.
+                s.animate = false;
+                (next, was)
+            })
+        }) else {
+            return;
+        };
+
+        self.end_fill_animation();
+        // Plain cell write - the slider is only pushed once the gesture
+        // ends, since touching another widget mid-drag is exactly the
+        // kind of thing that unsettles a tablet's grab.
+        self.fill.tolerance.set(tolerance);
+        if percent(tolerance) != was_percent {
+            self.toaster
+                .info(&format!("Threshold {}%", percent(tolerance)));
+        }
+        fill_request(&self.fill_ctx());
+    }
+
+    /// Lift: the threshold the user settled on is the fill, so record it
+    /// as one history entry. A fill still computing records itself when
+    /// it lands instead.
+    fn fill_end(&self) {
+        let done = {
+            let mut guard = self.fill_session.borrow_mut();
+            let Some(s) = guard.as_mut() else {
+                return;
+            };
+            s.released = true;
+            !s.in_flight && !s.restart
+        };
+        // Catch the slider up now the gesture is over.
+        self.fill.set_tolerance(self.fill.tolerance.get());
+        if done {
+            fill_finish(&self.fill_ctx());
+        }
+    }
+
+    /// The pieces the fill's async plumbing needs, bundled so the poll
+    /// timers can carry them without reaching back into the handler.
+    fn fill_ctx(&self) -> FillCtx {
+        FillCtx {
+            canvas: Rc::clone(&self.canvas),
+            paintable: self.paintable.clone(),
+            area: self.area.clone(),
+            tools: self.tools.clone(),
+            history: Rc::clone(&self.history),
+            session: Rc::clone(&self.fill_session),
+            reveal: Rc::clone(&self.fill_reveal),
+            pump: self.render_pump.clone(),
+        }
+    }
+
+    /// Record whatever a fill gesture has already put on the layer.
+    /// No-op when no fill is in progress.
+    fn finalize_pending_fill(&self) {
+        fill_finish(&self.fill_ctx());
+    }
+
+    /// Cut any running fill reveal short, leaving the committed pixels
+    /// fully visible. Undo/redo go through this so an animation can't
+    /// keep masking a fill that is no longer on the canvas.
+    fn end_fill_animation(&self) {
+        fill_reveal_stop(&self.fill_ctx(), true);
     }
 
     // -- shapes ------------------------------------------------------------
@@ -2061,98 +2146,388 @@ fn start_shape_animation(
 ///
 /// Timing is wall-clock driven (`Instant::elapsed`) so a slow frame
 /// doesn't desync the spread.
-#[allow(clippy::too_many_arguments)]
-fn start_fill_animation(
+/// Which kind of device drove the gesture's current event. Only used to
+/// tell pen input from mouse input in debug logs.
+fn event_source(gesture: &gtk::GestureDrag) -> Option<gtk::gdk::InputSource> {
+    gesture
+        .current_event()
+        .and_then(|e| e.device())
+        .map(|d| d.source())
+}
+
+/// How far sideways the pointer travels to sweep the whole threshold
+/// range. Matches the feel of dragging out a ColorDrop.
+const TOLERANCE_DRAG_RANGE_PX: f64 = 400.0;
+
+/// Sideways slack before a fill press counts as a threshold drag, so a
+/// slightly shaky tap is still just a tap.
+const TOLERANCE_DRAG_DEAD_ZONE_PX: f64 = 8.0;
+
+/// How long the reveal sweep takes end to end.
+const REVEAL_MS: u64 = 400;
+
+/// How far the sweep has got at `elapsed_ms`, or `None` once it is done.
+///
+/// Ease-out cubic: fast at first, slows at the edges - feels like
+/// ink/paint spreading and dragging at its boundary. The mask stores
+/// 0..=254 across the fill region, so the radius is capped just under
+/// the sentinel value for every in-region pixel to be admitted at the end.
+fn reveal_at(elapsed_ms: u64) -> Option<f32> {
+    if elapsed_ms >= REVEAL_MS {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let t = (elapsed_ms as f32 / REVEAL_MS as f32).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - t).powi(3);
+    let max_reveal = 254.0 / 255.0;
+    Some((eased * max_reveal).clamp(0.0, max_reveal))
+}
+
+/// The threshold as the percentage the user sees.
+const fn percent(tolerance: u8) -> u32 {
+    tolerance as u32 * 100 / 255
+}
+
+/// A fill gesture, live from press to release.
+///
+/// The buffers are shared with the worker thread rather than moved, so a
+/// threshold adjustment can re-run the flood fill without re-reading the
+/// canvas. `before` is the layer as it was at press: every recomputed
+/// fill is painted from it, so dragging back and forth never compounds.
+struct FillSession {
+    /// Identifies this gesture, so a flood fill that finishes after its
+    /// own session ended can be dropped instead of being applied to
+    /// whatever gesture is running by then.
+    generation: u64,
+    layer_idx: usize,
+    layer_id: String,
+    before: Arc<Vec<u8>>,
+    sample: Option<Arc<Vec<u8>>>,
+    occluders: Option<Arc<Vec<u8>>>,
+    mask: Option<Arc<Vec<u8>>>,
+    seed: (i32, i32),
+    size: (u32, u32),
+    color_bgr: [u8; 3],
+    auto_edge: bool,
+    /// Widget x at press, so a plain pointer position is enough to work
+    /// out how far the threshold has been dragged.
+    origin_x: f64,
+    /// Threshold at press; the drag offset is measured from here.
+    base_tolerance: u8,
+    tolerance: u8,
+    /// Pixels currently on the layer, kept for the history diff.
+    current: Option<Vec<u8>>,
+    in_flight: bool,
+    /// The threshold moved on while a flood fill was already running, so
+    /// one more pass is owed once it lands. Intermediate positions are
+    /// never worth computing - only where the pointer ended up.
+    restart: bool,
+    released: bool,
+    animate: bool,
+}
+
+/// The pieces the fill's async plumbing needs.
+#[derive(Clone)]
+struct FillCtx {
     canvas: Rc<RefCell<Canvas>>,
     paintable: CanvasPaintable,
     area: gtk::Picture,
-    layer_idx: usize,
-    original: Vec<u8>,
-    result: FillResult,
-    color_bgr: [u8; 3],
-    color: Color,
-    anim_handle: Rc<RefCell<Option<glib::SourceId>>>,
+    tools: ToolState,
     history: Rc<RefCell<HistoryStack>>,
-    layer_id: String,
-) {
-    const FRAME_MS: u64 = 16;
-    const DURATION_MS: u64 = 400;
+    session: Rc<RefCell<Option<FillSession>>>,
+    /// When the reveal sweep started, if one is running. It outlives the
+    /// session on purpose: a gesture that ends mid-sweep must not strand
+    /// the overlay hiding a fill that is already committed.
+    reveal: Rc<Cell<Option<std::time::Instant>>>,
+    pump: RenderPump,
+}
 
-    // Arm the GPU overlay: one mask upload + state setup.
-    {
-        let mut c = canvas.borrow_mut();
-        if let Err(e) = c.begin_fill_overlay(layer_idx, &result.distance_mask, color) {
-            tracing::error!(error = %e, "fill: begin_fill_overlay failed");
-            // Fall through to a one-shot commit so the user still
-            // sees the fill land instead of nothing.
-            let before_buf = original.clone();
-            let mut buf = original;
-            paint_indices(&mut buf, &result.sorted_indices, color_bgr);
-            if let Err(e) = c.restore_layer(layer_idx, &buf) {
-                tracing::error!(error = %e, "fill: restore_layer fallback failed");
-            }
-            let cs = c.size();
-            if let Some(patch) = LayerPatch::from_full_diff(&before_buf, &buf, cs.width, cs.height) {
-                history.borrow_mut().record(HistoryAction::Fill { layer_id, patch });
-            }
-            present_into_paintable(&mut c, &paintable, &area);
+/// Run the flood fill for the session's current threshold on a worker
+/// thread, then poll for it.
+///
+/// The BFS is off the main thread because at 8k canvas it is the
+/// difference between a 1.5s freeze and a smooth-but-pending click. Only
+/// one runs at a time; anything asked for meanwhile is coalesced into
+/// `queued` and picked up when this one lands.
+fn fill_request(ctx: &FillCtx) {
+    let Some(job) = ({
+        let mut guard = ctx.session.borrow_mut();
+        let Some(s) = guard.as_mut() else {
+            return;
+        };
+        if s.in_flight {
+            // Let the running pass finish and re-run for wherever the
+            // pointer has got to by then.
+            s.restart = true;
             return;
         }
-        present_into_paintable(&mut c, &paintable, &area);
-    }
+        s.in_flight = true;
+        s.restart = false;
+        let generation = s.generation;
+        Some(FillJob {
+            generation,
+            before: Arc::clone(&s.before),
+            sample: s.sample.clone(),
+            occluders: s.occluders.clone(),
+            mask: s.mask.clone(),
+            seed: s.seed,
+            size: s.size,
+            opts: FillOptions {
+                tolerance: s.tolerance,
+                auto_edge: s.auto_edge,
+                // Only the first showing is ever swept in; every
+                // threshold step after it appears at once, so it can
+                // skip the distance sort and mask entirely.
+                reveal_order: s.animate,
+            },
+        })
+    }) else {
+        return;
+    };
 
-    let before_pixels = original.clone();
-    let buffer = Rc::new(RefCell::new(original));
-    let indices = Rc::new(result.sorted_indices);
-    let start = std::time::Instant::now();
-    let anim_handle_inner = Rc::clone(&anim_handle);
-    let canvas_for_anim = Rc::clone(&canvas);
-
-    let src = glib::timeout_add_local(std::time::Duration::from_millis(FRAME_MS), move || {
-        #[allow(clippy::cast_possible_truncation)]
-        let elapsed_ms = start.elapsed().as_millis() as u64;
-        #[allow(clippy::cast_precision_loss)]
-        let t = (elapsed_ms as f32 / DURATION_MS as f32).clamp(0.0, 1.0);
-        // Ease-out cubic: fast at first, slows at the edges - feels
-        // like ink/paint spreading and dragging at its boundary.
-        let eased = 1.0 - (1.0 - t).powi(3);
-
-        // The R8 mask stores 0..=254 across the fill region; cap the
-        // reveal threshold just under the sentinel value so the
-        // shader's `d > reveal` test admits every in-region pixel
-        // exactly at eased == 1.0.
-        let max_reveal = 254.0 / 255.0;
-        let reveal = (eased * max_reveal).clamp(0.0, max_reveal);
-
-        let done = elapsed_ms >= DURATION_MS;
-
-        if done {
-            // Final frame: bake the fill into the layer pixels and
-            // tear down the overlay. The layer write is the one and
-            // only big upload of the entire animation.
-            paint_indices(&mut buffer.borrow_mut(), &indices, color_bgr);
-            let mut c = canvas_for_anim.borrow_mut();
-            let buf = buffer.borrow();
-            if let Err(e) = c.commit_fill_overlay(layer_idx, &buf) {
-                tracing::error!(error = %e, "fill: commit_fill_overlay failed");
-            }
-            let cs = c.size();
-            if let Some(patch) = LayerPatch::from_full_diff(&before_pixels, &buf, cs.width, cs.height) {
-                history.borrow_mut().record(HistoryAction::Fill { layer_id: layer_id.clone(), patch });
-            }
-            drop(buf);
-            present_into_paintable(&mut c, &paintable, &area);
-            *anim_handle_inner.borrow_mut() = None;
-            glib::ControlFlow::Break
-        } else {
-            let mut c = canvas_for_anim.borrow_mut();
-            c.set_fill_reveal(reveal);
-            present_into_paintable(&mut c, &paintable, &area);
-            glib::ControlFlow::Continue
-        }
+    let (tx, rx) = std::sync::mpsc::channel::<Option<FillResult>>();
+    let generation = job.generation;
+    std::thread::spawn(move || {
+        // Seed/match against the composite when sampling all layers;
+        // the paint still lands in the active layer, which is what
+        // decides how the fill combines with what's already there.
+        let source = FillSource {
+            sample: job.sample.as_ref().map_or(&job.before[..], |s| &s[..]),
+            target: &job.before,
+            occluders: job.occluders.as_ref().map(|o| &o[..]),
+            mask: job.mask.as_ref().map(|m| &m[..]),
+        };
+        let (w, h) = job.size;
+        let (sx, sy) = job.seed;
+        let started = std::time::Instant::now();
+        let result = flood_fill(&source, w, h, sx, sy, job.opts);
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            tolerance = job.opts.tolerance,
+            "fill: flood fill computed",
+        );
+        let _ = tx.send(result);
     });
 
-    *anim_handle.borrow_mut() = Some(src);
+    // The poll is deliberately not tracked alongside the animation: a
+    // fill in flight has to be allowed to land even if the user clicks
+    // again straight away.
+    let ctx = ctx.clone();
+    glib::timeout_add_local(
+        std::time::Duration::from_millis(16),
+        move || match rx.try_recv() {
+            Ok(result) => {
+                fill_arrived(&ctx, result, generation);
+                glib::ControlFlow::Break
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => glib::ControlFlow::Break,
+        },
+    );
+}
+
+/// Everything the worker thread needs, detached from the session.
+struct FillJob {
+    generation: u64,
+    before: Arc<Vec<u8>>,
+    sample: Option<Arc<Vec<u8>>>,
+    occluders: Option<Arc<Vec<u8>>>,
+    mask: Option<Arc<Vec<u8>>>,
+    seed: (i32, i32),
+    size: (u32, u32),
+    opts: FillOptions,
+}
+
+/// A flood fill came back: put it on the layer, then either sweep it in,
+/// run whatever threshold was asked for in the meantime, or - if the
+/// pointer is already up - close the gesture out.
+fn fill_arrived(ctx: &FillCtx, result: Option<FillResult>, generation: u64) {
+    // A flood fill that outlived the gesture that asked for it belongs
+    // to nothing: applying it to whatever gesture is running now would
+    // paint the wrong region and, worse, hand its `in_flight` flag back
+    // so two workers could run at once.
+    if ctx
+        .session
+        .borrow()
+        .as_ref()
+        .is_none_or(|s| s.generation != generation)
+    {
+        return;
+    }
+    // Switching tools mid-flight means the user is no longer expecting
+    // this fill to land. Close the session out rather than dropping it -
+    // an earlier threshold may already be on the layer, and it still
+    // belongs in the undo stack.
+    if !matches!(ctx.tools.active.get(), Tool::Fill(FillTool::Bucket)) {
+        fill_finish(ctx);
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let mut painted = None;
+    let mut animate = false;
+    let mut changed = false;
+    {
+        let mut guard = ctx.session.borrow_mut();
+        let Some(s) = guard.as_mut() else {
+            return;
+        };
+        s.in_flight = false;
+        let matched = result.filter(|r| !r.sorted_indices.is_empty());
+        if matched.is_some() || s.current.is_some() {
+            // Always paint from the pristine copy: a threshold drag
+            // replaces the previous fill rather than stacking on it. A
+            // threshold that now matches nothing lands back on the
+            // untouched layer, so the canvas tracks the drag either way.
+            let mut buf = s.current.take().unwrap_or_else(|| (*s.before).clone());
+            buf.copy_from_slice(&s.before);
+            if let Some(result) = &matched {
+                paint_fill(&mut buf, result, s.color_bgr);
+            }
+            s.current = Some(buf);
+            animate = s.animate && matched.is_some();
+            s.animate = false;
+            painted = matched;
+            changed = true;
+        }
+    }
+
+    if changed {
+        fill_paint_layer(ctx, painted.as_ref(), animate);
+        tracing::debug!(
+            ms = started.elapsed().as_millis(),
+            "fill: painted and presented",
+        );
+    }
+
+    let (restart, released) = {
+        let mut guard = ctx.session.borrow_mut();
+        let Some(s) = guard.as_mut() else {
+            return;
+        };
+        (std::mem::take(&mut s.restart), s.released)
+    };
+    if restart {
+        fill_request(ctx);
+    } else if released {
+        fill_finish(ctx);
+    }
+}
+
+/// Push the session's current pixels onto the layer, and arm the reveal
+/// sweep when this is the fill's first showing.
+fn fill_paint_layer(ctx: &FillCtx, result: Option<&FillResult>, animate: bool) {
+    tracing::debug!(animate, "fill: writing pixels to layer");
+    let mut c = ctx.canvas.borrow_mut();
+    let mut guard = ctx.session.borrow_mut();
+    let Some(s) = guard.as_mut() else {
+        return;
+    };
+    // Layers can be reordered or removed while the flood fill is
+    // computing, so the id is what identifies the target - never the
+    // index it happened to have at press. If the layer is gone the fill
+    // is abandoned: writing a whole-layer buffer into whatever now
+    // occupies that slot would destroy it, and the history entry is
+    // keyed on the missing id so undo couldn't put it back.
+    let layers = c.layers().snapshot();
+    let Some(layer_idx) = layers.iter().position(|l| l.id == s.layer_id) else {
+        tracing::warn!(layer = %s.layer_id, "fill: target layer is gone, abandoning");
+        drop(layers);
+        drop(guard);
+        ctx.session.borrow_mut().take();
+        return;
+    };
+    drop(layers);
+    s.layer_idx = layer_idx;
+    let Some(buf) = s.current.as_ref() else {
+        return;
+    };
+    if let Err(e) = c.commit_fill(layer_idx, buf) {
+        tracing::error!(error = %e, "fill: commit_fill failed");
+        return;
+    }
+    // Arm the reveal: one mask upload + state setup, which leaves the
+    // fill hidden at radius zero. If it fails the fill simply appears at
+    // once, which is no worse than the sweep.
+    let armed = animate
+        && result.is_some_and(|r| match c.begin_fill_overlay(layer_idx, r) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!(error = %e, "fill: begin_fill_overlay failed");
+                false
+            }
+        });
+    present_into_paintable(&mut c, &ctx.paintable, &ctx.area);
+    drop(guard);
+    drop(c);
+    tracing::debug!(armed, "fill: pixels on screen");
+    if armed {
+        // Hand the sweep to the frame clock. It runs at vsync whether or
+        // not the pointer moves, and outlives both this gesture and the
+        // drag that armed the pump.
+        ctx.reveal.set(Some(std::time::Instant::now()));
+        ctx.pump.arm();
+    }
+}
+
+/// Advance the reveal sweep by one frame. Called from the render pump's
+/// frame-clock tick, which presents straight afterwards - so this only
+/// moves canvas state and never presents itself.
+fn fill_reveal_tick(ctx: &FillCtx) {
+    let Some(started) = ctx.reveal.get() else {
+        return;
+    };
+    #[allow(clippy::cast_possible_truncation)]
+    let elapsed = started.elapsed().as_millis() as u64;
+    let mut c = ctx.canvas.borrow_mut();
+    // Undo, or a fresh fill, may have taken the overlay down already.
+    if !c.fill_overlay_active() {
+        drop(c);
+        fill_reveal_stop(ctx, false);
+        return;
+    }
+    if let Some(reveal) = reveal_at(elapsed) {
+        c.set_fill_reveal(reveal);
+    } else {
+        c.cancel_fill_overlay();
+        drop(c);
+        fill_reveal_stop(ctx, false);
+    }
+}
+
+/// End the sweep, releasing the pump reference exactly once. `show`
+/// drops the overlay so the finished fill is visible - used when
+/// something interrupts the sweep rather than letting it complete.
+fn fill_reveal_stop(ctx: &FillCtx, show: bool) {
+    if ctx.reveal.take().is_none() {
+        return;
+    }
+    ctx.pump.disarm();
+    if show {
+        let mut c = ctx.canvas.borrow_mut();
+        if c.fill_overlay_active() {
+            c.cancel_fill_overlay();
+            present_into_paintable(&mut c, &ctx.paintable, &ctx.area);
+        }
+    }
+}
+
+/// Close the gesture out: one history entry for the threshold the user
+/// settled on, whatever they tried on the way there.
+fn fill_finish(ctx: &FillCtx) {
+    let Some(s) = ctx.session.borrow_mut().take() else {
+        return;
+    };
+    let Some(after) = s.current else {
+        return;
+    };
+    let cs = ctx.canvas.borrow().size();
+    if let Some(patch) = LayerPatch::from_full_diff(&s.before, &after, cs.width, cs.height) {
+        ctx.history.borrow_mut().record(HistoryAction::Fill {
+            layer_id: s.layer_id,
+            patch,
+        });
+    }
 }
 
 pub(super) fn install_primary_drag(
@@ -2204,7 +2579,10 @@ pub(super) fn install_primary_drag(
         selection: selection.clone(),
         selection_drag_start: Rc::new(Cell::new(Point::ZERO)),
         fill: fill.clone(),
-        fill_anim: Rc::new(RefCell::new(None)),
+        fill_reveal: Rc::new(Cell::new(None)),
+        fill_generation: Rc::new(Cell::new(0)),
+        render_pump: viewport.render_pump(),
+        fill_session: Rc::new(RefCell::new(None)),
         shape: shape.clone(),
         shape_drag_start: Rc::new(Cell::new(Point::ZERO)),
         shape_cur_rect: Rc::new(Cell::new(None)),
@@ -2249,19 +2627,42 @@ pub(super) fn install_primary_drag(
     {
         let h = Rc::clone(&handler);
         let pump = viewport.render_pump();
-        drag.connect_drag_end(move |_, _, _| {
-            h.on_end();
+        drag.connect_drag_end(move |g, _, _| {
+            h.on_end(g);
             pump.disarm();
         });
     }
 
-    // Let undo/redo land an in-flight shape correction before they touch
-    // history, so the corrected shape is recorded rather than silently
-    // overwriting an older action's undo state.
+    // The fill's reveal sweep advances on the render pump's frame clock:
+    // vsync-paced whether or not the pointer moves, and in phase with
+    // the present that is already happening rather than blocking the
+    // main loop between input events.
+    {
+        let ctx = handler.fill_ctx();
+        *viewport.render_pump().tick_handle().borrow_mut() =
+            Some(Box::new(move || fill_reveal_tick(&ctx)));
+    }
+
+    // The motion controller feeds the fill's threshold drag too - see
+    // the note there for why the drag gesture alone isn't enough.
     {
         let h = Rc::clone(&handler);
-        *viewport.flush_correction_handle().borrow_mut() =
-            Some(Box::new(move || h.finalize_pending_brush()));
+        *viewport.fill_drag_handle().borrow_mut() =
+            Some(Box::new(move |x, held| h.fill_update_at(x, held)));
+    }
+
+    // Let undo/redo land an in-flight shape correction before they touch
+    // history, so the corrected shape is recorded rather than silently
+    // overwriting an older action's undo state. A running fill reveal is
+    // cut short at the same point - its pixels are already committed, so
+    // leaving it running would mask a fill that undo just removed.
+    {
+        let h = Rc::clone(&handler);
+        *viewport.flush_correction_handle().borrow_mut() = Some(Box::new(move || {
+            h.finalize_pending_brush();
+            h.finalize_pending_fill();
+            h.end_fill_animation();
+        }));
     }
 
     area.add_controller(drag);
