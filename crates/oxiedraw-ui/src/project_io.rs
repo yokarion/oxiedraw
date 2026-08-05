@@ -165,11 +165,8 @@ fn write_project(
     };
 
     session.global.save_in_progress.set(true);
-    let pending = if kind == SaveKind::Manual {
-        session.global.toaster.pending("Saving project...")
-    } else {
-        None
-    };
+    let pending = (kind == SaveKind::Manual)
+        .then(|| session.global.toaster.pending("Saving project..."));
 
     // Phase 2 (worker thread): PNG-encode + write the TAR archive.
     let (tx, rx) = mpsc::channel::<Result<(), String>>();
@@ -208,14 +205,7 @@ fn write_project(
                 // The document now lives in a real file; drop any recovery copy.
                 session.clear_recovery();
 
-                let win = window.clone();
-                let saved_path = path.clone();
-                session
-                    .global
-                    .toaster
-                    .action("Project saved!", "Open", move || {
-                        open_containing_folder(&win, &saved_path);
-                    });
+                session.global.toaster.info("Project saved!");
             }
             (Ok(()), SaveKind::Autosave) => {
                 tracing::debug!(path = %path.display(), "autosaved project");
@@ -319,16 +309,6 @@ fn process_autosave_queue(
     };
     // Autosave never rotates the numbered backups (those are for manual saves).
     write_project(&session, &window, path, kind, 0, next);
-}
-
-/// Reveal a saved file in the system file manager.
-fn open_containing_folder(window: &adw::ApplicationWindow, path: &Path) {
-    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
-    launcher.open_containing_folder(Some(window), None::<&gio::Cancellable>, |res| {
-        if let Err(e) = res {
-            tracing::warn!(error = %e, "open containing folder failed");
-        }
-    });
 }
 
 /// Prompt for a project file and load it. On success `on_loaded` is called with

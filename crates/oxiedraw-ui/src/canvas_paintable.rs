@@ -2648,9 +2648,9 @@ mod imp {
                 }
             }
 
-            // 10. Transient toast pill, bottom-center. Drawn last so it sits
-            //     above every overlay. Just a cached texture positioned + faded;
-            //     the slide/fade animates via the cheap invalidate path, never a
+            // 10. Transient toast pill, top-center. Drawn last so it sits above
+            //     every overlay. Just a cached texture positioned + faded; the
+            //     slide/fade animates via the cheap invalidate path, never a
             //     canvas re-composite, so it can't disturb an in-flight stroke.
             #[allow(clippy::cast_possible_truncation)]
             if self.toast_alpha.get() > 0.001
@@ -2659,7 +2659,9 @@ mod imp {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let margin = 28.0_f32;
                 let x = ((width as f32 - *pill_w) / 2.0).round();
-                let y = (height as f32 - *pill_h - margin + self.toast_offset.get()).round();
+                // The offset is subtracted so the pill slides in from above and
+                // retreats upward on the way out.
+                let y = (margin - self.toast_offset.get()).round();
                 let rect = graphene::Rect::new(x, y, *pill_w, *pill_h);
                 gtk_snap.push_opacity(f64::from(self.toast_alpha.get()));
                 gtk_snap.append_texture(texture, &rect);
