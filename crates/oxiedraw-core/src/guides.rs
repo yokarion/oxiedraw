@@ -110,6 +110,28 @@ impl SymElement {
             }
         }
     }
+
+    /// The translation-free (linear) part of this element as a row-major 2x2
+    /// matrix `[m00, m01, m10, m11]`.
+    ///
+    /// [`Self::apply`] maps *points*, which is all a brush dab needs. A liquify
+    /// dab also carries a *displacement vector*, and a vector must be mapped by
+    /// the linear part alone - reflecting only the dab centre would leave the
+    /// mirrored copy pushing pixels the wrong way. Both matrices are orthogonal,
+    /// so the inverse is the transpose and vector lengths are preserved.
+    #[must_use]
+    pub fn linear(self) -> [f32; 4] {
+        match self {
+            Self::Rotate { angle } => {
+                let (s, c) = angle.sin_cos();
+                [c, -s, s, c]
+            }
+            Self::Reflect { axis } => {
+                let (s, c) = (2.0 * axis).sin_cos();
+                [c, s, s, -c]
+            }
+        }
+    }
 }
 
 /// Resolved symmetry transform set for a live stroke, handed to the renderer

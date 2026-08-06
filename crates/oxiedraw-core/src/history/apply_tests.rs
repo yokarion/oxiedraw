@@ -160,6 +160,12 @@ fn transform_round_trip() {
     });
 }
 
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn liquify_round_trip() {
+    patch_round_trip(|layer_id, patch| HistoryAction::Liquify { layer_id, patch });
+}
+
 // ---------------------------------------------------------------------------
 // Layer-structure variants
 // ---------------------------------------------------------------------------

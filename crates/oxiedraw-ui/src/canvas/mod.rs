@@ -20,6 +20,7 @@ use oxiedraw_core::color::ColorState;
 use oxiedraw_core::document::LayerState;
 use oxiedraw_core::renderer::DmabufDescriptor;
 use oxiedraw_core::guides::GuideState;
+use oxiedraw_core::liquify::LiquifyState;
 use oxiedraw_core::tools::{
     CropRect, CropState, FillState, FillTool, GradientState, SelectionState, ShapeState, Tool,
     ToolState, TransformState,
@@ -652,6 +653,9 @@ pub(crate) fn wire(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    liquify: &LiquifyState,
+    liquify_ensure: Rc<dyn Fn() -> bool>,
+    liquify_bake_stroke: Rc<dyn Fn() -> bool>,
     guide: &GuideState,
     history: &Rc<RefCell<oxiedraw_core::history::HistoryStack>>,
     toaster: &crate::toaster::Toaster,
@@ -677,7 +681,8 @@ pub(crate) fn wire(
     }
 
     install_motion(
-        picture, viewport, brush_engine, colors, tools, crop, transform, gradient, text_edit,
+        picture, viewport, brush_engine, colors, tools, crop, transform, gradient, liquify,
+        text_edit,
     );
     install_pan(picture, viewport);
     install_scroll(picture, viewport);
@@ -694,6 +699,9 @@ pub(crate) fn wire(
         fill,
         shape,
         gradient,
+        liquify,
+        liquify_ensure,
+        liquify_bake_stroke,
         guide,
         history,
         toaster,
@@ -701,6 +709,22 @@ pub(crate) fn wire(
         cursor_activates_transform,
     );
     install_centering_and_present(picture, viewport);
+}
+
+/// A plain circle outline of `radius` canvas pixels, centred at the origin -
+/// the cursor footprint for tools that have a size but no brush tip.
+fn circle_cursor(radius: f32) -> oxiedraw_core::brush_engine::BrushCursor {
+    const SEGMENTS: usize = 48;
+    #[allow(clippy::cast_precision_loss)]
+    let points: Vec<Point> = (0..=SEGMENTS)
+        .map(|i| {
+            let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            Point::new(radius * a.cos(), radius * a.sin())
+        })
+        .collect();
+    oxiedraw_core::brush_engine::BrushCursor {
+        strokes: vec![points],
+    }
 }
 
 fn install_motion(
@@ -712,6 +736,7 @@ fn install_motion(
     crop: &CropState,
     transform: &TransformState,
     gradient: &GradientState,
+    liquify: &LiquifyState,
     text_edit: &crate::text_edit::TextEdit,
 ) {
     let motion = gtk::EventControllerMotion::new();
@@ -726,6 +751,7 @@ fn install_motion(
     let crop = crop.clone();
     let transform = transform.clone();
     let gradient = gradient.clone();
+    let liquify = liquify.clone();
     let brush_engine = brush_engine.clone();
     let colors = colors.clone();
     let area_c = area.clone();
@@ -834,6 +860,17 @@ fn install_motion(
                 );
                 let cursor = compute_brush_cursor(&preset, ctx, input, ctx.size);
                 paintable.set_brush_cursor(Some(cursor), canvas_pos);
+            }
+            Tool::Liquify => {
+                // Like the brush: the drawn outline is the cursor, so the OS
+                // pointer is hidden over the canvas.
+                area_c.set_cursor_from_name(Some("none"));
+                paintable.set_color_picker(None);
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
+                paintable.set_brush_cursor(
+                    Some(circle_cursor(liquify.size.get() * 0.5)),
+                    canvas_pos,
+                );
             }
             Tool::Text => {
                 // Resize cursor over a handle of the box being edited;

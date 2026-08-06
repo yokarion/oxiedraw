@@ -905,6 +905,7 @@ pub enum Tool {
     Shapes(ShapeTool),
     Text,
     Crop,
+    Liquify,
     DrawingGuide,
 }
 
@@ -920,6 +921,7 @@ impl Tool {
             Self::Shapes(s) => s.display_name(),
             Self::Text => "Text",
             Self::Crop => "Crop",
+            Self::Liquify => "Liquify",
             Self::DrawingGuide => "Drawing Guide",
         }
     }
@@ -935,6 +937,7 @@ impl Tool {
             Self::Shapes(s) => s.icon_name(),
             Self::Text => "oxiedraw-text-symbolic",
             Self::Crop => "oxiedraw-crop-symbolic",
+            Self::Liquify => "oxiedraw-liquify-symbolic",
             Self::DrawingGuide => "oxiedraw-guide-symbolic",
         }
     }

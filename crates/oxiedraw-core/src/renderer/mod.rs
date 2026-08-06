@@ -125,6 +125,7 @@ mod filters;
 mod gradient_overlay;
 mod instance;
 mod layers;
+mod liquify;
 mod mask;
 mod pass;
 mod pattern_atlas;

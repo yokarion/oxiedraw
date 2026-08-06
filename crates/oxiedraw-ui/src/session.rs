@@ -18,11 +18,13 @@ use oxiedraw_core::brush_engine::BrushEngine;
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::ColorState;
 use oxiedraw_core::components::{ComponentLayer, ComponentLibrary};
+use oxiedraw_core::liquify::LiquifyState;
 use oxiedraw_core::document::{
     ComponentInstance, Document, DocumentProperties, LayerKind, Placement,
 };
 use oxiedraw_core::history::{
-    CropLayer, HistoryAction, HistoryConfig, HistoryStack, LayerPatch, SelectionSnapshot,
+    CropLayer, HistoryAction, HistoryConfig, HistoryStack, LayerPatch, PatchBounds,
+    SelectionSnapshot,
 };
 use oxiedraw_core::guides::{GuideConfig, GuideState, Symmetry};
 use oxiedraw_core::renderer::RendererError;
@@ -158,6 +160,7 @@ pub(crate) struct DocumentSession {
     pub(crate) fill: FillState,
     pub(crate) shape: ShapeState,
     pub(crate) gradient: GradientState,
+    pub(crate) liquify: LiquifyState,
     /// Per-document drawing guide (symmetry / grid / perspective). Edited by the
     /// Drawing Guide tool; its symmetry keeps affecting strokes once assisted.
     pub(crate) guide: GuideState,
@@ -182,6 +185,13 @@ pub(crate) struct DocumentSession {
     pub(crate) apply_tool: Rc<dyn Fn(Tool)>,
     pub(crate) transform_apply: Rc<dyn Fn()>,
     pub(crate) transform_cancel: Rc<dyn Fn()>,
+    /// Revert to the pre-tool pixels (as an undoable edit) and close the session.
+    pub(crate) liquify_cancel: Rc<dyn Fn()>,
+    /// Revert to the pre-tool pixels, staying in the tool.
+    pub(crate) liquify_restore: Rc<dyn Fn()>,
+    /// Close a live liquify session before anything mutates the layer stack
+    /// behind the tool's back (undo/redo, layer delete, layer reorder, save).
+    pub(crate) liquify_flush: Rc<dyn Fn()>,
     pub(crate) crop_apply: Rc<dyn Fn()>,
     pub(crate) refresh_layers: Rc<dyn Fn()>,
     /// Create an adjustment layer next to the current selection (like the layer
@@ -326,6 +336,263 @@ fn build_select_folder_content(ctx: &SessionCtx) -> Rc<dyn Fn(Vec<usize>)> {
     })
 }
 
+/// The layer a liquify session is open on. `pristine` is the layer as it was
+/// when the tool picked it up, which is what Restore All / Cancel go back to.
+///
+/// Individual strokes do *not* go through here - each one bakes and records its
+/// own [`HistoryAction::Liquify`] at pen-up, so Ctrl+Z steps back one warp.
+///
+/// The target's *index* deliberately lives only in the renderer session (which
+/// remaps it when the layer stack shifts); this side keeps the stable id so a
+/// history entry can never be filed against the wrong layer.
+struct LiquifyPending {
+    id: String,
+    pristine: Vec<u8>,
+}
+
+/// The live session's target index, and the id the tool opened it on. `None`
+/// when there is no session or the UI's pending state has gone stale.
+fn liquify_target(ctx: &SessionCtx) -> Option<(usize, String)> {
+    let idx = ctx.canvas().borrow().liquify_target()?;
+    let id = ctx.liquify_pending.borrow().as_ref()?.id.clone();
+    Some((idx, id))
+}
+
+/// Open a liquify session on the active layer, reusing the live one when it
+/// already targets that layer. Returns false when the active layer can't be
+/// liquified (no layer, or a text / component / adjustment layer, whose pixels
+/// are re-rendered from their source and would be clobbered).
+fn build_liquify_ensure(ctx: &SessionCtx, flush: &Rc<dyn Fn()>) -> Rc<dyn Fn() -> bool> {
+    let ctx = ctx.clone();
+    let flush = Rc::clone(flush);
+    Rc::new(move || {
+        let canvas = ctx.canvas();
+        let Some(idx) = canvas.borrow().layers().active() else {
+            return false;
+        };
+        // Reuse the live session only if it is still on the *same layer*, by id.
+        // The session pins a slot index, and plenty of operations renumber the
+        // stack without going through a flush hook (duplicate, merge, group,
+        // ungroup, paste). Matching on index alone would silently adopt whatever
+        // layer had slid into that slot and bake one layer's warp over another.
+        let same_layer = {
+            let c = canvas.borrow();
+            c.liquify_target() == Some(idx)
+                && ctx.liquify_pending.borrow().as_ref().is_some_and(|p| {
+                    c.layers().snapshot().get(idx).is_some_and(|l| l.id == p.id)
+                })
+        };
+        if same_layer {
+            return true;
+        }
+        let kind = canvas.borrow().layers().kind(idx);
+        if !matches!(kind, Some(LayerKind::Raster)) {
+            ctx.global
+                .toaster
+                .info("Liquify only works on raster layers. Rasterize this one first.");
+            return false;
+        }
+        // Close any session on another layer first (its strokes are already
+        // baked and recorded, so this only frees the field).
+        flush();
+
+        let (id, pristine) = {
+            let mut c = canvas.borrow_mut();
+            let Some(id) = c.layers().snapshot().get(idx).map(|l| l.id.clone()) else {
+                return false;
+            };
+            match c.read_layer(idx) {
+                Ok(pristine) => (id, pristine),
+                Err(e) => {
+                    tracing::error!(error = %e, "liquify: read_layer failed");
+                    return false;
+                }
+            }
+        };
+        if let Err(e) = canvas.borrow_mut().begin_liquify(idx) {
+            tracing::error!(error = %e, "liquify: begin_liquify failed");
+            return false;
+        }
+        *ctx.liquify_pending.borrow_mut() = Some(LiquifyPending { id, pristine });
+        ctx.viewport.redraw_handle().request();
+        true
+    })
+}
+
+/// Write the warp painted since the last bake into the layer and record it as
+/// one undo entry. Runs at every pen-up, which is what makes Ctrl+Z step back a
+/// single warp instead of the whole tool session.
+///
+/// The patch is bounded to the region the field actually changed, so a small
+/// push on a large canvas doesn't cost a full-canvas readback.
+///
+/// Returns whether the layer and the undo stack still agree afterwards. `false`
+/// means either the warp never reached the layer, or (worse) it did and could
+/// not be recorded - in both cases the caller must tell the user rather than
+/// closing the session over it silently.
+fn build_liquify_bake_stroke(ctx: &SessionCtx) -> Rc<dyn Fn() -> bool> {
+    let ctx = ctx.clone();
+    Rc::new(move || {
+        let canvas = ctx.canvas();
+        let Some((idx, id)) = liquify_target(&ctx) else {
+            return true;
+        };
+        let Some((x, y, w, h)) = canvas.borrow().liquify_dirty_bounds() else {
+            return true; // nothing painted since the last bake
+        };
+
+        let mut before = Vec::new();
+        let mut after = Vec::new();
+        // Read `before` up front: once the bake runs, the pre-warp pixels are
+        // gone and the entry can never be reconstructed.
+        if let Err(e) = canvas
+            .borrow_mut()
+            .read_layer_region_into(idx, x, y, w, h, &mut before)
+        {
+            tracing::error!(error = %e, "liquify: before-region read failed");
+            return false;
+        }
+        let size = {
+            let mut c = canvas.borrow_mut();
+            if let Err(e) = c.liquify_bake() {
+                tracing::error!(error = %e, "liquify: bake failed");
+                return false;
+            }
+            if let Err(e) = c.read_layer_region_into(idx, x, y, w, h, &mut after) {
+                // The layer has already been rewritten, so this leaves a real
+                // edit with no way to undo it.
+                tracing::error!(error = %e, "liquify: after-region read failed");
+                return false;
+            }
+            c.size()
+        };
+        if before.len() != after.len() {
+            tracing::error!("liquify: region size mismatch - stroke left unrecorded");
+            return false;
+        }
+        let region = PatchBounds { x, y, w, h };
+        if let Some(patch) =
+            LayerPatch::from_region_diff(&before, &after, region, size.width, size.height)
+        {
+            ctx.history
+                .borrow_mut()
+                .record(HistoryAction::Liquify { layer_id: id, patch });
+        }
+        ctx.viewport.redraw_handle().request();
+        true
+    })
+}
+
+/// Close a live liquify session, baking any stroke that hasn't been written yet.
+///
+/// Anything that mutates the layer stack behind the tool's back has to call
+/// this. The session pins its target's index and warps a *snapshot* of the
+/// layer, so leaving it open across an undo, a delete or a reorder would let the
+/// field re-apply itself over whatever the other operation just did. Strokes are
+/// already recorded individually, so this normally just frees the field; the
+/// bake only matters if the pointer is still down.
+fn build_liquify_flush(ctx: &SessionCtx, bake_stroke: &Rc<dyn Fn() -> bool>) -> Rc<dyn Fn()> {
+    let ctx = ctx.clone();
+    let bake_stroke = Rc::clone(bake_stroke);
+    Rc::new(move || {
+        let active = ctx.canvas().borrow().liquify_active();
+        if !active {
+            // Clear any pending state even so: a canvas resize replaces the
+            // renderer wholesale, which drops the session without going through
+            // here and would otherwise strand a `pristine` sized for the old
+            // canvas.
+            ctx.liquify_pending.borrow_mut().take();
+            return;
+        }
+        // The session has to close regardless - the caller is about to mutate
+        // the layer stack, and leaving the field live would let it re-apply
+        // itself over that. But a failed bake means the on-screen warp is being
+        // dropped (or worse, kept without an undo entry), so say so rather than
+        // losing the user's work quietly.
+        if !bake_stroke() {
+            ctx.global
+                .toaster
+                .info("Liquify: the last warp could not be saved to the layer.");
+        }
+        ctx.liquify_pending.borrow_mut().take();
+        if let Err(e) = ctx.canvas().borrow_mut().end_liquify() {
+            tracing::error!(error = %e, "liquify: end session failed");
+        }
+        ctx.viewport.redraw_handle().request();
+    })
+}
+
+/// Put the layer back the way the tool found it, as one more undoable edit, and
+/// leave the session open. Photoshop's "Restore All".
+///
+/// Every stroke is already its own history entry, so this can't just discard
+/// state - it records the revert so Ctrl+Z brings the warps back.
+fn build_liquify_restore(ctx: &SessionCtx) -> Rc<dyn Fn()> {
+    let ctx = ctx.clone();
+    Rc::new(move || {
+        let canvas = ctx.canvas();
+        let Some((idx, id)) = liquify_target(&ctx) else {
+            return;
+        };
+        let pristine = {
+            let pending = ctx.liquify_pending.borrow();
+            let Some(p) = pending.as_ref() else {
+                return;
+            };
+            p.pristine.clone()
+        };
+        let (size, before) = {
+            let mut c = canvas.borrow_mut();
+            let before = match c.read_layer(idx) {
+                Ok(px) => px,
+                Err(e) => {
+                    tracing::error!(error = %e, "liquify: restore read failed");
+                    return;
+                }
+            };
+            if let Err(e) = c.liquify_restore_all() {
+                tracing::error!(error = %e, "liquify: restore all failed");
+                return;
+            }
+            if let Err(e) = c.liquify_bake() {
+                tracing::error!(error = %e, "liquify: restore bake failed");
+                return;
+            }
+            (c.size(), before)
+        };
+        // A canvas resize (component edit mode enter/exit) replaces the renderer
+        // without closing the session, so `pristine` can be sized for a canvas
+        // that no longer exists. `from_full_diff` only debug-asserts the lengths,
+        // so an unguarded call here panics on an out-of-range slice in release.
+        if before.len() != pristine.len() {
+            tracing::error!(
+                before = before.len(),
+                pristine = pristine.len(),
+                "liquify: canvas resized during the session - skipping restore",
+            );
+            return;
+        }
+        if let Some(patch) =
+            LayerPatch::from_full_diff(&before, &pristine, size.width, size.height)
+        {
+            ctx.history
+                .borrow_mut()
+                .record(HistoryAction::Liquify { layer_id: id, patch });
+        }
+        ctx.viewport.redraw_handle().request();
+    })
+}
+
+/// Restore All, then close the session. The tool switch itself is the caller's.
+fn build_liquify_cancel(restore: &Rc<dyn Fn()>, flush: &Rc<dyn Fn()>) -> Rc<dyn Fn()> {
+    let restore = Rc::clone(restore);
+    let flush = Rc::clone(flush);
+    Rc::new(move || {
+        restore();
+        flush();
+    })
+}
+
 /// Abandon the in-flight transform and put the layer back the way it was.
 ///
 /// Text and component layers re-render from their source rather than restoring
@@ -457,6 +724,9 @@ struct SessionCtx {
     crop: CropState,
     transform: TransformState,
     selection: SelectionState,
+    /// The live liquify session's target layer + pre-warp pixels, or `None` when
+    /// no session is open.
+    liquify_pending: Rc<RefCell<Option<LiquifyPending>>>,
 }
 
 impl SessionCtx {
@@ -508,6 +778,7 @@ impl DocumentSession {
         let fill = FillState::new();
         let shape = ShapeState::new();
         let gradient = GradientState::new();
+        let liquify = LiquifyState::new();
         let guide = GuideState::new();
         let doc_props = document.properties.clone();
         let viewport = Viewport::new(init_size, document.layers.clone());
@@ -541,9 +812,16 @@ impl DocumentSession {
             crop: crop.clone(),
             transform: transform.clone(),
             selection: selection.clone(),
+            liquify_pending: Rc::new(RefCell::new(None)),
         };
 
         let crop_apply = build_crop_apply(&ctx);
+
+        let liquify_bake_stroke = build_liquify_bake_stroke(&ctx);
+        let liquify_flush = build_liquify_flush(&ctx, &liquify_bake_stroke);
+        let liquify_restore = build_liquify_restore(&ctx);
+        let liquify_cancel = build_liquify_cancel(&liquify_restore, &liquify_flush);
+        let liquify_ensure = build_liquify_ensure(&ctx, &liquify_flush);
 
         let transform_cancel = build_transform_cancel(&ctx);
 
@@ -565,6 +843,7 @@ impl DocumentSession {
             &fill,
             &shape,
             &gradient,
+            &liquify,
             &text_edit_slot,
             global.default_brush_name.clone(),
             global.toaster.clone(),
@@ -601,7 +880,13 @@ impl DocumentSession {
         let prepare_delete: Rc<dyn Fn() -> bool> = {
             let transform = transform.clone();
             let transform_cancel = Rc::clone(&transform_cancel);
-            Rc::new(move || prepare_transform_for_delete(&transform, || transform_cancel()))
+            let liquify_flush = Rc::clone(&liquify_flush);
+            Rc::new(move || {
+                // A liquify session pins its target's index; a delete would shift
+                // the stack under it, so bake the warp before the stack moves.
+                liquify_flush();
+                prepare_transform_for_delete(&transform, || transform_cancel())
+            })
         };
 
         // Commit an in-progress transform before the layers panel reorders the
@@ -613,7 +898,10 @@ impl DocumentSession {
         let prepare_reorder: Rc<dyn Fn()> = {
             let transform = transform.clone();
             let transform_apply = Rc::clone(&transform_apply);
+            let liquify_flush = Rc::clone(&liquify_flush);
             Rc::new(move || {
+                // Same index hazard as the delete path above.
+                liquify_flush();
                 let in_progress = transform.has_targets() || transform.rect.get().is_some();
                 if in_progress {
                     transform_apply();
@@ -745,6 +1033,7 @@ impl DocumentSession {
             &layer_extensions,
             &components,
             &global.text_engine,
+            Rc::clone(&liquify_flush),
             Rc::clone(&set_tool_options),
             Rc::clone(&set_right_panel_tool),
         );
@@ -789,6 +1078,9 @@ impl DocumentSession {
             &fill,
             &shape,
             &gradient,
+            &liquify,
+            Rc::clone(&liquify_ensure),
+            Rc::clone(&liquify_bake_stroke),
             &guide,
             &history,
             &global.toaster,
@@ -929,6 +1221,7 @@ impl DocumentSession {
             fill,
             shape,
             gradient,
+            liquify,
             guide,
             viewport,
             doc_props,
@@ -941,6 +1234,9 @@ impl DocumentSession {
             apply_tool,
             transform_apply,
             transform_cancel,
+            liquify_cancel,
+            liquify_restore,
+            liquify_flush,
             crop_apply,
             refresh_layers,
             create_adjustment_layer,
@@ -1050,6 +1346,9 @@ impl DocumentSession {
         // first, so this undo pops a consistent canvas state instead of
         // reverting an older action behind an unrecorded corrected shape.
         self.viewport.flush_pending_correction();
+        // Same for a live liquify session: bake it so this undo pops the warp
+        // the user just made, rather than reaching past it to an older action.
+        (self.liquify_flush)();
         let canvas = self.viewport.canvas();
         // Extension state each transformed layer returns to (captured before the
         // entry moves to the redo stack).
@@ -1084,6 +1383,7 @@ impl DocumentSession {
 
     pub(crate) fn redo(&self) {
         self.viewport.flush_pending_correction();
+        (self.liquify_flush)();
         let canvas = self.viewport.canvas();
         let ext_reconcile = self.history.borrow().redo_ext_reconcile();
         let label = {
@@ -1677,6 +1977,7 @@ fn build_apply_tool(
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     components: &Rc<RefCell<ComponentLibrary>>,
     text_engine: &Rc<RefCell<oxiedraw_core::text::fonts::TextEngine>>,
+    liquify_flush: Rc<dyn Fn()>,
     set_tool_options: Rc<dyn Fn(Tool)>,
     set_right_panel_tool: Rc<dyn Fn(Tool)>,
 ) -> Rc<dyn Fn(Tool)> {
@@ -1694,6 +1995,13 @@ fn build_apply_tool(
     Rc::new(move |t: Tool| {
         set_tool_options(t);
         set_right_panel_tool(t);
+
+        // Leaving Liquify closes the session. Every stroke is already baked and
+        // recorded, so this keeps the work and just frees the displacement
+        // field - and stops it re-applying itself over later edits.
+        if t != Tool::Liquify {
+            liquify_flush();
+        }
 
         paintable.set_crop_active(t == Tool::Crop);
         if t != Tool::ColorPicker {

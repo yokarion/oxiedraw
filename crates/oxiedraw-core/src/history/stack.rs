@@ -191,7 +191,8 @@ fn apply_direction(
         | HistoryAction::Gradient { layer_id, patch }
         | HistoryAction::Clear { layer_id, patch }
         | HistoryAction::Transform { layer_id, patch, .. }
-        | HistoryAction::Filter { layer_id, patch } => {
+        | HistoryAction::Filter { layer_id, patch }
+        | HistoryAction::Liquify { layer_id, patch } => {
             if let Some(idx) = find_layer_idx(canvas, layer_id) {
                 patch.apply(canvas, idx, direction)?;
             }
