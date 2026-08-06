@@ -15,6 +15,7 @@ use oxiedraw_core::guides::{
     assist_lock, vp_default_color, AssistLock, GuideKind, GuideState, VanishingPoint,
 };
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
+use oxiedraw_core::liquify::{MAX_SIZE as LIQUIFY_MAX_SIZE, LiquifyStamp, LiquifyState};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::shape_correction::{ShapeKind, detect_correction};
 use oxiedraw_core::text::{ResizeMode, TextBox};
@@ -66,6 +67,13 @@ struct PendingCorrection {
 const GUIDE_ROT_HANDLE_PX: f32 = 64.0;
 /// Pointer-to-node grab radius in screen pixels (node radius + slack).
 const GUIDE_NODE_HIT_PX: f32 = 14.0;
+/// Liquify dab spacing as a fraction of the brush radius. Tight enough that a
+/// fast drag still warps continuously rather than leaving isolated pushes.
+const LIQUIFY_SPACING: f32 = 0.2;
+/// Cap on interpolated liquify dabs per motion event, so one huge pointer jump
+/// can't queue hundreds of GPU passes in a single frame.
+const LIQUIFY_MAX_STEPS: usize = 64;
+
 /// Screen-space deadzone before Drawing Assist locks a stroke to a guide line.
 /// The lock direction is chosen from the drag once it clears this, so a short
 /// nudge doesn't commit to the wrong axis (helpful, not twitchy).
@@ -159,6 +167,19 @@ pub(super) struct PrimaryDragHandler {
     gradient_cur_endpoints: Rc<Cell<Option<[f32; 4]>>>,
     /// Layer pixels + id captured at gradient_begin for the history patch.
     gradient_pending: Rc<RefCell<Option<GradientPending>>>,
+    // -- liquify ----------------------------------------------------------
+    liquify: LiquifyState,
+    /// Opens (or reuses) a liquify session on the active layer, returning false
+    /// when that layer can't be liquified. Built by the session so the toolbar's
+    /// Apply / Cancel and this handler share one lifecycle.
+    liquify_ensure: Rc<dyn Fn() -> bool>,
+    /// Bake + record the warp painted since the last bake. Runs at pen-up.
+    /// Returns whether the layer and the undo stack still agree; the drag path
+    /// has no recovery to offer, so it only reports through the shared toast in
+    /// the flush path.
+    liquify_bake_stroke: Rc<dyn Fn() -> bool>,
+    /// The in-flight liquify drag; drives dab spacing and the hold-in-place tick.
+    liquify_drag: Rc<RefCell<Option<LiquifyDrag>>>,
     // -- drawing guide ----------------------------------------------------
     guide: GuideState,
     /// Which guide node the current gesture grabbed.
@@ -196,6 +217,25 @@ pub(super) struct PrimaryDragHandler {
     /// Captured at brush_begin so brush_end can build a LayerPatch bounded
     /// to the stroke's dirty region.
     pending_capture: Rc<RefCell<Option<PendingStroke>>>,
+}
+
+/// Whether the mode a drag would use pushes by its drag vector (and so is
+/// already proportional to distance travelled) rather than applying a fixed
+/// fraction per dab.
+fn mode_needs_motion(liquify: &LiquifyState, alt: bool) -> bool {
+    liquify.resolve_mode(alt).0.needs_motion()
+}
+
+/// An in-flight liquify drag. `last` anchors the dab spacing; `pressure` and
+/// `alt` are re-read every motion event so a pen ramp or a held Alt takes effect
+/// mid-stroke.
+struct LiquifyDrag {
+    last: Point,
+    pressure: f32,
+    alt: bool,
+    /// Set by each motion event and cleared by the hold tick, so the
+    /// accumulating modes only fire on frames where the pointer stood still.
+    moved: bool,
 }
 
 /// State captured when a shape drag begins: which layer, its id, and
@@ -249,7 +289,7 @@ impl PrimaryDragHandler {
         // and only editable by opening the component.
         let raster_tool = matches!(
             self.tools.active.get(),
-            Tool::Brush | Tool::Fill(_) | Tool::Shapes(_)
+            Tool::Brush | Tool::Fill(_) | Tool::Shapes(_) | Tool::Liquify
         );
         if raster_tool && self.active_is_component() {
             self.toaster
@@ -278,6 +318,7 @@ impl PrimaryDragHandler {
             Tool::Shapes(kind) => self.shape_begin(kind, x, y),
             Tool::ColorPicker => self.color_pick_begin(x, y),
             Tool::Text => self.text_begin(x, y),
+            Tool::Liquify => self.liquify_begin(gesture, x, y),
             Tool::DrawingGuide => self.guide_begin(x, y),
             Tool::Cursor => {
                 (self.cursor_activates_transform)();
@@ -297,6 +338,7 @@ impl PrimaryDragHandler {
             Tool::Fill(FillTool::Gradient) => self.gradient_update(gesture, dx, dy),
             Tool::ColorPicker => self.color_pick_update(),
             Tool::Text => self.text_update(gesture, dx, dy),
+            Tool::Liquify => self.liquify_update(gesture, dx, dy),
             Tool::DrawingGuide => self.guide_update(gesture),
             _ => {}
         }
@@ -327,9 +369,183 @@ impl PrimaryDragHandler {
             }
             Tool::Fill(FillTool::Gradient) => self.gradient_end(),
             Tool::Text => self.text_end(),
+            Tool::Liquify => self.liquify_end(),
             Tool::DrawingGuide => self.guide_end(),
             _ => {}
         }
+    }
+
+    // -- liquify -----------------------------------------------------------
+
+    fn liquify_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
+        if !(self.liquify_ensure)() {
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        }
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
+        let (_shift, alt) = modifiers_from_gesture(gesture);
+        let pressure = sample_from(gesture, canvas_pos).pressure;
+        *self.liquify_drag.borrow_mut() = Some(LiquifyDrag {
+            last: canvas_pos,
+            pressure,
+            alt,
+            moved: true,
+        });
+        // A press with no movement still stamps once, so Pucker / Bloat / Twirl
+        // respond to a click the way they do in Photoshop.
+        self.liquify_emit(&[(canvas_pos, Point::ZERO)], pressure, alt, 1.0);
+    }
+
+    fn liquify_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
+        let Some((sx, sy)) = gesture.start_point() else {
+            return;
+        };
+        let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
+        let (_shift, alt) = modifiers_from_gesture(gesture);
+        let pressure = sample_from(gesture, cur).pressure;
+
+        let last = {
+            let mut drag = self.liquify_drag.borrow_mut();
+            let Some(drag) = drag.as_mut() else {
+                return;
+            };
+            // Pressure and Alt are refreshed even on a stationary event, so a
+            // pressure ramp or a held Alt is picked up by the hold tick.
+            drag.pressure = pressure;
+            drag.alt = alt;
+            drag.last
+        };
+
+        // Space dabs along the segment so a fast drag warps continuously instead
+        // of leaving a dotted trail of isolated pushes. Every event that moves at
+        // all emits something, so the warp keeps up with the cursor.
+        let radius = (self.liquify.size.get() * 0.5).max(1.0);
+        let spacing = (radius * LIQUIFY_SPACING).max(1.0);
+        let (seg_x, seg_y) = (cur.x - last.x, cur.y - last.y);
+        let distance = seg_x.hypot(seg_y);
+        if distance < 0.01 {
+            // Pure jitter (tablets report motion for pressure-only changes).
+            // Leaving `moved` alone lets the hold tick keep accumulating.
+            return;
+        }
+        {
+            let mut drag = self.liquify_drag.borrow_mut();
+            if let Some(drag) = drag.as_mut() {
+                drag.last = cur;
+                drag.moved = true;
+            }
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let steps = ((distance / spacing).ceil() as usize).clamp(1, LIQUIFY_MAX_STEPS);
+        #[allow(clippy::cast_precision_loss)]
+        let inv = 1.0 / steps as f32;
+        let step = Point::new(seg_x * inv, seg_y * inv);
+        // Forward Warp and Push Left push by the `drag` vector, which already
+        // carries how far the pointer went, so they are distance-driven for free.
+        // The others apply a fixed fraction per dab, so without this they would
+        // scale with the device's report rate - the same gesture biting about 3x
+        // harder on a 200Hz stylus than on a 60Hz mouse. Charging each dab for
+        // the distance it actually covers makes them distance-driven too.
+        #[allow(clippy::cast_precision_loss)]
+        let travel_scale = if mode_needs_motion(&self.liquify, alt) {
+            1.0
+        } else {
+            (distance / (steps as f32 * spacing)).min(1.0)
+        };
+        let points: Vec<(Point, Point)> = (1..=steps)
+            .map(|i| {
+                #[allow(clippy::cast_precision_loss)]
+                let t = i as f32 * inv;
+                (Point::new(last.x + seg_x * t, last.y + seg_y * t), step)
+            })
+            .collect();
+        self.liquify_emit(&points, pressure, alt, travel_scale);
+    }
+
+    /// Pen-up: write this stroke's warp into the layer and record it, so Ctrl+Z
+    /// steps back one warp at a time. The session stays open, still warping the
+    /// pristine snapshot, so the next stroke doesn't stack another resample.
+    fn liquify_end(&self) {
+        self.liquify_drag.borrow_mut().take();
+        let _recorded = (self.liquify_bake_stroke)();
+    }
+
+    /// Frame-clock tick for the modes that keep working while the pointer is
+    /// held still (Twirl / Pucker / Bloat / Reconstruct). Driven by the
+    /// render pump rather than a timer: a timer that presents between input
+    /// events starves a stylus until the compositor decides the pen lifted.
+    fn liquify_hold_tick(&self) {
+        // This tick runs for the whole armed frame loop, not just liquify drags,
+        // so it has to re-check both the tool and the session. A tool switch
+        // mid-drag (Escape, or a single-letter shortcut) routes pen-up to another
+        // tool's arm, which never clears `liquify_drag` - without these guards
+        // the stale drag would keep stamping and presenting on every later frame.
+        if self.tools.active.get() != Tool::Liquify || !self.canvas.borrow().liquify_active() {
+            self.liquify_drag.borrow_mut().take();
+            return;
+        }
+        let rate = self.liquify.rate.get();
+        let (mode, _strength) = self.liquify.resolve_mode(false);
+        if rate <= 0.0 || mode.needs_motion() {
+            return;
+        }
+        let Some((at, pressure, alt)) = ({
+            let mut drag = self.liquify_drag.borrow_mut();
+            drag.as_mut().and_then(|d| {
+                if std::mem::replace(&mut d.moved, false) {
+                    None
+                } else {
+                    Some((d.last, d.pressure, d.alt))
+                }
+            })
+        }) else {
+            return;
+        };
+        // No present here: `liquify_emit` already did one, and the pump presents
+        // again after this callback returns. Whatever this changed rides out on
+        // that frame, the same way `fill_reveal_tick` leaves its work to ride.
+        self.liquify_emit(&[(at, Point::ZERO)], pressure, alt, rate);
+    }
+
+    /// Turn `(centre, drag)` pairs into stamps at the current settings and hand
+    /// them to the canvas, which reproduces each across the drawing guide.
+    fn liquify_emit(&self, points: &[(Point, Point)], pressure: f32, alt: bool, scale: f32) {
+        if points.is_empty() {
+            return;
+        }
+        let (mode, strength) = self.liquify.resolve_mode(alt);
+        let pressure_scale = if self.liquify.pressure_drives_strength.get() {
+            pressure.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        // Clamped, not just floored: the compose pass loops every dab for every
+        // pixel in their combined AABB, so an out-of-range size would cost real
+        // GPU time rather than just looking wrong.
+        let radius = (self.liquify.size.get().clamp(1.0, LIQUIFY_MAX_SIZE) * 0.5).max(1.0);
+        let density = self.liquify.density.get();
+        let strength = strength * pressure_scale * scale;
+        if strength.abs() < 1e-4 {
+            return;
+        }
+        let stamps: Vec<LiquifyStamp> = points
+            .iter()
+            .map(|&(center, drag)| LiquifyStamp {
+                center,
+                drag,
+                radius,
+                density,
+                strength,
+                mode,
+            })
+            .collect();
+
+        let mut canvas = self.canvas.borrow_mut();
+        if let Err(e) = canvas.liquify_stamps(&stamps) {
+            tracing::error!(error = %e, "liquify: applying dabs failed");
+            return;
+        }
+        present_into_paintable(&mut canvas, &self.paintable, &self.area);
     }
 
     // -- drawing guide -----------------------------------------------------
@@ -2542,6 +2758,9 @@ pub(super) fn install_primary_drag(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    liquify: &LiquifyState,
+    liquify_ensure: Rc<dyn Fn() -> bool>,
+    liquify_bake_stroke: Rc<dyn Fn() -> bool>,
     guide: &GuideState,
     history: &Rc<RefCell<HistoryStack>>,
     toaster: &crate::toaster::Toaster,
@@ -2591,6 +2810,10 @@ pub(super) fn install_primary_drag(
         gradient_drag_start: Rc::new(Cell::new(Point::ZERO)),
         gradient_cur_endpoints: Rc::new(Cell::new(None)),
         gradient_pending: Rc::new(RefCell::new(None)),
+        liquify: liquify.clone(),
+        liquify_ensure,
+        liquify_bake_stroke,
+        liquify_drag: Rc::new(RefCell::new(None)),
         guide: guide.clone(),
         guide_drag: Rc::new(Cell::new(GuideDrag::None)),
         guide_drag_start: Rc::new(Cell::new(None)),
@@ -2633,14 +2856,25 @@ pub(super) fn install_primary_drag(
         });
     }
 
-    // The fill's reveal sweep advances on the render pump's frame clock:
-    // vsync-paced whether or not the pointer moves, and in phase with
-    // the present that is already happening rather than blocking the
-    // main loop between input events.
+    // Per-frame work driven by the render pump's frame clock: vsync-paced
+    // whether or not the pointer moves, and in phase with the present that is
+    // already happening rather than blocking the main loop between input events.
+    // Both the fill's reveal sweep and liquify's hold-in-place accumulation ride
+    // this one callback slot.
+    //
+    // The handler is captured weakly on purpose: it owns the `RenderPump`, which
+    // owns this very callback slot, so a strong capture would be a reference
+    // cycle and the whole graph (canvas, history, and a liquify session's
+    // full-canvas pristine snapshot) would outlive its document tab.
     {
         let ctx = handler.fill_ctx();
-        *viewport.render_pump().tick_handle().borrow_mut() =
-            Some(Box::new(move || fill_reveal_tick(&ctx)));
+        let weak = Rc::downgrade(&handler);
+        *viewport.render_pump().tick_handle().borrow_mut() = Some(Box::new(move || {
+            fill_reveal_tick(&ctx);
+            if let Some(h) = weak.upgrade() {
+                h.liquify_hold_tick();
+            }
+        }));
     }
 
     // The motion controller feeds the fill's threshold drag too - see

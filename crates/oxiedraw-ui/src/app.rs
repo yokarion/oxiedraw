@@ -278,6 +278,10 @@ fn register_window_actions(
         let action = gio::SimpleAction::new("export-as", None);
         action.connect_activate(move |_, _| {
             if let Some(s) = manager.active() {
+                // Export reads the composited canvas, which a live liquify
+                // session doesn't refresh (it renders into the preview image
+                // instead). Close the session so the export sees the warp.
+                (s.liquify_flush)();
                 crate::export_window::show(&win, &s.viewport.canvas());
             }
         });
@@ -415,7 +419,14 @@ fn install_key_handler(
             return glib::Propagation::Stop;
         }
 
-        if active == Tool::Transform {
+        // The two tool blocks below swallow Enter / Escape from this
+        // capture-phase handler, so - like the Delete branch above - they must
+        // stand down while a text field has focus. Otherwise Enter eats a layer
+        // rename, and Escape (which Liquify maps to a destructive Restore All)
+        // eats the "close this popover" the user actually meant.
+        let typing = focus_is_text_editable(&manager.root);
+
+        if active == Tool::Transform && !typing {
             return match keyval {
                 gdk::Key::Return | gdk::Key::KP_Enter => {
                     (session.transform_apply)();
@@ -423,6 +434,19 @@ fn install_key_handler(
                 }
                 gdk::Key::Escape => {
                     (session.transform_cancel)();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            };
+        }
+        if active == Tool::Liquify && !typing {
+            return match keyval {
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    app_handle().activate_action("liquify-apply", None);
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Escape => {
+                    app_handle().activate_action("liquify-cancel", None);
                     glib::Propagation::Stop
                 }
                 _ => glib::Propagation::Proceed,

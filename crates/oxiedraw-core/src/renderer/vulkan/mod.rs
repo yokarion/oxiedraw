@@ -16,6 +16,7 @@ mod filter_ops;
 mod gradient_ops;
 mod io;
 mod layer_ops;
+mod liquify_ops;
 mod pattern_ops;
 mod present;
 mod preview;
@@ -49,6 +50,8 @@ use super::present_convert::PresentConvertPipeline;
 use adjust_ops::{GroupAccumulator, MaskEditPreview};
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
+use super::liquify::LiquifyPipelines;
+use liquify_ops::LiquifySession;
 use super::instance;
 use super::layers::{LayerBlendPipeline, LayerCompositePipeline, LayerStack};
 use transform_preview::TransformPreview;
@@ -331,6 +334,13 @@ pub struct VulkanRenderer {
     /// stroke start; the dab shader lerps from it so opacity is a ceiling.
     /// Lazily allocated on first smudge stroke.
     pub(super) smudge_before: Option<(ManuallyDrop<Image>, vk::DescriptorPool, vk::DescriptorSet)>,
+
+    /// Liquify pipelines, built on the first liquify session and kept for the
+    /// renderer's lifetime (most sessions never liquify).
+    pub(super) liquify_pipelines: Option<LiquifyPipelines>,
+    /// The live liquify session's field + snapshot, present only while the
+    /// Liquify tool has a layer open.
+    pub(super) liquify: Option<LiquifySession>,
 
     /// Display-side dmabuf image. Per-frame `present_to_display` copies
     /// the chosen source (canvas or preview) into here.
@@ -666,6 +676,8 @@ impl VulkanRenderer {
             filter_affected: Vec::new(),
             smudge_pipeline: None,
             smudge_before: None,
+            liquify_pipelines: None,
+            liquify: None,
             display,
             present_convert: ManuallyDrop::new(present_convert),
             display_framebuffers,
@@ -1300,8 +1312,12 @@ impl VulkanRenderer {
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
         self.clear_transform_preview_gpu();
+        self.end_liquify();
         unsafe {
             let _ = self.device.device_wait_idle();
+            if let Some(pipelines) = self.liquify_pipelines.take() {
+                pipelines.destroy(&self.device);
+            }
             self.device.destroy_query_pool(self.timestamp_pool, None);
             for &f in &self.ring_fences {
                 self.device.destroy_fence(f, None);

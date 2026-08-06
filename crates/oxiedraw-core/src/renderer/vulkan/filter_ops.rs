@@ -82,7 +82,9 @@ impl VulkanRenderer {
         self.build_preview_scoped(
             steps,
             target_idx,
-            PreviewTarget::Filter { src_img, set, mode, opacity },
+            // The filter tool only runs on layers the user can see, so the
+            // target is visible by construction here.
+            PreviewTarget::Filter { src_img, set, mode, opacity, visible: true },
         )
     }
 

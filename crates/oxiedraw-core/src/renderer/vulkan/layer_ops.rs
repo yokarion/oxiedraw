@@ -40,11 +40,17 @@ impl VulkanRenderer {
         )?;
         self.transition_layer_initial(idx)?;
         self.clear_layer(idx, [0.0, 0.0, 0.0, 0.0])?;
+        self.liquify_shift_for_insert(idx);
         Ok(idx)
     }
 
     /// Remove the layer at `idx`.
     pub fn remove_layer(&mut self, idx: usize) -> Result<(), RendererError> {
+        // A live liquify session pins its target by slot index. Remap it here
+        // rather than making every caller remember to close the tool first.
+        if self.liquify_shift_for_remove(idx) {
+            self.end_liquify();
+        }
         unsafe { self.device.device_wait_idle()? };
         unsafe {
             self.layer_stack
@@ -55,6 +61,7 @@ impl VulkanRenderer {
 
     /// Move the layer at `from` to position `to`. Metadata-only.
     pub fn reorder_layer(&mut self, from: usize, to: usize) {
+        self.liquify_shift_for_reorder(from, to);
         self.layer_stack.reorder(from, to);
     }
 

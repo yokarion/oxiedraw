@@ -127,6 +127,13 @@ fn write_project(
         return;
     }
 
+    // A liquify session holds the in-flight stroke in a GPU field over a
+    // snapshot, so the layer still has its pre-warp pixels until the stroke
+    // bakes at pen-up. Close the session here - the shared choke point for every
+    // writer - so autosave and the untitled-document recovery copy can't fire
+    // between motion events and persist an image missing the live stroke.
+    (session.liquify_flush)();
+
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();

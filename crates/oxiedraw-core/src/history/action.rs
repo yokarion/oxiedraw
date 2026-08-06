@@ -91,6 +91,12 @@ pub enum HistoryAction {
         layer_id: String,
         patch: LayerPatch,
     },
+    /// One liquify stroke (pointer down to up), or a Restore All. Each bakes
+    /// into its own patch, so undo steps back one warp at a time.
+    Liquify {
+        layer_id: String,
+        patch: LayerPatch,
+    },
     /// New layer appended (or inserted at idx). Patch carries the layer's
     /// initial pixels; before is empty.
     LayerAdd {
@@ -350,6 +356,7 @@ impl HistoryAction {
             Self::TextEdit { .. } => "Edit text",
             Self::ComponentRetransform { .. } => "Transform component",
             Self::Filter { .. } => "Filter",
+            Self::Liquify { .. } => "Liquify",
             Self::LayerAdd { .. } => "Add layer",
             Self::LayerRemove { .. } => "Remove layer",
             Self::LayerReorder { .. } => "Reorder layer",

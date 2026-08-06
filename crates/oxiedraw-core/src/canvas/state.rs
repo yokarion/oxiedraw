@@ -77,6 +77,11 @@ pub struct Canvas {
     /// composite so a batch of layer edits can recomposite once at the end
     /// instead of per edit. See [`Self::defer_recomposite`].
     defer_recomposite: bool,
+    /// A liquify bake wrote the layer but the stored composite still predates it
+    /// (the live view during a session is the preview image, not the composite).
+    /// Readback paths recomposite once when this is set; the drawing path never
+    /// pays for it. See [`Self::sync_canvas_for_liquify`].
+    liquify_composite_stale: bool,
 }
 
 impl Canvas {
@@ -109,6 +114,7 @@ impl Canvas {
             is_smudge_stroke: false,
             smudge_prev_center: None,
             defer_recomposite: false,
+            liquify_composite_stale: false,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -784,45 +790,36 @@ impl Canvas {
     /// straight into `cairo::Format::ARgb32` and
     /// `gdk::MemoryFormat::B8g8r8a8` on little-endian.
     pub fn read_pixels(&mut self) -> Result<Vec<u8>, RendererError> {
-        match self.current_stroke {
-            Some(ctx) => {
-                let linear = ctx.color.to_linear_rgb();
-                let visibilities = self.visibilities();
-                if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
-                    let snapshot = self.layers.snapshot();
-                    let steps = self.preview_steps(&snapshot);
-                    self.renderer.render_mask_edit_preview_and_read(
-                        &steps,
-                        ctx.layer_idx,
-                        linear,
-                        ctx.opacity,
-                    )
-                } else if let Some(steps) = self.folder_scoped_steps(&self.layers.snapshot()) {
-                    // Folder-bounded adjustment: scope the effect to its folder
-                    // (the flat path below would apply it to the whole backdrop).
-                    self.renderer.render_preview_scoped_and_read(
-                        &steps,
-                        ctx.layer_idx,
-                        linear,
-                        ctx.opacity,
-                    )
-                } else if self.effective_adjustment_above(ctx.layer_idx) {
-                    self.renderer.render_preview_adjusted_and_read(
-                        &visibilities,
-                        ctx.layer_idx,
-                        linear,
-                        ctx.opacity,
-                    )
-                } else {
-                    self.renderer.render_preview_layered_and_read(
-                        &visibilities,
-                        ctx.layer_idx,
-                        linear,
-                        ctx.opacity,
-                    )
-                }
-            }
-            None => self.renderer.read_canvas(),
+        let Some(ctx) = self.current_stroke else {
+            self.sync_canvas_for_liquify()?;
+            return self.renderer.read_canvas();
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
+            let snapshot = self.layers.snapshot();
+            let steps = self.preview_steps(&snapshot);
+            self.renderer
+                .render_mask_edit_preview_and_read(&steps, ctx.layer_idx, linear, ctx.opacity)
+        } else if let Some(steps) = self.folder_scoped_steps(&self.layers.snapshot()) {
+            // Folder-bounded adjustment: scope the effect to its folder
+            // (the flat path below would apply it to the whole backdrop).
+            self.renderer
+                .render_preview_scoped_and_read(&steps, ctx.layer_idx, linear, ctx.opacity)
+        } else if self.effective_adjustment_above(ctx.layer_idx) {
+            self.renderer.render_preview_adjusted_and_read(
+                &visibilities,
+                ctx.layer_idx,
+                linear,
+                ctx.opacity,
+            )
+        } else {
+            self.renderer.render_preview_layered_and_read(
+                &visibilities,
+                ctx.layer_idx,
+                linear,
+                ctx.opacity,
+            )
         }
     }
 
@@ -863,20 +860,14 @@ impl Canvas {
     /// readbacks (e.g. layer-panel thumbnail refresh) to avoid churning a
     /// full-canvas allocation every time.
     pub fn read_pixels_into(&mut self, out: &mut Vec<u8>) -> Result<(), RendererError> {
-        match self.current_stroke {
-            Some(ctx) => {
-                let linear = ctx.color.to_linear_rgb();
-                let visibilities = self.visibilities();
-                self.renderer.render_preview_layered_into(
-                    &visibilities,
-                    ctx.layer_idx,
-                    linear,
-                    ctx.opacity,
-                    out,
-                )
-            }
-            None => self.renderer.read_canvas_into(out),
-        }
+        let Some(ctx) = self.current_stroke else {
+            self.sync_canvas_for_liquify()?;
+            return self.renderer.read_canvas_into(out);
+        };
+        let linear = ctx.color.to_linear_rgb();
+        let visibilities = self.visibilities();
+        self.renderer
+            .render_preview_layered_into(&visibilities, ctx.layer_idx, linear, ctx.opacity, out)
     }
 
     /// Like [`Self::read_layer`] but fills a caller-owned buffer.
@@ -1005,6 +996,24 @@ impl Canvas {
                     self.renderer.render_gradient_preview_scoped(&steps, target)?;
                 } else {
                     self.renderer.render_gradient_preview(&visibilities)?;
+                }
+                self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.liquify_active() {
+                let visibilities = self.visibilities();
+                // Same reasoning as the transform preview: the flat path skips
+                // adjustment slots, so any effective adjustment other than the
+                // warped layer itself needs the folder-scoped walk to preview
+                // (and clip) the way the commit will.
+                let scoped = self
+                    .renderer
+                    .liquify_target()
+                    .is_some_and(|t| self.effective_adjustment_excluding(t));
+                if scoped {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_liquify_preview_scoped(&steps, &visibilities)?;
+                } else {
+                    self.renderer.render_liquify_preview(&visibilities)?;
                 }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.transform_preview_active() {
@@ -1921,6 +1930,117 @@ impl Canvas {
             self.renderer.clear_transform_preview_gpu();
             self.bump_version();
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Liquify
+    // ----------------------------------------------------------------
+
+    /// Open a liquify session on `layer_idx`. The layer's pixels are snapshotted
+    /// and left alone; everything the user does lives in the displacement field
+    /// until [`Self::liquify_bake`].
+    pub fn begin_liquify(&mut self, layer_idx: usize) -> Result<(), RendererError> {
+        self.renderer.begin_liquify(layer_idx)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn liquify_active(&self) -> bool {
+        self.renderer.liquify_active()
+    }
+
+    /// Whether the field has changed since the last bake - i.e. whether there
+    /// is a stroke worth writing into the layer and recording.
+    #[must_use]
+    pub fn liquify_touched(&self) -> bool {
+        self.renderer.liquify_touched()
+    }
+
+    /// Canvas region `(x, y, w, h)` the next bake will rewrite, so the caller
+    /// can build a bounded history patch. `None` when nothing is pending.
+    #[must_use]
+    pub fn liquify_dirty_bounds(&self) -> Option<(u32, u32, u32, u32)> {
+        self.renderer.liquify_dirty_bounds()
+    }
+
+    #[must_use]
+    pub fn liquify_target(&self) -> Option<usize> {
+        self.renderer.liquify_target()
+    }
+
+    /// Apply painted dabs, reproducing each across the active drawing guide's
+    /// symmetry. Pixels outside an active selection are left alone - the
+    /// selection is the mask.
+    pub fn liquify_stamps(
+        &mut self,
+        stamps: &[crate::liquify::LiquifyStamp],
+    ) -> Result<(), RendererError> {
+        if stamps.is_empty() {
+            return Ok(());
+        }
+        let dabs = crate::liquify::expand(stamps, self.active_symmetry.as_ref());
+        // `expand` groups by symmetry element with one group per stamp batch, so
+        // this stride keeps a GPU pass from mixing a dab with its far-away mirror.
+        self.renderer.liquify_dabs(&dabs, stamps.len())?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Reset the field to zero, restoring the layer's original shape on the
+    /// next bake.
+    pub fn liquify_restore_all(&mut self) -> Result<(), RendererError> {
+        self.renderer.liquify_restore_all()?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Write the current warp into the layer, keeping the session open. Called
+    /// at the end of every stroke so each warp is its own undo step.
+    ///
+    /// Deliberately does *not* recomposite: that is a full-canvas composite of
+    /// every layer, and this runs at every pen-up. The stored composite is stale
+    /// for the whole session anyway (the live view is the preview image), so the
+    /// readback paths refresh it on demand instead - see [`Self::read_pixels`].
+    pub fn liquify_bake(&mut self) -> Result<(), RendererError> {
+        self.renderer.liquify_bake()?;
+        self.liquify_composite_stale = true;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Bring the stored composite up to date with a live liquify session.
+    ///
+    /// During a session the user is looking at the preview image, so the canvas
+    /// composite stays frozen at whatever it was when the tool opened. Anything
+    /// that reads the composite back (export, clipboard) has to pay for a
+    /// refresh first; nothing on the drawing path does.
+    fn sync_canvas_for_liquify(&mut self) -> Result<(), RendererError> {
+        if self.liquify_composite_stale {
+            self.liquify_composite_stale = false;
+            self.recomposite_canvas()?;
+        }
+        Ok(())
+    }
+
+    /// Close the session without baking. The caller bakes first if it wants the
+    /// pending stroke kept.
+    pub fn end_liquify(&mut self) -> Result<(), RendererError> {
+        if !self.renderer.liquify_active() {
+            return Ok(());
+        }
+        self.renderer.end_liquify();
+        self.recomposite_canvas()?;
+        self.liquify_composite_stale = false;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Render the live liquify preview and read it back as BGRA8. Diagnostic /
+    /// test helper; the interactive path presents it instead.
+    pub fn read_liquify_preview(&mut self) -> Result<Vec<u8>, RendererError> {
+        let visibilities = self.visibilities();
+        self.renderer.read_liquify_preview(&visibilities)
     }
 }
 

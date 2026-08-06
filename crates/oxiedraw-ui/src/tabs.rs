@@ -101,6 +101,17 @@ impl TabManager {
     /// Make `session` the active document: swap its chrome into the window slots,
     /// re-point the doc-scoped gio actions, and sync the shared tool visuals.
     pub(crate) fn activate(&self, session: &Rc<DocumentSession>) {
+        // Close any liquify session on the tab being left. The active tool is
+        // global but `apply_tool` only reaches the foreground document, so a
+        // session on a background tab would otherwise stay live: its preview
+        // splice hides later edits to that layer (`Canvas::present` branches on
+        // renderer state, not on the tool), and the next bake would overwrite
+        // them from a stale snapshot with no history entry.
+        if let Some(previous) = self.active.borrow().as_ref()
+            && !Rc::ptr_eq(previous, session)
+        {
+            (previous.liquify_flush)();
+        }
         *self.active.borrow_mut() = Some(Rc::clone(session));
         set_slot_child(&self.tool_options_slot, &session.tool_options);
         set_slot_child(&self.right_bar_slot, &session.right_bar);
@@ -470,6 +481,7 @@ impl TabManager {
             ),
             ("select-text", Tool::Text),
             ("select-crop", Tool::Crop),
+            ("select-liquify", Tool::Liquify),
             ("select-guide", Tool::DrawingGuide),
         ];
         for &(id, tool) in tool_actions {
@@ -499,6 +511,39 @@ impl TabManager {
                 manager.set_active_tool(Tool::Brush);
             });
             app.add_action(&cancel);
+        }
+
+        // Liquify Apply / Cancel / Restore All (top-bar buttons, mirroring the
+        // Crop tool). Apply and Cancel both leave the tool; Restore All only
+        // zeroes the field, so the user stays in Liquify and can keep warping.
+        {
+            let manager = Rc::clone(self);
+            let action = gio::SimpleAction::new("liquify-apply", None);
+            // Each stroke is already baked and recorded, so Apply is just
+            // "I'm done" - the tool switch closes the session.
+            action.connect_activate(move |_, _| manager.set_active_tool(Tool::Brush));
+            app.add_action(&action);
+        }
+        {
+            let manager = Rc::clone(self);
+            let action = gio::SimpleAction::new("liquify-cancel", None);
+            action.connect_activate(move |_, _| {
+                if let Some(s) = manager.active() {
+                    (s.liquify_cancel)();
+                }
+                manager.set_active_tool(Tool::Brush);
+            });
+            app.add_action(&action);
+        }
+        {
+            let manager = Rc::clone(self);
+            let action = gio::SimpleAction::new("liquify-restore", None);
+            action.connect_activate(move |_, _| {
+                if let Some(s) = manager.active() {
+                    (s.liquify_restore)();
+                }
+            });
+            app.add_action(&action);
         }
 
         // Eraser mode toggle (brush). Stateful boolean action: the brush bar's
