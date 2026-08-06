@@ -11,10 +11,6 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::Color;
 use oxiedraw_utils::geometry::{Point, Size};
 
-fn sample(x: f32, y: f32, t: u64) -> InputSample {
-    sample_p(x, y, t, 1.0)
-}
-
 fn sample_p(x: f32, y: f32, t: u64, pressure: f32) -> InputSample {
     InputSample {
         position: Point::new(x, y),

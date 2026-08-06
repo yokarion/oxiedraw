@@ -313,6 +313,9 @@ impl HistoryAction {
     /// can reconcile its extension map with undo/redo. Each entry's outer `None`
     /// means "leave this layer's extension untouched".
     #[must_use]
+    // The three states are all meaningful and distinct here - see the outer
+    // `None` note above - so this is not the accidental nesting the lint hunts.
+    #[allow(clippy::option_option)]
     pub fn transform_ext_reconcile(
         &self,
         direction: Direction,
@@ -322,6 +325,7 @@ impl HistoryAction {
         out
     }
 
+    #[allow(clippy::option_option)]
     fn collect_transform_ext_reconcile(
         &self,
         direction: Direction,

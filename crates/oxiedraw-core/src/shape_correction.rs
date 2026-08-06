@@ -670,8 +670,8 @@ mod tests {
             .iter()
             .map(|p| p.distance(Point::new(100.0, 100.0)))
             .collect();
-        let max_r = radii.iter().cloned().fold(0.0_f32, f32::max);
-        let min_r = radii.iter().cloned().fold(f32::MAX, f32::min);
+        let max_r = radii.iter().copied().fold(0.0_f32, f32::max);
+        let min_r = radii.iter().copied().fold(f32::MAX, f32::min);
         assert!(
             max_r - min_r < 1.0,
             "clean circle should be near-perfect, spread {}",

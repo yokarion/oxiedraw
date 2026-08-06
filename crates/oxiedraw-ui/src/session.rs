@@ -695,14 +695,14 @@ fn build_transform_apply(ctx: &SessionCtx, cancel: &Rc<dyn Fn()>) -> Rc<dyn Fn()
             }
         }
 
-        // One undo step for the whole (possibly multi-layer) transform.
-        match actions.len() {
-            0 => {}
-            1 => ctx.history.borrow_mut().record(actions.pop().unwrap()),
-            _ => ctx
-                .history
+        // One undo step for the whole (possibly multi-layer) transform. A lone
+        // action is recorded bare rather than wrapped in a single-entry batch.
+        if actions.len() > 1 {
+            ctx.history
                 .borrow_mut()
-                .record(HistoryAction::Batch { label: "Transform".into(), actions }),
+                .record(HistoryAction::Batch { label: "Transform".into(), actions });
+        } else if let Some(action) = actions.pop() {
+            ctx.history.borrow_mut().record(action);
         }
         ctx.finish_transform();
     })
@@ -2606,6 +2606,8 @@ fn non_empty_bounds(pixels: &[u8], w: u32, h: u32) -> Option<TransformRect> {
 /// Apply an undo/redo extension reconcile list to the extension map: outer
 /// `None` leaves a layer untouched, `Some(None)` removes it, `Some(Some(e))`
 /// sets it. Keeps the map in lock-step with transform undo/redo.
+// All three states are distinct and load-bearing here - see the doc above.
+#[allow(clippy::option_option)]
 fn reconcile_extensions(
     extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     reconcile: Vec<(String, Option<Option<LayerExtension>>)>,
@@ -3011,13 +3013,21 @@ fn commit_target(
                 // The undo "before" is the whole layer as it was pre-transform.
                 // For a selection lift that's the stashed original (pixels holds
                 // only the lifted selection); otherwise pixels is the full layer.
-                let before_canvas = if let Some(before) = &target.history_before {
-                    before.clone()
-                } else if let Some((off_x, off_y)) = target.src_offset {
-                    let (ew, eh) = target.src_dims;
-                    crop_from_extension(&target.pixels, off_x, off_y, ew, eh, cs.width, cs.height)
-                } else {
-                    target.pixels.clone()
+                let before_canvas = match (&target.history_before, target.src_offset) {
+                    (Some(before), _) => before.clone(),
+                    (None, Some((off_x, off_y))) => {
+                        let (ew, eh) = target.src_dims;
+                        crop_from_extension(
+                            &target.pixels,
+                            off_x,
+                            off_y,
+                            ew,
+                            eh,
+                            cs.width,
+                            cs.height,
+                        )
+                    }
+                    (None, None) => target.pixels.clone(),
                 };
                 Ok(LayerPatch::from_full_diff(&before_canvas, &after_px, cs.width, cs.height)
                     .map(|patch| HistoryAction::Transform {
