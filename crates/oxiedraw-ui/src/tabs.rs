@@ -14,6 +14,7 @@ use adw::prelude::*;
 use gtk::gio;
 use oxiedraw_core::project::{self, format::OxieProject};
 use oxiedraw_core::tools::Tool;
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::Size;
 use relm4::gtk;
 use relm4::gtk::glib;
@@ -62,6 +63,45 @@ impl TabManager {
         }
     }
 
+    /// Switch the active document's drawing guide on or off (the top bar's
+    /// symmetry button). Switching it on also enters the Drawing Guide tool so
+    /// the nodes can be dragged - Done / Cancel leave that tool with the guide
+    /// still live. Switching it off puts the config aside, so the next toggle
+    /// brings the same guide back instead of a fresh default.
+    pub(crate) fn set_guide_enabled(&self, on: bool) {
+        let Some(session) = self.active() else { return };
+        if on {
+            if let Some(stashed) = session.guide.stash.borrow_mut().take() {
+                *session.guide.config.borrow_mut() = Some(stashed);
+            }
+            // `apply_tool` seeds a centred, accent-coloured guide if none exists.
+            self.set_active_tool(Tool::DrawingGuide);
+        } else {
+            let live = session.guide.config.borrow_mut().take();
+            *session.guide.stash.borrow_mut() = live;
+            session.guide.notify_changed();
+            if self.global.tools.active.get() == Tool::DrawingGuide {
+                self.set_active_tool(Tool::Brush);
+            }
+        }
+    }
+
+    /// Push the active document's guide on/off state into `app.guide-toggle`,
+    /// which the top-bar button follows. The button is not the only thing that
+    /// turns a guide on - picking a type in the settings popup does too, as do
+    /// tab switches, project loads and the tool's Cancel.
+    pub(crate) fn sync_guide_toggle(&self) {
+        let on = self
+            .active()
+            .is_some_and(|s| s.guide.config.borrow().is_some());
+        if let Some(gio_app) = gio::Application::default()
+            && let Some(action) = gio_app.lookup_action("guide-toggle")
+            && let Ok(action) = action.downcast::<gio::SimpleAction>()
+        {
+            action.set_state(&on.to_variant());
+        }
+    }
+
     fn next_untitled_title(&self) -> String {
         let n = self.untitled_counter.get() + 1;
         self.untitled_counter.set(n);
@@ -88,6 +128,22 @@ impl TabManager {
 
     /// Register an already-built session as a tab and select it.
     pub(crate) fn add_session(self: &Rc<Self>, session: &Rc<DocumentSession>) {
+        // Keep the top-bar symmetry button in step with this document's guide,
+        // whichever side changed it. Weak on both ends: the manager owns the
+        // sessions, and a session owns this callback.
+        {
+            let manager = Rc::downgrade(self);
+            let owner = Rc::downgrade(session);
+            session.guide.connect_changed(Box::new(move || {
+                let (Some(manager), Some(owner)) = (manager.upgrade(), owner.upgrade()) else {
+                    return;
+                };
+                if manager.active().is_some_and(|a| Rc::ptr_eq(&a, &owner)) {
+                    manager.sync_guide_toggle();
+                }
+            }));
+        }
+
         let page = self.tab_view.add_page(&session.canvas_root, None);
         page.set_title(&session.display_title());
         *session.tab_page.borrow_mut() = Some(page.clone());
@@ -128,8 +184,13 @@ impl TabManager {
         let t = self.global.tools.active.get();
         (session.set_tool_options)(t);
         (session.set_right_panel_tool)(t);
+        self.sync_guide_toggle();
         session.viewport.paintable().set_crop_active(t == Tool::Crop);
         session.viewport.paintable().set_transform_active(t == Tool::Transform);
+        // Same reason as the two above: the tool is shared, so a document that
+        // was in the background while it changed has stale overlay flags - here,
+        // guide nodes that would be drawn (or missing) against the active tool.
+        session.viewport.paintable().set_guide_editing(t == Tool::DrawingGuide);
         session.viewport.redraw_handle().request();
     }
 
@@ -241,6 +302,7 @@ impl TabManager {
         const TICK: Duration = Duration::from_secs(5);
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(TICK, move || {
+            let _span = frame_profile::span(frame_profile::Stage::Timers);
             let Some(manager) = weak.upgrade() else {
                 return glib::ControlFlow::Break;
             };
@@ -482,7 +544,6 @@ impl TabManager {
             ("select-text", Tool::Text),
             ("select-crop", Tool::Crop),
             ("select-liquify", Tool::Liquify),
-            ("select-guide", Tool::DrawingGuide),
         ];
         for &(id, tool) in tool_actions {
             let manager = Rc::clone(self);
@@ -491,8 +552,25 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // Drawing Guide commit / cancel (top-bar buttons). Done keeps the live
-        // config; Cancel restores the snapshot taken when the tool was entered.
+        // Symmetry on/off (the top bar's button). Stateful boolean, like the
+        // eraser toggle, so the button and the manager's own state pushes drive
+        // the same thing (and it is bindable if it ever earns a shortcut).
+        {
+            let manager = Rc::clone(self);
+            let action = gio::SimpleAction::new_stateful("guide-toggle", None, &false.to_variant());
+            action.connect_change_state(move |_, state| {
+                let on = state.and_then(glib::Variant::get::<bool>).unwrap_or(false);
+                manager.set_guide_enabled(on);
+                // Publish what actually happened - with no open document there
+                // is no guide to switch on.
+                manager.sync_guide_toggle();
+            });
+            app.add_action(&action);
+        }
+
+        // Drawing Guide commit / cancel (tool-bar buttons). Both leave the tool
+        // with the guide still on; Cancel first rolls back to the snapshot taken
+        // when the tool was entered, so only the on-canvas edit is discarded.
         {
             let manager = Rc::clone(self);
             let done = gio::SimpleAction::new("guide-done", None);
@@ -504,9 +582,15 @@ impl TabManager {
             let cancel = gio::SimpleAction::new("guide-cancel", None);
             cancel.connect_activate(move |_, _| {
                 if let Some(s) = manager.active.borrow().as_ref() {
+                    // Only roll back a document that actually entered the tool.
+                    // The tool is shared, so this bar is showing for a tab that
+                    // may never have taken a snapshot - restoring `None` there
+                    // would silently delete a guide nobody was editing.
                     let snapshot = s.guide.entry_snapshot.borrow().clone();
-                    *s.guide.config.borrow_mut() = snapshot;
-                    s.guide.notify_changed();
+                    if snapshot.is_some() {
+                        *s.guide.config.borrow_mut() = snapshot;
+                        s.guide.notify_changed();
+                    }
                 }
                 manager.set_active_tool(Tool::Brush);
             });

@@ -5,6 +5,7 @@
 //! `oxiedraw-ui` depend on it.
 
 pub mod color;
+pub mod frame_profile;
 pub mod geometry;
 pub mod math;
 pub mod pixels;

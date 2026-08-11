@@ -1,3 +1,4 @@
+use oxiedraw_utils::frame_profile::{self, Stage};
 use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
 use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
@@ -272,6 +273,7 @@ impl Canvas {
     where
         F: FnOnce(&mut dyn PaintTarget),
     {
+        let _span = frame_profile::span(Stage::Brush);
         let result = if self.is_smudge_stroke {
             self.stamp_smudge(paint)
         } else {
@@ -951,6 +953,7 @@ impl Canvas {
     /// uses to import it.
     pub fn present(&mut self) -> Result<DmabufDescriptor, RendererError> {
         use crate::renderer::PresentSource;
+        let _span = frame_profile::span(Stage::Composite);
         // When an adjustment layer is the active selection (and nothing else is
         // in flight), the canvas shows its grayscale mask so it can be edited.
         let want_mask = self.mask_view_idx();
@@ -3019,6 +3022,26 @@ mod tests {
             "green R={:02x}",
             bytes[green_i + 2]
         );
+    }
+
+    /// The stack must actually reach MAX_LAYERS - the descriptor pool is sized
+    /// off that constant, so a mismatch would surface as an allocation failure
+    /// somewhere below the cap instead of a clean LayerLimit at it.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn layer_stack_fills_to_max_layers() {
+        use crate::renderer::MAX_LAYERS;
+
+        let mut canvas = Canvas::headless(Size::new(8, 8)).expect("canvas init");
+        let start = canvas.layers().snapshot().len();
+        for i in start..MAX_LAYERS as usize {
+            canvas.add_layer(format!("L{i}")).unwrap_or_else(|e| panic!("add layer {i}: {e}"));
+        }
+        assert_eq!(canvas.layers().snapshot().len(), MAX_LAYERS as usize);
+        assert!(matches!(
+            canvas.add_layer("over"),
+            Err(RendererError::LayerLimit)
+        ));
     }
 
     /// In-flight preview with the stroke on a *lower* layer and an opaque

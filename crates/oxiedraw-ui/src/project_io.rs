@@ -14,6 +14,7 @@ use gtk::gio;
 use gtk::glib;
 
 use oxiedraw_core::project::{self, format::OxieProject};
+use oxiedraw_utils::frame_profile;
 
 use crate::session::DocumentSession;
 
@@ -138,6 +139,9 @@ fn write_project(
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();
     let snapshot = {
+        // Full GPU readback of every layer, on the main thread - the one part of
+        // a save that can visibly hitch a stroke.
+        let _span = frame_profile::span(frame_profile::Stage::Timers);
         let canvas = session.viewport.canvas();
         let components = session.components.borrow();
         // Embed the font files used by any text layer so the project renders
@@ -188,6 +192,7 @@ fn write_project(
     let session = Rc::clone(session);
     let window = window.clone();
     glib::timeout_add_local(Duration::from_millis(50), move || {
+        let _span = frame_profile::span(frame_profile::Stage::Timers);
         let outcome = match rx.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,

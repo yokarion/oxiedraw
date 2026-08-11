@@ -30,7 +30,7 @@ static SHAPE_SUBTOOLS: [Tool; 4] = [
     Tool::Shapes(ShapeTool::Triangle),
 ];
 
-static GROUPS: [ToolGroupSpec; 11] = [
+static GROUPS: [ToolGroupSpec; 10] = [
     ToolGroupSpec {
         name: "Cursor",
         subtools: &[Tool::Cursor],
@@ -80,11 +80,6 @@ static GROUPS: [ToolGroupSpec; 11] = [
         name: "Liquify",
         subtools: &[Tool::Liquify],
         action_id: Some("select-liquify"),
-    },
-    ToolGroupSpec {
-        name: "Drawing Guide",
-        subtools: &[Tool::DrawingGuide],
-        action_id: Some("select-guide"),
     },
 ];
 
@@ -141,6 +136,15 @@ pub(crate) fn build(
                     return;
                 }
             }
+            // Tools with no button here (the Drawing Guide lives in the top
+            // bar): clear the selection, or the bar keeps pointing at a tool
+            // that isn't active - and clicking that button, already active,
+            // would emit nothing and strand the user in the other tool.
+            prog.set(true);
+            for (_, btn, _) in &groups {
+                btn.set_active(false);
+            }
+            prog.set(false);
         }
     };
 

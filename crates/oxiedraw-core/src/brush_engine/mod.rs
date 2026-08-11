@@ -325,8 +325,9 @@ impl BrushEngine {
         });
     }
 
-    /// Clone of the currently selected brush. Presets are small POD  - 
-    /// cloning avoids holding a `Ref` across stroke construction.
+    /// Clone of the currently selected brush. A preset carries its icon and
+    /// preview PNG bytes (~1 MB for the built-ins), so this is expensive -
+    /// use [`Self::with_active_brush`] on anything that runs per input event.
     pub fn active_brush(&self) -> BrushPreset {
         let id = self.active.get();
         self.brushes
@@ -335,6 +336,24 @@ impl BrushEngine {
             .find(|p| p.id == id)
             .cloned()
             .expect("active id must exist in brushes")
+    }
+
+    /// Run `f` against the active preset by reference. Holds a `Ref` on the
+    /// brush list for the call, so `f` must not mutate the engine.
+    pub fn with_active_brush<R>(&self, f: impl FnOnce(&BrushPreset) -> R) -> R {
+        let id = self.active.get();
+        let brushes = self.brushes.borrow();
+        let preset = brushes
+            .iter()
+            .find(|p| p.id == id)
+            .expect("active id must exist in brushes");
+        f(preset)
+    }
+
+    /// Whether the active brush accumulates coverage on overlap.
+    #[must_use]
+    pub fn active_buildup(&self) -> bool {
+        self.with_active_brush(|p| p.buildup)
     }
 
     pub fn begin_stroke(&self, sample: InputSample, color: Color, target: &mut dyn PaintTarget) {

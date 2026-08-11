@@ -716,14 +716,22 @@ pub(super) fn reorder_steps(before: &[String], after: &[String]) -> Vec<(usize, 
 }
 
 // Drives the canvas's flat layer order from the tree. Tree top = canvas top.
+// Tree leaves the canvas doesn't have, and ids repeated in the tree, are dropped
+// first: the target positions are canvas indices, so a tree holding more leaves
+// than the canvas has layers would walk off the end of the stack.
 pub(super) fn sync_canvas_order(tree: &[LayerNode], canvas: &mut Canvas) {
-    let top_first = leaf_ids_top_first(tree);
+    let mut current: Vec<String> =
+        canvas.layers().snapshot().iter().map(|l| l.id.clone()).collect();
+    let on_canvas: HashSet<&String> = current.iter().collect();
+    let mut seen: HashSet<String> = HashSet::new();
+    let top_first: Vec<String> = leaf_ids_top_first(tree)
+        .into_iter()
+        .filter(|id| on_canvas.contains(id) && seen.insert(id.clone()))
+        .collect();
     let n = top_first.len();
     if n == 0 {
         return;
     }
-    let mut current: Vec<String> =
-        canvas.layers().snapshot().iter().map(|l| l.id.clone()).collect();
     for desired_pos in 0..n {
         let target_id = &top_first[n - 1 - desired_pos];
         let Some(cur_pos) = current.iter().position(|id| id == target_id) else { continue };
@@ -1142,25 +1150,25 @@ fn find_group_position_inner(
 }
 
 // Used by "duplicate group": each leaf is remapped through `id_map`, each group
-// gets a fresh id so the copy and the original are independent.
+// gets a fresh id so the copy and the original are independent. Leaves missing
+// from `id_map` (their canvas copy failed - layer limit, mostly) are dropped;
+// keeping the source id would put one layer in two places in the tree.
 pub(super) fn mirror_tree(
     nodes: &[LayerNode],
     id_map: &std::collections::HashMap<String, String>,
 ) -> Vec<LayerNode> {
     nodes
         .iter()
-        .map(|n| match n {
-            LayerNode::Layer(id) => {
-                LayerNode::Layer(id_map.get(id).cloned().unwrap_or_else(|| id.clone()))
-            }
-            LayerNode::Group(g) => LayerNode::Group(GroupData {
+        .filter_map(|n| match n {
+            LayerNode::Layer(id) => id_map.get(id).map(|new_id| LayerNode::Layer(new_id.clone())),
+            LayerNode::Group(g) => Some(LayerNode::Group(GroupData {
                 id: new_group_id(),
                 name: g.name.clone(),
                 expanded: g.expanded,
                 visible: g.visible,
                 children: mirror_tree(&g.children, id_map),
                 masked_leaves: HashSet::new(),
-            }),
+            })),
         })
         .collect()
 }
@@ -3782,6 +3790,34 @@ mod tests {
         collect_group_ids(&tree, &mut ids);
         let unique: HashSet<&String> = ids.iter().collect();
         assert_eq!(unique.len(), ids.len(), "nested group ids should be unique: {ids:?}");
+    }
+
+    // --- mirror_tree ---
+    fn panel_group(id: &str, children: Vec<LayerNode>) -> LayerNode {
+        LayerNode::Group(GroupData {
+            id: id.to_string(),
+            name: "G".into(),
+            expanded: true,
+            visible: true,
+            children,
+            masked_leaves: HashSet::new(),
+        })
+    }
+
+    #[test]
+    fn mirror_tree_drops_leaves_that_were_not_duplicated() {
+        // "b" hit the layer limit, so it never made it into the id map.
+        let src = vec![
+            LayerNode::Layer("a".into()),
+            panel_group("g1", vec![LayerNode::Layer("b".into()), LayerNode::Layer("c".into())]),
+        ];
+        let id_map: std::collections::HashMap<String, String> =
+            [("a".to_string(), "a2".to_string()), ("c".to_string(), "c2".to_string())]
+                .into_iter()
+                .collect();
+
+        let mirror = mirror_tree(&src, &id_map);
+        assert_eq!(leaf_ids_top_first(&mirror), vec!["a2".to_string(), "c2".to_string()]);
     }
 
     // --- drag_span ---

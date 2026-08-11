@@ -11,6 +11,7 @@ mod transform_geometry;
 use std::cell::{Cell, RefCell};
 use std::os::fd::AsRawFd;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use oxiedraw_core::brush_engine::{
     BrushEngine, InputSample, StrokeContext, compute_brush_cursor, make_spawn_input,
@@ -25,6 +26,7 @@ use oxiedraw_core::tools::{
     CropRect, CropState, FillState, FillTool, GradientState, SelectionState, ShapeState, Tool,
     ToolState, TransformState,
 };
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::{Point, Size};
 
 use relm4::gtk;
@@ -254,6 +256,69 @@ impl RenderPump {
     /// End one interaction; the tick stops once the last one ends.
     pub(crate) fn disarm(&self) {
         self.active.set(self.active.get().saturating_sub(1));
+    }
+}
+
+/// How long the pointer must sit still before the hover lease is released.
+const HOVER_IDLE: Duration = Duration::from_millis(150);
+/// How often the lease checks whether motion has stopped.
+const HOVER_POLL: Duration = Duration::from_millis(50);
+
+/// Holds a [`RenderPump`] lease while the pointer is moving over the canvas.
+///
+/// Without it, a hover redraw is chained to the input event stream - each
+/// motion event invalidates the paintable, so the repaint rate is the pointer's
+/// report rate rather than the display's, and never aligns to vsync. Holding
+/// the pump puts hover on the frame clock like a stroke.
+///
+/// The lease is released once motion stops, so a pointer parked over the canvas
+/// doesn't pin it at full refresh forever. Ownership of the poll timer *is* the
+/// lease: at most one is live, and taking its `SourceId` marks it released.
+#[derive(Clone)]
+struct HoverPump {
+    pump: RenderPump,
+    last_motion: Rc<Cell<Instant>>,
+    timer: Rc<RefCell<Option<glib::SourceId>>>,
+}
+
+impl HoverPump {
+    fn new(pump: RenderPump) -> Self {
+        Self {
+            pump,
+            last_motion: Rc::new(Cell::new(Instant::now())),
+            timer: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    /// Call on every hover motion event. Cheap once the lease is held: a `Cell`
+    /// write and a borrow, no per-event timer churn.
+    fn poke(&self) {
+        self.last_motion.set(Instant::now());
+        if self.timer.borrow().is_some() {
+            return;
+        }
+        self.pump.arm();
+        let me = self.clone();
+        let id = glib::timeout_add_local(HOVER_POLL, move || {
+            if me.last_motion.get().elapsed() < HOVER_IDLE {
+                return glib::ControlFlow::Continue;
+            }
+            // Returning Break removes this source, so drop the handle rather
+            // than removing it from inside its own callback.
+            if me.timer.borrow_mut().take().is_some() {
+                me.pump.disarm();
+            }
+            glib::ControlFlow::Break
+        });
+        *self.timer.borrow_mut() = Some(id);
+    }
+
+    /// Release early - the pointer left the canvas.
+    fn release(&self) {
+        if let Some(id) = self.timer.borrow_mut().take() {
+            id.remove();
+            self.pump.disarm();
+        }
     }
 }
 
@@ -768,7 +833,13 @@ fn install_motion(
     let last_motion_c = Rc::clone(&last_motion);
     let last_direction_c = Rc::clone(&last_direction);
 
+    let hover = HoverPump::new(viewport.render_pump());
+    let hover_pump = hover.clone();
+
     motion.connect_motion(move |ctrl, x, y| {
+        // Runs during strokes too (both controllers sit on the same widget), so
+        // its cost belongs to the input stage on the perf overlay.
+        let _span = frame_profile::span(frame_profile::Stage::Input);
         #[allow(clippy::cast_possible_truncation)]
         cursor_pos.set(Point::new(x as f32, y as f32));
 
@@ -780,6 +851,11 @@ fn install_motion(
             paintable.set_gradient_cursor(None);
             return;
         }
+
+        // Put the hover cursor overlay on the frame clock. A nav drag already
+        // holds the pump, hence taking the lease only past that early return.
+        hover_pump.poke();
+        frame_profile::note_input();
 
         // Only the Gradient tool draws the ramp cursor; clear it otherwise.
         if !matches!(tools_c.active.get(), Tool::Fill(FillTool::Gradient)) {
@@ -840,25 +916,29 @@ fn install_motion(
                 let (speed_px_ms, direction_rad) =
                     motion_kinematics(&last_motion_c, &last_direction_c, canvas_pos, time_ms);
                 let (pressure, tilt_x, tilt_y, pen_rotation_rad) = device_axes(ctrl);
-                let preset = brush_engine.active_brush();
-                let ctx = StrokeContext {
-                    preset: preset.id,
-                    color: colors.current(),
-                    size: brush_engine.size.get(),
-                    opacity: brush_engine.opacity.get(),
-                };
-                let input = make_spawn_input(
-                    pressure,
-                    speed_px_ms,
-                    direction_rad,
-                    /* cumulative distance */ 0.0,
-                    ctx.size,
-                    stable_random_for(canvas_pos),
-                    pen_rotation_rad,
-                    tilt_x,
-                    tilt_y,
-                );
-                let cursor = compute_brush_cursor(&preset, ctx, input, ctx.size);
+                // Borrowed, not cloned: a preset owns its icon and preview PNG
+                // bytes (~1 MB for the built-ins) and this runs on every motion
+                // event, pen down included.
+                let cursor = brush_engine.with_active_brush(|preset| {
+                    let ctx = StrokeContext {
+                        preset: preset.id,
+                        color: colors.current(),
+                        size: brush_engine.size.get(),
+                        opacity: brush_engine.opacity.get(),
+                    };
+                    let input = make_spawn_input(
+                        pressure,
+                        speed_px_ms,
+                        direction_rad,
+                        /* cumulative distance */ 0.0,
+                        ctx.size,
+                        stable_random_for(canvas_pos),
+                        pen_rotation_rad,
+                        tilt_x,
+                        tilt_y,
+                    );
+                    compute_brush_cursor(preset, ctx, input, ctx.size)
+                });
                 paintable.set_brush_cursor(Some(cursor), canvas_pos);
             }
             Tool::Liquify => {
@@ -925,6 +1005,8 @@ fn install_motion(
         let paintable = viewport.paintable.clone();
         let fill_drag = viewport.fill_drag_handle();
         motion.connect_leave(move |ctrl| {
+            // No pointer over the canvas means nothing left to pace.
+            hover.release();
             paintable.set_brush_cursor(None, Point::ZERO);
             paintable.set_color_picker(None);
             paintable.set_gradient_cursor(None);
@@ -1403,6 +1485,7 @@ pub(super) fn apply_descriptor_to_paintable(
     paintable: &CanvasPaintable,
     area: &gtk::Picture,
 ) {
+    let _span = frame_profile::span(frame_profile::Stage::Texture);
     let previous = paintable.texture();
     match build_texture(area, desc, previous.as_ref(), damage) {
         Ok(texture) => paintable.set_texture(Some(texture)),

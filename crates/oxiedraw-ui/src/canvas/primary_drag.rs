@@ -24,6 +24,7 @@ use oxiedraw_core::tools::{
     SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, TargetKind, Tool,
     ToolState, TransformFilter, TransformHandle, TransformState,
 };
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::{Point, Size, TransformRect};
 use relm4::gtk;
 use relm4::gtk::glib;
@@ -984,7 +985,7 @@ impl PrimaryDragHandler {
         // Shape correction is not offered for build-up brushes - their
         // overlap-accumulating look is the whole point, so snapping the
         // path to a clean shape would misrepresent the stroke.
-        if self.brush_engine.active_brush().buildup {
+        if self.brush_engine.active_buildup() {
             return;
         }
 
@@ -2845,7 +2846,11 @@ pub(super) fn install_primary_drag(
     }
     {
         let h = Rc::clone(&handler);
-        drag.connect_drag_update(move |g, dx, dy| h.on_update(g, dx, dy));
+        drag.connect_drag_update(move |g, dx, dy| {
+            frame_profile::note_input();
+            let _span = frame_profile::span(frame_profile::Stage::Input);
+            h.on_update(g, dx, dy);
+        });
     }
     {
         let h = Rc::clone(&handler);

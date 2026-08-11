@@ -508,6 +508,9 @@ pub struct GuideState {
     pub config: Rc<RefCell<Option<GuideConfig>>>,
     /// Snapshot taken when the Drawing Guide tool is entered, for Cancel.
     pub entry_snapshot: Rc<RefCell<Option<GuideConfig>>>,
+    /// The config set aside while the guide is switched off, so switching it
+    /// back on restores the same guide instead of a fresh default.
+    pub stash: Rc<RefCell<Option<GuideConfig>>>,
     changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
 }
 
@@ -517,6 +520,7 @@ impl GuideState {
         Self {
             config: Rc::new(RefCell::new(None)),
             entry_snapshot: Rc::new(RefCell::new(None)),
+            stash: Rc::new(RefCell::new(None)),
             changed: Rc::new(RefCell::new(Vec::new())),
         }
     }

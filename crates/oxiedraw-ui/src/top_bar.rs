@@ -45,6 +45,8 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     let spacer = gtk::Box::builder().hexpand(true).build();
     bar.append(&spacer);
 
+    bar.append(&build_guide_control());
+
     // Primary (gear) menu button
     let primary_btn = gtk::MenuButton::builder()
         .icon_name("emblem-system-symbolic")
@@ -79,6 +81,40 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     };
 
     (handle, apply)
+}
+
+/// The symmetry button, next to the gear menu. Switches the drawing guide on
+/// and off via `app.guide-toggle`; switching it on enters the Drawing Guide
+/// tool, which opens the guide settings in the right sidebar and puts the
+/// position / rotation nodes on the canvas. Flat like the gear button beside it
+/// while off, accent while the guide is on.
+fn build_guide_control() -> gtk::ToggleButton {
+    let toggle = gtk::ToggleButton::builder()
+        .icon_name("oxiedraw-guide-symbolic")
+        .tooltip_text("Symmetry - switch the drawing guide on or off")
+        .action_name("app.guide-toggle")
+        .valign(gtk::Align::Center)
+        .margin_end(6)
+        .build();
+    toggle.inline_css("padding-top: 0; padding-bottom: 0;");
+
+    apply_guide_style(&toggle, toggle.is_active());
+    // The action drives `active` (button, keybinding, or a state push from the
+    // tab manager); restyle whenever it changes.
+    toggle.connect_active_notify(|b| apply_guide_style(b, b.is_active()));
+    toggle
+}
+
+/// Flat (bar background) normally, full system accent while the guide is on -
+/// the same two states as the brush bar's eraser toggle.
+fn apply_guide_style(toggle: &gtk::ToggleButton, on: bool) {
+    if on {
+        toggle.remove_css_class("flat");
+        toggle.add_css_class("suggested-action");
+    } else {
+        toggle.remove_css_class("suggested-action");
+        toggle.add_css_class("flat");
+    }
 }
 
 fn load_css() {

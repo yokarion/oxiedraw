@@ -38,6 +38,7 @@ use std::rc::Rc;
 use ash::{Device, Instance, vk};
 use gpu_allocator::MemoryLocation;
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::Size;
 
 use super::RendererError;
@@ -1150,7 +1151,10 @@ impl VulkanRenderer {
         self.fence = self.ring_fences[slot];
         // The slot's previous submission must finish before we reuse its command
         // buffer. Fences start signaled, so the first use is a no-op.
-        unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+        {
+            let _span = frame_profile::span(frame_profile::Stage::GpuWait);
+            unsafe { self.device.wait_for_fences(&[self.fence], true, u64::MAX)? };
+        }
         unsafe { self.device.reset_fences(&[self.fence])? };
         unsafe {
             self.device
@@ -1206,6 +1210,7 @@ impl VulkanRenderer {
     /// Wait for slot `slot`'s last submission to finish so its instance region
     /// is safe to overwrite. submit_to_ring waits too, but only after the upload.
     pub(super) fn wait_ring_slot(&self, slot: usize) -> Result<(), RendererError> {
+        let _span = frame_profile::span(frame_profile::Stage::GpuWait);
         unsafe {
             self.device
                 .wait_for_fences(&[self.ring_fences[slot]], true, u64::MAX)?;
@@ -1215,6 +1220,7 @@ impl VulkanRenderer {
 
     /// Wait for the most recent submission to finish.
     pub fn wait_last(&self) -> Result<(), RendererError> {
+        let _span = frame_profile::span(frame_profile::Stage::GpuWait);
         unsafe {
             self.device
                 .wait_for_fences(&[self.ring_fences[self.last_slot]], true, u64::MAX)?;

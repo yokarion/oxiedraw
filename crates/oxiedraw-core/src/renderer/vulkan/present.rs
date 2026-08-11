@@ -39,10 +39,20 @@ impl VulkanRenderer {
         // Async: don't stall the input loop on the dmabuf present. GTK syncs to
         // our GPU writes via dma-buf implicit sync, and same-queue order keeps
         // the next preview write after this pass.
+        //
+        // Timestamped like the stroke path so the perf overlay reports this
+        // frame instead of re-reading a stale ring slot. Whatever built `source`
+        // ran in an earlier submit and can't be measured from here, so the
+        // render mark sits at the start: this submit is present-only, and 0 ms
+        // of render is the honest answer for it.
         self.record_and_submit_async(|this| {
+            this.cmd_frame_timing_begin();
+            this.cmd_frame_timing_mark(1);
             this.record_present_copy(src_image, src_view);
+            this.cmd_frame_timing_mark(2);
             Ok(())
         })?;
+        self.note_frame_timing();
         Ok(())
     }
 

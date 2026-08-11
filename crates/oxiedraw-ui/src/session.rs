@@ -32,6 +32,7 @@ use oxiedraw_core::tools::{
     CropRect, CropState, FillState, GradientState, SelectionState, ShapeState, TargetKind, Tool,
     ToolState, TransformFilter, TransformRect, TransformState, TransformTarget,
 };
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::Size;
 use relm4::gtk;
 use relm4::gtk::glib;
@@ -1155,6 +1156,7 @@ impl DocumentSession {
             let paintable_c = viewport.paintable().clone();
             let offset = Rc::new(Cell::new(0.0_f64));
             glib::timeout_add_local(std::time::Duration::from_millis(80), move || {
+                let _span = frame_profile::span(frame_profile::Stage::Timers);
                 if !selection_c.ants_contours.borrow().is_empty() {
                     let next = (offset.get() + 1.0) % 10.0;
                     offset.set(next);
@@ -1197,6 +1199,7 @@ impl DocumentSession {
             let tab_page = Rc::clone(&tab_page);
             let last_dirty = Cell::new(false);
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                let _span = frame_profile::span(frame_profile::Stage::Timers);
                 if weak.upgrade().is_none() {
                     return glib::ControlFlow::Break;
                 }

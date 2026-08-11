@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use oxiedraw_core::canvas::Canvas;
+use oxiedraw_utils::frame_profile;
 use relm4::gtk;
 use relm4::gtk::cairo;
 use relm4::gtk::glib;
@@ -26,6 +27,7 @@ pub(super) fn start_thumbnail_refresh(
     // a fresh full-canvas allocation per layer.
     let mut scratch: Vec<u8> = Vec::new();
     glib::timeout_add_local(Duration::from_millis(150), move || {
+        let _span = frame_profile::span(frame_profile::Stage::Timers);
         if canvas.borrow().is_drawing() {
             return glib::ControlFlow::Continue;
         }

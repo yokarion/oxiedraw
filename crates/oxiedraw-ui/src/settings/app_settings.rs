@@ -246,6 +246,9 @@ pub(crate) fn recovery_dir() -> PathBuf {
 
 impl AppSettings {
     pub(crate) fn load() -> Self {
+        // Uncached disk read + parse, and it is called from pen-down and from
+        // every tooltip build - worth seeing on the perf overlay.
+        let _span = oxiedraw_utils::frame_profile::span(oxiedraw_utils::frame_profile::Stage::Timers);
         let path = config_path();
         match std::fs::read_to_string(&path) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_else(|e| {

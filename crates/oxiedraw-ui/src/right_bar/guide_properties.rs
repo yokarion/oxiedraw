@@ -1,10 +1,11 @@
 //! Drawing Guide sidebar panel.
 //!
 //! Replaces the normal right panel while the Drawing Guide tool is active
-//! (like the crop panel). Edits the per-document [`GuideState`]: guide type,
-//! symmetry mode, mirror/rotational, assisted drawing, and appearance. The two
-//! on-canvas nodes handle position and rotation; Cancel / Done live in the top
-//! bar (see `top_bar`).
+//! (like the crop panel) - the top bar's symmetry button is what enters it.
+//! Edits the per-document [`GuideState`]: guide type, symmetry mode,
+//! mirror/rotational, assisted drawing, and appearance. The two on-canvas nodes
+//! handle position and rotation; that same button switches the guide off again,
+//! and Cancel / Done live in the tool-options bar.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -71,7 +72,7 @@ pub(crate) fn build(
     setup_color_rows(&appearance, guide, &syncing, &refreshers);
     content.append(&appearance);
 
-    content.append(&build_position_section(guide));
+    content.append(&build_position_section(guide, canvas));
 
     // Show/hide the kind-specific bits when the config changes.
     {
@@ -200,21 +201,16 @@ fn build_guide_cards(
             let syncing = Rc::clone(syncing);
             let preset = *preset;
             // `clicked` (not `toggled`) so re-picking the already-selected card
-            // after a Reset re-creates the guide.
+            // still applies (the switched-off guide starts from nothing again).
             btn.connect_clicked(move |btn| {
                 if syncing.get() {
                     return;
                 }
                 let primary = color_to_rgb(colors.current());
-                let accent = accent_rgb(btn.upcast_ref::<gtk::Widget>());
-                // Reset clears the config; picking a card starts a fresh guide
-                // of that type centred on the canvas, its line colour seeded to
-                // roughly match the theme accent.
+                // With the guide switched off there is no config to edit, so
+                // picking a card starts a fresh centred one of that type.
                 if guide.config.borrow().is_none() {
-                    let cs = canvas.borrow().size();
-                    let mut cfg = GuideConfig::centered(cs.width, cs.height);
-                    cfg.color = guide_pos_from_rgb(accent.0, accent.1, accent.2);
-                    *guide.config.borrow_mut() = Some(cfg);
+                    *guide.config.borrow_mut() = Some(fresh_config(&canvas, btn));
                 }
                 guide.update(|c| {
                     c.kind = preset.kind;
@@ -562,13 +558,13 @@ fn color_to_rgb(c: oxiedraw_core::color::Color) -> (f32, f32, f32) {
 // Position
 // ---------------------------------------------------------------------------
 
-fn build_position_section(guide: &GuideState) -> gtk::Box {
+fn build_position_section(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> gtk::Box {
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(6)
         .build();
     let hint = gtk::Label::builder()
-        .label("Drag the node to move the guide; the outer node rotates it. Pick a Guide Type above to start a new one.")
+        .label("Drag the node to move the guide; the outer node rotates it. Reset puts a fresh default guide back at the canvas centre.")
         .wrap(true)
         .xalign(0.0)
         .build();
@@ -576,20 +572,30 @@ fn build_position_section(guide: &GuideState) -> gtk::Box {
     hint.inline_css("font-size: 12px;");
     outer.append(&hint);
 
-    // Reset clears the guide entirely (hides all guidelines). Re-selecting a
-    // Guide Type card starts a fresh one.
+    // Reset restores the default guide (type, appearance and position) and
+    // leaves it visible - switching guides off is the button's job, not this.
     let reset = gtk::Button::with_label("Reset");
     reset.set_halign(gtk::Align::Start);
-    reset.add_css_class("destructive-action");
     {
         let guide = guide.clone();
-        reset.connect_clicked(move |_| {
-            *guide.config.borrow_mut() = None;
+        let canvas = Rc::clone(canvas);
+        reset.connect_clicked(move |btn| {
+            *guide.config.borrow_mut() = Some(fresh_config(&canvas, btn));
             guide.notify_changed();
         });
     }
     outer.append(&reset);
     outer
+}
+
+/// A fresh guide centred on the canvas, its line colour seeded to roughly match
+/// the theme accent. `widget` is any realized widget, used to read that accent.
+fn fresh_config(canvas: &Rc<RefCell<Canvas>>, widget: &impl IsA<gtk::Widget>) -> GuideConfig {
+    let size = canvas.borrow().size();
+    let mut cfg = GuideConfig::centered(size.width, size.height);
+    let (r, g, b) = accent_rgb(widget.upcast_ref());
+    cfg.color = guide_pos_from_rgb(r, g, b);
+    cfg
 }
 
 // ---------------------------------------------------------------------------

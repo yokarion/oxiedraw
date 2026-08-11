@@ -414,6 +414,15 @@ pub(super) fn install_layer_actions(
                 }
             }
 
+            // Nothing got copied (the canvas was already full), so there is no
+            // copy to put in the tree - just say why.
+            if id_map.is_empty() {
+                if hit_limit {
+                    toaster.layer_limit_reached();
+                }
+                return;
+            }
+
             let mirror_children = mirror_tree(&group_clone.children, &id_map);
             let new_gid = new_group_id();
             let mirror = LayerNode::Group(GroupData {

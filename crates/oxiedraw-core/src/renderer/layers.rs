@@ -29,8 +29,9 @@ const BLEND_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/layer_bl
 pub(super) const BLEND_PUSH_BYTES: u32 = 8;
 
 /// Maximum number of layers per document. Fixed-size descriptor pool -
-/// keeps the allocator dead-simple; can be made elastic later.
-pub const MAX_LAYERS: u32 = 128;
+/// keeps the allocator dead-simple; can be made elastic later. Each layer
+/// costs one canvas-sized image in VRAM, so this is the real memory ceiling.
+pub const MAX_LAYERS: u32 = 256;
 
 /// Pipeline that samples one premultiplied BGRA layer image and blends
 /// it onto the bound render target (canvas) with premultiplied OVER.

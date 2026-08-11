@@ -14,6 +14,7 @@ use std::f64::consts::{FRAC_PI_3, PI, TAU};
 use oxiedraw_core::brush_engine::BrushCursor;
 use oxiedraw_core::color::Color;
 use oxiedraw_core::tools::{CropOverlay, CropRect, GradientSettings, PendingMarquee, TransformRect};
+use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::Point;
 
 use crate::perf_graph::PerfGraph;
@@ -364,6 +365,10 @@ impl CanvasPaintable {
     /// Show or hide the frame-time performance overlay (F3). Triggers a redraw
     /// so the panel appears/disappears immediately.
     pub(crate) fn toggle_perf_graph(&self) {
+        // Stage timing costs a clock read per span, so it only runs while some
+        // overlay is up - every span is a bool check otherwise. Held as a
+        // refcount because the toggle is per document: closing one document's
+        // overlay must not stop measuring for another that still shows one.
         self.imp().perf.borrow_mut().toggle();
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
@@ -1599,63 +1604,85 @@ fn draw_pixel_grid_cairo(
 
 /// Stroke the brush footprint outline as a two-tone haloed line - a
 /// thicker dark underlay with a thin white line on top - so it stays
-/// readable over any canvas background. True compositor inversion
-/// isn't reachable here: `append_cairo` gives us a fresh transparent
-/// surface, so cairo's `Operator::Difference` only mixes with what we
-/// draw inside that surface, not with the canvas underneath. The
-/// dual-tone halo is what Photoshop / Krita / GIMP do for the same
-/// reason.
-fn draw_brush_cursor_cairo(
-    cr: &gtk::cairo::Context,
+/// readable over any canvas background. True compositor inversion isn't
+/// reachable here (nothing composites against the canvas underneath), so the
+/// dual-tone halo is what Photoshop / Krita / GIMP do for the same reason.
+///
+/// Emitted as GSK stroke nodes rather than a cairo node: this runs on every
+/// frame of every stroke, and `append_cairo(widget_rect)` would allocate,
+/// software-rasterise and upload a canvas-sized surface each time.
+fn append_brush_cursor(
+    snapshot: &gtk::Snapshot,
     cursor: &BrushCursor,
     anchor_canvas: Point,
     pan_x: f32,
     pan_y: f32,
     zoom: f32,
 ) {
+    use gtk::prelude::SnapshotExt;
     if cursor.is_empty() || zoom <= 0.0 {
         return;
     }
 
-    let to_widget = |p: Point| -> (f64, f64) {
-        let wx = pan_x + (anchor_canvas.x + p.x) * zoom;
-        let wy = pan_y + (anchor_canvas.y + p.y) * zoom;
-        (f64::from(wx), f64::from(wy))
-    };
-
-    let append_paths = |cr: &gtk::cairo::Context| {
-        for stroke in &cursor.strokes {
-            if stroke.len() < 2 {
-                continue;
-            }
-            let (x0, y0) = to_widget(stroke[0]);
-            cr.move_to(x0, y0);
-            for p in &stroke[1..] {
-                let (x, y) = to_widget(*p);
-                cr.line_to(x, y);
-            }
+    let builder = gsk::PathBuilder::new();
+    let mut any = false;
+    for stroke in &cursor.strokes {
+        if stroke.len() < 2 {
+            continue;
         }
+        let to_widget = |p: &Point| {
+            (
+                pan_x + (anchor_canvas.x + p.x) * zoom,
+                pan_y + (anchor_canvas.y + p.y) * zoom,
+            )
+        };
+        let (x0, y0) = to_widget(&stroke[0]);
+        builder.move_to(x0, y0);
+        for p in &stroke[1..] {
+            let (x, y) = to_widget(p);
+            builder.line_to(x, y);
+        }
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    let path = builder.to_path();
+
+    let make_stroke = |width: f32| {
+        let s = gsk::Stroke::new(width);
+        s.set_line_join(gsk::LineJoin::Round);
+        s.set_line_cap(gsk::LineCap::Round);
+        s
     };
 
-    cr.save().ok();
-    cr.set_line_join(gtk::cairo::LineJoin::Round);
-    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    // Dark halo - slightly wider, mostly opaque. Stays visible on bright
+    // backgrounds; provides a shadow on dark ones.
+    snapshot.append_stroke(
+        &path,
+        &make_stroke(2.5),
+        &gdk::RGBA::new(0.0, 0.0, 0.0, 0.85),
+    );
+    // Light core line - 1px white, fully opaque. Pops on dark backgrounds and
+    // sits cleanly inside the dark halo on light ones.
+    snapshot.append_stroke(
+        &path,
+        &make_stroke(1.0),
+        &gdk::RGBA::new(1.0, 1.0, 1.0, 1.0),
+    );
+}
 
-    // Dark halo - slightly wider, mostly opaque. Stays visible on
-    // bright backgrounds; provides a shadow on dark ones.
-    cr.set_source_rgba(0.0, 0.0, 0.0, 0.85);
-    cr.set_line_width(2.5);
-    append_paths(cr);
-    cr.stroke().ok();
-
-    // Light core line - 1px white, fully opaque. Pops on dark
-    // backgrounds and sits cleanly inside the dark halo on light ones.
-    cr.set_source_rgba(1.0, 1.0, 1.0, 1.0);
-    cr.set_line_width(1.0);
-    append_paths(cr);
-    cr.stroke().ok();
-
-    cr.restore().ok();
+/// Rotate the snapshot about the pan origin - the GSK twin of
+/// [`apply_view_rotation`], for overlays emitted as nodes instead of cairo.
+/// Caller must `save()` first and `restore()` after.
+fn snapshot_view_rotation(snapshot: &gtk::Snapshot, pan_x: f32, pan_y: f32, rotation: f32) {
+    use gtk::prelude::SnapshotExt;
+    if rotation == 0.0 {
+        return;
+    }
+    snapshot.translate(&graphene::Point::new(pan_x, pan_y));
+    snapshot.rotate(rotation.to_degrees());
+    snapshot.translate(&graphene::Point::new(-pan_x, -pan_y));
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,10 +1909,11 @@ mod imp {
         BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
         GradientCursorOverlay, GuideCacheEntry, GuideCacheKey, PendingMarquee, Point, RefCell,
         TransformRect,
-        apply_view_rotation, draw_brush_cursor_cairo, draw_color_picker_cairo,
+        append_brush_cursor, apply_view_rotation, draw_color_picker_cairo,
         draw_crop_overlay_cairo, draw_gradient_cursor_cairo, draw_pixel_grid_cairo,
         draw_selection_overlay_cairo, draw_text_edit_overlay_cairo, draw_transform_overlay_cairo,
-        gdk, glib, graphene, gsk, gtk, render_guide_texture,
+        frame_profile, gdk, glib, graphene, gsk, gtk, render_guide_texture,
+        snapshot_view_rotation,
     };
     use gtk::prelude::*;
     use gtk::subclass::prelude::*;
@@ -1987,6 +2015,10 @@ mod imp {
         /// Bumped on every armed settle timer; the timer only acts if it still
         /// holds the latest generation (debounce over a burst of motion frames).
         pub(super) guide_zoom_gen: Cell<u64>,
+        /// Bumped every snapshot to jitter the backdrop colour below the 8-bit
+        /// quantisation step, so GSK's node diff always damages the whole widget.
+        /// See the backdrop in `snapshot`.
+        pub(super) repaint_jitter: Cell<u8>,
         /// Performance overlay (toggle with F3). Records one sample per snapshot
         /// and paints itself in the top-left corner.
         pub(super) perf: RefCell<super::PerfGraph>,
@@ -2050,6 +2082,7 @@ mod imp {
                 guide_last_pan: Cell::new((0.0, 0.0)),
                 guide_do_rerender: Cell::new(false),
                 guide_zoom_gen: Cell::new(0),
+                repaint_jitter: Cell::new(0),
                 perf: RefCell::new(super::PerfGraph::default()),
             }
         }
@@ -2172,10 +2205,42 @@ mod imp {
 
     impl PaintableImpl for CanvasPaintable {
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+            // Drain the stage timings before opening this frame's own span, so
+            // the sample covers a whole frame ending with the previous snapshot.
+            let profile = frame_profile::take_frame();
+            let _profile_span = frame_profile::span(frame_profile::Stage::Snapshot);
+
             // 1. Solid dark backdrop behind everything (off-canvas).
+            //
+            // Doubles as the full-repaint anchor. The checker `RepeatNode`
+            // renders wrong under a partial (sub-region) repaint - the offscreen
+            // it rasterises into takes a shifted sub-pixel origin and leaves
+            // dark tile-boundary seams, which trail behind a moving cursor.
+            // Overlays used to guarantee a full repaint by being full-widget
+            // cairo nodes, at the cost of a canvas-sized CPU surface per frame.
+            // Instead, jitter this node's colour below the 8-bit quantisation
+            // step: GSK's node diff compares the floats and damages the whole
+            // widget, while the rendered pixels are bit-identical.
+            //
+            // A long cycle rather than a 2-value flip: were this snapshot ever
+            // called an even number of times per frame, alternating would land
+            // on the same value each frame and the damage would silently
+            // vanish, taking the seams with it.
+            //
+            // Only while the brush cursor is up, which is exactly the case the
+            // old full-widget cairo node covered. Forcing it unconditionally
+            // would also defeat the damage region on pans and toast fades,
+            // which never needed it - the remaining full-widget overlays
+            // (selection ants, crop, transform) still force their own.
             #[allow(clippy::cast_possible_truncation)]
             let widget_rect = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
-            snapshot.append_color(&gdk::RGBA::new(0.12, 0.12, 0.14, 1.0), &widget_rect);
+            let mut blue = 0.14;
+            if self.brush_cursor.borrow().is_some() {
+                let jitter = self.repaint_jitter.get().wrapping_add(1);
+                self.repaint_jitter.set(jitter);
+                blue += f32::from(jitter % 251) * 1e-7;
+            }
+            snapshot.append_color(&gdk::RGBA::new(0.12, 0.12, blue, 1.0), &widget_rect);
 
             #[allow(clippy::cast_precision_loss)]
             let canvas_w = self.canvas_w.get() as f32;
@@ -2567,25 +2632,30 @@ mod imp {
             //     what the active brush would paint at the current
             //     pointer position. Drawn before selection ants so the
             //     marching pattern stays on top when both are visible.
-            // Drawn into a full-widget cairo node on purpose: any partial
-            // (sub-region) repaint of the canvas re-rasterises the checker
-            // `RepeatNode` into an offscreen with a shifted sub-pixel origin,
-            // which leaves dark tile-boundary seams (and trails as the cursor
-            // moves). A full-widget node forces a full repaint, matching every
-            // other overlay here.
+            // GSK stroke nodes, not a cairo node: this redraws on every frame
+            // of every stroke, and a canvas-sized cairo surface would be
+            // allocated, rasterised on the CPU and uploaded each time.
+            //
+            // The previous full-widget cairo node also had the side effect of
+            // forcing a full repaint, which hid a checker bug: a partial
+            // (sub-region) repaint re-rasterises the checker `RepeatNode` into
+            // an offscreen with a shifted sub-pixel origin, leaving dark
+            // tile-boundary seams. `full_repaint_anchor` below keeps the damage
+            // full-widget without paying for a surface.
             let brush_cursor = self.brush_cursor.borrow();
             if let Some(cursor) = brush_cursor.as_ref() {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
-                let cr = gtk_snap.append_cairo(&widget_rect);
-                apply_view_rotation(&cr, pan_x, pan_y, rotation);
-                draw_brush_cursor_cairo(
-                    &cr,
+                gtk_snap.save();
+                snapshot_view_rotation(gtk_snap, pan_x, pan_y, rotation);
+                append_brush_cursor(
+                    gtk_snap,
                     cursor,
                     self.brush_cursor_anchor.get(),
                     pan_x,
                     pan_y,
                     zoom,
                 );
+                gtk_snap.restore();
             }
             drop(brush_cursor);
 
@@ -2643,8 +2713,12 @@ mod imp {
                 let mut perf = self.perf.borrow_mut();
                 if perf.enabled() {
                     let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
-                    let cr = gtk_snap.append_cairo(&widget_rect);
-                    perf.render(&cr, self.gpu_timings.get());
+                    // Node bounded to the panel, not the widget: the overlay
+                    // should not be a measurable part of what it measures.
+                    let (pw, ph) = crate::perf_graph::panel_extent();
+                    let panel_rect = graphene::Rect::new(0.0, 0.0, pw, ph);
+                    let cr = gtk_snap.append_cairo(&panel_rect);
+                    perf.render(&cr, self.gpu_timings.get(), profile);
                 }
             }
 
@@ -2667,6 +2741,12 @@ mod imp {
                 gtk_snap.append_texture(texture, &rect);
                 gtk_snap.pop();
             }
+
+            // Close the input-latency clock here rather than at the present:
+            // an overlay-only drag (crop, transform, selection) never presents,
+            // so a pending input would otherwise sit unclosed until some later
+            // frame and report its whole idle gap as latency.
+            frame_profile::note_presented();
         }
 
         fn intrinsic_width(&self) -> i32 {
