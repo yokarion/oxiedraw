@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use oxiedraw_core::canvas::Canvas;
@@ -780,6 +780,9 @@ fn run_export(
 
     let (tx, rx) = mpsc::channel::<Result<PathBuf, String>>();
 
+    let started = Instant::now();
+    let logged_format = settings.format.label();
+    let logged_scale = settings.scale;
     std::thread::spawn(move || {
         let result = export_pixels(&raw_bgra8, canvas_w, canvas_h, &settings, &path)
             .map(|()| path.clone())
@@ -804,6 +807,16 @@ fn run_export(
                 Ok(exported_path) => {
                     btn.set_label("Exported!");
                     btn.set_sensitive(true);
+
+                    tracing::info!(
+                        target: "oxiedraw::doc",
+                        path = %exported_path.display(),
+                        format = logged_format,
+                        scale = logged_scale,
+                        bytes = std::fs::metadata(&exported_path).map_or(0, |m| m.len()),
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "export done"
+                    );
 
                     let path_str = exported_path.display().to_string();
                     let t = adw::Toast::new(&format!("File exported at {path_str}"));

@@ -325,6 +325,23 @@ impl BrushEngine {
         });
     }
 
+    /// Select `id` as the active preset. Every user-facing brush switch goes
+    /// through here so the change is logged once, whichever picker made it.
+    pub fn set_active(&self, id: BrushPresetId) {
+        if self.active.get() == id {
+            return;
+        }
+        self.active.set(id);
+        if let Some(preset) = self.brushes.borrow().iter().find(|p| p.id == id) {
+            tracing::info!(
+                target: "oxiedraw::brush",
+                name = %preset.name,
+                family = preset.family.label(),
+                "brush selected"
+            );
+        }
+    }
+
     /// Clone of the currently selected brush. A preset carries its icon and
     /// preview PNG bytes (~1 MB for the built-ins), so this is expensive -
     /// use [`Self::with_active_brush`] on anything that runs per input event.

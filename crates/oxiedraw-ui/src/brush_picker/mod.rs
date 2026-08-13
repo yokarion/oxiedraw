@@ -280,7 +280,7 @@ fn build_popover_content(
         let refresh_trigger = refresh_trigger.clone();
         listbox.connect_row_activated(move |_, row| {
             if let Some((id, _)) = row_map.borrow().iter().find(|(_, r)| r == row) {
-                brush_engine.active.set(*id);
+                brush_engine.set_active(*id);
                 refresh_trigger();
                 popover.popdown();
             }
@@ -295,7 +295,7 @@ fn build_popover_content(
         let refresh_trigger = refresh_trigger.clone();
         flowbox.connect_child_activated(move |_, child| {
             if let Some((id, _)) = flow_map.borrow().iter().find(|(_, c)| c == child) {
-                brush_engine.active.set(*id);
+                brush_engine.set_active(*id);
                 refresh_trigger();
                 popover.popdown();
             }

@@ -158,6 +158,17 @@ impl BrushFamily {
         matches!(self, Self::Smudge)
     }
 
+    /// Short name for logs. `Debug` would dump the whole pattern bitmap.
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::SoftRound => "soft-round",
+            Self::Pixel => "pixel",
+            Self::Textured(_) => "textured",
+            Self::ImageTip { .. } => "image-tip",
+            Self::Smudge => "smudge",
+        }
+    }
+
     /// Total number of pipeline slots the renderer reserves.
     pub const COUNT: usize = 3;
 }

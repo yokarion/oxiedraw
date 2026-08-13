@@ -362,6 +362,7 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     {
         let crop_c = crop.clone();
         clear_btn.connect_clicked(move |_| {
+            tracing::info!(target: "oxiedraw::canvas", by = "clear", "canvas resize reset");
             crop_c.rect.set(None);
             crop_c.notify_rect_changed();
         });
@@ -380,6 +381,7 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     {
         let crop_c = crop.clone();
         cancel_btn.connect_clicked(move |_| {
+            tracing::info!(target: "oxiedraw::canvas", by = "cancel", "canvas resize reset");
             crop_c.rect.set(None);
             crop_c.notify_rect_changed();
         });

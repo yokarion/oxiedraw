@@ -52,6 +52,15 @@ impl TabManager {
     /// Window-level "set the active tool": updates the shared tool state, the
     /// left toolbar toggle, and runs the active document's tool-apply logic.
     pub(crate) fn set_active_tool(&self, t: Tool) {
+        let previous = self.global.tools.active.get();
+        if previous != t {
+            tracing::info!(
+                target: "oxiedraw::tool",
+                tool = t.display_name(),
+                from = previous.display_name(),
+                "tool selected"
+            );
+        }
         // Leaving a text edit (or any tool switch) commits the in-flight box.
         if let Some(s) = self.active.borrow().as_ref() {
             s.text_edit.commit();
@@ -84,6 +93,18 @@ impl TabManager {
                 self.set_active_tool(Tool::Brush);
             }
         }
+        // The guide rewrites every stroke while it is on (mirroring, snapping),
+        // so its on/off edges are worth a line - unlike the per-stroke detail.
+        // Logged after the swap: the live guide is in `config` while on and in
+        // `stash` once off, so this reads whichever side now holds it.
+        let kind = session
+            .guide
+            .config
+            .borrow()
+            .as_ref()
+            .or(session.guide.stash.borrow().as_ref())
+            .map(|c| c.kind);
+        tracing::info!(target: "oxiedraw::tool", on, ?kind, "drawing guide toggled");
     }
 
     /// Push the active document's guide on/off state into `app.guide-toggle`,
@@ -115,6 +136,13 @@ impl TabManager {
     /// Create a blank document of the given size and open it in a new tab.
     pub(crate) fn new_document(self: &Rc<Self>, size: Size) -> Rc<DocumentSession> {
         let title = self.next_untitled_title();
+        tracing::info!(
+            target: "oxiedraw::doc",
+            title = %title,
+            width = size.width,
+            height = size.height,
+            "document created"
+        );
         let session = DocumentSession::new(
             &self.global,
             &self.set_active_tool_late,
@@ -167,6 +195,21 @@ impl TabManager {
             && !Rc::ptr_eq(previous, session)
         {
             (previous.liquify_flush)();
+        }
+        // Only a real change of document is a tab switch; `activate` also runs
+        // again for the tab that is already in front (add_session, re-selects).
+        let switched = self
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| !Rc::ptr_eq(p, session));
+        if switched {
+            tracing::info!(
+                target: "oxiedraw::doc",
+                title = %session.display_title(),
+                open_tabs = self.sessions.borrow().len(),
+                "tab switched"
+            );
         }
         *self.active.borrow_mut() = Some(Rc::clone(session));
         set_slot_child(&self.tool_options_slot, &session.tool_options);

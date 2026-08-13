@@ -454,6 +454,14 @@ impl TextEdit {
             return;
         }
 
+        tracing::info!(
+            target: "oxiedraw::tool",
+            layer = %a.layer_id,
+            runs = content.runs.len(),
+            new_layer = a.created,
+            "text committed"
+        );
+
         let pixels = {
             let mut engine = self.engine.borrow_mut();
             a.editor.render_into_slot(&mut engine, cs.width, cs.height)

@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adw::prelude::*;
 use gtk::gio;
@@ -339,8 +339,23 @@ pub(crate) fn open_dialog(
     dialog.open(Some(window), None::<&gio::Cancellable>, move |result| {
         let Ok(file) = result else { return };
         let Some(path) = file.path() else { return };
+        // Timed in two halves: parsing the archive off disk, then handing it to
+        // the caller, which uploads every layer to the GPU and builds the tab.
+        let started = Instant::now();
         match project::load::load(&path) {
-            Ok(p) => on_loaded(p, path),
+            Ok(p) => {
+                let parse_ms = started.elapsed().as_millis();
+                let layers = p.layer_pixels.len();
+                on_loaded(p, path.clone());
+                tracing::info!(
+                    target: "oxiedraw::doc",
+                    path = %path.display(),
+                    layers,
+                    parse_ms,
+                    total_ms = started.elapsed().as_millis(),
+                    "document opened"
+                );
+            }
             Err(e) => show_error(&window_cb, "Open Failed", &e.to_string()),
         }
     });

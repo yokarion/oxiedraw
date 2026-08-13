@@ -676,14 +676,6 @@ impl PrimaryDragHandler {
         let snaps = cfg
             .as_ref()
             .is_some_and(oxiedraw_core::guides::GuideConfig::snaps_strokes);
-        tracing::info!(
-            target: "guide_assist",
-            has_cfg = cfg.is_some(),
-            kind = ?cfg.as_ref().map(|c| c.kind),
-            assisted = ?cfg.as_ref().map(|c| c.assisted),
-            snaps,
-            "arm_guide_snap"
-        );
         if snaps {
             self.guide_snap_start.set(Some(start));
         }
@@ -1069,6 +1061,12 @@ impl PrimaryDragHandler {
                     erase,
                     final_samples,
                 });
+                tracing::info!(
+                    target: "oxiedraw::assist",
+                    shape = ?correction.kind,
+                    samples = positions.len(),
+                    "shape corrected"
+                );
 
                 let anim_src = start_shape_animation(
                     Rc::clone(&canvas_t),
@@ -1118,6 +1116,12 @@ impl PrimaryDragHandler {
         let hx = pan.x + canvas_pos.x * zoom;
         let hy = pan.y + canvas_pos.y * zoom;
         let h = crop_geom::hit_test_widget(rect_widget, hx, hy);
+        tracing::info!(
+            target: "oxiedraw::canvas",
+            handle = ?h,
+            from = ?rect.map(|r| (r.normalized().width_px(), r.normalized().height_px())),
+            "canvas resize start"
+        );
         self.crop_handle.set(h);
         self.crop_start.set(canvas_pos);
         self.crop_start_rect.set(rect);
@@ -1166,6 +1170,11 @@ impl PrimaryDragHandler {
             self.crop.rect.set(final_rect);
             self.crop.notify_rect_changed();
             self.paintable.set_crop(final_rect, self.crop.overlay.get());
+            tracing::info!(
+                target: "oxiedraw::canvas",
+                rect = ?final_rect.map(|r| (r.width_px(), r.height_px())),
+                "canvas resize stop"
+            );
         }
     }
 
@@ -1607,6 +1616,7 @@ impl PrimaryDragHandler {
             origin_x: x,
             base_tolerance: tolerance,
             tolerance,
+            threshold_adjusted: false,
             current: None,
             in_flight: false,
             restart: false,
@@ -1658,6 +1668,15 @@ impl PrimaryDragHandler {
             (next != s.tolerance).then(|| {
                 let was = percent(s.tolerance);
                 s.tolerance = next;
+                if !s.threshold_adjusted {
+                    s.threshold_adjusted = true;
+                    tracing::info!(
+                        target: "oxiedraw::fill",
+                        threshold_pct = percent(s.base_tolerance),
+                        seed = ?s.seed,
+                        "fill threshold adjust start"
+                    );
+                }
                 // Adjusting is a live edit - no point sweeping it in.
                 s.animate = false;
                 (next, was)
@@ -1850,6 +1869,13 @@ impl PrimaryDragHandler {
                 return;
             }
         };
+        tracing::info!(
+            target: "oxiedraw::tool",
+            shape = kind.display_name(),
+            size = ?(w.abs().round(), h.abs().round()),
+            "shape drawn"
+        );
+
         if let Some(patch) =
             LayerPatch::from_full_diff(&pending.before, &after, cs.width, cs.height)
         {
@@ -1958,6 +1984,12 @@ impl PrimaryDragHandler {
                 return;
             }
         };
+        tracing::info!(
+            target: "oxiedraw::tool",
+            gradient = ?self.gradient.gradient_type.get(),
+            "gradient drawn"
+        );
+
         if let Some(patch) =
             LayerPatch::from_full_diff(&pending.before, &after, cs.width, cs.height)
         {
@@ -2432,6 +2464,9 @@ struct FillSession {
     /// Threshold at press; the drag offset is measured from here.
     base_tolerance: u8,
     tolerance: u8,
+    /// The user held the button and dragged the threshold at least once, which
+    /// is what separates a plain click-fill from a tuned one in the logs.
+    threshold_adjusted: bool,
     /// Pixels currently on the layer, kept for the history diff.
     current: Option<Vec<u8>>,
     in_flight: bool,
@@ -2735,11 +2770,36 @@ fn fill_finish(ctx: &FillCtx) {
     let Some(s) = ctx.session.borrow_mut().take() else {
         return;
     };
-    let Some(after) = s.current else {
-        return;
-    };
-    let cs = ctx.canvas.borrow().size();
-    if let Some(patch) = LayerPatch::from_full_diff(&s.before, &after, cs.width, cs.height) {
+    // A threshold that matched nothing leaves `current` unset - still worth a
+    // line, since from the user's side the tool was used and did nothing.
+    let patch = s.current.as_ref().and_then(|after| {
+        let cs = ctx.canvas.borrow().size();
+        LayerPatch::from_full_diff(&s.before, after, cs.width, cs.height)
+    });
+    if s.threshold_adjusted {
+        tracing::info!(
+            target: "oxiedraw::fill",
+            from_pct = percent(s.base_tolerance),
+            to_pct = percent(s.tolerance),
+            seed = ?s.seed,
+            layer = %s.layer_id,
+            smart_edges = s.auto_edge,
+            sampled_all_layers = s.sample.is_some(),
+            in_selection = s.mask.is_some(),
+            filled = patch.is_some(),
+            "fill threshold adjust stop"
+        );
+    } else {
+        tracing::info!(
+            target: "oxiedraw::fill",
+            threshold_pct = percent(s.tolerance),
+            seed = ?s.seed,
+            layer = %s.layer_id,
+            filled = patch.is_some(),
+            "fill applied"
+        );
+    }
+    if let Some(patch) = patch {
         ctx.history.borrow_mut().record(HistoryAction::Fill {
             layer_id: s.layer_id,
             patch,

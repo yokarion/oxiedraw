@@ -128,6 +128,12 @@ pub(super) fn commit(ctx: &FilterContext, affected: &[(usize, String)], spec: Fi
     (ctx.refresh_layers)();
     ctx.redraw.request();
     ctx.toaster.info(&format!("Applied {}", spec.display_name()));
+    tracing::info!(
+        target: "oxiedraw::filters",
+        filter = spec.display_name(),
+        layers = affected.len(),
+        "filter applied"
+    );
     true
 }
 
@@ -159,9 +165,11 @@ pub(super) fn open_adjustable(
     };
     let on_cancel: Rc<dyn Fn()> = {
         let ctx = ctx.clone();
+        let title = title.to_string();
         Rc::new(move || {
             ctx.canvas.borrow_mut().cancel_filter();
             ctx.redraw.request();
+            tracing::info!(target: "oxiedraw::filters", filter = %title, "filter cancelled");
         })
     };
 

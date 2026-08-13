@@ -134,7 +134,7 @@ impl GlobalState {
                     .or_else(|| brushes.iter().find(|p| p.name == "Default Round"))
                     .or_else(|| brushes.first());
                 if let Some(preset) = target {
-                    brush_engine.active.set(preset.id);
+                    brush_engine.set_active(preset.id);
                     brush_engine.size.set(preset.default_size);
                     brush_engine.opacity.set(preset.default_opacity);
                 }
@@ -273,6 +273,13 @@ fn build_crop_apply(ctx: &SessionCtx) -> Rc<dyn Fn()> {
 
         if ctx.viewport.apply_crop(rect).is_some() {
             let (after_size, after_layers) = snapshot_crop_layers(&canvas);
+            tracing::info!(
+                target: "oxiedraw::canvas",
+                from = ?before_size,
+                to = ?after_size,
+                layers = after_layers.len(),
+                "canvas resize applied"
+            );
             ctx.history.borrow_mut().record(HistoryAction::CropCanvas {
                 before_size,
                 after_size,
@@ -414,6 +421,7 @@ fn build_liquify_ensure(ctx: &SessionCtx, flush: &Rc<dyn Fn()>) -> Rc<dyn Fn() -
             tracing::error!(error = %e, "liquify: begin_liquify failed");
             return false;
         }
+        tracing::info!(target: "oxiedraw::tool", layer = %id, idx, "liquify session opened");
         *ctx.liquify_pending.borrow_mut() = Some(LiquifyPending { id, pristine });
         ctx.viewport.redraw_handle().request();
         true
@@ -695,6 +703,13 @@ fn build_transform_apply(ctx: &SessionCtx, cancel: &Rc<dyn Fn()>) -> Rc<dyn Fn()
                 tracing::error!(error = %e, "transform apply: final recomposite failed");
             }
         }
+
+        tracing::info!(
+            target: "oxiedraw::tool",
+            targets = targets.len(),
+            filter = ?filter,
+            "transform applied"
+        );
 
         // One undo step for the whole (possibly multi-layer) transform. A lone
         // action is recorded bare rather than wrapped in a single-entry batch.

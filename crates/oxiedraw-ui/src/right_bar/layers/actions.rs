@@ -74,6 +74,13 @@ pub(super) fn install_layer_actions(
                         let pixels = c.read_layer(new_idx).unwrap_or_default();
                         (id, name, kind, blend, opacity, pixels)
                     };
+                    tracing::info!(
+                        target: "oxiedraw::layers",
+                        name = %new_name,
+                        from_idx = idx,
+                        to_idx = new_idx,
+                        "layer duplicated"
+                    );
                     history.borrow_mut().record(HistoryAction::LayerDuplicate {
                         src_idx: idx,
                         new_idx,
@@ -138,6 +145,12 @@ pub(super) fn install_layer_actions(
             match result {
                 Ok(()) => {
                     if let Some((id, name, visible, kind, blend, opacity, pixels)) = pre {
+                        tracing::info!(
+                            target: "oxiedraw::layers",
+                            name = %name,
+                            idx,
+                            "layer deleted"
+                        );
                         history.borrow_mut().record(HistoryAction::LayerRemove {
                             idx,
                             id,
@@ -178,6 +191,11 @@ pub(super) fn install_layer_actions(
             ui.multi_selected.borrow_mut().clear();
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             record_tree_edit(&history, before, tree_to_core(&ui.tree.borrow()), "Group layers");
+            tracing::info!(
+                target: "oxiedraw::layers",
+                nodes = ids.len(),
+                "layers grouped"
+            );
             sync_height(&area, &ui);
             area.queue_draw();
             refresh_action_sensitivity(&ui);
@@ -244,6 +262,12 @@ pub(super) fn install_layer_actions(
                 Ok(_) => {
                     let survivor_post = canvas.borrow_mut()
                         .read_layer(sorted[0]).unwrap_or_default();
+                    tracing::info!(
+                        target: "oxiedraw::layers",
+                        layers = sorted.len(),
+                        into_idx = sorted[0],
+                        "layers merged"
+                    );
                     history.borrow_mut().record(HistoryAction::LayerMerge {
                         survivor_idx: sorted[0],
                         survivor_pre,
@@ -279,6 +303,7 @@ pub(super) fn install_layer_actions(
         let action = gio::SimpleAction::new("group-ungroup", None);
         action.connect_activate(move |_, _| {
             let Some(gid) = ui.active_group.borrow().clone() else { return };
+            tracing::info!(target: "oxiedraw::layers", group = %gid, "group ungrouped");
             let before = tree_to_core(&ui.tree.borrow());
             ungroup_node(&mut ui.tree.borrow_mut(), &gid);
             *ui.active_group.borrow_mut() = None;

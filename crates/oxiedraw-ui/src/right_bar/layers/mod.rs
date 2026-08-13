@@ -6,7 +6,7 @@ mod actions;
 mod thumbnail;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::f64::consts::TAU;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
@@ -696,6 +696,68 @@ fn record_reorder(
     }
 }
 
+/// The panel tree on one line, top row first: `Sky, Ink[Lines, Fills], Paper`.
+/// Layer ids are swapped for names so the line reads like the panel looks.
+fn format_tree_inline(nodes: &[LayerNode], names: &HashMap<&str, &str>) -> String {
+    nodes
+        .iter()
+        .map(|n| match n {
+            LayerNode::Layer(id) => names
+                .get(id.as_str())
+                .map_or_else(|| id.clone(), |name| (*name).to_string()),
+            LayerNode::Group(g) => {
+                format!("{}[{}]", g.name, format_tree_inline(&g.children, names))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// One line per drag-drop. A group carries all its leaves, and dropping a layer
+/// past a folder can shuffle several others, so the three cases are reported
+/// apart: a plain single-layer move, a multi-layer shuffle, and a group move.
+/// The resulting tree rides along so the whole outcome is one grep away.
+fn log_layer_move(
+    ui: &Ui,
+    canvas: &Rc<RefCell<Canvas>>,
+    dragged_group: bool,
+    dragged_name: &str,
+    before: &[String],
+    after: &[String],
+) {
+    let snapshot = canvas.borrow().layers().snapshot();
+    let names: HashMap<&str, &str> = snapshot
+        .iter()
+        .map(|l| (l.id.as_str(), l.name.as_str()))
+        .collect();
+    let tree = format_tree_inline(&ui.tree.borrow(), &names);
+    let moved = reorder_steps(before, after).len();
+    if dragged_group {
+        tracing::info!(
+            target: "oxiedraw::layers",
+            group = dragged_name,
+            layers_moved = moved,
+            tree = %tree,
+            "group moved"
+        );
+    } else if moved > 1 {
+        tracing::info!(
+            target: "oxiedraw::layers",
+            layer = dragged_name,
+            layers_moved = moved,
+            tree = %tree,
+            "layers moved"
+        );
+    } else {
+        tracing::info!(
+            target: "oxiedraw::layers",
+            layer = dragged_name,
+            tree = %tree,
+            "layer moved"
+        );
+    }
+}
+
 /// Compute a sequence of `(from, to)` single-layer moves that transform the
 /// `before` id order into `after`. Each move is independently invertible, so a
 /// `Batch` of the resulting `LayerReorder`s round-trips cleanly through undo.
@@ -886,7 +948,7 @@ pub(super) fn commit_groups_quiet(tree: &[LayerNode], canvas: &mut Canvas) {
 
 /// Which kind of layer the add buttons create. Both land relative to the
 /// current selection; only the core call and default name differ.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub(super) enum NewLayerKind {
     Raster,
     Adjustment,
@@ -972,6 +1034,7 @@ pub(super) fn create_layer_at_selection(
         NewLayerKind::Raster => format!("Layer {}", ui.state.len() + 1),
         NewLayerKind::Adjustment => "Adjustment".to_string(),
     };
+    let name_for_log = name.clone();
     let top_idx = {
         let mut c = canvas.borrow_mut();
         match kind {
@@ -1011,6 +1074,14 @@ pub(super) fn create_layer_at_selection(
     }
     ui.state.set_active(Some(final_idx));
 
+    tracing::info!(
+        target: "oxiedraw::layers",
+        name = %name_for_log,
+        kind = ?kind,
+        idx = final_idx,
+        total = ui.state.len(),
+        "layer created"
+    );
     Ok(final_idx)
 }
 
@@ -3075,9 +3146,16 @@ fn install_list_input(
                         // transform first so it can't write onto a shifted index.
                         prepare_reorder();
                         let dragged_row = rows.get(d.from_row);
-                        let dragged_id = if let Some(r) = dragged_row { match &r.kind {
-                            RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.clone(),
-                        } } else {
+                        let Some((dragged_id, dragged_name, dragged_group)) =
+                            dragged_row.map(|r| match &r.kind {
+                                RowKind::Layer { id, name, .. } => {
+                                    (id.clone(), name.clone(), false)
+                                }
+                                RowKind::Group { id, name, .. } => {
+                                    (id.clone(), name.clone(), true)
+                                }
+                            })
+                        else {
                             area_w.set_cursor(None);
                             area_w.queue_draw();
                             return;
@@ -3122,6 +3200,14 @@ fn install_list_input(
                                 &after_order,
                                 tree_before,
                                 tree_after,
+                            );
+                            log_layer_move(
+                                &ui,
+                                &canvas,
+                                dragged_group,
+                                &dragged_name,
+                                &before_order,
+                                &after_order,
                             );
 
                             // Group membership may have changed without touching
