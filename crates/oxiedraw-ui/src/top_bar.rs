@@ -25,7 +25,6 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
 
     let menus: &[(&str, gio::MenuModel)] = &[
         ("File", build_file_menu().upcast()),
-        ("View", build_view_menu().upcast()),
         ("Filters", build_filters_menu().upcast()),
     ];
 
@@ -161,23 +160,6 @@ fn build_file_menu() -> gio::Menu {
     s4.append_item(&item("Close Tab", "app.close-tab", None));
     s4.append_item(&item("Quit", "app.quit", None));
     menu.append_section(None, &s4);
-
-    menu
-}
-
-fn build_view_menu() -> gio::Menu {
-    let menu = gio::Menu::new();
-
-    let s1 = gio::Menu::new();
-    s1.append_item(&item("Zoom In", "app.zoom-in", None));
-    s1.append_item(&item("Zoom Out", "app.zoom-out", None));
-    s1.append_item(&item("Zoom to Fit", "app.zoom-fit", None));
-    menu.append_section(None, &s1);
-
-    let s2 = gio::Menu::new();
-    s2.append_item(&item("Full Screen", "app.fullscreen", None));
-    s2.append_item(&item("Performance Graph", "app.perf-graph", None));
-    menu.append_section(None, &s2);
 
     menu
 }
