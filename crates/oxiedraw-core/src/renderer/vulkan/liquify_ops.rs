@@ -556,11 +556,11 @@ impl VulkanRenderer {
         let warped_set = session.warped_set;
         let visible = visibilities.get(target_idx).copied().unwrap_or(false);
         let (mode, opacity) = self.layer_stack.blend(target_idx);
-        // `Filter` is the target kind that replaces the layer's pixels wholesale
-        // rather than compositing over them, which is exactly liquify's shape.
-        // A hidden target composes nothing; it must not fall back to the flat
-        // preview, which skips adjustment slots and folder scope entirely.
-        let target = super::adjust_ops::PreviewTarget::Filter {
+        // `Replace` swaps the layer's pixels wholesale rather than compositing
+        // over them, which is exactly liquify's shape. A hidden target composes
+        // nothing; it must not fall back to the flat preview, which skips
+        // adjustment slots and folder scope entirely.
+        let target = super::adjust_ops::PreviewTarget::Replace {
             src_img: warped_img,
             set: warped_set,
             mode,

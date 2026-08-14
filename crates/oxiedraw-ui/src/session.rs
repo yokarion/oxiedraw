@@ -1743,9 +1743,9 @@ fn do_exit_component_edit(
     viewport.load_layers_resized(ctx.main_size, &main_tuples, ctx.main_active);
     {
         let canvas = viewport.canvas();
-        let c = canvas.borrow();
-        for (i, l) in ctx.main_layers.iter().enumerate() {
-            c.layers().set_kind(i, l.kind.clone());
+        let kinds: Vec<_> = ctx.main_layers.iter().map(|l| l.kind.clone()).collect();
+        if let Err(e) = canvas.borrow_mut().restore_layer_kinds(&kinds) {
+            tracing::error!(error = %e, "restoring layer kinds after component edit failed");
         }
     }
 

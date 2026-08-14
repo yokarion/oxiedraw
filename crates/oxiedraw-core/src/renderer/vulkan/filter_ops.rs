@@ -9,8 +9,13 @@
 //!
 //! - Live preview: [`Self::render_filter_preview`] composites the visible
 //!   layers into the preview image, substituting the filtered scratch for
-//!   each affected layer. The layer images themselves are never touched, so
-//!   cancelling a filter is a no-op.
+//!   each affected layer. It has no notion of adjustment slots or folder
+//!   scope, so it only serves documents without adjustment layers;
+//!   [`Self::render_filter_preview_scoped`] walks the composite tree instead.
+//!   The layer images themselves are never touched, so cancelling a filter is
+//!   a no-op.
+//! - An adjustment layer's slot holds its mask, so filtering one filters the
+//!   mask: the preview runs the effect gated by the filtered mask.
 //! - Apply: [`Self::apply_filter_to_layer`] runs the same chain and copies
 //!   the result back into the layer image.
 
@@ -52,53 +57,53 @@ impl VulkanRenderer {
         self.filter_active
     }
 
-    /// The single affected layer when exactly one layer is filtered, else
-    /// `None`. Used to route the live preview through the folder-scoped
-    /// composite when an adjustment is in play.
+    /// Whether the armed filter applies to the layer at `idx`.
     #[must_use]
-    pub fn filter_single_target(&self) -> Option<usize> {
-        match self.filter_affected.as_slice() {
-            [idx] => Some(*idx),
-            _ => None,
-        }
+    pub fn filter_targets(&self, idx: usize) -> bool {
+        self.filter_active && self.filter_affected.contains(&idx)
     }
 
-    /// Folder-scoped / adjustment-aware filter preview: run the target layer's
-    /// filter chain, then walk the composite tree with the filtered scratch
-    /// spliced in at the target so an adjustment above (or below) clips exactly
-    /// like the committed recomposite. Mirrors
+    /// Folder-scoped / adjustment-aware filter preview: walk the composite tree
+    /// with every filtered layer spliced in at its own slot, so an adjustment
+    /// above (or below) it clips exactly like the committed recomposite. Mirrors
     /// [`Self::render_gradient_preview_scoped`]; the flat
-    /// [`Self::render_filter_preview`] is used when no adjustment is in play.
+    /// [`Self::render_filter_preview`] is only usable with no adjustment slots,
+    /// since it composites an adjustment's mask as if it were pixels.
     pub fn render_filter_preview_scoped(
         &mut self,
         steps: &[CompositeStep],
-        target_idx: usize,
     ) -> Result<(), RendererError> {
         let spec = self.filter_spec;
-        let result = self.produce_filtered_layer(target_idx, spec)?;
-        let src_img = self.filter_resources.scratch_handle(result);
-        let set = self.filter_resources.composite_set(result);
-        let (mode, opacity) = self.layer_stack.blend(target_idx);
-        self.build_preview_scoped(
-            steps,
-            target_idx,
-            // The filter tool only runs on layers the user can see, so the
-            // target is visible by construction here.
-            PreviewTarget::Filter { src_img, set, mode, opacity, visible: true },
-        )
+        let count = self.layer_stack.slots.len();
+        let targets: Vec<(usize, PreviewTarget)> = self
+            .filter_affected
+            .iter()
+            .copied()
+            .filter(|&idx| idx < count)
+            .map(|idx| (idx, PreviewTarget::Filtered { spec }))
+            .collect();
+        self.build_preview_scoped_multi(steps, &targets)
     }
 
-    /// As [`Self::render_filter_preview_scoped`] but reads the preview back to
-    /// host memory (tests / diagnostics) instead of presenting it.
-    pub fn read_filter_preview_scoped(
-        &mut self,
-        steps: &[CompositeStep],
-        target_idx: usize,
-    ) -> Result<Vec<u8>, RendererError> {
-        self.render_filter_preview_scoped(steps, target_idx)?;
-        let extent = self.canvas.extent;
-        self.read_image_to_staging(self.preview.handle, extent)?;
-        self.copy_staging_bytes()
+    /// Preview the armed filter on an adjustment layer's mask while that mask
+    /// is what the canvas is showing: the filtered mask itself, unblended, the
+    /// way [`Self::render_mask_preview`] shows the committed one.
+    pub fn render_filtered_mask_preview(&mut self, idx: usize) -> Result<(), RendererError> {
+        if idx >= self.layer_stack.slots.len() {
+            return Err(RendererError::LayerIndexOutOfRange);
+        }
+        let result = self.produce_filtered_layer(idx, self.filter_spec)?;
+        self.record_and_submit(|this| {
+            this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
+            Ok(())
+        })?;
+        let src_img = self.filter_resources.scratch_handle(result);
+        let descriptor_set = self.filter_resources.composite_set(result);
+        self.record_and_submit(|this| {
+            this.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        self.composite_set_into_preview(descriptor_set, 0, 1.0)
     }
 
     /// Compose the preview image: every visible layer in z-order, with each
@@ -126,20 +131,6 @@ impl VulkanRenderer {
             }
         }
         Ok(())
-    }
-
-    /// Render the filter preview and read it back as BGRA8. Test/diagnostic
-    /// helper - the live path presents the preview image to the display
-    /// rather than reading it to host memory.
-    pub fn read_filter_preview(
-        &mut self,
-        visibilities: &[bool],
-    ) -> Result<Vec<u8>, RendererError> {
-        self.render_filter_preview(visibilities)?;
-        let image = self.preview.handle;
-        let extent = self.canvas.extent;
-        self.read_image_to_staging(image, extent)?;
-        self.copy_staging_bytes()
     }
 
     /// Apply the filter permanently to one layer: run the chain and copy the
@@ -204,7 +195,7 @@ impl VulkanRenderer {
     /// Run the filter's pass chain for layer `idx`, ending with a mask-mix
     /// pass that blends the filtered result over the original by the
     /// selection mask. Returns the scratch slot holding the final image.
-    fn produce_filtered_layer(
+    pub(super) fn produce_filtered_layer(
         &mut self,
         idx: usize,
         spec: FilterSpec,

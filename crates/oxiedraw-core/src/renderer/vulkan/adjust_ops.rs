@@ -17,7 +17,7 @@ use crate::document::CompositeStep;
 use crate::effects::{AdjustmentData, EffectKind};
 use crate::filters::FilterSpec;
 use crate::renderer::PresentSource;
-use crate::renderer::filters::INPUT_RING;
+use crate::renderer::filters::{INPUT_RING, Scratch};
 
 /// A canvas-sized sub-accumulator for one folder nesting level: an image to
 /// composite the folder's contents into, plus the descriptor set that samples
@@ -124,9 +124,13 @@ pub(super) enum PreviewTarget {
     Stroke { push: [f32; 4], erase: bool },
     Warp { set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
     Gradient { endpoints: [f32; 4], extra: [f32; 4] },
-    // The target layer's filtered result, pre-produced into a filter scratch.
-    // Replaces the stored pixels outright, so a hidden target composes nothing.
-    Filter { src_img: vk::Image, set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
+    // A ready-made image (liquify's warped copy) that replaces the layer's
+    // stored pixels outright, so a hidden target composes nothing.
+    Replace { src_img: vk::Image, set: vk::DescriptorSet, mode: u32, opacity: f32, visible: bool },
+    // The target layer's pixels run through `spec`. Produced during the walk
+    // rather than up front: the chain writes the two shared filter scratches, so
+    // several filtered targets would otherwise overwrite each other's result.
+    Filtered { spec: FilterSpec },
 }
 
 /// The in-flight mask stroke for a live mask-edit preview: which adjustment slot
@@ -389,6 +393,27 @@ impl VulkanRenderer {
                 CompositeStep::Layer(idx) => {
                     let acc = frames.last().expect("non-empty accumulator stack").acc;
                     if let Some(target) = find_target(idx) {
+                        // A filtered target runs its own multi-submit pass chain
+                        // first; the shared scratch only has to survive until
+                        // this step composites it. Resolving it here (rather than
+                        // for every target up front) is what keeps two filtered
+                        // targets from overwriting each other's result.
+                        let target = match target {
+                            PreviewTarget::Filtered { spec } => {
+                                let scratch = self.produce_filtered_layer(idx, spec)?;
+                                // An adjustment slot holds a mask, so filtering it
+                                // filters the mask: run the effect gated by the
+                                // filtered mask, as apply + recomposite will.
+                                if self.layer_stack.slots[idx].adjustment.is_some() {
+                                    let (view, img) = self.park_filtered_mask(scratch)?;
+                                    self.apply_adjustment_with_mask(acc, idx, view, img)?;
+                                    i += 1;
+                                    continue;
+                                }
+                                self.replace_with_scratch(idx, scratch)
+                            }
+                            other => other,
+                        };
                         self.record_and_submit(|this| {
                             this.cmd_compose_preview_target(acc, idx, target);
                             Ok(())
@@ -505,6 +530,8 @@ impl VulkanRenderer {
 
     /// Record (no submit) the in-flight target content into `acc` per the
     /// preview's [`PreviewTarget`]: a stroked target copy or the warped layer.
+    /// `filtered` carries the scratch slot a [`PreviewTarget::Filtered`] target
+    /// was just produced into.
     fn cmd_compose_preview_target(
         &self,
         acc: Accumulator,
@@ -542,12 +569,30 @@ impl VulkanRenderer {
                     extra,
                 );
             }
-            PreviewTarget::Filter { src_img, set, mode, opacity, visible } => {
+            PreviewTarget::Replace { src_img, set, mode, opacity, visible } => {
                 self.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
                 if visible {
                     self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
                 }
             }
+            // The walk runs the filter chain and hands us the resulting scratch
+            // as a `Replace`; there is nothing to composite from a spec alone.
+            PreviewTarget::Filtered { .. } => {
+                unreachable!("filtered targets are resolved before compositing")
+            }
+        }
+    }
+
+    /// The `Replace` target that composites `scratch` in place of the layer's
+    /// stored pixels, at the layer's own blend mode and opacity.
+    fn replace_with_scratch(&self, idx: usize, scratch: Scratch) -> PreviewTarget {
+        let (mode, opacity) = self.layer_stack.blend(idx);
+        PreviewTarget::Replace {
+            src_img: self.filter_resources.scratch_handle(scratch),
+            set: self.filter_resources.composite_set(scratch),
+            mode,
+            opacity,
+            visible: true,
         }
     }
 
@@ -920,7 +965,6 @@ impl VulkanRenderer {
         mask_img: ash::vk::Image,
         cursor: &mut usize,
     ) {
-        use crate::renderer::filters::Scratch;
         let EffectKind::Stroke {
             color,
             opacity,
@@ -968,8 +1012,7 @@ impl VulkanRenderer {
         src_img: ash::vk::Image,
         spec: FilterSpec,
         cursor: &mut usize,
-    ) -> crate::renderer::filters::Scratch {
-        use crate::renderer::filters::Scratch;
+    ) -> Scratch {
         let layout = self.filter_resources.pipeline_layout;
         let render_pass = self.canvas_target.render_pass;
         #[allow(clippy::cast_precision_loss)]
@@ -1263,6 +1306,29 @@ impl VulkanRenderer {
         self.apply_adjustment_with_mask(acc, idx, mask_view, mask_img)
     }
 
+    /// Move a filtered result out of the two filter scratches into the
+    /// erase-preview scratch: an adjustment's own effect chain ping-pongs A/B
+    /// and would overwrite it before it could gate anything.
+    fn park_filtered_mask(
+        &mut self,
+        scratch: Scratch,
+    ) -> Result<(vk::ImageView, vk::Image), RendererError> {
+        // The erase scratch is only borrowable because it holds a stroke-merged
+        // mask solely while a mask stroke is in flight.
+        debug_assert!(
+            self.mask_edit.is_none(),
+            "filtered mask would clobber the in-flight mask stroke's scratch"
+        );
+        let src = self.filter_resources.scratch_handle(scratch);
+        let dst = self.erase_preview.scratch.handle;
+        self.record_and_submit(|this| {
+            this.cmd_copy_image_full(src, dst);
+            this.barrier(dst, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        Ok((self.erase_preview.scratch.view, dst))
+    }
+
     /// Build the committed mask of slot `idx` merged with the in-flight stroke
     /// into the erase-preview scratch, returning that scratch's (view, image).
     /// Used by the mask-edit preview so the effect gates on the live mask.
@@ -1392,7 +1458,6 @@ impl VulkanRenderer {
         // this with `clip` unset, so the flood is full-canvas (correct distance
         // propagation); a Stroke effect forces those paths via
         // `batched_input_pass_count`.
-        use crate::renderer::filters::Scratch;
         let set = self.filter_resources.composite_set(Scratch::A);
         let stroke_img = self.filter_resources.scratch_handle(Scratch::A);
         self.record_and_submit(|this| {

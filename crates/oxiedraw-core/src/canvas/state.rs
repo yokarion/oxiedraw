@@ -432,6 +432,37 @@ impl Canvas {
         Ok(())
     }
 
+    /// Set a layer's kind, keeping the renderer slot in step. A bare
+    /// `layers().set_kind` desyncs the two: an adjustment would have no effect
+    /// stack on the GPU (its mask then composites as if it were pixels), and a
+    /// layer demoted to raster would keep running a stale one.
+    pub fn set_layer_kind(&mut self, idx: usize, kind: LayerKind) -> Result<(), RendererError> {
+        match kind {
+            LayerKind::Adjustment(data) => self.set_layer_effects(idx, data),
+            other => {
+                self.layers.set_kind(idx, other);
+                self.renderer.set_layer_adjustment(idx, None);
+                self.recomposite_canvas()
+            }
+        }
+    }
+
+    /// Re-apply saved kinds by index after [`Self::replace_all_layers`], which
+    /// resets every slot to a plain raster layer. Composites once for the whole
+    /// batch rather than once per adjustment layer.
+    pub fn restore_layer_kinds(&mut self, kinds: &[LayerKind]) -> Result<(), RendererError> {
+        let was_deferred = self.defer_recomposite;
+        self.defer_recomposite = true;
+        let result = kinds
+            .iter()
+            .take(self.layers.len())
+            .enumerate()
+            .try_for_each(|(idx, kind)| self.set_layer_kind(idx, kind.clone()));
+        self.defer_recomposite = was_deferred;
+        result?;
+        self.recomposite()
+    }
+
     /// The effect stack of the adjustment layer at `idx`, if it is one.
     #[must_use]
     pub fn layer_effects(&self, idx: usize) -> Option<AdjustmentData> {
@@ -961,21 +992,16 @@ impl Canvas {
             self.display_version != self.pixels_version || want_mask != self.displayed_mask_idx;
         if dirty {
             if self.renderer.filter_active() {
-                let visibilities = self.visibilities();
-                // Folder-bounded / global adjustment around a single filtered
-                // layer: the flat preview ignores adjustment slots and folder
-                // scope, so the adjustment would bleed onto the whole canvas
-                // (unclipped) until the filter is applied. Route through the
-                // scoped walk so the live preview clips like the committed result.
-                match self.renderer.filter_single_target() {
-                    Some(target) if self.effective_adjustment_excluding(target) => {
-                        let snapshot = self.layers.snapshot();
-                        let steps = self.preview_steps(&snapshot);
-                        self.renderer.render_filter_preview_scoped(&steps, target)?;
+                // With a mask toggled into view the canvas shows that mask, not
+                // the composite - and a filter armed on its layer filters the
+                // mask, so preview it there instead of swapping the canvas away
+                // from what the user is editing.
+                match want_mask {
+                    Some(idx) if self.renderer.filter_targets(idx) => {
+                        self.renderer.render_filtered_mask_preview(idx)?;
                     }
-                    _ => {
-                        self.renderer.render_filter_preview(&visibilities)?;
-                    }
+                    Some(idx) => self.renderer.render_mask_preview(idx)?,
+                    None => self.render_armed_filter_preview()?,
                 }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.fill_active() {
@@ -1391,11 +1417,8 @@ impl Canvas {
         // boxes stay aligned with their now-translated pixels.
         #[allow(clippy::cast_precision_loss)]
         let (dx, dy) = (-(crop_x as f32), -(crop_y as f32));
-        for (idx, kind) in kinds.iter().enumerate() {
-            if !matches!(kind, LayerKind::Raster) {
-                self.layers.set_kind(idx, kind.translated(dx, dy));
-            }
-        }
+        let translated: Vec<LayerKind> = kinds.iter().map(|k| k.translated(dx, dy)).collect();
+        self.restore_layer_kinds(&translated)?;
 
         // replace_all_layers always resets active to Some(0); restore the
         // caller's active selection so downstream operations target the right layer.
@@ -1685,32 +1708,43 @@ impl Canvas {
     }
 
     /// Commit the filter to every armed layer, writing the filtered pixels
-    /// into the layer images and re-compositing. History is captured by the
-    /// caller via `read_layer` before/after.
+    /// into the layer images and re-compositing. Filtering an adjustment layer
+    /// filters its mask. History is captured by the caller via `read_layer`
+    /// before/after.
     pub fn apply_filter(&mut self, indices: &[usize], spec: FilterSpec) -> Result<(), RendererError> {
-        for &idx in indices {
+        // Disarm even if a layer fails, so a bad index can't leave the preview
+        // armed for the rest of the session with the dialog already closed.
+        let result = indices.iter().try_for_each(|&idx| {
             self.renderer.apply_filter_to_layer(idx, spec)?;
-        }
+            self.normalize_adjustment_slot(idx)
+        });
         self.renderer.clear_filter();
+        result?;
         self.recomposite_canvas()?;
         self.bump_version();
         Ok(())
     }
 
+    /// Render the armed filter preview into the preview image. Routed on the
+    /// same test the committed composite uses, so the two can never disagree:
+    /// the flat path has no notion of adjustment slots or folder scope and
+    /// would composite an adjustment's mask as if it were pixels.
+    fn render_armed_filter_preview(&mut self) -> Result<(), RendererError> {
+        if self.renderer.has_adjustment_layers() {
+            let snapshot = self.layers.snapshot();
+            let steps = self.preview_steps(&snapshot);
+            self.renderer.render_filter_preview_scoped(&steps)
+        } else {
+            let visibilities = self.visibilities();
+            self.renderer.render_filter_preview(&visibilities)
+        }
+    }
+
     /// Render the armed filter preview and read it back as BGRA8. Intended
     /// for tests/diagnostics; the live path presents straight to the display.
     pub fn read_filter_preview(&mut self) -> Result<Vec<u8>, RendererError> {
-        match self.renderer.filter_single_target() {
-            Some(target) if self.effective_adjustment_excluding(target) => {
-                let snapshot = self.layers.snapshot();
-                let steps = self.preview_steps(&snapshot);
-                self.renderer.read_filter_preview_scoped(&steps, target)
-            }
-            _ => {
-                let vis = self.visibilities();
-                self.renderer.read_filter_preview(&vis)
-            }
-        }
+        self.render_armed_filter_preview()?;
+        self.renderer.read_preview()
     }
 
     /// Cancel an in-flight filter preview. Layer images were never modified,

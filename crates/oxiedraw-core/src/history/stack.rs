@@ -489,11 +489,8 @@ fn apply_direction(
             canvas.replace_all_layers(&layers)?;
             // replace_all_layers resets kinds to Raster; restore the snapshot's
             // kinds (geometry already in the target coordinate space).
-            for (idx, l) in target_layers.iter().enumerate() {
-                if !matches!(l.kind, crate::document::LayerKind::Raster) {
-                    canvas.layers().set_kind(idx, l.kind.clone());
-                }
-            }
+            let kinds: Vec<_> = target_layers.iter().map(|l| l.kind.clone()).collect();
+            canvas.restore_layer_kinds(&kinds)?;
             if let Some(idx) = active_layer
                 && *idx < canvas.layers().len()
             {
@@ -592,8 +589,5 @@ fn recreate_layer(
         kinds.push(kind.clone());
     }
     canvas.replace_all_layers(&entries)?;
-    for (i, k) in kinds.into_iter().enumerate() {
-        canvas.layers().set_kind(i, k);
-    }
-    Ok(())
+    canvas.restore_layer_kinds(&kinds)
 }

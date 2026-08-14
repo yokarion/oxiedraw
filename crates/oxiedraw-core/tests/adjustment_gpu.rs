@@ -1296,3 +1296,257 @@ fn filter_preview_respects_folder_scope() {
         "adjustment bled onto the filtered layer below its folder, got B{rb} G{rg} R{rr}"
     );
 }
+
+/// A live filter preview over SEVERAL selected layers must still run the
+/// adjustment chain. The flat preview it used to fall back to for anything but
+/// a single target has no notion of adjustment slots: it dropped every effect
+/// and composited the adjustment's mask as if it were pixels, so arming the
+/// filter turned the canvas white until the filter was applied.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn filter_preview_keeps_adjustment_with_several_targets() {
+    use oxiedraw_core::filters::FilterSpec;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let base = canvas
+        .add_layer_with_pixels("base-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let second = canvas
+        .add_layer_with_pixels("second", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    canvas.begin_filter(&[base, second], FilterSpec::hsv_identity());
+    let frame = canvas.read_filter_preview().unwrap();
+
+    // Brightness 0 over the whole canvas: an identity filter under it changes
+    // nothing, so every pixel stays black.
+    for (i, px) in frame.chunks_exact(4).enumerate() {
+        assert!(
+            px[0] <= 6 && px[1] <= 6 && px[2] <= 6,
+            "pixel {i} not blackened by the adjustment: B{} G{} R{}",
+            px[0],
+            px[1],
+            px[2]
+        );
+    }
+}
+
+/// `replace_all_layers` resets every slot to a plain raster layer, so restoring
+/// the saved kinds afterwards (undo/redo, project load, component edit) has to
+/// push an adjustment's effect stack back to the renderer. Restoring the kind on
+/// the layer state alone left the effect off the GPU slot and composited the
+/// mask as pixels - a white sheet over the canvas.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn restored_adjustment_kind_still_composites() {
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    canvas
+        .add_layer_with_pixels("base-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+    let before = canvas.read_pixels().unwrap();
+
+    let snapshot = canvas.layers().snapshot();
+    let mut entries = Vec::with_capacity(snapshot.len());
+    let mut kinds = Vec::with_capacity(snapshot.len());
+    for (i, l) in snapshot.iter().enumerate() {
+        let pixels = canvas.read_layer(i).unwrap();
+        entries.push((l.id.clone(), l.name.clone(), l.visible, l.blend, l.opacity, pixels));
+        kinds.push(l.kind.clone());
+    }
+    canvas.replace_all_layers(&entries).unwrap();
+    for (i, kind) in kinds.into_iter().enumerate() {
+        canvas.set_layer_kind(i, kind).unwrap();
+    }
+
+    let after = canvas.read_pixels().unwrap();
+    for (i, (a, b)) in before.iter().zip(after.iter()).enumerate() {
+        assert!(
+            near(*a, *b, 2),
+            "byte {i} changed across the layer restore: {a} vs {b}"
+        );
+    }
+}
+
+/// An adjustment layer's slot holds its mask, so a filter armed on it filters
+/// the mask - and the live preview has to show the effect gated by that filtered
+/// mask, the way apply + recomposite will. The flat preview instead dropped the
+/// effect and pushed the raw white mask on screen.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn filter_preview_on_the_adjustment_layer_filters_its_mask() {
+    use oxiedraw_core::filters::FilterSpec;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let base = canvas
+        .add_layer_with_pixels("base-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+    // Default mask is white everywhere, so the effect blackens the blue base.
+    let composite = canvas.read_pixels().unwrap();
+    assert!(composite[0] <= 6, "expected a blackened canvas to start from");
+
+    // An identity filter on the mask leaves the composite alone.
+    canvas.begin_filter(&[adj], FilterSpec::hsv_identity());
+    let frame = canvas.read_filter_preview().unwrap();
+    for (i, (a, b)) in composite.iter().zip(frame.iter()).enumerate() {
+        assert!(near(*a, *b, 2), "byte {i}: preview {b} != composite {a}");
+    }
+
+    // Inverting the mask turns it black, which gates the effect off entirely:
+    // the base layer previews unadjusted (blue).
+    canvas.update_filter(FilterSpec::Invert);
+    let frame = canvas.read_filter_preview().unwrap();
+    let base_pixels = canvas.read_layer(base).unwrap();
+    for (i, (a, b)) in base_pixels.iter().zip(frame.iter()).enumerate() {
+        assert!(
+            near(*a, *b, 2),
+            "byte {i}: inverted mask should gate the effect off, {b} != {a}"
+        );
+    }
+
+    // ...and applying it gives the same picture the preview promised.
+    canvas.apply_filter(&[adj], FilterSpec::Invert).unwrap();
+    let applied = canvas.read_pixels().unwrap();
+    for (i, (a, b)) in frame.iter().zip(applied.iter()).enumerate() {
+        assert!(near(*a, *b, 2), "byte {i}: apply {b} != preview {a}");
+    }
+}
+
+/// With the mask toggled into view the canvas shows that mask, so a filter armed
+/// on its layer must preview on the mask - not swap the canvas back to the
+/// composite while the user drags the sliders.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn filter_preview_with_the_mask_in_view_filters_what_is_on_screen() {
+    use oxiedraw_core::filters::FilterSpec;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    canvas
+        .add_layer_with_pixels("base-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let adj_id = canvas.layers().snapshot()[adj].id.clone();
+    canvas.set_mask_view(Some(adj_id));
+    canvas.present().unwrap();
+    let mask_view = canvas.read_display().unwrap();
+    assert!(
+        mask_view[0] >= 250 && mask_view[3] >= 250,
+        "expected the white mask on screen, got {:?}",
+        &mask_view[..4]
+    );
+
+    // Inverting turns the white mask black. The composite (blue blackened by the
+    // effect) is opaque black too, so check a mid-gray filter as well: only the
+    // mask can go gray, the composite stays black.
+    canvas.begin_filter(&[adj], FilterSpec::Invert);
+    canvas.present().unwrap();
+    let inverted = canvas.read_display().unwrap();
+    assert!(
+        inverted[0] <= 6 && inverted[3] >= 250,
+        "inverted mask should be black and opaque, got {:?}",
+        &inverted[..4]
+    );
+
+    canvas.update_filter(FilterSpec::Hsv {
+        hue_degrees: 0.0,
+        saturation: 1.0,
+        value: 0.5,
+    });
+    canvas.present().unwrap();
+    let dimmed = canvas.read_display().unwrap();
+    assert!(
+        dimmed[0] > 20 && dimmed[0] < 235,
+        "expected the dimmed mask on screen, got {:?}",
+        &dimmed[..4]
+    );
+}
+
+/// Cropping rebuilds the renderer and reloads every layer as a plain raster one.
+/// The kinds are restored afterwards, and adjustment layers have to reach the
+/// GPU slot too - otherwise the effect is gone and its white mask composites as
+/// pixels, whiting out the canvas.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn cropping_keeps_adjustment_layers_working() {
+    use oxiedraw_core::tools::CropRect;
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    canvas
+        .add_layer_with_pixels("base-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+    let before = canvas.read_pixels().unwrap();
+    assert!(before[0] <= 6, "expected a blackened canvas to start from");
+
+    canvas.apply_crop(CropRect::new(0.0, 0.0, 32.0, 32.0)).unwrap();
+
+    assert!(
+        canvas.layer_effects(adj).is_some(),
+        "crop dropped the adjustment kind"
+    );
+    let after = canvas.read_pixels().unwrap();
+    for (i, px) in after.chunks_exact(4).enumerate() {
+        assert!(
+            px[0] <= 6 && px[1] <= 6 && px[2] <= 6,
+            "pixel {i} lost the adjustment across the crop: {px:?}"
+        );
+    }
+}
