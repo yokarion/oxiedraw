@@ -15,7 +15,8 @@
 //!             extraction (drives the marching-ants overlay).
 //!
 //! Plus four blend pipelines, one per `SelectionBlendMode`, all sharing
-//! one fragment shader.
+//! one fragment shader, and the mask brush's feather pass (mask + brush
+//! coverage in, blurred mask out).
 
 use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
@@ -35,7 +36,12 @@ pub(super) const EDGES_DOWNSAMPLE: u32 = 4;
 
 const BLEND_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selection_blend.frag.spv"));
 const EDGES_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/selection_edges.frag.spv"));
+const FEATHER_FRAG_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/selection_feather.frag.spv"));
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
+
+/// `vec2 step_uv + float sigma + float mix_scale`.
+const FEATHER_PUSH_BYTES: u32 = 16;
 
 /// Which boolean operation to use when blending an incoming shape (in
 /// `scratch`) into the mask.
@@ -50,6 +56,10 @@ pub enum SelectionBlendMode {
     Subtract,
     /// `min(dst, src)` - intersect.
     Intersect,
+    /// `dst + src * (1 - dst)` - src OVER dst. Unlike `Add` this compounds,
+    /// so repeating it walks the mask toward fully selected: the mask brush
+    /// builds up while you hold it somewhere.
+    Accumulate,
 }
 
 pub(super) struct SelectionResources {
@@ -70,11 +80,26 @@ pub(super) struct SelectionResources {
     pub scratch_descriptor_set: vk::DescriptorSet,
     /// Reads from `mask`. Bound for the edges pass.
     pub mask_descriptor_set: vk::DescriptorSet,
+    /// Reads from the brush stroke buffer, so the mask brush can blend its
+    /// coverage in with the same pipelines a rasterised shape uses.
+    pub stroke_descriptor_set: vk::DescriptorSet,
+
+    /// Horizontal half of the blur brush's separable pass.
+    pub feather_scratch: Image,
+    pub feather_target: ImageTarget,
+    /// Feather sets bind `(blur source, original mask, stroke coverage)`. The
+    /// two passes differ only in the source: the mask copy, then its
+    /// horizontally blurred form.
+    pub feather_set_layout: vk::DescriptorSetLayout,
+    pub feather_horizontal_set: vk::DescriptorSet,
+    pub feather_vertical_set: vk::DescriptorSet,
+    pub feather_layout: vk::PipelineLayout,
+    pub feather_pipeline: vk::Pipeline,
 
     /// One pipeline per blend mode, all sharing the same fragment shader.
     /// Index by `SelectionBlendMode as usize`.
     pub blend_layout: vk::PipelineLayout,
-    pub blend_pipelines: [vk::Pipeline; 4],
+    pub blend_pipelines: [vk::Pipeline; 5],
 
     pub edges_layout: vk::PipelineLayout,
     pub edges_pipeline: vk::Pipeline,
@@ -83,10 +108,13 @@ pub(super) struct SelectionResources {
 }
 
 impl SelectionResources {
+    /// `stroke_view` is the brush stroke buffer (R8, canvas-sized); the mask
+    /// brush blends its coverage straight out of it.
     pub(super) fn new(
         device: &Device,
         allocator: &mut Allocator,
         canvas_extent: vk::Extent2D,
+        stroke_view: vk::ImageView,
     ) -> Result<Self, RendererError> {
         let format = vk::Format::R8_UNORM;
         let mask_usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -127,8 +155,20 @@ impl SelectionResources {
             vk::ImageAspectFlags::COLOR,
         )?;
 
+        let feather_scratch = Image::new_2d(
+            device,
+            allocator,
+            "selection-feather-scratch",
+            format,
+            canvas_extent,
+            mask_usage,
+            vk::ImageAspectFlags::COLOR,
+        )?;
+
         let mask_target = ImageTarget::new(device, format, canvas_extent, mask.view)?;
         let edges_target = ImageTarget::new(device, format, edges_extent, edges.view)?;
+        let feather_target =
+            ImageTarget::new(device, format, canvas_extent, feather_scratch.view)?;
 
         let sampler = linear_clamp_sampler(device)?;
         let descriptor_set_layout = sampler_set_layout(device, 1)?;
@@ -147,6 +187,30 @@ impl SelectionResources {
             &[mask.view],
             sampler,
         )?;
+        let stroke_descriptor_set = allocate_sampler_set(
+            device,
+            descriptor_pool,
+            descriptor_set_layout,
+            &[stroke_view],
+            sampler,
+        )?;
+        let feather_set_layout = sampler_set_layout(device, 3)?;
+        let feather_horizontal_set = allocate_sampler_set(
+            device,
+            descriptor_pool,
+            feather_set_layout,
+            &[scratch.view, scratch.view, stroke_view],
+            sampler,
+        )?;
+        let feather_vertical_set = allocate_sampler_set(
+            device,
+            descriptor_pool,
+            feather_set_layout,
+            &[feather_scratch.view, scratch.view, stroke_view],
+            sampler,
+        )?;
+        let feather_layout = pipeline_layout(device, feather_set_layout, FEATHER_PUSH_BYTES)?;
+        let feather_pipeline = create_feather_pipeline(device, feather_layout, mask_target.render_pass)?;
 
         let blend_layout = pipeline_layout(device, descriptor_set_layout, 0)?;
         let blend_pipelines = [
@@ -154,10 +218,11 @@ impl SelectionResources {
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Add)?,
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Subtract)?,
             create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Intersect)?,
+            create_blend_pipeline(device, blend_layout, mask_target.render_pass, BlendMode::Accumulate)?,
         ];
 
-        // 8 bytes of push data: the edge-detect texel step.
-        let edges_layout = pipeline_layout(device, descriptor_set_layout, 8)?;
+        // Pure downsample - the shader takes no push data.
+        let edges_layout = pipeline_layout(device, descriptor_set_layout, 0)?;
         let edges_pipeline = create_edges_pipeline(device, edges_layout, edges_target.render_pass)?;
 
         Ok(Self {
@@ -171,6 +236,14 @@ impl SelectionResources {
             descriptor_pool,
             scratch_descriptor_set,
             mask_descriptor_set,
+            stroke_descriptor_set,
+            feather_scratch,
+            feather_target,
+            feather_set_layout,
+            feather_horizontal_set,
+            feather_vertical_set,
+            feather_layout,
+            feather_pipeline,
             blend_layout,
             blend_pipelines,
             edges_layout,
@@ -194,11 +267,16 @@ impl SelectionResources {
             device.destroy_pipeline_layout(self.blend_layout, None);
             device.destroy_pipeline(self.edges_pipeline, None);
             device.destroy_pipeline_layout(self.edges_layout, None);
+            device.destroy_pipeline(self.feather_pipeline, None);
+            device.destroy_pipeline_layout(self.feather_layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(self.feather_set_layout, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);
             device.destroy_sampler(self.sampler, None);
+            self.feather_target.destroy(device);
             self.edges_target.destroy(device);
             self.mask_target.destroy(device);
+            self.feather_scratch.destroy(device, allocator);
             self.edges.destroy(device, allocator);
             self.scratch.destroy(device, allocator);
             self.mask.destroy(device, allocator);
@@ -212,6 +290,7 @@ enum BlendMode {
     Add,
     Subtract,
     Intersect,
+    Accumulate,
 }
 
 impl BlendMode {
@@ -253,18 +332,28 @@ impl BlendMode {
                 .src_alpha_blend_factor(vk::BlendFactor::ONE)
                 .dst_alpha_blend_factor(vk::BlendFactor::ONE)
                 .alpha_blend_op(vk::BlendOp::MIN),
+            // out = src*(1-dst) + dst = dst + src*(1-dst)
+            Self::Accumulate => base
+                .src_color_blend_factor(vk::BlendFactor::ONE_MINUS_DST_COLOR)
+                .dst_color_blend_factor(vk::BlendFactor::ONE)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_DST_ALPHA)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+                .alpha_blend_op(vk::BlendOp::ADD),
         }
     }
 }
 
+/// Five sets: scratch, mask and stroke (one sampler each), plus the blur
+/// brush's two passes (three each).
 fn create_descriptor_pool(device: &Device) -> Result<vk::DescriptorPool, RendererError> {
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: 2,
+        descriptor_count: 9,
     }];
     let info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&sizes)
-        .max_sets(2);
+        .max_sets(5);
     Ok(unsafe { device.create_descriptor_pool(&info, None)? })
 }
 
@@ -281,6 +370,25 @@ fn create_blend_pipeline(
         COMPOSITE_VERT_SPV,
         BLEND_FRAG_SPV,
         mode.attachment(),
+    )
+}
+
+fn create_feather_pipeline(
+    device: &Device,
+    layout: vk::PipelineLayout,
+    render_pass: vk::RenderPass,
+) -> Result<vk::Pipeline, RendererError> {
+    // Writes the mask outright (it carries the un-feathered pixels through).
+    let attachment = vk::PipelineColorBlendAttachmentState::default()
+        .blend_enable(false)
+        .color_write_mask(vk::ColorComponentFlags::R);
+    build_fullscreen_pipeline(
+        device,
+        layout,
+        render_pass,
+        COMPOSITE_VERT_SPV,
+        FEATHER_FRAG_SPV,
+        attachment,
     )
 }
 

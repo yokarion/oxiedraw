@@ -848,6 +848,16 @@ impl DocumentSession {
         // so the B/I/U buttons dispatch through this late-bound slot.
         let text_edit_slot: Rc<RefCell<Option<crate::text_edit::TextEdit>>> =
             Rc::new(RefCell::new(None));
+        // The heatmap lives in the present pass, so flipping it only needs the
+        // canvas flag plus a repaint - no recomposite.
+        let on_selection_heatmap: Rc<dyn Fn(bool)> = {
+            let canvas = viewport.canvas();
+            let redraw = viewport.redraw_handle();
+            Rc::new(move |on: bool| {
+                canvas.borrow_mut().set_selection_heatmap(on);
+                redraw.request();
+            })
+        };
         let (tool_options_widget, set_tool_options) = crate::tool_options_bar::build(
             &global.tools,
             &global.brush_engine,
@@ -856,6 +866,8 @@ impl DocumentSession {
             &transform,
             Rc::clone(&transform_apply),
             Rc::clone(&transform_cancel),
+            &selection,
+            on_selection_heatmap,
             &fill,
             &shape,
             &gradient,
@@ -1900,15 +1912,7 @@ fn prepare_transform_for_delete(transform: &TransformState, cancel: impl FnOnce(
 
 /// Read the current selection mask into a [`SelectionSnapshot`] for history.
 fn snapshot_selection(canvas: &Rc<RefCell<Canvas>>) -> SelectionSnapshot {
-    let mut c = canvas.borrow_mut();
-    if c.selection_active() {
-        c.read_selection_mask().map_or(
-            SelectionSnapshot { active: true, mask: None },
-            |m| SelectionSnapshot { active: true, mask: Some(m) },
-        )
-    } else {
-        SelectionSnapshot { active: false, mask: None }
-    }
+    crate::canvas::primary_drag::read_selection_snapshot(&mut canvas.borrow_mut())
 }
 
 /// Capture the layers above `target_idx` and hand them to the paintable so the

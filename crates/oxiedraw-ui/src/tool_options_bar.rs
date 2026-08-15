@@ -4,8 +4,8 @@ use std::rc::Rc;
 use oxiedraw_core::brush_engine::BrushEngine;
 use oxiedraw_core::liquify::{LiquifyMode, LiquifyState};
 use oxiedraw_core::tools::{
-    CropState, FillState, FillTool, GradientState, GradientType, ShapeState, Tool, ToolState,
-    TransformFilter, TransformState,
+    CropState, FillState, FillTool, GradientState, GradientType, SelectionEdit, SelectionState,
+    SelectionTool, ShapeState, Tool, ToolState, TransformFilter, TransformState,
 };
 use relm4::RelmWidgetExt;
 use relm4::gtk;
@@ -32,6 +32,7 @@ const SIZE_SEGMENTS: [(f64, f64, f64, f64); 3] = [
 
 const OPACITY_SLIDER_WIDTH: i32 = 120;
 
+const STACK_SELECTION: &str = "selection";
 const STACK_BRUSH: &str = "brush";
 const STACK_CROP: &str = "crop";
 const STACK_TRANSFORM: &str = "transform";
@@ -57,6 +58,8 @@ pub(crate) fn build(
     transform: &TransformState,
     on_transform_apply: Rc<dyn Fn()>,
     on_transform_cancel: Rc<dyn Fn()>,
+    selection: &SelectionState,
+    on_selection_heatmap: Rc<dyn Fn(bool)>,
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
@@ -96,6 +99,13 @@ pub(crate) fn build(
         &build_transform_page(transform, on_transform_apply, on_transform_cancel),
         Some(STACK_TRANSFORM),
     );
+    let (selection_page, marquee_btn) = build_selection_page(
+        selection,
+        brush_engine,
+        on_selection_heatmap,
+        marquee_shape(tools.active.get()),
+    );
+    stack.add_named(&selection_page, Some(STACK_SELECTION));
     stack.add_named(&build_fill_page(fill), Some(STACK_FILL));
     stack.add_named(&build_shape_page(shape), Some(STACK_SHAPE));
     stack.add_named(&build_gradient_page(gradient), Some(STACK_GRADIENT));
@@ -111,9 +121,33 @@ pub(crate) fn build(
 
     let setter: Rc<dyn Fn(Tool)> = Rc::new(move |t: Tool| {
         update_chip(t);
+        // The marquee mode button wears the shape it will draw, so switching
+        // Square / Circle / Lasso in the toolbar has to reach it here.
+        if let Tool::Selection(shape) = t {
+            marquee_btn.set_icon_name(shape.icon_name());
+            marquee_btn.set_tooltip_text(Some(marquee_tooltip(shape)));
+        }
         stack.set_visible_child_name(stack_name_for(t));
     });
     (bar, setter)
+}
+
+/// The marquee shape the mode button should show. Anything that isn't a
+/// selection tool leaves it on the default; the bar's selection page is not
+/// visible then anyway.
+const fn marquee_shape(tool: Tool) -> SelectionTool {
+    match tool {
+        Tool::Selection(shape) => shape,
+        _ => SelectionTool::Square,
+    }
+}
+
+const fn marquee_tooltip(shape: SelectionTool) -> &'static str {
+    match shape {
+        SelectionTool::Square => "Draw selections with the square marquee",
+        SelectionTool::Circle => "Draw selections with the circle marquee",
+        SelectionTool::Free => "Draw selections with the lasso",
+    }
 }
 
 const fn stack_name_for(tool: Tool) -> &'static str {
@@ -127,7 +161,163 @@ const fn stack_name_for(tool: Tool) -> &'static str {
         Tool::Text => STACK_TEXT,
         Tool::Liquify => STACK_LIQUIFY,
         Tool::DrawingGuide => STACK_GUIDE,
-        Tool::Cursor | Tool::Selection(_) | Tool::ColorPicker => STACK_NONE,
+        Tool::Selection(_) => STACK_SELECTION,
+        Tool::Cursor | Tool::ColorPicker => STACK_NONE,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Selection page
+// ---------------------------------------------------------------------------
+
+/// Edit modes, brush size / strength for the painting ones, and the
+/// mask-preview toggle. Marching ants only show where the selection crosses
+/// 50%, which says nothing about a feathered or partially-subtracted mask;
+/// the heatmap paints the actual coverage over the canvas instead.
+fn build_selection_page(
+    selection: &SelectionState,
+    brush_engine: &BrushEngine,
+    on_heatmap: Rc<dyn Fn(bool)>,
+    marquee: SelectionTool,
+) -> (gtk::Box, gtk::ToggleButton) {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(ROW_SPACING)
+        .margin_start(6)
+        .margin_end(LABEL_MARGIN)
+        .valign(gtk::Align::Center)
+        .build();
+
+    // Sliders only drive the painting modes, so they follow the mode's state.
+    let brush_controls = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(ROW_SPACING)
+        .valign(gtk::Align::Center)
+        .sensitive(selection.edit.get().paints())
+        .build();
+    brush_controls.append(&gtk::Label::new(Some("Size")));
+    brush_controls.append(&build_size_slider(brush_engine));
+    brush_controls.append(&gtk::Label::new(Some("Strength")));
+    brush_controls.append(&build_strength_slider(selection));
+
+    let heatmap = selection.heatmap.clone();
+    let preview_btn = gtk::ToggleButton::builder()
+        .active(heatmap.get())
+        .valign(gtk::Align::Center)
+        .build();
+    apply_mask_preview_style(&preview_btn, preview_btn.is_active());
+    preview_btn.connect_toggled(move |b| {
+        apply_mask_preview_style(b, b.is_active());
+        heatmap.set(b.is_active());
+        on_heatmap(b.is_active());
+    });
+
+    let (modes, marquee_btn) = build_selection_modes(selection, &brush_controls, marquee);
+    row.append(&preview_btn);
+    row.append(&dim_sep());
+    row.append(&modes);
+    row.append(&dim_sep());
+    row.append(&brush_controls);
+
+    (row, marquee_btn)
+}
+
+/// The linked mode selector: marquee (None) or one of the mask brushes.
+/// Toggling a mode enables/disables `brush_controls` with it. Returns the
+/// marquee button too - it wears the active marquee shape, so it has to be
+/// updated when the toolbar switches between square, circle and lasso.
+fn build_selection_modes(
+    selection: &SelectionState,
+    brush_controls: &gtk::Box,
+    marquee: SelectionTool,
+) -> (gtk::Box, gtk::ToggleButton) {
+    let modes = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .css_classes(["linked"])
+        .valign(gtk::Align::Center)
+        .build();
+
+    let mut first: Option<gtk::ToggleButton> = None;
+    let mut marquee_btn: Option<gtk::ToggleButton> = None;
+    for &mode in <SelectionEdit as oxiedraw_core::enum_meta::EnumMeta>::ALL {
+        // No icon of its own means the marquee mode, which borrows the shape
+        // the toolbar is set to draw.
+        let is_marquee = mode.icon_name().is_none();
+        let (icon, tooltip) = mode.icon_name().map_or_else(
+            || (marquee.icon_name(), marquee_tooltip(marquee)),
+            |icon| (icon, selection_edit_tooltip(mode)),
+        );
+        let btn = gtk::ToggleButton::builder()
+            .icon_name(icon)
+            .tooltip_text(tooltip)
+            .build();
+        if let Some(ref f) = first {
+            btn.set_group(Some(f));
+        } else {
+            first = Some(btn.clone());
+        }
+        if is_marquee {
+            marquee_btn = Some(btn.clone());
+        }
+        btn.set_active(selection.edit.get() == mode);
+        let selection = selection.clone();
+        let brush_controls = brush_controls.clone();
+        btn.connect_toggled(move |b| {
+            if !b.is_active() {
+                return;
+            }
+            selection.edit.set(mode);
+            brush_controls.set_sensitive(mode.paints());
+        });
+        modes.append(&btn);
+    }
+    let marquee_btn = marquee_btn.expect("SelectionEdit::ALL contains the marquee mode");
+    (modes, marquee_btn)
+}
+
+const fn selection_edit_tooltip(mode: SelectionEdit) -> &'static str {
+    match mode {
+        SelectionEdit::None => "Draw selections with the marquee",
+        SelectionEdit::Add => "Paint selection into the mask",
+        SelectionEdit::Erase => "Paint selection out of the mask",
+        SelectionEdit::Blur => "Feather the mask under the brush",
+    }
+}
+
+/// How much coverage a full-pressure dab lays down (or takes away, or blurs).
+fn build_strength_slider(selection: &SelectionState) -> gtk::Scale {
+    let strength = selection.strength.clone();
+    slider::build(
+        (0.0, 1.0),
+        OPACITY_STEP,
+        f64::from(strength.get()),
+        OPACITY_SLIDER_WIDTH,
+        |value| {
+            #[allow(clippy::cast_possible_truncation)]
+            let pct = (value * 100.0).round() as i32;
+            format!("{pct:>3}%")
+        },
+        move |value| {
+            #[allow(clippy::cast_possible_truncation)]
+            strength.set(value as f32);
+        },
+    )
+}
+
+/// Flat outline icon when off, filled icon on a system-accent background when
+/// on - the same read as the eraser toggle, plus the duotone icon swap. The
+/// tooltip names what the next click does, not the current state.
+fn apply_mask_preview_style(btn: &gtk::ToggleButton, active: bool) {
+    if active {
+        btn.set_icon_name("oxiedraw-mask-preview-active-symbolic");
+        btn.set_tooltip_text(Some("Change Mask Preview to Transparent"));
+        btn.remove_css_class("flat");
+        btn.add_css_class("suggested-action");
+    } else {
+        btn.set_icon_name("oxiedraw-mask-preview-symbolic");
+        btn.set_tooltip_text(Some("Change Mask Preview to Gradient"));
+        btn.remove_css_class("suggested-action");
+        btn.add_css_class("flat");
     }
 }
 
@@ -188,9 +378,16 @@ fn apply_eraser_style(btn: &gtk::ToggleButton, active: bool) {
     }
 }
 
+/// Brush size, bound to the shared engine cell. The Brush and Selection pages
+/// each build one of these, so the thumb is re-seeded whenever the page is
+/// shown - otherwise a size set on the other page (or by a keybinding) would
+/// look lost when this one comes back.
 fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
     let size = brush_engine.size.clone();
-    slider::build_mapped(
+    // Re-seeding runs the value-changed handler; without this the snap in
+    // `size_pos_to_value` would quietly round the shared size on every switch.
+    let programmatic = Rc::new(Cell::new(false));
+    let scale = slider::build_mapped(
         f64::from(brush_engine.size.get()),
         SIZE_SLIDER_WIDTH,
         size_pos_to_value,
@@ -200,11 +397,26 @@ fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
             let v = value.round() as i32;
             format!("{v:>4}")
         },
-        move |value| {
-            #[allow(clippy::cast_possible_truncation)]
-            size.set(value as f32);
+        {
+            let programmatic = Rc::clone(&programmatic);
+            move |value| {
+                if programmatic.get() {
+                    return;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                size.set(value as f32);
+            }
         },
-    )
+    );
+    {
+        let size = brush_engine.size.clone();
+        scale.connect_map(move |s| {
+            programmatic.set(true);
+            s.set_value(size_value_to_pos(f64::from(size.get())));
+            programmatic.set(false);
+        });
+    }
+    scale
 }
 
 /// Maps a `[0, 1]` trough position to a size snapped to the piecewise step of

@@ -2,7 +2,7 @@ use oxiedraw_utils::frame_profile::{self, Stage};
 use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
 use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
-use crate::brush_engine::PaintTarget;
+use crate::brush_engine::{Dab, PaintTarget};
 use crate::color::Color;
 use crate::document::{
     build_composite_steps, BlendMode, CompositeStep, LayerKind, LayerState, LayerTreeNode,
@@ -10,8 +10,8 @@ use crate::document::{
 use crate::effects::AdjustmentData;
 use crate::filters::FilterSpec;
 use crate::renderer::{
-    DmabufDescriptor, EdgesBuffer, GradientKind, RendererError, SelectionBlendMode, ShapeKind,
-    VulkanRenderer,
+    DabFamily, DabInstance, DmabufDescriptor, EdgesBuffer, GradientKind, MaskBrushMode,
+    RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
 };
 use crate::selection::SelectionShape;
 use crate::tools::{CropRect, SelectionMode};
@@ -203,7 +203,6 @@ impl Canvas {
         self.renderer.set_stroke_erase(erase);
         // Default to MAX-blend; a build-up brush opts in via
         // `set_stroke_buildup(true)` right after this call.
-        self.renderer.set_stroke_buildup(false);
         // Default to the mask path; a smudge brush opts in via
         // `set_smudge_stroke(true)` right after this call.
         self.is_smudge_stroke = false;
@@ -1408,7 +1407,9 @@ impl Canvas {
             ));
         }
 
+        let heatmap = self.renderer.selection_heatmap();
         self.renderer = VulkanRenderer::new(new_size)?;
+        self.renderer.set_selection_heatmap(heatmap);
         self.current_stroke = None;
         self.replace_all_layers(&cropped)?;
 
@@ -1442,7 +1443,9 @@ impl Canvas {
         layers: &[(String, String, bool, BlendMode, f32, Vec<u8>)],
         active: Option<usize>,
     ) -> Result<(), RendererError> {
+        let heatmap = self.renderer.selection_heatmap();
         self.renderer = VulkanRenderer::new(size)?;
+        self.renderer.set_selection_heatmap(heatmap);
         self.current_stroke = None;
         self.replace_all_layers(layers)?;
         if let Some(a) = active
@@ -2193,6 +2196,58 @@ impl Canvas {
     #[must_use]
     pub const fn selection_active(&self) -> bool {
         self.renderer.selection_active()
+    }
+
+    /// Start a mask-brush stroke (the selection tool's Add / Erase / Blur
+    /// modes), clearing the buffer the dabs land in.
+    pub fn begin_mask_brush(&mut self) -> Result<(), RendererError> {
+        self.renderer.begin_mask_brush()
+    }
+
+    /// Apply one pass of the mask brush: `dabs` land in a freshly cleared
+    /// coverage buffer, which is then folded into the mask. Passes compound,
+    /// which is what makes the strength slider build up over a held brush.
+    pub fn stamp_mask_brush(
+        &mut self,
+        dabs: &[Dab],
+        mode: MaskBrushMode,
+        radius: f32,
+    ) -> Result<(), RendererError> {
+        if dabs.is_empty() {
+            return Ok(());
+        }
+        self.renderer.clear_stroke()?;
+        // The dab pass picks its blend from the stroke's build-up flag, which
+        // only a paint stroke ever sets. Left alone, the mask brush would
+        // inherit whichever preset was painted with last: an OVER-blending
+        // preset saturates one pass' coverage and the strength slider dies.
+        self.renderer.set_stroke_buildup(false);
+        let instances: Vec<DabInstance> = dabs.iter().map(DabInstance::from_dab).collect();
+        self.renderer.stamp_mask(DabFamily::SoftRound, &instances)?;
+        self.renderer.apply_mask_brush(mode, radius)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Finish a mask-brush stroke: drop the coverage buffer so the next
+    /// ordinary brush stroke doesn't inherit it.
+    pub fn end_mask_brush(&mut self) -> Result<(), RendererError> {
+        self.renderer.clear_stroke()?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Show or hide the selection heatmap (mask coverage tinted transparent ->
+    /// blue -> green -> red over the canvas). The overlay lives in the present
+    /// pass, so this only has to force the next present.
+    pub const fn set_selection_heatmap(&mut self, on: bool) {
+        self.renderer.set_selection_heatmap(on);
+        self.bump_version();
+    }
+
+    #[must_use]
+    pub const fn selection_heatmap(&self) -> bool {
+        self.renderer.selection_heatmap()
     }
 
     /// Run the GPU edge/downsample pass and return the small R8 buffer.

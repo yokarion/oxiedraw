@@ -3,6 +3,11 @@
 //! Samples the canvas (premultiplied linear) and writes premultiplied-gamma
 //! pixels into the display dmabuf, which is the form GSK composites correctly.
 //! `present_convert.frag` has the reasoning.
+//!
+//! The pass also carries the optional selection heatmap: the mask is bound
+//! alongside the source and blended over the converted pixels when the push
+//! constant enables it, so the overlay costs no extra pass and can never
+//! contaminate the canvas image itself.
 
 use ash::{Device, vk};
 
@@ -14,6 +19,9 @@ use super::vulkan::RING_FRAMES;
 
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/present_convert.frag.spv"));
+
+/// One `float`: the selection heatmap's opacity, 0 = overlay off.
+pub(super) const HEATMAP_PUSH_BYTES: u32 = 4;
 
 /// Fullscreen conversion pipeline, with one source descriptor set per ring
 /// frame so a present can rebind its own slot without racing frames still in
@@ -31,8 +39,9 @@ pub(super) struct PresentConvertPipeline {
 impl PresentConvertPipeline {
     pub(super) fn new(device: &Device, display_format: vk::Format) -> Result<Self, RendererError> {
         let render_pass = create_render_pass(device, display_format)?;
-        let descriptor_set_layout = sampler_set_layout(device, 1)?;
-        let layout = pipeline_layout(device, descriptor_set_layout, 0)?;
+        // Binding 0 = the image being presented, 1 = the selection mask.
+        let descriptor_set_layout = sampler_set_layout(device, 2)?;
+        let layout = pipeline_layout(device, descriptor_set_layout, HEATMAP_PUSH_BYTES)?;
         // Replace, not blend: the shader writes the final display pixel.
         let pipeline = FullscreenPass {
             vert_spv: VERT_SPV,
@@ -59,13 +68,25 @@ impl PresentConvertPipeline {
 
     /// Point ring slot `slot`'s source set at `view` (in GENERAL layout).
     pub(super) fn bind_source(&self, device: &Device, slot: usize, view: vk::ImageView) {
+        self.bind(device, self.src_sets[slot], 0, view);
+    }
+
+    /// Point every slot at the selection mask. The mask image outlives the
+    /// renderer, so this is a one-time wiring at construction.
+    pub(super) fn bind_selection_mask(&self, device: &Device, view: vk::ImageView) {
+        for &set in &self.src_sets {
+            self.bind(device, set, 1, view);
+        }
+    }
+
+    fn bind(&self, device: &Device, set: vk::DescriptorSet, binding: u32, view: vk::ImageView) {
         let image_info = [vk::DescriptorImageInfo::default()
             .image_view(view)
             .image_layout(vk::ImageLayout::GENERAL)
             .sampler(self.sampler)];
         let writes = [vk::WriteDescriptorSet::default()
-            .dst_set(self.src_sets[slot])
-            .dst_binding(0)
+            .dst_set(set)
+            .dst_binding(binding)
             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
             .image_info(&image_info)];
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -136,9 +157,10 @@ fn create_descriptor_sets(
     layout: vk::DescriptorSetLayout,
     count: usize,
 ) -> Result<(vk::DescriptorPool, Vec<vk::DescriptorSet>), RendererError> {
+    // Two samplers per set: the presented image and the selection mask.
     let sizes = [vk::DescriptorPoolSize {
         ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
-        descriptor_count: count as u32,
+        descriptor_count: 2 * count as u32,
     }];
     let pool_info = vk::DescriptorPoolCreateInfo::default()
         .pool_sizes(&sizes)

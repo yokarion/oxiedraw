@@ -79,6 +79,12 @@ impl VulkanRenderer {
         // Make the source's prior writes (composite passes in this same submit)
         // visible to the fragment sampler.
         self.barrier(src_image, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        // The shader samples the selection mask too when the heatmap is on, and
+        // a mask brush writes it from its own earlier submit.
+        if self.selection_heatmap {
+            let mask = self.selection.mask.handle;
+            self.barrier(mask, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        }
 
         let extent = self.canvas_extent_2d();
         #[allow(clippy::cast_precision_loss)]
@@ -131,11 +137,28 @@ impl VulkanRenderer {
                 &[set],
                 &[],
             );
+            self.device.cmd_push_constants(
+                self.command_buffer,
+                self.present_convert.layout,
+                vk::ShaderStageFlags::FRAGMENT,
+                0,
+                &self.heatmap_opacity().to_ne_bytes(),
+            );
             self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(self.command_buffer);
         }
         // The render pass's subpass dependency flushes the colour writes to
         // MEMORY_READ and leaves the image in GENERAL for the dma-buf importer;
         // implicit dma-buf sync propagates our GPU fence to the compositor.
+    }
+
+    /// Heatmap opacity for the present shader. Zero unless the overlay is on
+    /// AND a selection is live - the mask holds stale bytes otherwise.
+    const fn heatmap_opacity(&self) -> f32 {
+        if self.selection_heatmap && self.selection_active {
+            1.0
+        } else {
+            0.0
+        }
     }
 }

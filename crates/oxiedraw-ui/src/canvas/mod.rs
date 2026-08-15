@@ -746,8 +746,8 @@ pub(crate) fn wire(
     }
 
     install_motion(
-        picture, viewport, brush_engine, colors, tools, crop, transform, gradient, liquify,
-        text_edit,
+        picture, viewport, brush_engine, colors, tools, crop, transform, selection, gradient,
+        liquify, text_edit,
     );
     install_pan(picture, viewport);
     install_scroll(picture, viewport);
@@ -800,6 +800,7 @@ fn install_motion(
     tools: &ToolState,
     crop: &CropState,
     transform: &TransformState,
+    selection: &SelectionState,
     gradient: &GradientState,
     liquify: &LiquifyState,
     text_edit: &crate::text_edit::TextEdit,
@@ -815,6 +816,7 @@ fn install_motion(
     let tools_c = tools.clone();
     let crop = crop.clone();
     let transform = transform.clone();
+    let selection = selection.clone();
     let gradient = gradient.clone();
     let liquify = liquify.clone();
     let brush_engine = brush_engine.clone();
@@ -949,6 +951,18 @@ fn install_motion(
                 let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
                 paintable.set_brush_cursor(
                     Some(circle_cursor(liquify.size.get() * 0.5)),
+                    canvas_pos,
+                );
+            }
+            Tool::Selection(_) if selection.edit.get().paints() => {
+                // The mask brush shares the brush's size, so it gets the same
+                // outline-as-cursor treatment. Blur especially: without the
+                // circle there is nothing on screen saying what it will touch.
+                area_c.set_cursor_from_name(Some("none"));
+                paintable.set_color_picker(None);
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
+                paintable.set_brush_cursor(
+                    Some(circle_cursor(brush_engine.size.get() * 0.5)),
                     canvas_pos,
                 );
             }

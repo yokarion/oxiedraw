@@ -28,6 +28,7 @@ mod transform_ops;
 mod transform_preview;
 
 pub use gradient_ops::GradientKind;
+pub use selection_ops::MaskBrushMode;
 pub use shape_ops::ShapeKind;
 pub use smudge_ops::SmudgeDab;
 
@@ -277,6 +278,9 @@ pub struct VulkanRenderer {
     /// 0 and the mask is ignored. Composite paths that pass through the
     /// stroke pipeline read this flag.
     pub(super) selection_active: bool,
+    /// Blender-style selection heatmap: the present pass tints the display
+    /// buffer by mask coverage. Display-only - never touches the canvas image.
+    pub(super) selection_heatmap: bool,
 
     pub(super) fill_overlay: ManuallyDrop<FillOverlayResources>,
     /// True when a bucket-fill animation is in flight. Gates the preview
@@ -500,7 +504,7 @@ impl VulkanRenderer {
             stroke_target.render_pass,
             pattern_atlas.descriptor_set_layout(),
         )?;
-        let selection = SelectionResources::new(&dev.device, &mut allocator, extent)?;
+        let selection = SelectionResources::new(&dev.device, &mut allocator, extent, stroke.view)?;
         let fill_overlay = FillOverlayResources::new(
             &dev.device,
             &mut allocator,
@@ -578,6 +582,7 @@ impl VulkanRenderer {
             .collect::<Result<Vec<_>, _>>()?;
 
         let present_convert = PresentConvertPipeline::new(&dev.device, DISPLAY_FORMAT)?;
+        present_convert.bind_selection_mask(&dev.device, selection.mask.view);
         let display_framebuffers = display
             .iter()
             .map(|buf| {
@@ -654,6 +659,7 @@ impl VulkanRenderer {
             layer_stack: ManuallyDrop::new(layer_stack),
             selection: ManuallyDrop::new(selection),
             selection_active: false,
+            selection_heatmap: false,
             fill_overlay: ManuallyDrop::new(fill_overlay),
             fill_active: false,
             fill_reveal: 0.0,

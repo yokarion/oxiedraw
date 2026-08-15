@@ -1,11 +1,76 @@
-//! CPU-side selection helpers: shape rasterisation into an R8 buffer
-//! and marching-squares contour extraction for marching ants.
+//! CPU-side selection helpers: shape rasterisation into an R8 buffer,
+//! marching-squares contour extraction for marching ants, and the dab
+//! spacing for the mask brush.
 //!
 //! All rasterisers produce row-major `Vec<u8>` of length `w*h`, with
 //! 0 = outside the shape and 255 = inside. Coordinates are in canvas
 //! pixels with `(0,0)` at the top-left.
 
 use oxiedraw_utils::geometry::Point;
+
+use crate::brush_engine::Dab;
+use crate::color::Color;
+
+/// Dab spacing as a fraction of the brush radius. Tight enough that a soft
+/// dab overlaps its neighbour heavily, so a fast drag still lays a smooth
+/// band rather than a string of blobs.
+const MASK_DAB_SPACING: f32 = 0.15;
+
+/// Edge falloff of the mask brush. Soft enough to feather a selection edge
+/// by painting, hard enough to still cover solidly in the middle.
+const MASK_DAB_HARDNESS: f32 = 0.5;
+
+/// Lay soft round dabs along `from -> to`, appending to `out`. `pressure`
+/// interpolates across the segment (stylus), scaling coverage the way the
+/// strength slider does. `size` is the brush diameter in canvas pixels.
+///
+/// `carry` is the distance already walked since the last dab; pass the return
+/// value back on the next segment. Without it, dab density would follow the
+/// motion-event rate rather than the path - a slow drag would deposit several
+/// times the coverage of a fast one over the same pixels, and every segment
+/// boundary would be stamped twice. Pass [`f32::INFINITY`] to start a stroke
+/// (it puts the first dab on `from`).
+pub fn mask_brush_dabs(
+    from: Point,
+    to: Point,
+    pressure: (f32, f32),
+    size: f32,
+    strength: f32,
+    carry: f32,
+    out: &mut Vec<Dab>,
+) -> f32 {
+    let radius = (size * 0.5).max(0.5);
+    let spacing = (radius * MASK_DAB_SPACING).max(0.5);
+    let (dx, dy) = (to.x - from.x, to.y - from.y);
+    let distance = dx.hypot(dy);
+
+    let mut dab_at = |t: f32| {
+        let center = Point::new(dx.mul_add(t, from.x), dy.mul_add(t, from.y));
+        let flow = strength * (pressure.1 - pressure.0).mul_add(t, pressure.0);
+        out.push(Dab {
+            hardness: MASK_DAB_HARDNESS,
+            flow: flow.clamp(0.0, 1.0),
+            ..Dab::round(center, radius, Color::WHITE)
+        });
+    };
+
+    let mut walked = carry.min(spacing);
+    if distance <= f32::EPSILON {
+        // A click that never travels still has to paint once.
+        if walked >= spacing {
+            dab_at(1.0);
+            return 0.0;
+        }
+        return walked;
+    }
+    let mut along = 0.0_f32;
+    while along + (spacing - walked) <= distance {
+        along += spacing - walked;
+        walked = 0.0;
+        dab_at(along / distance);
+    }
+    walked + (distance - along)
+}
 
 /// Rectangle defined by its top-left corner and size in canvas pixels.
 /// `w` / `h` may be negative - `normalize()` fixes that.

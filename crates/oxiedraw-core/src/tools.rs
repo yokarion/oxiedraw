@@ -378,6 +378,55 @@ pub enum SelectionMode {
     Intersect,
 }
 
+/// What a selection-tool drag does. `None` is the marquee/lasso the tool has
+/// always been; the rest paint the mask directly with a soft round brush.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SelectionEdit {
+    #[default]
+    None,
+    /// Brush coverage into the mask. Compounds pass over pass, so holding the
+    /// brush keeps pushing toward fully selected (not `SelectionBlendMode::Add`,
+    /// which is a MAX blend and would stall at the strength setting).
+    Add,
+    /// Take coverage back out of the mask.
+    Erase,
+    /// Feather the mask inside the brush, softening whatever edge it covers.
+    Blur,
+}
+
+impl crate::enum_meta::EnumMeta for SelectionEdit {
+    const ALL: &'static [Self] = &[Self::None, Self::Add, Self::Erase, Self::Blur];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Add => "Add",
+            Self::Erase => "Erase",
+            Self::Blur => "Blur",
+        }
+    }
+}
+
+impl SelectionEdit {
+    /// `None` has no icon of its own: its button wears the active marquee
+    /// shape (square / circle / lasso), which is what that mode actually draws.
+    #[must_use]
+    pub const fn icon_name(self) -> Option<&'static str> {
+        match self {
+            Self::None => Option::None,
+            Self::Add => Some("oxiedraw-brush-symbolic"),
+            Self::Erase => Some("oxiedraw-eraser-symbolic"),
+            Self::Blur => Some("oxiedraw-mask-blur-symbolic"),
+        }
+    }
+
+    /// Whether this mode paints the mask (and so uses size / strength).
+    #[must_use]
+    pub const fn paints(self) -> bool {
+        !matches!(self, Self::None)
+    }
+}
+
 /// Live rubber-band shape being dragged out by the user. Stored in
 /// canvas-pixel coordinates. Replaced with a fresh shape on every drag
 /// update; cleared when the drag commits or cancels.
@@ -400,6 +449,13 @@ pub struct SelectionState {
     pub active: Rc<Cell<bool>>,
     /// Current boolean op applied to the next committed shape.
     pub mode: Rc<Cell<SelectionMode>>,
+    /// Blender-style mask preview: tint the canvas by selection coverage
+    /// instead of showing the marching ants alone. Display-only.
+    pub heatmap: Rc<Cell<bool>>,
+    /// Whether a drag draws a marquee or paints the mask, and how.
+    pub edit: Rc<Cell<SelectionEdit>>,
+    /// Mask-brush strength, `0..=1`. Scaled by stylus pressure per dab.
+    pub strength: Rc<Cell<f32>>,
     /// In-flight rubber-band shape; not yet committed to the mask.
     pub pending: Rc<RefCell<Option<PendingMarquee>>>,
     /// Contour polylines for the marching-ants overlay. In *canvas*
@@ -435,6 +491,9 @@ impl Clone for SelectionState {
         Self {
             active: Rc::clone(&self.active),
             mode: Rc::clone(&self.mode),
+            heatmap: Rc::clone(&self.heatmap),
+            edit: Rc::clone(&self.edit),
+            strength: Rc::clone(&self.strength),
             pending: Rc::clone(&self.pending),
             ants_contours: Rc::clone(&self.ants_contours),
             source_layer: Rc::clone(&self.source_layer),
@@ -449,6 +508,9 @@ impl SelectionState {
         Self {
             active: Rc::new(Cell::new(false)),
             mode: Rc::new(Cell::new(SelectionMode::Replace)),
+            heatmap: Rc::new(Cell::new(false)),
+            edit: Rc::new(Cell::new(SelectionEdit::None)),
+            strength: Rc::new(Cell::new(1.0)),
             pending: Rc::new(RefCell::new(None)),
             ants_contours: Rc::new(RefCell::new(Vec::new())),
             source_layer: Rc::new(Cell::new(None)),

@@ -5,6 +5,7 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
 use oxiedraw_core::canvas::Canvas;
@@ -16,13 +17,14 @@ use oxiedraw_core::guides::{
 };
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch, PatchBounds, SelectionSnapshot};
 use oxiedraw_core::liquify::{MAX_SIZE as LIQUIFY_MAX_SIZE, LiquifyStamp, LiquifyState};
-use oxiedraw_core::selection::{RectShape, SelectionShape};
+use oxiedraw_core::renderer::MaskBrushMode;
+use oxiedraw_core::selection::{RectShape, SelectionShape, mask_brush_dabs};
 use oxiedraw_core::shape_correction::{ShapeKind, detect_correction};
 use oxiedraw_core::text::{ResizeMode, TextBox};
 use oxiedraw_core::tools::{
     CropHandle, CropRect, CropState, FillState, FillTool, GradientState, PendingMarquee,
-    SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, TargetKind, Tool,
-    ToolState, TransformFilter, TransformHandle, TransformState,
+    SelectionEdit, SelectionMode, SelectionState, SelectionTool, ShapeState, ShapeTool, TargetKind,
+    Tool, ToolState, TransformFilter, TransformHandle, TransformState,
 };
 use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::{Point, Size, TransformRect};
@@ -35,7 +37,7 @@ use crate::settings::{AppSettings, ShapeCorrectionSettings};
 
 use super::{RenderPump, Viewport};
 use super::{
-    BUTTON_PRIMARY, crop_geom, present_into_paintable, sample_from,
+    BUTTON_PRIMARY, crop_geom, present_into_paintable, pressure_from, sample_from,
     transform_geometry, widget_to_canvas,
 };
 
@@ -139,6 +141,13 @@ pub(super) struct PrimaryDragHandler {
     // -- selection --------------------------------------------------------
     selection: SelectionState,
     selection_drag_start: Rc<Cell<Point>>,
+    /// Whether Shift constrains this drag to 1:1. Shift is also the Add
+    /// modifier, so it can only mean "square / circle" when the drag started
+    /// with nothing to add to. Captured at pen-down.
+    selection_shift_constrains: Rc<Cell<bool>>,
+    /// Live mask-brush stroke (Add / Erase / Blur), or `None` for a marquee
+    /// drag. Holds what the drag needs to interpolate dabs and to record undo.
+    mask_stroke: Rc<RefCell<Option<MaskStroke>>>,
     // -- fill -------------------------------------------------------------
     fill: FillState,
     /// When the reveal sweep started, if one is running. Driven by the
@@ -247,6 +256,49 @@ struct ShapePending {
     id: String,
     before: Vec<u8>,
 }
+
+/// The GPU mask-brush op for an edit mode, or `None` for the marquee.
+const fn mask_brush_mode(edit: SelectionEdit) -> Option<MaskBrushMode> {
+    match edit {
+        SelectionEdit::None => None,
+        SelectionEdit::Add => Some(MaskBrushMode::Add),
+        SelectionEdit::Erase => Some(MaskBrushMode::Erase),
+        SelectionEdit::Blur => Some(MaskBrushMode::Feather),
+    }
+}
+
+/// The mask as an undo snapshot. An inactive selection records as "no
+/// selection" rather than the stale bytes still sitting in the mask image.
+pub(crate) fn read_selection_snapshot(canvas: &mut Canvas) -> SelectionSnapshot {
+    if !canvas.selection_active() {
+        return SelectionSnapshot { active: false, mask: None };
+    }
+    canvas.read_selection_mask().map_or(
+        SelectionSnapshot { active: true, mask: None },
+        |mask| SelectionSnapshot { active: true, mask: Some(mask) },
+    )
+}
+
+/// A mask-brush stroke in flight: where the last dab landed (and at what
+/// pressure) so the next motion event can interpolate from it, plus the
+/// pre-stroke mask for undo.
+struct MaskStroke {
+    mode: MaskBrushMode,
+    last: Point,
+    last_pressure: f32,
+    before: SelectionSnapshot,
+    /// Distance walked since the last dab, carried across motion events so dab
+    /// density follows the path instead of the event rate.
+    dab_carry: f32,
+    /// When the ants were last retraced, so the live refresh can skip events
+    /// that arrive faster than the eye can follow them. `None` until the first.
+    last_ants: Option<Instant>,
+}
+
+/// Minimum gap between live ant refreshes during a mask-brush stroke. A pen
+/// streams motion far faster than 30 Hz and each refresh costs a readback plus
+/// a trace, so this caps the work without the outline looking stepped.
+const LIVE_ANTS_INTERVAL: Duration = Duration::from_millis(33);
 
 /// State captured when a gradient drag begins: the target layer, its id,
 /// and its pristine pixels for the undo before-state. Selection clipping is
@@ -1334,8 +1386,17 @@ impl PrimaryDragHandler {
         x: f64,
         y: f64,
     ) {
+        if let Some(brush) = mask_brush_mode(self.selection.edit.get()) {
+            self.mask_brush_begin(gesture, brush, x, y);
+            return;
+        }
         let mode = selection_mode_from_modifiers(gesture);
         self.selection.mode.set(mode);
+        // Shift wears two hats: Add, and constrain-to-1:1. With a selection
+        // already on the canvas the user means Add, so the drag must not also
+        // snap to a square - they'd have no way to add a free rectangle.
+        self.selection_shift_constrains
+            .set(!self.canvas.borrow().selection_active());
         // Snap to the pixel grid so selection edges land on whole pixels.
         let canvas_pos = snap_to_pixel(widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation));
         self.selection_drag_start.set(canvas_pos);
@@ -1365,15 +1426,25 @@ impl PrimaryDragHandler {
             return;
         };
         let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
+        // Route on the edit mode, not on whether a stroke armed: a mask-brush
+        // drag whose GPU setup failed must stay inert, not fall through and
+        // commit a marquee from a stale drag origin.
+        if mask_brush_mode(self.selection.edit.get()).is_some() {
+            if self.mask_stroke.borrow().is_some() {
+                self.mask_brush_update(gesture, cur);
+            }
+            return;
+        }
         match tool {
             SelectionTool::Square | SelectionTool::Circle => {
                 let start = self.selection_drag_start.get();
                 let cur = snap_to_pixel(cur);
                 let (mut w, mut h) = (cur.x - start.x, cur.y - start.y);
                 // Shift constrains to a 1:1 square/circle, keeping the drag
-                // direction on each axis.
+                // direction on each axis - but only when it isn't already
+                // spoken for as the Add modifier.
                 let (shift, _) = modifiers_from_gesture(gesture);
-                if shift {
+                if shift && self.selection_shift_constrains.get() {
                     let side = w.abs().max(h.abs());
                     w = side.copysign(w);
                     h = side.copysign(h);
@@ -1408,6 +1479,12 @@ impl PrimaryDragHandler {
     }
 
     fn selection_end(&self, _tool: SelectionTool) {
+        if mask_brush_mode(self.selection.edit.get()).is_some() {
+            if self.mask_stroke.borrow().is_some() {
+                self.mask_brush_end();
+            }
+            return;
+        }
         let pending = self.selection.pending.borrow_mut().take();
         self.paintable.set_selection_pending(None);
         let Some(p) = pending else {
@@ -1460,17 +1537,7 @@ impl PrimaryDragHandler {
         };
 
         // Read before state for history.
-        let before_sel = {
-            let mut c = self.canvas.borrow_mut();
-            if c.selection_active() {
-                c.read_selection_mask().map_or(
-                    SelectionSnapshot { active: true, mask: None },
-                    |m| SelectionSnapshot { active: true, mask: Some(m) },
-                )
-            } else {
-                SelectionSnapshot { active: false, mask: None }
-            }
-        };
+        let before_sel = read_selection_snapshot(&mut self.canvas.borrow_mut());
 
         // Commit to the GPU mask.
         {
@@ -1484,17 +1551,7 @@ impl PrimaryDragHandler {
         }
 
         // Read after state and record history.
-        let after_sel = {
-            let mut c = self.canvas.borrow_mut();
-            if c.selection_active() {
-                c.read_selection_mask().map_or(
-                    SelectionSnapshot { active: true, mask: None },
-                    |m| SelectionSnapshot { active: true, mask: Some(m) },
-                )
-            } else {
-                SelectionSnapshot { active: false, mask: None }
-            }
-        };
+        let after_sel = read_selection_snapshot(&mut self.canvas.borrow_mut());
         self.history.borrow_mut().record(HistoryAction::SelectionChange {
             before: before_sel,
             after: after_sel,
@@ -1503,6 +1560,134 @@ impl PrimaryDragHandler {
         // A drag-drawn selection is layer-agnostic; drop any layer-binding
         // from a previous preview-click so Transform reverts to acting on
         // the active layer.
+        self.selection.source_layer.set(None);
+        refresh_selection_contours(&self.canvas, &self.selection, &self.canvas_size);
+        self.selection.notify_changed();
+        self.refresh_after_selection_change();
+    }
+
+    // -- selection mask brush ---------------------------------------------
+
+    /// Snapshot the mask for undo, arm the GPU stroke, and lay the first dab.
+    /// The heatmap is left as the user set it - painting is no reason to turn
+    /// an overlay on behind their back.
+    fn mask_brush_begin(&self, gesture: &gtk::GestureDrag, mode: MaskBrushMode, x: f64, y: f64) {
+        let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
+        let pressure = pressure_from(gesture);
+
+        let mut canvas = self.canvas.borrow_mut();
+        let before = read_selection_snapshot(&mut canvas);
+        if let Err(e) = canvas.begin_mask_brush() {
+            tracing::error!(error = %e, "begin_mask_brush failed");
+            return;
+        }
+        *self.mask_stroke.borrow_mut() = Some(MaskStroke {
+            mode,
+            last: canvas_pos,
+            last_pressure: pressure,
+            before,
+            dab_carry: f32::INFINITY,
+            last_ants: None,
+        });
+        drop(canvas);
+        self.mask_brush_stamp(canvas_pos, canvas_pos, (pressure, pressure));
+    }
+
+    fn mask_brush_update(&self, gesture: &gtk::GestureDrag, cur: Point) {
+        let pressure = pressure_from(gesture);
+        let Some((from, from_pressure)) = self
+            .mask_stroke
+            .borrow_mut()
+            .as_mut()
+            .map(|s| {
+                let previous = (s.last, s.last_pressure);
+                s.last = cur;
+                s.last_pressure = pressure;
+                previous
+            })
+        else {
+            return;
+        };
+        self.mask_brush_stamp(from, cur, (from_pressure, pressure));
+    }
+
+    /// Stamp one segment of the stroke and re-present. Each event contributes
+    /// exactly one compounding pass over its own dabs, which is what makes
+    /// strength build up while the brush is held over the same spot.
+    fn mask_brush_stamp(&self, from: Point, to: Point, pressure: (f32, f32)) {
+        let Some((mode, carry)) = self
+            .mask_stroke
+            .borrow()
+            .as_ref()
+            .map(|s| (s.mode, s.dab_carry))
+        else {
+            return;
+        };
+        let size = self.brush_engine.size.get();
+        let strength = self.selection.strength.get();
+        let mut dabs = Vec::new();
+        let carry = mask_brush_dabs(from, to, pressure, size, strength, carry, &mut dabs);
+        if let Some(stroke) = self.mask_stroke.borrow_mut().as_mut() {
+            stroke.dab_carry = carry;
+        }
+
+        {
+            let mut canvas = self.canvas.borrow_mut();
+            if let Err(e) = canvas.stamp_mask_brush(&dabs, mode, size * 0.5) {
+                tracing::error!(error = %e, "stamp_mask_brush failed");
+                return;
+            }
+            present_into_paintable(&mut canvas, &self.paintable, &self.area);
+        }
+        self.refresh_live_ants();
+    }
+
+    /// Retrace the ants against the mask as it is being painted, so the outline
+    /// follows the brush instead of jumping into place at pen-up. Rate-limited:
+    /// the trace is cheap, not free, and the pen out-runs the display anyway.
+    fn refresh_live_ants(&self) {
+        let due = {
+            let mut stroke = self.mask_stroke.borrow_mut();
+            let Some(stroke) = stroke.as_mut() else {
+                return;
+            };
+            let due = stroke
+                .last_ants
+                .is_none_or(|t| t.elapsed() >= LIVE_ANTS_INTERVAL);
+            if due {
+                stroke.last_ants = Some(Instant::now());
+            }
+            due
+        };
+        if !due {
+            return;
+        }
+        refresh_selection_contours_live(&self.canvas, &self.selection, &self.canvas_size);
+        self.selection.notify_changed();
+    }
+
+    /// Close the stroke: drop the coverage buffer, record undo, and retrace the
+    /// ants pixel-perfect against the mask the stroke left behind.
+    fn mask_brush_end(&self) {
+        let Some(stroke) = self.mask_stroke.borrow_mut().take() else {
+            return;
+        };
+        let after = {
+            let mut canvas = self.canvas.borrow_mut();
+            if let Err(e) = canvas.end_mask_brush() {
+                tracing::error!(error = %e, "end_mask_brush failed");
+            }
+            self.selection.active.set(canvas.selection_active());
+            read_selection_snapshot(&mut canvas)
+        };
+        self.history
+            .borrow_mut()
+            .record(HistoryAction::SelectionChange {
+                before: stroke.before,
+                after,
+            });
+
+        // A painted mask is layer-agnostic, same as a marquee drag.
         self.selection.source_layer.set(None);
         refresh_selection_contours(&self.canvas, &self.selection, &self.canvas_size);
         self.selection.notify_changed();
@@ -2163,6 +2348,48 @@ pub(crate) fn refresh_selection_contours(
     // iso=1 so the outline hugs every non-empty pixel, including the soft
     // anti-aliased edge of an alpha-derived selection.
     let contours = oxiedraw_core::selection::pixel_perfect_contours(&mask, mw, mh, 1);
+    *selection.ants_contours.borrow_mut() = contours;
+}
+
+/// [`refresh_selection_contours`] for a live stroke: traces the downsampled
+/// edges buffer instead, an order of magnitude cheaper (~0.6 ms against ~4.7 ms
+/// on a 2k canvas) for an outline quantised to the downsample grid.
+fn refresh_selection_contours_live(
+    canvas: &Rc<RefCell<Canvas>>,
+    selection: &SelectionState,
+    canvas_size: &Rc<Cell<Size>>,
+) {
+    let edges = {
+        let mut c = canvas.borrow_mut();
+        if !c.selection_active() {
+            selection.ants_contours.borrow_mut().clear();
+            return;
+        }
+        match c.read_selection_edges() {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::error!(error = %err, "read_selection_edges failed");
+                return;
+            }
+        }
+    };
+    if edges.width == 0 || edges.height == 0 {
+        return;
+    }
+    let size = canvas_size.get();
+    #[allow(clippy::cast_precision_loss)]
+    let (scale_x, scale_y) = (
+        size.width as f32 / edges.width as f32,
+        size.height as f32 / edges.height as f32,
+    );
+    let mut contours =
+        oxiedraw_core::selection::pixel_perfect_contours(&edges.bytes, edges.width, edges.height, 1);
+    for contour in &mut contours {
+        for p in contour.iter_mut() {
+            p.x *= scale_x;
+            p.y *= scale_y;
+        }
+    }
     *selection.ants_contours.borrow_mut() = contours;
 }
 
@@ -2858,6 +3085,8 @@ pub(super) fn install_primary_drag(
         transform_drag_start_rotation_angle: Rc::new(Cell::new(0.0)),
         selection: selection.clone(),
         selection_drag_start: Rc::new(Cell::new(Point::ZERO)),
+        selection_shift_constrains: Rc::new(Cell::new(true)),
+        mask_stroke: Rc::new(RefCell::new(None)),
         fill: fill.clone(),
         fill_reveal: Rc::new(Cell::new(None)),
         fill_generation: Rc::new(Cell::new(0)),
