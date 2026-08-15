@@ -66,6 +66,12 @@ Building from source, the project layout, and the contribution rules live in the
 [Development guide](https://oxiedraw.yokarion.com/development/overview)
 (source: [docs/4.development/](docs/4.development/)).
 
+## Changelog
+
+Notable changes in each release are tracked in the
+[Changelog](https://oxiedraw.yokarion.com/development/changelog)
+(source: [docs/4.development/3.changelog.md](docs/4.development/3.changelog.md)).
+
 ## LLMs and AI usage
 
 LLMs are fine for small, scoped, fully-reviewed changes - but automated
