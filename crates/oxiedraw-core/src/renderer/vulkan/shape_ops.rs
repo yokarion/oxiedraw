@@ -5,6 +5,8 @@
 
 use ash::vk;
 
+use crate::document::CompositeStep;
+
 use super::super::RendererError;
 use super::super::shape_overlay::SHAPE_PUSH_BYTES;
 use super::VulkanRenderer;
@@ -118,6 +120,34 @@ impl VulkanRenderer {
         })
     }
 
+    /// Folder- and clip-aware shape preview: build (target layer + shape) into
+    /// the shared scratch, then walk the composite tree with that scratch
+    /// standing in for the target, so the live preview clips exactly like the
+    /// commit will. Mirrors `render_fill_preview_scoped`.
+    pub fn render_shape_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+    ) -> Result<(), RendererError> {
+        let target_idx = self.shape_layer_idx;
+        if target_idx >= self.layer_stack.slots.len() {
+            return Ok(());
+        }
+        let color = self.shape_color_premul;
+        let rect = self.shape_rect;
+        let extra = self.shape_extra;
+        let scratch = self.erase_preview.scratch.handle;
+        let scratch_fb = self.erase_preview.framebuffer;
+        let layer_image = self.layer_stack.slots[target_idx].image.handle;
+        self.record_and_submit(|this| {
+            this.cmd_copy_image_full(layer_image, scratch);
+            this.record_shape_pass_into(scratch_fb, color, rect, extra);
+            this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        let target = self.replace_target_from_erase_scratch(target_idx);
+        self.build_preview_scoped_multi(steps, &[(target_idx, target)])
+    }
+
     /// Final commit: render the shape directly into the layer's
     /// framebuffer with OVER blend. Clears the overlay state.
     /// Caller is responsible for `recomposite_canvas` afterwards.
@@ -171,7 +201,11 @@ impl VulkanRenderer {
         extra: [f32; 4],
     ) {
         let render_pass = self.canvas_target.render_pass;
-        let pipeline = self.shape_overlay.pipeline;
+        let pipeline = if self.alpha_lock {
+            self.shape_overlay.pipeline_alpha_lock
+        } else {
+            self.shape_overlay.pipeline
+        };
         let layout = self.shape_overlay.layout;
         let descriptor_set = self.shape_overlay.descriptor_set;
 

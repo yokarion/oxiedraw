@@ -13,8 +13,8 @@ use gpu_allocator::vulkan::Allocator;
 
 use super::RendererError;
 use super::pass::{
-    FullscreenPass, allocate_sampler_set, dst_out_blend, nearest_clamp_sampler, over_blend,
-    pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
+    FullscreenPass, allocate_sampler_set, alpha_lock_blend, dst_out_blend, nearest_clamp_sampler,
+    over_blend, pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
 };
 use super::resources::Image;
 
@@ -45,6 +45,8 @@ pub(super) struct FillOverlayResources {
     /// undoes a fill that went in underneath, leaving what was on top
     /// of it in place.
     pub pipeline_behind: vk::Pipeline,
+    /// Alpha-preserving variant, used when the target layer is alpha-locked.
+    pub pipeline_alpha_lock: vk::Pipeline,
 }
 
 impl FillOverlayResources {
@@ -80,22 +82,18 @@ impl FillOverlayResources {
         let layout = pipeline_layout(device, descriptor_set_layout, FILL_OVERLAY_PUSH_BYTES)?;
         // Premultiplied OVER - the un-revealed pixels get the seed
         // colour painted back on top of the committed fill.
-        let pipeline = FullscreenPass {
+        let mut pass = FullscreenPass {
             vert_spv: COMPOSITE_VERT_SPV,
             frag_spv: FILL_OVERLAY_FRAG_SPV,
             render_pass: canvas_render_pass,
             layout,
             blend: over_blend(),
-        }
-        .build(device)?;
-        let pipeline_behind = FullscreenPass {
-            vert_spv: COMPOSITE_VERT_SPV,
-            frag_spv: FILL_OVERLAY_FRAG_SPV,
-            render_pass: canvas_render_pass,
-            layout,
-            blend: dst_out_blend(),
-        }
-        .build(device)?;
+        };
+        let pipeline = pass.build(device)?;
+        pass.blend = dst_out_blend();
+        let pipeline_behind = pass.build(device)?;
+        pass.blend = alpha_lock_blend();
+        let pipeline_alpha_lock = pass.build(device)?;
 
         Ok(Self {
             mask,
@@ -106,6 +104,7 @@ impl FillOverlayResources {
             layout,
             pipeline,
             pipeline_behind,
+            pipeline_alpha_lock,
         })
     }
 
@@ -115,6 +114,7 @@ impl FillOverlayResources {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline(self.pipeline_behind, None);
+            device.destroy_pipeline(self.pipeline_alpha_lock, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);

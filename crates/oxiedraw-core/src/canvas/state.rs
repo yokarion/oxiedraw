@@ -83,6 +83,11 @@ pub struct Canvas {
     /// Readback paths recomposite once when this is set; the drawing path never
     /// pays for it. See [`Self::sync_canvas_for_liquify`].
     liquify_composite_stale: bool,
+    /// Pre-session pixels of an alpha-locked liquify target, `(index, BGRA8)`.
+    /// Liquify resamples the whole layer on the GPU rather than compositing
+    /// into it, so the lock is re-imposed against this at bake time. `None`
+    /// unless the session opened on a locked layer.
+    liquify_alpha_lock_snapshot: Option<(usize, Vec<u8>)>,
 }
 
 impl Canvas {
@@ -116,6 +121,7 @@ impl Canvas {
             smudge_prev_center: None,
             defer_recomposite: false,
             liquify_composite_stale: false,
+            liquify_alpha_lock_snapshot: None,
         };
         // Initial canvas state == empty layer stack composited. Yields
         // a fully-transparent canvas regardless of layer count.
@@ -199,6 +205,16 @@ impl Canvas {
         } else {
             (color, erase)
         };
+
+        // Alpha lock can only be honoured by paint, not by the eraser: erasing
+        // removes alpha by definition. Refuse the stroke outright rather than
+        // starting one that would be silently dropped at commit.
+        let locked = self.layers.alpha_lock_active(layer_idx);
+        if locked && erase {
+            self.current_stroke = None;
+            return Ok(());
+        }
+        self.renderer.set_alpha_lock(locked);
 
         self.renderer.set_stroke_erase(erase);
         // Default to MAX-blend; a build-up brush opts in via
@@ -346,9 +362,10 @@ impl Canvas {
         // commit_stroke_into_layer composites flat; redo it folder-scoped if any
         // folder bounds an adjustment, so the committed result clips correctly.
         self.rescope_composite()?;
-        // Clear erase mode now the stroke is done so a later composite that
-        // does not start with `begin_stroke` cannot inherit it.
+        // Clear erase / lock mode now the stroke is done so a later composite
+        // that does not start with `begin_stroke` cannot inherit either.
         self.renderer.set_stroke_erase(false);
+        self.renderer.set_alpha_lock(false);
         self.renderer.invalidate_preview_cache();
         self.bump_version();
         Ok(())
@@ -359,7 +376,7 @@ impl Canvas {
     /// that build the canvas flat (the stroke commit).
     fn rescope_composite(&mut self) -> Result<(), RendererError> {
         let snapshot = self.layers.snapshot();
-        if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+        if let Some(steps) = self.scoped_steps(&snapshot) {
             self.renderer.composite_layers_scoped(&steps)?;
         }
         Ok(())
@@ -375,8 +392,22 @@ impl Canvas {
         self.smudge_prev_center = None;
         self.renderer.clear_stroke()?;
         self.renderer.set_stroke_erase(false);
+        self.renderer.set_alpha_lock(false);
         self.bump_version();
         Ok(())
+    }
+
+    /// `true` when this operation cannot run on the active layer because that
+    /// layer is alpha-locked. Erasing (and filling behind) only ever remove
+    /// alpha, which the lock forbids, so those are refused rather than
+    /// silently doing nothing. The UI checks this to explain the refusal.
+    #[must_use]
+    pub fn alpha_lock_refuses(&self, removes_coverage: bool) -> bool {
+        removes_coverage
+            && self
+                .layers
+                .active()
+                .is_some_and(|idx| self.layers.alpha_lock_active(idx))
     }
 
     // ----------------------------------------------------------------
@@ -462,6 +493,35 @@ impl Canvas {
         self.recomposite()
     }
 
+    /// Re-apply saved `(clipped, alpha_locked)` flags by index after
+    /// `replace_all_layers`, which resets both. Recomposites once at the end -
+    /// clipping changes the composited image.
+    pub fn restore_layer_flags(&mut self, flags: &[(bool, bool)]) -> Result<(), RendererError> {
+        for (idx, &(clipped, locked)) in flags.iter().take(self.layers.len()).enumerate() {
+            self.layers.set_clipped(idx, clipped);
+            self.layers.set_alpha_locked(idx, locked);
+        }
+        self.recomposite_canvas()
+    }
+
+    /// Set the clipping-mask flag on the layer at `idx` and recomposite.
+    pub fn set_layer_clipped(&mut self, idx: usize, clipped: bool) -> Result<(), RendererError> {
+        self.layers.set_clipped(idx, clipped);
+        self.recomposite_canvas()
+    }
+
+    /// Set the alpha-lock flag on the layer at `idx`. Alpha lock only
+    /// constrains future writes, so there is nothing to recomposite.
+    pub fn set_layer_alpha_locked(&mut self, idx: usize, locked: bool) {
+        self.layers.set_alpha_locked(idx, locked);
+    }
+
+    /// `true` when the layer at `idx` is alpha-locked and the flag applies.
+    #[must_use]
+    pub fn layer_alpha_locked(&self, idx: usize) -> bool {
+        self.layers.alpha_lock_active(idx)
+    }
+
     /// The effect stack of the adjustment layer at `idx`, if it is one.
     #[must_use]
     pub fn layer_effects(&self, idx: usize) -> Option<AdjustmentData> {
@@ -531,6 +591,8 @@ impl Canvas {
             .layers
             .blend(src_idx)
             .unwrap_or((BlendMode::Normal, 1.0));
+        let src_clipped = self.layers.clipped(src_idx).unwrap_or(false);
+        let src_locked = self.layers.alpha_lock_active(src_idx);
 
         let top_idx = self.renderer.add_layer()?;
         let state_idx = self.layers.add(new_name);
@@ -546,10 +608,14 @@ impl Canvas {
             self.renderer.reorder_layer(top_idx, target_idx);
         }
 
-        // The duplicate inherits the source's blend mode + opacity.
+        // The duplicate inherits the source's blend mode + opacity, and its
+        // clip / lock flags: it lands directly above the source, so a clipped
+        // source's copy resolves to the same base.
         self.layers.set_blend(target_idx, src_blend, src_opacity);
         self.renderer
             .set_layer_blend(target_idx, src_blend.to_gpu(), src_opacity);
+        self.layers.set_clipped(target_idx, src_clipped);
+        self.layers.set_alpha_locked(target_idx, src_locked);
 
         self.layers.set_active(Some(target_idx));
         self.recomposite_canvas()?;
@@ -699,7 +765,7 @@ impl Canvas {
         let visibilities: Vec<bool> = snapshot.iter().map(|l| l.visible).collect();
         // Folder-scoped path only when there are adjustments to clip AND the
         // tree actually nests them; otherwise the flat composite is identical.
-        if let Some(steps) = self.folder_scoped_steps(&snapshot) {
+        if let Some(steps) = self.scoped_steps(&snapshot) {
             self.renderer.composite_layers_scoped(&steps)?;
         } else {
             self.renderer.composite_layers_to_canvas(&visibilities)?;
@@ -742,25 +808,36 @@ impl Canvas {
         Ok(())
     }
 
-    /// Composite steps for a preview: folder-scoped when folders bound an
-    /// adjustment, otherwise a flat list of the visible layers in canvas order.
-    /// Always covers every visible layer.
+    /// Composite steps for a preview: the scoped walk when clipping or folder
+    /// scoping needs it, otherwise a flat list of the visible layers in canvas
+    /// order. Always covers every visible layer.
     fn preview_steps(&self, snapshot: &[crate::document::Layer]) -> Vec<CompositeStep> {
-        self.folder_scoped_steps(snapshot).unwrap_or_else(|| {
+        self.scoped_steps(snapshot).unwrap_or_else(|| {
             snapshot
                 .iter()
                 .enumerate()
-                .filter_map(|(i, l)| l.visible.then_some(CompositeStep::Layer(i)))
+                .filter_map(|(i, l)| l.visible.then_some(CompositeStep::layer(i)))
                 .collect()
         })
     }
 
-    /// Build the bracketed composite step stream when folder-scoped compositing
-    /// is needed and possible: there is a folder tree, it has adjustment layers
-    /// to scope, it actually contains a folder, and it matches the live stack.
+    /// `true` when any layer carries a clipping mask. Every preview path has to
+    /// take the scoped walk when this holds: the flat compositor has no clip
+    /// mask, so a clipped layer would preview as if it covered the canvas.
+    fn any_clipped(&self) -> bool {
+        self.layers.snapshot().iter().any(|l| l.clipped)
+    }
+
+    /// Build the bracketed composite step stream when the flat composite would
+    /// give the wrong answer. Two things need it: a folder bounding an
+    /// adjustment layer (folder scoping), and any clipped layer (whose base has
+    /// to be resolved from the tree, before hidden layers are dropped).
     /// `None` falls back to the flat composite path.
-    fn folder_scoped_steps(&self, snapshot: &[crate::document::Layer]) -> Option<Vec<CompositeStep>> {
-        if self.layer_tree.is_empty() || !self.renderer.has_adjustment_layers() {
+    fn scoped_steps(&self, snapshot: &[crate::document::Layer]) -> Option<Vec<CompositeStep>> {
+        let any_clipped = snapshot.iter().any(|l| l.clipped);
+        let scoped_adjustments =
+            !self.layer_tree.is_empty() && self.renderer.has_adjustment_layers();
+        if !any_clipped && !scoped_adjustments {
             return None;
         }
         let visible: Vec<usize> = snapshot
@@ -774,7 +851,29 @@ impl Canvas {
                 .position(|l| l.id == id)
                 .filter(|&i| snapshot[i].visible)
         };
-        let steps = build_composite_steps(&self.layer_tree, &resolve, &visible);
+        let clipped = |id: &str| {
+            snapshot
+                .iter()
+                .find(|l| l.id == id)
+                .is_some_and(|l| l.clipped)
+        };
+        // Clipping needs a tree to resolve bases against. A document the panel
+        // has not pushed a tree for is flat by definition, so synthesise one
+        // rather than silently dropping every clip.
+        let flat_tree: Vec<LayerTreeNode>;
+        let tree = if self.layer_tree.is_empty() {
+            flat_tree = snapshot
+                .iter()
+                .map(|l| LayerTreeNode::layer(l.id.clone()))
+                .collect();
+            &flat_tree
+        } else {
+            &self.layer_tree
+        };
+        let steps = build_composite_steps(tree, &resolve, &clipped, &visible);
+        if any_clipped {
+            return Some(steps);
+        }
         // No folders left after dropping hidden/empty ones -> flat is identical.
         steps
             .iter()
@@ -833,7 +932,7 @@ impl Canvas {
             let steps = self.preview_steps(&snapshot);
             self.renderer
                 .render_mask_edit_preview_and_read(&steps, ctx.layer_idx, linear, ctx.opacity)
-        } else if let Some(steps) = self.folder_scoped_steps(&self.layers.snapshot()) {
+        } else if let Some(steps) = self.scoped_steps(&self.layers.snapshot()) {
             // Folder-bounded adjustment: scope the effect to its folder
             // (the flat path below would apply it to the whole backdrop).
             self.renderer
@@ -1004,12 +1103,27 @@ impl Canvas {
                 }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.fill_active() {
-                let visibilities = self.visibilities();
-                self.renderer.render_fill_preview(&visibilities)?;
+                // The flat overlay path has no clip mask, so a clipped layer
+                // would flash over the whole canvas for the length of the
+                // reveal sweep.
+                if self.any_clipped() {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_fill_preview_scoped(&steps)?;
+                } else {
+                    let visibilities = self.visibilities();
+                    self.renderer.render_fill_preview(&visibilities)?;
+                }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.shape_active() {
-                let visibilities = self.visibilities();
-                self.renderer.render_shape_preview(&visibilities)?;
+                if self.any_clipped() {
+                    let snapshot = self.layers.snapshot();
+                    let steps = self.preview_steps(&snapshot);
+                    self.renderer.render_shape_preview_scoped(&steps)?;
+                } else {
+                    let visibilities = self.visibilities();
+                    self.renderer.render_shape_preview(&visibilities)?;
+                }
                 self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.gradient_active() {
                 let visibilities = self.visibilities();
@@ -1018,7 +1132,7 @@ impl Canvas {
                 // the ramp unadjusted (bright) until commit. Route through the
                 // scoped walk so the live preview clips like the committed result.
                 let target = self.renderer.gradient_target();
-                if self.effective_adjustment_excluding(target) {
+                if self.any_clipped() || self.effective_adjustment_excluding(target) {
                     let snapshot = self.layers.snapshot();
                     let steps = self.preview_steps(&snapshot);
                     self.renderer.render_gradient_preview_scoped(&steps, target)?;
@@ -1032,10 +1146,11 @@ impl Canvas {
                 // adjustment slots, so any effective adjustment other than the
                 // warped layer itself needs the folder-scoped walk to preview
                 // (and clip) the way the commit will.
-                let scoped = self
-                    .renderer
-                    .liquify_target()
-                    .is_some_and(|t| self.effective_adjustment_excluding(t));
+                let scoped = self.any_clipped()
+                    || self
+                        .renderer
+                        .liquify_target()
+                        .is_some_and(|t| self.effective_adjustment_excluding(t));
                 if scoped {
                     let snapshot = self.layers.snapshot();
                     let steps = self.preview_steps(&snapshot);
@@ -1052,11 +1167,15 @@ impl Canvas {
                 // fast path skips adjustment slots, so it would drop the effect on
                 // the static layers under the one being transformed).
                 let n = self.renderer.transform_preview_target_count();
-                let needs_scoped = (0..n).any(|i| {
-                    self.renderer
-                        .transform_preview_target_at(i)
-                        .is_some_and(|t| self.effective_adjustment_excluding(t))
-                });
+                // Clipping needs the scoped walk for the same reason: the flat
+                // path has no clip mask, so a clipped layer would preview as if
+                // it covered the whole canvas.
+                let needs_scoped = self.any_clipped()
+                    || (0..n).any(|i| {
+                        self.renderer
+                            .transform_preview_target_at(i)
+                            .is_some_and(|t| self.effective_adjustment_excluding(t))
+                    });
                 if needs_scoped {
                     let snapshot = self.layers.snapshot();
                     let steps = self.preview_steps(&snapshot);
@@ -1088,7 +1207,7 @@ impl Canvas {
                         // below). The scoped path caches static folders per stroke,
                         // so it stays cheap even when painting outside that folder.
                         else if let Some(steps) =
-                            self.folder_scoped_steps(&self.layers.snapshot())
+                            self.scoped_steps(&self.layers.snapshot())
                         {
                             self.renderer.render_preview_scoped_and_present(
                                 &steps,
@@ -1248,7 +1367,7 @@ impl Canvas {
         if self.is_smudge_stroke {
             let snapshot = self.layers.snapshot();
             let has_adjustments = snapshot.iter().any(|l| l.kind.is_adjustment());
-            let scoped = self.folder_scoped_steps(&snapshot).is_some();
+            let scoped = self.scoped_steps(&snapshot).is_some();
             if has_adjustments || scoped {
                 self.stamp_smudge(paint)?;
                 self.bump_version();
@@ -1282,7 +1401,7 @@ impl Canvas {
         // Strokes no adjustment influences keep the fast path - no slowdown.
         let needs_adjusted_preview = self.effective_adjustment_above(ctx.layer_idx)
             || self.painting_hidden_adjustment_mask(ctx.layer_idx)
-            || self.folder_scoped_steps(&self.layers.snapshot()).is_some();
+            || self.scoped_steps(&self.layers.snapshot()).is_some();
         if self.renderer.filter_active()
             || self.renderer.fill_active()
             || self.renderer.shape_active()
@@ -1394,6 +1513,7 @@ impl Canvas {
         let mut cropped: Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> =
             Vec::with_capacity(snap.len());
         let kinds: Vec<LayerKind> = snap.iter().map(|l| l.kind.clone()).collect();
+        let flags: Vec<(bool, bool)> = snap.iter().map(|l| (l.clipped, l.alpha_locked)).collect();
         for (idx, layer) in snap.iter().enumerate() {
             let raw = self.renderer.read_layer(idx)?;
             let pixels = crop_bgra8(&raw, old_size.width, old_size.height, crop_x, crop_y, w, h);
@@ -1420,6 +1540,9 @@ impl Canvas {
         let (dx, dy) = (-(crop_x as f32), -(crop_y as f32));
         let translated: Vec<LayerKind> = kinds.iter().map(|k| k.translated(dx, dy)).collect();
         self.restore_layer_kinds(&translated)?;
+        // Same for the clip / alpha-lock flags, which replace_all_layers also
+        // cleared. A crop must not silently unclip the document.
+        self.restore_layer_flags(&flags)?;
 
         // replace_all_layers always resets active to Some(0); restore the
         // caller's active selection so downstream operations target the right layer.
@@ -1504,7 +1627,17 @@ impl Canvas {
     /// canvas and the undo stack never disagree about whether a fill
     /// happened.
     pub fn commit_fill(&mut self, layer_idx: usize, pixels: &[u8]) -> Result<(), RendererError> {
-        self.renderer.write_layer(layer_idx, pixels)?;
+        // The fill is computed on the CPU and written whole, so it misses the
+        // GPU blend variant the other tools use. Re-impose the lock here on the
+        // same terms: colour may change, alpha may not.
+        if self.layers.alpha_lock_active(layer_idx) {
+            let before = self.renderer.read_layer(layer_idx)?;
+            let mut locked = pixels.to_vec();
+            apply_alpha_lock_bgra(&mut locked, &before);
+            self.renderer.write_layer(layer_idx, &locked)?;
+        } else {
+            self.renderer.write_layer(layer_idx, pixels)?;
+        }
         self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()?;
         Ok(())
@@ -1579,6 +1712,10 @@ impl Canvas {
     /// directly into the preview image - no CPU rasterisation or
     /// texture upload per frame.
     pub fn begin_shape_overlay(&mut self, layer_idx: usize) {
+        // Armed for the whole drag so the live preview is clipped the same way
+        // the commit will be.
+        self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
         self.renderer.begin_shape_overlay(layer_idx);
         self.bump_version();
     }
@@ -1623,7 +1760,10 @@ impl Canvas {
         let linear = color.to_linear_rgb();
         let premul = [linear[0], linear[1], linear[2], 1.0];
         self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
+        self.renderer
             .commit_shape(layer_idx, kind, rect, premul, antialias, line_width)?;
+        self.renderer.set_alpha_lock(false);
         self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()
     }
@@ -1631,6 +1771,7 @@ impl Canvas {
     /// Cancel an in-flight shape overlay without committing.
     pub fn cancel_shape_overlay(&mut self) {
         self.renderer.clear_shape_overlay();
+        self.renderer.set_alpha_lock(false);
         self.bump_version();
     }
 
@@ -1641,6 +1782,8 @@ impl Canvas {
     /// Arm the GPU gradient overlay for a drag on `layer_idx`. Upload the
     /// LUT once with `set_gradient_lut`, then push endpoints per drag move.
     pub fn begin_gradient_overlay(&mut self, layer_idx: usize) {
+        self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
         self.renderer.begin_gradient_overlay(layer_idx);
         self.bump_version();
     }
@@ -1674,7 +1817,10 @@ impl Canvas {
         kind: GradientKind,
         endpoints: [f32; 4],
     ) -> Result<(), RendererError> {
+        self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
         self.renderer.commit_gradient(layer_idx, kind, endpoints)?;
+        self.renderer.set_alpha_lock(false);
         self.normalize_adjustment_slot(layer_idx)?;
         self.recomposite_canvas()
     }
@@ -1682,6 +1828,7 @@ impl Canvas {
     /// Cancel an in-flight gradient overlay without committing.
     pub fn cancel_gradient_overlay(&mut self) {
         self.renderer.clear_gradient_overlay();
+        self.renderer.set_alpha_lock(false);
         self.bump_version();
     }
 
@@ -1730,11 +1877,12 @@ impl Canvas {
 
     /// Render the armed filter preview into the preview image. Routed on the
     /// same test the committed composite uses, so the two can never disagree:
-    /// the flat path has no notion of adjustment slots or folder scope and
-    /// would composite an adjustment's mask as if it were pixels.
+    /// the flat path has no notion of adjustment slots, folder scope or
+    /// clipping - it would composite an adjustment's mask as if it were pixels,
+    /// and draw a clipped layer over everything.
     fn render_armed_filter_preview(&mut self) -> Result<(), RendererError> {
-        if self.renderer.has_adjustment_layers() {
-            let snapshot = self.layers.snapshot();
+        let snapshot = self.layers.snapshot();
+        if self.renderer.has_adjustment_layers() || self.scoped_steps(&snapshot).is_some() {
             let steps = self.preview_steps(&snapshot);
             self.renderer.render_filter_preview_scoped(&steps)
         } else {
@@ -1949,11 +2097,14 @@ impl Canvas {
     pub fn read_transform_preview(&mut self) -> Result<Vec<u8>, RendererError> {
         let visibilities = self.visibilities();
         let n = self.renderer.transform_preview_target_count();
-        let needs_scoped = (0..n).any(|i| {
-            self.renderer
-                .transform_preview_target_at(i)
-                .is_some_and(|t| self.effective_adjustment_above(t))
-        });
+        // Same routing as the presented preview, so this helper cannot report a
+        // result the user never sees.
+        let needs_scoped = self.any_clipped()
+            || (0..n).any(|i| {
+                self.renderer
+                    .transform_preview_target_at(i)
+                    .is_some_and(|t| self.effective_adjustment_above(t))
+            });
         if needs_scoped {
             let snapshot = self.layers.snapshot();
             let steps = self.preview_steps(&snapshot);
@@ -1980,6 +2131,11 @@ impl Canvas {
     /// and left alone; everything the user does lives in the displacement field
     /// until [`Self::liquify_bake`].
     pub fn begin_liquify(&mut self, layer_idx: usize) -> Result<(), RendererError> {
+        self.liquify_alpha_lock_snapshot = if self.layers.alpha_lock_active(layer_idx) {
+            Some((layer_idx, self.renderer.read_layer(layer_idx)?))
+        } else {
+            None
+        };
         self.renderer.begin_liquify(layer_idx)?;
         self.bump_version();
         Ok(())
@@ -2044,6 +2200,16 @@ impl Canvas {
     /// readback paths refresh it on demand instead - see [`Self::read_pixels`].
     pub fn liquify_bake(&mut self) -> Result<(), RendererError> {
         self.renderer.liquify_bake()?;
+        // The warp moved pixels freely; put the original alpha back so the
+        // silhouette is exactly what it was before the session.
+        if let Some((idx, before)) = self.liquify_alpha_lock_snapshot.take() {
+            let mut warped = self.renderer.read_layer(idx)?;
+            apply_alpha_lock_bgra(&mut warped, &before);
+            self.renderer.write_layer(idx, &warped)?;
+            // Later strokes in the same session warp from the baked result, so
+            // the lock has to keep measuring against the original silhouette.
+            self.liquify_alpha_lock_snapshot = Some((idx, before));
+        }
         self.liquify_composite_stale = true;
         self.bump_version();
         Ok(())
@@ -2070,6 +2236,7 @@ impl Canvas {
             return Ok(());
         }
         self.renderer.end_liquify();
+        self.liquify_alpha_lock_snapshot = None;
         self.recomposite_canvas()?;
         self.liquify_composite_stale = false;
         self.bump_version();
@@ -2411,6 +2578,33 @@ fn split_layer_by_mask(layer: &[u8], mask: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (masked, remaining)
 }
 
+/// Re-impose an alpha lock on `new` (premultiplied BGRA8) using `old`'s alpha:
+/// keep the new colour, keep the old alpha. Where the op left nothing behind
+/// (new alpha 0) the old pixel is restored whole, so an operation that would
+/// have erased is a no-op rather than a black hole.
+fn apply_alpha_lock_bgra(new: &mut [u8], old: &[u8]) {
+    debug_assert_eq!(new.len(), old.len(), "alpha lock needs matching buffers");
+    for (n, o) in new.chunks_exact_mut(4).zip(old.chunks_exact(4)) {
+        let old_a = o[3];
+        if n[3] == 0 || old_a == 0 {
+            n.copy_from_slice(o);
+            if old_a == 0 {
+                // Nothing was there and nothing may be added.
+                n.fill(0);
+            }
+            continue;
+        }
+        // Un-premultiply by the new alpha, re-premultiply by the old one.
+        let scale = f32::from(old_a) / f32::from(n[3]);
+        for c in &mut n[..3] {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let v = (f32::from(*c) * scale).round().clamp(0.0, f32::from(old_a)) as u8;
+            *c = v;
+        }
+        n[3] = old_a;
+    }
+}
+
 // CPU pixel helpers (crop_bgra8, transform_bgra8, sample_*) live in
 // oxiedraw_utils::pixels - see the use statement at the top of this file.
 
@@ -2430,6 +2624,44 @@ mod tests {
     use crate::brush_engine::{BrushEngine, InputSample};
 
     use super::*;
+
+    #[test]
+    fn alpha_lock_keeps_alpha_and_takes_colour() {
+        // Opaque red under, opaque blue painted over: colour changes, alpha holds.
+        let mut new = vec![255, 0, 0, 255];
+        let old = vec![0, 0, 255, 255];
+        apply_alpha_lock_bgra(&mut new, &old);
+        assert_eq!(new, vec![255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn alpha_lock_refuses_to_paint_on_empty_pixels() {
+        // Nothing underneath: the paint is dropped entirely.
+        let mut new = vec![255, 255, 255, 255];
+        let old = vec![0, 0, 0, 0];
+        apply_alpha_lock_bgra(&mut new, &old);
+        assert_eq!(new, vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn alpha_lock_rescales_paint_to_the_old_alpha() {
+        // Half-transparent underneath: opaque white paint lands premultiplied
+        // against that alpha, and the alpha itself is untouched.
+        let mut new = vec![255, 255, 255, 255];
+        let old = vec![10, 20, 30, 128];
+        apply_alpha_lock_bgra(&mut new, &old);
+        assert_eq!(new, vec![128, 128, 128, 128]);
+    }
+
+    #[test]
+    fn alpha_lock_restores_pixels_an_op_cleared() {
+        // An op that removed coverage (an eraser slipping through, a liquify
+        // warp pulling pixels away) leaves the original pixel intact.
+        let mut new = vec![0, 0, 0, 0];
+        let old = vec![10, 20, 30, 200];
+        apply_alpha_lock_bgra(&mut new, &old);
+        assert_eq!(new, vec![10, 20, 30, 200]);
+    }
 
     fn sample(x: f32, y: f32, t: u64) -> InputSample {
         InputSample {
@@ -2545,6 +2777,180 @@ mod tests {
 
         // Far-from-stroke corner stays transparent.
         assert_eq!(&bytes[..4], &[0x00, 0x00, 0x00, 0x00]);
+    }
+
+    /// A clipped layer renders only where the layer beneath it has alpha.
+    ///
+    /// Base: an opaque red square in the left half. Clipped layer: opaque blue
+    /// over the whole canvas. The composite must be blue where the base was and
+    /// transparent everywhere else - the blue outside the base is discarded.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn clipped_layer_is_confined_to_its_base() {
+        let (w, h) = (32_usize, 16_usize);
+        let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
+
+        // Premultiplied BGRA8. Base covers x < 16 only.
+        let mut base = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w / 2 {
+                let i = (y * w + x) * 4;
+                base[i + 2] = 255; // R
+                base[i + 3] = 255; // A
+            }
+        }
+        let blue: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 0, 0, 255]).collect();
+
+        canvas.replace_all_layers(&[(
+            "base".into(),
+            "Base".into(),
+            true,
+            BlendMode::Normal,
+            1.0,
+            base,
+        )])
+        .expect("base layer");
+        let top = canvas.add_layer_with_pixels("Shade", &blue).expect("top layer");
+        canvas.set_layer_clipped(top, true).expect("clip");
+
+        let px = canvas.read_pixels().expect("readback");
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+
+        // Inside the base: the clipped blue wins, at full alpha.
+        let inside = at(4, 8);
+        assert_eq!(inside[3], 255, "clipped layer paints inside the base");
+        assert!(
+            inside[0] > 200 && inside[2] < 40,
+            "expected blue inside the base, got {inside:?}"
+        );
+
+        // Outside the base: nothing at all, though the layer's own pixels are
+        // opaque there.
+        assert_eq!(at(28, 8), [0, 0, 0, 0], "clip must discard paint off the base");
+
+        // Releasing the clip brings the whole layer back.
+        canvas.set_layer_clipped(top, false).expect("unclip");
+        let px = canvas.read_pixels().expect("readback");
+        let i = (8 * w + 28) * 4;
+        assert_eq!(px[i + 3], 255, "unclipped layer covers the whole canvas");
+    }
+
+    /// Painting an alpha-locked layer recolours the pixels that exist and adds
+    /// none. The lock rides a blend-state variant, so this exercises the real
+    /// GPU path rather than the CPU helper the fill tool uses.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn alpha_lock_recolours_without_growing_the_layer() {
+        let (w, h) = (32_usize, 16_usize);
+        let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
+
+        // Opaque red in the left half, empty in the right.
+        let mut base = vec![0u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w / 2 {
+                let i = (y * w + x) * 4;
+                base[i + 2] = 255;
+                base[i + 3] = 255;
+            }
+        }
+        canvas.replace_all_layers(&[(
+            "l".into(),
+            "Layer".into(),
+            true,
+            BlendMode::Normal,
+            1.0,
+            base,
+        )])
+        .expect("layer");
+        canvas.set_layer_alpha_locked(0, true);
+
+        // A wide stroke straight across the middle, crossing both halves.
+        let brush = crisp_brush(10.0);
+        let blue = Color::new(0, 0, 255);
+        canvas.begin_stroke(blue, 1.0, false).expect("begin_stroke");
+        let mut iter = (0_u32..8).map(|i| {
+            #[allow(clippy::cast_precision_loss)]
+            let x = (i as f32).mul_add(4.0, 2.0);
+            sample(x, 8.0, u64::from(i) * 10)
+        });
+        let first = iter.next().expect("non-empty");
+        canvas.stamp(|t| brush.begin_stroke(first, blue, t)).expect("begin");
+        for s in iter {
+            canvas.stamp(|t| brush.push_sample(s, t)).expect("push");
+        }
+        canvas.stamp(|t| brush.end_stroke(t)).expect("end");
+        canvas.commit_stroke().expect("commit");
+
+        let px = canvas.read_layer(0).expect("read");
+        let at = |x: usize, y: usize| {
+            let i = (y * w + x) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+
+        // Where the layer had pixels, the stroke recoloured them and left alpha
+        // untouched.
+        let painted = at(4, 8);
+        assert_eq!(painted[3], 255, "alpha lock must not change alpha");
+        assert!(
+            painted[0] > 200 && painted[2] < 40,
+            "expected the stroke's blue on existing pixels, got {painted:?}"
+        );
+
+        // Where it was empty, nothing was added - the stroke passed right over
+        // x=18..30 at y=8.
+        for x in [18_usize, 24, 30] {
+            assert_eq!(at(x, 8), [0, 0, 0, 0], "alpha lock leaked paint at x={x}");
+        }
+    }
+
+    /// Crop rebuilds the whole layer stack, which resets per-layer state. The
+    /// clip / lock flags have to be restored with the kinds, or a crop silently
+    /// unclips the document.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn crop_preserves_clip_and_lock_flags() {
+        let mut canvas = Canvas::headless(Size::new(16, 16)).expect("canvas init");
+        canvas.add_layer("Top").expect("add layer");
+        canvas.set_layer_clipped(1, true).expect("clip");
+        canvas.set_layer_alpha_locked(0, true);
+
+        canvas
+            .apply_crop(crate::tools::CropRect::new(0.0, 0.0, 8.0, 8.0))
+            .expect("crop");
+
+        let snap = canvas.layers().snapshot();
+        assert!(snap[1].clipped, "crop cleared the clipping mask");
+        assert!(snap[0].alpha_locked, "crop cleared the alpha lock");
+    }
+
+    /// Hiding the base takes its clipped layers with it: they have nothing to
+    /// render against.
+    #[test]
+    #[ignore = "requires vulkan loader and device"]
+    fn hiding_the_base_hides_its_clipped_layer() {
+        let (w, h) = (16_usize, 16_usize);
+        let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
+        let opaque: Vec<u8> = (0..w * h).flat_map(|_| [0u8, 0, 255, 255]).collect();
+        let blue: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 0, 0, 255]).collect();
+
+        canvas.replace_all_layers(&[(
+            "base".into(),
+            "Base".into(),
+            true,
+            BlendMode::Normal,
+            1.0,
+            opaque,
+        )])
+        .expect("base layer");
+        let top = canvas.add_layer_with_pixels("Shade", &blue).expect("top layer");
+        canvas.set_layer_clipped(top, true).expect("clip");
+        canvas.set_layer_visible(0, false).expect("hide base");
+
+        let px = canvas.read_pixels().expect("readback");
+        assert_eq!(&px[..4], &[0, 0, 0, 0], "clipped layer follows its hidden base");
     }
 
     /// A resize recreates the renderer; drawing must keep working afterward.

@@ -11,8 +11,8 @@ use ash::{Device, vk};
 
 use super::RendererError;
 use super::pass::{
-    FullscreenPass, allocate_sampler_set, linear_clamp_sampler, over_blend, pipeline_layout,
-    sampler_descriptor_pool, sampler_set_layout,
+    FullscreenPass, allocate_sampler_set, alpha_lock_blend, linear_clamp_sampler, over_blend,
+    pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
 };
 
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
@@ -28,6 +28,8 @@ pub(super) struct ShapeOverlayResources {
     pub descriptor_set: vk::DescriptorSet,
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
+    /// Alpha-preserving variant, used when the target layer is alpha-locked.
+    pub pipeline_alpha_lock: vk::Pipeline,
 }
 
 impl ShapeOverlayResources {
@@ -52,14 +54,16 @@ impl ShapeOverlayResources {
         let layout = pipeline_layout(device, descriptor_set_layout, SHAPE_PUSH_BYTES)?;
         // Premultiplied OVER - colour is `coverage * push.color`, alpha is
         // `coverage * push.color.a`, both blend identically.
-        let pipeline = FullscreenPass {
+        let mut pass = FullscreenPass {
             vert_spv: COMPOSITE_VERT_SPV,
             frag_spv: SHAPE_FRAG_SPV,
             render_pass: canvas_render_pass,
             layout,
             blend: over_blend(),
-        }
-        .build(device)?;
+        };
+        let pipeline = pass.build(device)?;
+        pass.blend = alpha_lock_blend();
+        let pipeline_alpha_lock = pass.build(device)?;
         Ok(Self {
             sampler,
             descriptor_set_layout,
@@ -67,6 +71,7 @@ impl ShapeOverlayResources {
             descriptor_set,
             layout,
             pipeline,
+            pipeline_alpha_lock,
         })
     }
 
@@ -75,6 +80,7 @@ impl ShapeOverlayResources {
     pub(super) unsafe fn destroy(self, device: &Device) {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline(self.pipeline_alpha_lock, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);

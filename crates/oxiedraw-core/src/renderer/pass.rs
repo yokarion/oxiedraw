@@ -192,6 +192,26 @@ pub(super) fn dst_out_blend() -> vk::PipelineColorBlendAttachmentState {
         .alpha_blend_op(vk::BlendOp::ADD)
 }
 
+/// Alpha-locked OVER: paints colour but leaves the destination's alpha exactly
+/// as it was, so a stroke can only recolour pixels that already exist.
+///
+/// For premultiplied `src` over `dst`, holding the output alpha at `dst.a`
+/// makes the correct colour `dst.rgb * (1 - src.a) + src.rgb * dst.a`, which is
+/// what these factors compute. Alpha takes the destination untouched
+/// (`src * 0 + dst * 1`). No destination read is needed, so this works as a
+/// drop-in pipeline variant on any pass that composites into a layer.
+pub(super) fn alpha_lock_blend() -> vk::PipelineColorBlendAttachmentState {
+    vk::PipelineColorBlendAttachmentState::default()
+        .color_write_mask(vk::ColorComponentFlags::RGBA)
+        .blend_enable(true)
+        .src_color_blend_factor(vk::BlendFactor::DST_ALPHA)
+        .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+        .color_blend_op(vk::BlendOp::ADD)
+        .src_alpha_blend_factor(vk::BlendFactor::ZERO)
+        .dst_alpha_blend_factor(vk::BlendFactor::ONE)
+        .alpha_blend_op(vk::BlendOp::ADD)
+}
+
 /// No blending - the fragment replaces whatever the load op left behind.
 pub(super) fn replace_blend() -> vk::PipelineColorBlendAttachmentState {
     vk::PipelineColorBlendAttachmentState::default()

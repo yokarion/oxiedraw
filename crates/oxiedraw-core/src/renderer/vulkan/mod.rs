@@ -55,7 +55,7 @@ use super::filters::FilterResources;
 use super::liquify::LiquifyPipelines;
 use liquify_ops::LiquifySession;
 use super::instance;
-use super::layers::{LayerBlendPipeline, LayerCompositePipeline, LayerStack};
+use super::layers::{ClipMaskPipeline, LayerBlendPipeline, LayerCompositePipeline, LayerStack};
 use transform_preview::TransformPreview;
 use super::mask::{DabPipelineSet, MaskPipelineSet};
 use super::pattern_atlas::PatternAtlas;
@@ -193,6 +193,11 @@ pub struct VulkanRenderer {
     /// target layer) instead of painting. Set per stroke at `begin_stroke`
     /// and read by the preview and commit paths.
     pub(super) stroke_erase: bool,
+    /// Alpha lock on the layer currently being written. Selects the
+    /// alpha-preserving blend variant on every pass that paints into a layer
+    /// (or into the layer-copy scratch a preview builds), so preview and commit
+    /// stay identical. Set by the canvas before an op, cleared after.
+    pub(super) alpha_lock: bool,
     /// AABB (canvas pixels, `min_x, min_y, max_x, max_y`) covering every
     /// dab quad stamped into the stroke buffer since the last
     /// `reset_stroke_dirty`. Lets `commit_stroke` build a tight history
@@ -243,6 +248,11 @@ pub struct VulkanRenderer {
     pub(super) layer_composite_pipeline: ManuallyDrop<LayerCompositePipeline>,
     /// Blend pipeline (per-layer mode + opacity), driven by `cmd_compose_layer_blended`.
     pub(super) layer_blend_pipeline: ManuallyDrop<LayerBlendPipeline>,
+    /// Intersects an adjustment mask with a clipping base's alpha. Paired with
+    /// `clip_mask_scratch`, both allocated on first use - a document with no
+    /// clipped adjustment layer never pays for either.
+    pub(super) clip_mask_pipeline: ManuallyDrop<ClipMaskPipeline>,
+    pub(super) clip_mask_scratch: Option<GroupAccumulator>,
     /// Canvas-sized scratch holding a copy of the current accumulator so the
     /// blend pass can sample the destination while writing it. Paired with
     /// `blend_scratch_dst_set` (binds its view as the blend pipeline's set 1).
@@ -566,6 +576,12 @@ impl VulkanRenderer {
             layer_composite_pipeline.descriptor_set_layout,
             layer_composite_pipeline.sampler,
         )?;
+        // Shares the filter set + pipeline layout, so it has to follow them.
+        let clip_mask_pipeline = ClipMaskPipeline::new(
+            &dev.device,
+            canvas_target.render_pass,
+            filter_resources.pipeline_layout,
+        )?;
         let transform_pipeline = TransformPipeline::new(&dev.device, canvas_target.render_pass)?;
         let layer_stack = LayerStack::new(&dev.device)?;
         let display = (0..DISPLAY_BUFFERS)
@@ -628,6 +644,7 @@ impl VulkanRenderer {
             preview_cache_valid: false,
             erase_preview: ManuallyDrop::new(erase_preview),
             stroke_erase: false,
+            alpha_lock: false,
             stroke_dirty: None,
             preview_pending_dirty: None,
             last_present_area: None,
@@ -647,6 +664,8 @@ impl VulkanRenderer {
             composite_pipeline: ManuallyDrop::new(composite_pipeline),
             layer_composite_pipeline: ManuallyDrop::new(layer_composite_pipeline),
             layer_blend_pipeline: ManuallyDrop::new(layer_blend_pipeline),
+            clip_mask_pipeline: ManuallyDrop::new(clip_mask_pipeline),
+            clip_mask_scratch: None,
             blend_scratch: ManuallyDrop::new(blend_scratch),
             blend_scratch_dst_set,
             group_accumulators: Vec::new(),
@@ -1095,11 +1114,27 @@ impl VulkanRenderer {
         mode: u32,
         opacity: f32,
     ) {
+        self.cmd_compose_layer_clipped(acc_img, acc_fb, src_set, mode, opacity, None);
+    }
+
+    /// As [`Self::cmd_compose_layer_blended`], but `clip_set` (a clipping-mask
+    /// base layer) confines the source to that layer's alpha. A clipped layer
+    /// always takes the shader path: the fixed-function fast path cannot
+    /// multiply in a third image.
+    pub(super) fn cmd_compose_layer_clipped(
+        &self,
+        acc_img: vk::Image,
+        acc_fb: vk::Framebuffer,
+        src_set: vk::DescriptorSet,
+        mode: u32,
+        opacity: f32,
+        clip_set: Option<vk::DescriptorSet>,
+    ) {
         // Normal at full opacity is plain premultiplied OVER, which the
         // fixed-function blend pipeline does without reading the destination.
         // Skip the scratch copy + extra pass on this (overwhelmingly common)
         // path.
-        if mode == 0 && opacity >= 1.0 {
+        if mode == 0 && opacity >= 1.0 && clip_set.is_none() {
             self.cmd_compose_image(acc_fb, src_set);
             self.barrier(acc_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
             return;
@@ -1111,10 +1146,17 @@ impl VulkanRenderer {
         let pipeline = self.layer_blend_pipeline.pipeline;
         let layout = self.layer_blend_pipeline.layout;
         self.cmd_begin_fullscreen_pass(render_pass, acc_fb, pipeline);
-        let sets = [src_set, self.blend_scratch_dst_set];
-        let mut push = [0u8; 8];
+        // Set 2 must always point at a live image even when unused; the source
+        // layer is the cheapest valid stand-in.
+        let sets = [
+            src_set,
+            self.blend_scratch_dst_set,
+            clip_set.unwrap_or(src_set),
+        ];
+        let mut push = [0u8; 12];
         push[0..4].copy_from_slice(&mode.to_ne_bytes());
         push[4..8].copy_from_slice(&opacity.clamp(0.0, 1.0).to_ne_bytes());
+        push[8..12].copy_from_slice(&u32::from(clip_set.is_some()).to_ne_bytes());
         unsafe {
             self.device.cmd_bind_descriptor_sets(
                 self.command_buffer,
@@ -1346,6 +1388,9 @@ impl Drop for VulkanRenderer {
             for mut ga in self.scoped_group_cache.drain(..) {
                 ga.destroy(&self.device, &mut self.allocator);
             }
+            if let Some(mut ga) = self.clip_mask_scratch.take() {
+                ga.destroy(&self.device, &mut self.allocator);
+            }
             if let Some((layout, pipeline)) = self.smudge_pipeline.take() {
                 self.device.destroy_pipeline(pipeline, None);
                 self.device.destroy_pipeline_layout(layout, None);
@@ -1354,6 +1399,7 @@ impl Drop for VulkanRenderer {
                 self.device.destroy_descriptor_pool(pool, None);
                 ManuallyDrop::take(&mut image).destroy(&self.device, &mut self.allocator);
             }
+            ManuallyDrop::take(&mut self.clip_mask_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.layer_blend_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.layer_composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);

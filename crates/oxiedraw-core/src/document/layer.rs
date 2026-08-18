@@ -204,6 +204,15 @@ pub struct Layer {
     pub blend: BlendMode,
     /// Layer opacity in `0.0..=1.0` (1.0 = fully opaque).
     pub opacity: f32,
+    /// Clipping mask: render only where the layer beneath has alpha. A flag,
+    /// never a reference - the base is resolved positionally at composite time
+    /// (see `build_composite_steps`), so reorders and deletes re-resolve on
+    /// their own and there is no repair pass.
+    pub clipped: bool,
+    /// Lock transparent pixels: paint can change colour but never alpha, so
+    /// every write is confined to pixels that already exist. Composites
+    /// identically either way - this only constrains future writes.
+    pub alpha_locked: bool,
 }
 
 impl Layer {
@@ -216,6 +225,8 @@ impl Layer {
             kind: LayerKind::Raster,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
         }
     }
 
@@ -228,6 +239,8 @@ impl Layer {
             kind: LayerKind::Raster,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
         }
     }
 
@@ -255,6 +268,21 @@ impl Layer {
     #[must_use]
     pub const fn is_adjustment(&self) -> bool {
         matches!(self.kind, LayerKind::Adjustment(_))
+    }
+
+    /// `true` when alpha lock is meaningful for this layer. An adjustment
+    /// slot holds a mask that is opaque by construction, so there is no
+    /// transparency to preserve.
+    #[must_use]
+    pub const fn can_alpha_lock(&self) -> bool {
+        !self.is_adjustment()
+    }
+
+    /// `true` when alpha lock is on *and* applies, so paint must be confined
+    /// to existing pixels.
+    #[must_use]
+    pub const fn alpha_lock_active(&self) -> bool {
+        self.alpha_locked && self.can_alpha_lock()
     }
 
     /// The effect stack of this layer, if it is an adjustment layer.

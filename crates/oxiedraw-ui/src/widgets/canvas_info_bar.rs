@@ -25,6 +25,13 @@ const DIAL_BOX: i32 = 18;
 /// Extra width (px) for the "X.XX deg" text.
 const TEXT_W: i32 = 76;
 
+/// Reserved slot for the alpha-lock chip, immediately left of the rotator. The
+/// slot is allocated whether or not the chip is lit, so nothing in the bar moves
+/// when it appears - a widget that resized here would queue a relayout and
+/// cancel an in-flight stylus grab.
+const CHIP_W: i32 = 104;
+const CHIP_H: i32 = 22;
+
 #[derive(Clone)]
 pub(crate) struct CanvasInfoBar {
     root: gtk::Box,
@@ -32,6 +39,10 @@ pub(crate) struct CanvasInfoBar {
     rotator: gtk::DrawingArea,
     /// Current rotation (radians) mirrored for the rotator's draw function.
     angle: Rc<Cell<f32>>,
+    /// Alpha-lock chip: lit when the active layer is locked. Drawn, not a
+    /// widget swap, for the same reason the rotation readout is.
+    lock_chip: gtk::DrawingArea,
+    alpha_locked: Rc<Cell<bool>>,
 }
 
 impl CanvasInfoBar {
@@ -68,8 +79,24 @@ impl CanvasInfoBar {
 
         install_dial_gestures(&rotator, &on_rotate);
 
+        let alpha_locked = Rc::new(Cell::new(false));
+        let lock_chip = gtk::DrawingArea::builder()
+            .content_width(CHIP_W)
+            .content_height(CHIP_H)
+            .valign(gtk::Align::Center)
+            .build();
+        {
+            let alpha_locked = Rc::clone(&alpha_locked);
+            lock_chip.set_draw_func(move |area, cr, w, h| {
+                if alpha_locked.get() {
+                    draw_lock_chip(area, cr, w, h);
+                }
+            });
+        }
+
         root.append(&size_label);
         root.append(&spacer);
+        root.append(&lock_chip);
         root.append(&rotator);
 
         Self {
@@ -77,7 +104,19 @@ impl CanvasInfoBar {
             size_label,
             rotator,
             angle,
+            lock_chip,
+            alpha_locked,
         }
+    }
+
+    /// Light or clear the alpha-lock chip. Called whenever the active layer or
+    /// its lock state changes. Only redraws on an actual change.
+    pub(crate) fn set_alpha_locked(&self, locked: bool) {
+        if self.alpha_locked.get() == locked {
+            return;
+        }
+        self.alpha_locked.set(locked);
+        self.lock_chip.queue_draw();
     }
 
     pub(crate) fn widget(&self) -> gtk::Widget {
@@ -208,6 +247,43 @@ fn draw_rotator(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, _w: i32, h: i
     let ty = cy + cr.text_extents(&text).map_or(4.0, |e| e.height() / 2.0);
     cr.move_to(f64::from(h) + 4.0, ty);
     cr.show_text(&text).ok();
+}
+
+/// The "Alpha locked" pill: padlock plus label on a warning-tinted ground.
+/// Alpha lock has no effect on the rendered image, so without a reminder here a
+/// user who forgot it is on paints into empty space, sees nothing happen, and
+/// concludes the app is broken.
+fn draw_lock_chip(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32) {
+    let (w, h) = (f64::from(w), f64::from(h));
+    let fg = area.color();
+    let (fr, fg_, fb) = (f64::from(fg.red()), f64::from(fg.green()), f64::from(fg.blue()));
+
+    // Ground: a warm wash that reads as a caution without shouting.
+    let r = h / 2.0;
+    cr.new_sub_path();
+    cr.arc(w - r, r, r, -std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
+    cr.arc(r, r, r, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
+    cr.close_path();
+    cr.set_source_rgba(0.9, 0.68, 0.16, 0.26);
+    cr.fill().ok();
+
+    // Padlock: shackle arc over a rounded body.
+    let cx = 12.0;
+    let cy = h / 2.0;
+    cr.set_source_rgba(fr, fg_, fb, 0.85);
+    cr.set_line_width(1.3);
+    cr.new_path();
+    cr.arc(cx, cy - 1.6, 2.6, std::f64::consts::PI, std::f64::consts::TAU);
+    cr.stroke().ok();
+    cr.rectangle(cx - 3.8, cy - 0.8, 7.6, 5.4);
+    cr.fill().ok();
+
+    cr.set_font_size(11.0);
+    cr.set_source_rgba(fr, fg_, fb, 0.9);
+    let text = "Alpha locked";
+    let ty = cy + cr.text_extents(text).map_or(4.0, |e| e.height() / 2.0);
+    cr.move_to(cx + 9.0, ty);
+    cr.show_text(text).ok();
 }
 
 /// Normalise degrees to `(-180, 180]` for a tidy readout.

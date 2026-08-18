@@ -22,10 +22,40 @@ use crate::toaster::{PendingToast, Toaster};
 
 use super::{
     GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
-    find_group_position, group_leaf_ids, group_nodes, insert_at_in_group, item_at, mirror_tree,
+    find_group_position, group_leaf_ids, group_nodes, insert_at_in_group, mirror_tree, RowLayout,
     new_group_id, record_tree_edit, sync_canvas_order, sync_height, take_node, tree_to_core,
     ungroup_node,
 };
+
+/// `(layer id, flat index)` for every selected layer, in canvas order. Both
+/// per-layer toggles apply to the whole selection.
+fn selected_layer_targets(ui: &Ui) -> Vec<(String, usize)> {
+    let ids = ui.selected_layer_ids_in_order();
+    let snapshot = ui.state.snapshot();
+    ids.into_iter()
+        .filter_map(|id| {
+            snapshot
+                .iter()
+                .position(|l| l.id == id)
+                .map(|idx| (id, idx))
+        })
+        .collect()
+}
+
+/// Record a multi-layer toggle as exactly one undo step. A single change is
+/// recorded on its own so the undo label names the real action rather than a
+/// batch of one.
+fn record_one_step(history: &Rc<RefCell<HistoryStack>>, mut steps: Vec<HistoryAction>) {
+    let action = match steps.len() {
+        0 => return,
+        1 => steps.pop().expect("length checked"),
+        _ => HistoryAction::Batch {
+            label: steps[0].label().to_string(),
+            actions: steps,
+        },
+    };
+    history.borrow_mut().record(action);
+}
 
 pub(super) fn install_layer_actions(
     area: &gtk::DrawingArea,
@@ -60,7 +90,16 @@ pub(super) fn install_layer_actions(
             let result = canvas.borrow_mut().duplicate_layer(idx);
             match result {
                 Ok(new_idx) => {
-                    let (new_id, new_name, new_kind, new_blend, new_opacity, new_pixels) = {
+                    let (
+                        new_id,
+                        new_name,
+                        new_kind,
+                        new_blend,
+                        new_opacity,
+                        new_pixels,
+                        new_clipped,
+                        new_locked,
+                    ) = {
                         let mut c = canvas.borrow_mut();
                         let snap = c.layers().snapshot();
                         let id = snap.get(new_idx).map(|l| l.id.clone()).unwrap_or_default();
@@ -71,8 +110,10 @@ pub(super) fn install_layer_actions(
                             |l| l.blend,
                         );
                         let opacity = snap.get(new_idx).map_or(1.0, |l| l.opacity);
+                        let clipped = snap.get(new_idx).is_some_and(|l| l.clipped);
+                        let locked = snap.get(new_idx).is_some_and(|l| l.alpha_locked);
                         let pixels = c.read_layer(new_idx).unwrap_or_default();
-                        (id, name, kind, blend, opacity, pixels)
+                        (id, name, kind, blend, opacity, pixels, clipped, locked)
                     };
                     tracing::info!(
                         target: "oxiedraw::layers",
@@ -90,6 +131,8 @@ pub(super) fn install_layer_actions(
                         blend: new_blend,
                         opacity: new_opacity,
                         pixels: new_pixels,
+                        clipped: new_clipped,
+                        alpha_locked: new_locked,
                     });
                     sync_height(&area, &ui);
                     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
@@ -100,6 +143,95 @@ pub(super) fn install_layer_actions(
                 Err(RendererError::LayerLimit) => toaster.layer_limit_reached(),
                 Err(e) => tracing::error!(error = %e, "layer-duplicate failed"),
             }
+        });
+        app.add_action(&action);
+    }
+
+    // --- Clip to layer below ---
+    {
+        let ui = ui.clone();
+        let area = area.clone();
+        let canvas = Rc::clone(canvas);
+        let redraw = redraw.clone();
+        let history = Rc::clone(history);
+        let action = gio::SimpleAction::new("layer-clip", None);
+        action.connect_activate(move |_, _| {
+            let targets = selected_layer_targets(&ui);
+            if targets.is_empty() {
+                return;
+            }
+            // Mixed selection follows the first row: if it is unclipped the
+            // whole selection clips, and vice versa.
+            let turn_on = !canvas
+                .borrow()
+                .layers()
+                .clipped(targets[0].1)
+                .unwrap_or(false);
+            let mut steps = Vec::new();
+            for (id, idx) in &targets {
+                let old = canvas.borrow().layers().clipped(*idx).unwrap_or(false);
+                if old == turn_on {
+                    continue;
+                }
+                if let Err(e) = canvas.borrow_mut().set_layer_clipped(*idx, turn_on) {
+                    tracing::error!(error = %e, "layer-clip failed");
+                    continue;
+                }
+                steps.push(HistoryAction::LayerClip {
+                    id: id.clone(),
+                    old,
+                    new: turn_on,
+                });
+            }
+            record_one_step(&history, steps);
+            ui.sync_blend_controls();
+            area.queue_draw();
+            redraw.request();
+        });
+        app.add_action(&action);
+    }
+
+    // --- Lock alpha ---
+    {
+        let ui = ui.clone();
+        let area = area.clone();
+        let canvas = Rc::clone(canvas);
+        let redraw = redraw.clone();
+        let history = Rc::clone(history);
+        let action = gio::SimpleAction::new("layer-alpha-lock", None);
+        action.connect_activate(move |_, _| {
+            let targets: Vec<_> = selected_layer_targets(&ui)
+                .into_iter()
+                .filter(|(_, idx)| {
+                    canvas
+                        .borrow()
+                        .layers()
+                        .snapshot()
+                        .get(*idx)
+                        .is_some_and(oxiedraw_core::document::Layer::can_alpha_lock)
+                })
+                .collect();
+            if targets.is_empty() {
+                return;
+            }
+            let turn_on = !canvas.borrow().layer_alpha_locked(targets[0].1);
+            let mut steps = Vec::new();
+            for (id, idx) in &targets {
+                let old = canvas.borrow().layer_alpha_locked(*idx);
+                if old == turn_on {
+                    continue;
+                }
+                canvas.borrow_mut().set_layer_alpha_locked(*idx, turn_on);
+                steps.push(HistoryAction::LayerAlphaLock {
+                    id: id.clone(),
+                    old,
+                    new: turn_on,
+                });
+            }
+            record_one_step(&history, steps);
+            ui.sync_blend_controls();
+            area.queue_draw();
+            redraw.request();
         });
         app.add_action(&action);
     }
@@ -136,22 +268,40 @@ pub(super) fn install_layer_actions(
                     let kind = layer.kind.clone();
                     let blend = layer.blend;
                     let opacity = layer.opacity;
-                    c.read_layer(idx)
-                        .ok()
-                        .map(|pixels| (id, name, visible, kind, blend, opacity, pixels))
+                    let clipped = layer.clipped;
+                    let alpha_locked = layer.alpha_locked;
+                    c.read_layer(idx).ok().map(|pixels| {
+                        (id, name, visible, kind, blend, opacity, pixels, clipped, alpha_locked)
+                    })
                 })
             };
+            // The panel's folder tree drops the leaf as part of the delete, and
+            // nothing else records that. Without it undo puts the layer back in
+            // the stack but not in its group, and the panel re-adopts it at the
+            // root - taking any clip relationship with it.
+            let tree_before = tree_to_core(&ui.tree.borrow());
             let result = canvas.borrow_mut().remove_layer(idx);
             match result {
                 Ok(()) => {
-                    if let Some((id, name, visible, kind, blend, opacity, pixels)) = pre {
+                    if let Some((
+                        id,
+                        name,
+                        visible,
+                        kind,
+                        blend,
+                        opacity,
+                        pixels,
+                        clipped,
+                        alpha_locked,
+                    )) = pre
+                    {
                         tracing::info!(
                             target: "oxiedraw::layers",
                             name = %name,
                             idx,
                             "layer deleted"
                         );
-                        history.borrow_mut().record(HistoryAction::LayerRemove {
+                        let removal = HistoryAction::LayerRemove {
                             idx,
                             id,
                             name,
@@ -160,7 +310,26 @@ pub(super) fn install_layer_actions(
                             blend,
                             opacity,
                             pixels,
-                        });
+                            clipped,
+                            alpha_locked,
+                        };
+                        // Reconcile first so `tree_after` reflects the drop.
+                        sync_height(&area, &ui);
+                        let tree_after = tree_to_core(&ui.tree.borrow());
+                        if tree_after == tree_before {
+                            history.borrow_mut().record(removal);
+                        } else {
+                            history.borrow_mut().record(HistoryAction::Batch {
+                                label: "Delete layer".to_string(),
+                                actions: vec![
+                                    removal,
+                                    HistoryAction::LayerTreeEdit {
+                                        before: tree_before,
+                                        after: tree_after,
+                                    },
+                                ],
+                            });
+                        }
                     }
                     sync_height(&area, &ui);
                     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
@@ -346,6 +515,8 @@ pub(super) fn install_layer_actions(
                     continue;
                 }
                 if let Some((id, name, visible, kind, blend, opacity, pixels)) = captured {
+                    // Removals run highest-index-first, so the pre-removal
+                    // snapshot still indexes each layer correctly.
                     removals.push(HistoryAction::LayerRemove {
                         idx,
                         id,
@@ -355,6 +526,8 @@ pub(super) fn install_layer_actions(
                         blend,
                         opacity,
                         pixels,
+                        clipped: snap.get(idx).is_some_and(|l| l.clipped),
+                        alpha_locked: snap.get(idx).is_some_and(|l| l.alpha_locked),
                     });
                 }
             }
@@ -921,7 +1094,7 @@ pub(super) fn refresh_action_sensitivity(ui: &Ui) {
     let has_active = ui.state.active().is_some();
     let has_active_group = ui.active_group.borrow().is_some();
     let selected_count = ui.selected_layer_ids_in_order().len();
-    for name in &["layer-duplicate", "layer-delete"] {
+    for name in &["layer-duplicate", "layer-delete", "layer-clip", "layer-alpha-lock"] {
         if let Some(a) = app.lookup_action(name)
             && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
                 sa.set_enabled(has_active);
@@ -952,19 +1125,49 @@ pub(super) fn install_context_menu(
     ui: &Ui,
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
 ) {
-    let layer_menu = gio::Menu::new();
-    layer_menu.append(Some("Rename Layer"), Some("app.rename"));
-    layer_menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
-    layer_menu.append(Some("Copy Layer"), Some("app.copy"));
-    layer_menu.append(Some("Delete Layer"), Some("app.layer-delete"));
+    // The clip entry names the action it performs rather than carrying a check
+    // mark, because the result is visible on the canvas either way. Two menus
+    // per layer kind, swapped on the clipped state of the clicked row.
+    let build_layer_menu = |clipped: bool, locked: bool| {
+        let menu = gio::Menu::new();
+        menu.append(
+            Some(if clipped {
+                "Release Clipping Mask"
+            } else {
+                "Clip to Layer Below"
+            }),
+            Some("app.layer-clip"),
+        );
+        menu.append(
+            Some(if locked { "Unlock Alpha" } else { "Lock Alpha" }),
+            Some("app.layer-alpha-lock"),
+        );
+        menu.append(Some("Rename Layer"), Some("app.rename"));
+        menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
+        menu.append(Some("Copy Layer"), Some("app.copy"));
+        menu.append(Some("Delete Layer"), Some("app.layer-delete"));
+        menu
+    };
 
     // Same as a regular layer, plus the entry that re-opens the effect editor.
-    let adjustment_menu = gio::Menu::new();
-    adjustment_menu.append(Some("Edit Adjustment"), Some("app.layer-add-adjustment"));
-    adjustment_menu.append(Some("Rename Layer"), Some("app.rename"));
-    adjustment_menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
-    adjustment_menu.append(Some("Copy Layer"), Some("app.copy"));
-    adjustment_menu.append(Some("Delete Layer"), Some("app.layer-delete"));
+    // An adjustment slot holds an opaque mask, so it has no alpha to lock.
+    let build_adjustment_menu = |clipped: bool| {
+        let menu = gio::Menu::new();
+        menu.append(Some("Edit Adjustment"), Some("app.layer-add-adjustment"));
+        menu.append(
+            Some(if clipped {
+                "Release Clipping Mask"
+            } else {
+                "Clip to Layer Below"
+            }),
+            Some("app.layer-clip"),
+        );
+        menu.append(Some("Rename Layer"), Some("app.rename"));
+        menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
+        menu.append(Some("Copy Layer"), Some("app.copy"));
+        menu.append(Some("Delete Layer"), Some("app.layer-delete"));
+        menu
+    };
 
     let group_menu = gio::Menu::new();
     group_menu.append(Some("Rename Group"), Some("app.rename"));
@@ -983,8 +1186,6 @@ pub(super) fn install_context_menu(
         let area_w = area.clone();
         let popover = Rc::clone(&popover);
         let layer_clipboard = Rc::clone(layer_clipboard);
-        let layer_menu = layer_menu.clone();
-        let adjustment_menu = adjustment_menu.clone();
         let group_menu = group_menu.clone();
         click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -992,20 +1193,21 @@ pub(super) fn install_context_menu(
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
             // Row hit-testing is in content space; the pointer Y is viewport.
-            let Some(row_idx) = item_at(y + ui.vadj.value(), rows.len()) else { return };
+            let Some(row_idx) = RowLayout::new(&rows).at(y + ui.vadj.value()) else { return };
             let row = &rows[row_idx];
 
             // Make the clicked row the sole selection so menu actions target it.
             ui.multi_selected.borrow_mut().clear();
             match &row.kind {
-                RowKind::Layer { flat_idx, .. } => {
+                RowKind::Layer { flat_idx, clipped, alpha_locked, .. } => {
                     ui.state.select_index(*flat_idx);
                     *ui.active_group.borrow_mut() = None;
-                    if super::row_is_adjustment(&ui, row) {
-                        popover.set_menu_model(Some(&adjustment_menu));
+                    let menu = if super::row_is_adjustment(&ui, row) {
+                        build_adjustment_menu(*clipped)
                     } else {
-                        popover.set_menu_model(Some(&layer_menu));
-                    }
+                        build_layer_menu(*clipped, *alpha_locked)
+                    };
+                    popover.set_menu_model(Some(&menu));
                 }
                 RowKind::Group { id, .. } => {
                     *ui.active_group.borrow_mut() = Some(id.clone());

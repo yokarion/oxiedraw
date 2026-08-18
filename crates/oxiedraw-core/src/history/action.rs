@@ -128,6 +128,12 @@ pub enum HistoryAction {
         #[serde(default = "crate::serde_defaults::default_opacity")]
         opacity: f32,
         pixels: Vec<u8>,
+        /// Clipping mask / alpha lock at removal time, so undo brings the layer
+        /// back exactly as it was. Absent in older histories (both off).
+        #[serde(default)]
+        clipped: bool,
+        #[serde(default)]
+        alpha_locked: bool,
     },
     /// Layer moved from `from` to `to` in the z-order.
     LayerReorder { from: usize, to: usize },
@@ -139,6 +145,11 @@ pub enum HistoryAction {
     },
     /// Layer visibility toggled.
     LayerVisibility { id: String, old: bool, new: bool },
+    /// Clipping mask toggled on a layer. One entry per layer, so a multi-row
+    /// toggle batches several of these into a single undo step.
+    LayerClip { id: String, old: bool, new: bool },
+    /// Alpha lock toggled on a layer.
+    LayerAlphaLock { id: String, old: bool, new: bool },
     /// Layer blend mode and/or opacity changed (keyed by layer id so it is
     /// stable across reorders). Both old and new carry the full pair so a
     /// dropdown-only or slider-only change round-trips exactly.
@@ -191,6 +202,12 @@ pub enum HistoryAction {
         #[serde(default = "crate::serde_defaults::default_opacity")]
         opacity: f32,
         pixels: Vec<u8>,
+        /// The duplicate inherits the source's clip / lock flags, so redo has
+        /// to as well. Absent in older histories (both off).
+        #[serde(default)]
+        clipped: bool,
+        #[serde(default)]
+        alpha_locked: bool,
     },
     /// Several layers merged into one. `folded` describes each removed
     /// layer (in original z-order) so undo can re-create them.
@@ -301,6 +318,12 @@ pub struct CropLayer {
     pub blend: BlendMode,
     #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
+    /// Clipping mask / alpha lock at snapshot time. Absent in histories
+    /// written before these existed (both off).
+    #[serde(default)]
+    pub clipped: bool,
+    #[serde(default)]
+    pub alpha_locked: bool,
 }
 
 const fn default_blend() -> BlendMode {
@@ -366,6 +389,14 @@ impl HistoryAction {
             Self::LayerReorder { .. } => "Reorder layer",
             Self::LayerRename { .. } => "Rename layer",
             Self::LayerVisibility { .. } => "Toggle layer visibility",
+            Self::LayerClip { new, .. } => {
+                if *new {
+                    "Clip to layer below"
+                } else {
+                    "Release clipping mask"
+                }
+            }
+            Self::LayerAlphaLock { .. } => "Lock alpha",
             Self::LayerBlend { .. } => "Change layer blend",
             Self::EffectEdit { .. } => "Edit adjustment effects",
             Self::LayerDuplicate { .. } => "Duplicate layer",

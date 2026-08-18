@@ -48,6 +48,38 @@ const HANDLE_WIDTH: f64 = 18.0;
 const HANDLE_LINE_THICKNESS: f64 = 1.5;
 const HANDLE_LINE_GAP: f64 = 4.0;
 
+// Nesting is drawn as a container: a folder or an adjustment layer is filled in
+// together with everything it covers, so the shade itself says "this holds
+// that" and no connector lines are needed. Each level costs `NEST_PAD` of
+// horizontal room on both sides.
+// The same padding on all four sides. Vertically that means the row pitch is
+// not uniform - opening or closing a container adds space - which is why
+// positions come from `RowLayout` rather than a constant slot height.
+const NEST_PAD: f64 = 6.0;
+const NEST_INSET: f64 = NEST_PAD;
+const NEST_RADIUS: f64 = 10.0;
+
+// Drop shadow under whatever is being dragged, faked by stacking rounded rects.
+const SHADOW_STEPS: usize = 8;
+const SHADOW_SPREAD: f64 = 9.0;
+const SHADOW_OFFSET_Y: f64 = 2.0;
+const SHADOW_STEP_ALPHA: f64 = 0.05;
+
+// The clip rod sits near the left of its own 10px gutter column, so the hook
+// that turns into the base row has room to read.
+const CONNECTOR_INSET: f64 = 3.0;
+const CONNECTOR_WIDTH: f64 = 1.5;
+const CONNECTOR_R: f64 = 3.0;
+
+// Clip gutter: a clipped row is indented one step past its siblings and the
+// freed column carries the rod down into the base it clips to.
+const CLIP_GUTTER_W: f64 = 20.0; // hit zone width: the gutter plus its indent step
+
+// Alpha lock reads as a badge knocked out of the thumbnail's bottom-right
+// corner: the state belongs to the pixels, and the swatch is the pixels.
+const LOCK_RING_D: f64 = 13.0;
+const LOCK_DISC_D: f64 = 10.5;
+
 const EYE_RADIUS: f64 = 9.0;   // half the hit-box width/height
 const EDIT_RADIUS: f64 = 8.0;  // adjustment "edit settings" sliders, sits left of the eye
 const MASK_RADIUS: f64 = 8.0;  // adjustment "show mask" toggle, sits left of the sliders
@@ -72,6 +104,7 @@ const SCROLL_THUMB_MIN: f64 = 24.0;
 // --- Color types and fallbacks ---
 type Rgb = (f64, f64, f64);
 
+const FALLBACK_WINDOW_BG: Rgb = (0.92, 0.92, 0.92);
 const FALLBACK_ROW_BG: Rgb = (0.96, 0.96, 0.96);
 const FALLBACK_ACCENT_BG: Rgb = (0.21, 0.52, 0.89);
 const FALLBACK_ACCENT_FG: Rgb = (1.0, 1.0, 1.0);
@@ -133,6 +166,8 @@ pub(super) enum RowKind {
         name: String,
         visible: bool,
         flat_idx: usize,
+        clipped: bool,
+        alpha_locked: bool,
     },
     Group {
         id: String,
@@ -162,6 +197,7 @@ pub(super) enum HitZone {
     Eye,
     Edit,    // adjustment layers only: the "edit settings" sliders left of the eye
     Mask,    // adjustment layers only: the "show mask" toggle left of the sliders
+    Clip,    // clipped layers only: the gutter elbow; click releases the clip
     Chevron, // groups only
     Folder,  // groups only: the folder icon; selects the folder's contents
     Swatch,  // layers only
@@ -472,6 +508,8 @@ fn collect_rows(
                             name: layer.name.clone(),
                             visible: layer.visible,
                             flat_idx,
+                            clipped: layer.clipped,
+                            alpha_locked: layer.alpha_lock_active(),
                         },
                         depth,
                         adjust_indent: indent_here,
@@ -501,6 +539,160 @@ fn collect_rows(
                 }
             }
         }
+    }
+}
+
+/// Visual nesting depth of a row: real folder depth plus the extra step an
+/// adjustment layer opens over the rows it covers. Both are the same
+/// relationship - "these rows live under that one" - so both get boxed the same
+/// way. The clip indent is deliberately excluded: a clipped layer is still a
+/// sibling of its base, it just borrows a gutter to draw its rod in.
+fn tree_depth(row: &VisibleRow) -> usize {
+    row.depth + row.adjust_indent
+}
+
+/// The rows a container row encloses: everything after it, up to the first row
+/// that is not nested inside it. Empty when it holds nothing visible - a
+/// collapsed or empty folder, or an adjustment with nothing beneath it - in
+/// which case no box is drawn.
+fn contained_rows(rows: &[VisibleRow], i: usize) -> usize {
+    let depth = tree_depth(&rows[i]);
+    rows.iter()
+        .skip(i + 1)
+        .take_while(|r| tree_depth(r) > depth)
+        .count()
+}
+
+/// `true` when this row opens a container. A folder always does, collapsed or
+/// not - it is a container whether or not you can currently see inside it, and
+/// having it change shape on expand would make the list jump. An adjustment
+/// layer only does when it actually covers something.
+fn opens_box(rows: &[VisibleRow], i: usize) -> bool {
+    matches!(rows[i].kind, RowKind::Group { .. }) || contained_rows(rows, i) > 0
+}
+
+/// How many boxes a row sits inside. A container row counts its own, so it
+/// lines up with the contents it encloses - the box is what shows the nesting,
+/// not a difference in indent.
+pub(super) fn box_depth(rows: &[VisibleRow], i: usize) -> usize {
+    tree_depth(&rows[i]) + usize::from(opens_box(rows, i))
+}
+
+/// Left edge of the content at nesting level `level`.
+fn nest_left(level: usize) -> f64 {
+    nest_left_f(count_f64(level))
+}
+
+/// As [`nest_left`] but at a fractional level, for a row easing between depths
+/// mid-drag.
+fn nest_left_f(level: f64) -> f64 {
+    LIST_PADDING + level * NEST_INSET
+}
+
+/// Bottom edge of the container opened at `i`, including its own padding.
+///
+/// Several containers can end on the same row - a folder whose last child is a
+/// folder - and each still owes a full pad, so their edges have to nest rather
+/// than land on top of each other.
+fn container_bottom(rows: &[VisibleRow], layout: &RowLayout, i: usize) -> f64 {
+    let last = i + contained_rows(rows, i);
+    let depth = tree_depth(&rows[i]);
+    let inside = (0..rows.len())
+        .filter(|&j| j != i && opens_box(rows, j))
+        .filter(|&j| j + contained_rows(rows, j) == last && tree_depth(&rows[j]) > depth)
+        .count();
+    layout.bottom(last) + NEST_PAD * count_f64(inside + 1)
+}
+
+/// Right edge of every row and container, whatever their nesting.
+///
+/// Nesting only insets the left, so the eye / drag-handle rail keeps one x for
+/// the whole list: a layer's controls must not shift just because it was moved
+/// into a folder.
+fn nest_right(width: f64) -> f64 {
+    (width - LIST_PADDING_RIGHT).max(LIST_PADDING)
+}
+
+/// Everything the clip gutter needs to draw one row, derived from its
+/// neighbours. Rows are in display order (index 0 is the topmost), so the layer
+/// a clipped row binds to is the next *following* sibling that is not itself
+/// clipped - the one drawn directly beneath it.
+#[derive(Clone, Copy, Default)]
+pub(super) struct ClipInfo {
+    pub(super) clipped: bool,
+    /// The row directly above is clipped too, so the bracket continues upward.
+    pub(super) clipped_above: bool,
+    /// The row directly below is clipped too, so this row is not the one that
+    /// turns the corner into the base.
+    pub(super) clipped_below: bool,
+    /// A base resolved. `false` draws the bracket without its corner: the flag
+    /// is kept but inactive.
+    pub(super) has_base: bool,
+    /// The resolved base is hidden, so this row does not render either.
+    pub(super) base_hidden: bool,
+    /// Some row above clips to this one.
+    pub(super) is_base: bool,
+}
+
+// Two rows are clip neighbours only inside one sibling list: same parent and
+// same tree depth. Rows at a different depth belong to a folder in between.
+fn same_sibling_list(a: &VisibleRow, b: &VisibleRow) -> bool {
+    a.depth == b.depth && a.parent_id == b.parent_id
+}
+
+fn row_clipped(row: &VisibleRow) -> bool {
+    matches!(row.kind, RowKind::Layer { clipped: true, .. })
+}
+
+pub(super) fn clip_info(rows: &[VisibleRow], i: usize) -> ClipInfo {
+    let row = &rows[i];
+    if !matches!(row.kind, RowKind::Layer { .. }) {
+        // Folders neither clip nor serve as a base: there is no single slot
+        // whose alpha could be the mask.
+        return ClipInfo::default();
+    }
+    let clipped = row_clipped(row);
+
+    // The row directly above is what clips onto this one: its downward scan
+    // for a base stops at the first unclipped row, which is this one.
+    let clipped_above = i
+        .checked_sub(1)
+        .is_some_and(|a| same_sibling_list(row, &rows[a]) && row_clipped(&rows[a]));
+
+    if !clipped {
+        return ClipInfo {
+            is_base: clipped_above,
+            ..ClipInfo::default()
+        };
+    }
+    let clipped_below = rows
+        .get(i + 1)
+        .is_some_and(|b| same_sibling_list(row, b) && row_clipped(b));
+
+    // Resolve the base by scanning down for the first unclipped sibling.
+    let mut has_base = false;
+    let mut base_hidden = false;
+    for below in rows.iter().skip(i + 1) {
+        if !same_sibling_list(row, below) {
+            break;
+        }
+        if row_clipped(below) {
+            continue;
+        }
+        if let RowKind::Layer { visible, .. } = below.kind {
+            has_base = true;
+            base_hidden = !visible;
+        }
+        break;
+    }
+
+    ClipInfo {
+        clipped: true,
+        clipped_above,
+        clipped_below,
+        has_base,
+        base_hidden,
+        is_base: false,
     }
 }
 
@@ -1293,6 +1485,10 @@ pub(crate) fn build(
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
+    // Filled by the session with the canvas info bar's chip setter. Called
+    // whenever the selection or its lock state changes, which is the same
+    // moment the blend strip re-syncs.
+    alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Box,
     Rc<dyn Fn()>,
@@ -1344,6 +1540,7 @@ pub(crate) fn build(
             on_edit_component,
             prepare_delete,
             prepare_reorder,
+            alpha_lock_observer,
         );
     let (components_page, refresh_components, component_begin_rename) = super::components::build(
         Rc::clone(components),
@@ -1490,6 +1687,7 @@ fn build_layers_page(
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
+    alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Box,
     Rc<dyn Fn()>,
@@ -1562,7 +1760,13 @@ fn build_layers_page(
     start_thumbnail_refresh(&ui, Rc::clone(canvas), area.clone());
 
     page.append(&build_layers_header(&ui, &area, canvas, redraw, toaster, history));
-    page.append(&build_blend_controls(&ui, canvas, redraw, history));
+    page.append(&build_blend_controls(
+        &ui,
+        canvas,
+        redraw,
+        history,
+        alpha_lock_observer,
+    ));
 
     // List body: the drawing area plus our own vertical scrollbar. We manage the
     // scroll offset ourselves (via `ui.vadj`) instead of a GtkScrolledWindow so
@@ -1813,6 +2017,7 @@ fn build_blend_controls(
     canvas: &Rc<RefCell<Canvas>>,
     redraw: &RedrawHandle,
     history: &Rc<RefCell<HistoryStack>>,
+    alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> gtk::Box {
     let controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1823,6 +2028,26 @@ fn build_blend_controls(
     let mode_dropdown = gtk::DropDown::from_strings(&labels);
     mode_dropdown.set_hexpand(true);
     mode_dropdown.set_tooltip_text(Some("Blend mode of the selected layers"));
+
+    // Alpha lock lives with the other per-layer properties. It is the feature's
+    // discoverable home - the row badge is only a readout - and it keeps its
+    // 34x34 footprint in every state so the strip never reflows.
+    let lock_btn = gtk::ToggleButton::builder()
+        .icon_name("oxiedraw-alpha-lock-symbolic")
+        .tooltip_text("Lock alpha - paint only where this layer already has pixels")
+        .css_classes(["flat"])
+        .width_request(34)
+        .height_request(34)
+        .build();
+
+    load_lock_toggle_css();
+
+    let mode_row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(TAB_SPACING)
+        .build();
+    mode_row.append(&mode_dropdown);
+    mode_row.append(&lock_btn);
 
     let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
     opacity.set_hexpand(true);
@@ -1844,7 +2069,7 @@ fn build_blend_controls(
     opacity_row.append(&opacity);
     opacity_row.append(&opacity_label);
 
-    controls.append(&mode_dropdown);
+    controls.append(&mode_row);
     controls.append(&opacity_row);
 
     // True while the sync callback is writing the widgets, so their change
@@ -1896,6 +2121,8 @@ fn build_blend_controls(
         let mode_dropdown = mode_dropdown.clone();
         let opacity = opacity.clone();
         let opacity_label = opacity_label.clone();
+        let lock_btn = lock_btn.clone();
+        let alpha_lock_observer = Rc::clone(alpha_lock_observer);
         let commit_opacity = Rc::clone(&commit_opacity);
         let commit_source = Rc::clone(&commit_source);
         Rc::new(move || {
@@ -1916,14 +2143,63 @@ fn build_blend_controls(
             let (blend, op) = primary
                 .and_then(|i| ui.state.blend(i))
                 .unwrap_or((BlendMode::Normal, 1.0));
+            // Alpha lock: on when the whole selection is locked, mixed when
+            // only part of it is, insensitive when nothing in the selection can
+            // carry the flag (an adjustment slot holds an opaque mask).
+            let snapshot = ui.state.snapshot();
+            let lockable: Vec<_> = indices
+                .iter()
+                .filter_map(|i| snapshot.get(*i))
+                .filter(|l| l.can_alpha_lock())
+                .collect();
+            let locked_count = lockable.iter().filter(|l| l.alpha_locked).count();
+            let all_locked = !lockable.is_empty() && locked_count == lockable.len();
+            let mixed = locked_count > 0 && !all_locked;
+            lock_btn.set_sensitive(!lockable.is_empty());
+            if mixed {
+                lock_btn.add_css_class("mixed");
+            } else {
+                lock_btn.remove_css_class("mixed");
+            }
+
             guard.set(true);
             mode_dropdown.set_selected(blend.to_index());
             opacity.set_value(f64::from(op));
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             opacity_label.set_label(&format!("{}%", (op * 100.0).round() as i32));
+            lock_btn.set_active(all_locked);
             guard.set(false);
+
+            // The canvas chip tracks the active layer alone: it answers "can I
+            // paint here right now", not "what is selected".
+            let active_locked = ui
+                .state
+                .active()
+                .and_then(|i| snapshot.get(i))
+                .is_some_and(oxiedraw_core::document::Layer::alpha_lock_active);
+            let observer = alpha_lock_observer.borrow().clone();
+            if let Some(observer) = observer {
+                observer(active_locked);
+            }
         })
     };
+    // Routed through the action rather than an action_name binding, so the
+    // toggle's own state stays driven by `sync` and a click cannot both flip
+    // the button and run the action twice.
+    {
+        let guard = Rc::clone(&guard);
+        lock_btn.connect_toggled(move |_| {
+            if guard.get() {
+                return;
+            }
+            if let Some(gio_app) = gio::Application::default()
+                && let Ok(app) = gio_app.downcast::<gtk::Application>()
+            {
+                app.activate_action("layer-alpha-lock", None);
+            }
+        });
+    }
+
     sync();
     *ui.blend_sync.borrow_mut() = Some(Rc::clone(&sync));
 
@@ -2061,15 +2337,88 @@ const fn count_f64(n: usize) -> f64 {
     n as f64
 }
 
-const fn slot_top(index: usize) -> f64 {
-    count_f64(index).mul_add(SLOT_HEIGHT, LIST_PADDING)
+/// Vertical placement of every visible row.
+///
+/// The pitch is not uniform: a container's padding has to come from somewhere,
+/// and the 4px inter-row gap is not enough, so opening or closing one adds
+/// `NEST_PAD` of space. Everything that positions or hit-tests a row goes
+/// through this, so drawing and input can never disagree about where a row is.
+pub(super) struct RowLayout {
+    tops: Vec<f64>,
+    total: f64,
 }
 
-/// Total content height in pixels for `count` visible rows.
-fn list_content_height(count: usize) -> f64 {
-    let body =
-        count_f64(count).mul_add(ITEM_HEIGHT, count_f64(count.saturating_sub(1)) * ITEM_GAP);
-    LIST_PADDING.mul_add(2.0, body)
+impl RowLayout {
+    pub(super) fn new(rows: &[VisibleRow]) -> Self {
+        let mut opening = vec![0.0; rows.len()];
+        let mut closing_pad = vec![0.0; rows.len()];
+        for i in 0..rows.len() {
+            if opens_box(rows, i) {
+                opening[i] += NEST_PAD;
+                // Several containers can end on the same row - a nested folder
+                // whose last child is also the outer folder's last child - and
+                // each one owes its own padding.
+                closing_pad[i + contained_rows(rows, i)] += NEST_PAD;
+            }
+        }
+
+        let mut tops = Vec::with_capacity(rows.len());
+        let mut y = LIST_PADDING;
+        for i in 0..rows.len() {
+            if i > 0 {
+                y += ITEM_HEIGHT + ITEM_GAP + closing_pad[i - 1];
+            }
+            y += opening[i];
+            tops.push(y);
+        }
+        let total = tops.last().map_or(LIST_PADDING * 2.0, |last| {
+            last + ITEM_HEIGHT
+                + closing_pad.last().copied().unwrap_or(0.0)
+                + LIST_PADDING
+        });
+        Self { tops, total }
+    }
+
+    pub(super) fn top(&self, index: usize) -> f64 {
+        // Past the end: used for "drop below everything" clamps.
+        self.tops
+            .get(index)
+            .copied()
+            .unwrap_or(self.total - LIST_PADDING)
+    }
+
+    /// Bottom edge of the row's own box, excluding any container padding.
+    fn bottom(&self, index: usize) -> f64 {
+        self.top(index) + ITEM_HEIGHT
+    }
+
+    /// The slot a dragged block whose top is at `top_y` should land in: the row
+    /// whose own top is nearest. A plain divide by the row pitch would drift
+    /// here, because container padding makes that pitch uneven.
+    pub(super) fn slot_nearest(&self, top_y: f64) -> usize {
+        let mut best = 0;
+        let mut best_d = f64::MAX;
+        for (i, &t) in self.tops.iter().enumerate() {
+            let d = (top_y - t).abs();
+            if d < best_d {
+                best_d = d;
+                best = i;
+            }
+        }
+        best
+    }
+
+    pub(super) const fn total_height(&self) -> f64 {
+        self.total
+    }
+
+    /// The row containing `y`, or `None` in the space between rows.
+    pub(super) fn at(&self, y: f64) -> Option<usize> {
+        self.tops
+            .iter()
+            .position(|&t| y >= t && y <= t + ITEM_HEIGHT)
+    }
+
 }
 
 /// Keep the scroll adjustment in sync with the content and viewport size, then
@@ -2077,8 +2426,8 @@ fn list_content_height(count: usize) -> f64 {
 /// page size alone - the draw callback sets it once a real height is known.
 fn update_list_metrics(ui: &Ui, viewport_h: f64) {
     let snapshot = ui.state.snapshot();
-    let count = compute_visible_rows(&ui.tree.borrow(), &snapshot).len();
-    let total = list_content_height(count);
+    let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
+    let total = RowLayout::new(&rows).total_height();
     let adj = &ui.vadj;
     if (adj.upper() - total).abs() > 0.5 {
         adj.set_upper(total);
@@ -2116,12 +2465,20 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         let thumbnails = ui.thumbnails.borrow();
         let width = f64::from(width_px);
 
+        // Paint the window colour ourselves rather than inheriting whatever the
+        // `.sidebar` style class supplies, so the list sits on the app's real
+        // background and the rows' card colour reads against it. Done before the
+        // scroll translate, so it covers the viewport rather than the content.
+        set_source(ctx, palette.window_bg);
+        ctx.paint().ok();
+
         // Manual scroll: translate the whole list up by the scroll offset. The
         // adjustment metrics are maintained by sync_height (content) and the
         // area's resize handler (viewport), never from inside draw.
         ctx.translate(0.0, -ui.scroll_offset());
 
         let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
+        let layout = RowLayout::new(&rows);
         let count = rows.len();
         // No hover highlight mid-drag (rows are sliding around).
         let hover = if drag.is_none() { *ui.hover.borrow() } else { None };
@@ -2137,6 +2494,39 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             }
         });
 
+        // Nesting surfaces go down first so every row sits on top of its own
+        // container. Containers wholly inside the dragged block are skipped
+        // here and drawn with the floating stack instead, so the block keeps
+        // its appearance while it moves.
+        for (row_idx, _) in rows.iter().enumerate() {
+            if !opens_box(&rows, row_idx) {
+                continue;
+            }
+            let held = contained_rows(&rows, row_idx);
+            if drag_handle.is_some_and(|(from, span, _)| {
+                row_idx >= from && row_idx + held < from + span
+            }) {
+                continue;
+            }
+            let level = tree_depth(&rows[row_idx]);
+            // Follow the reorder animation: the first and last rows carry the
+            // container's edges with them.
+            let anim_at = |r: usize| {
+                drag.as_ref()
+                    .filter(|d| d.zone == HitZone::Handle)
+                    .and_then(|d| d.row_y_anim.get(r).copied())
+                    .unwrap_or(0.0)
+            };
+            draw_nest_box(
+                ctx,
+                count_f64(level),
+                width,
+                layout.top(row_idx) - NEST_PAD + anim_at(row_idx),
+                container_bottom(&rows, &layout, row_idx) + anim_at(row_idx + held),
+                palette.surface(level),
+            );
+        }
+
         for (row_idx, row) in rows.iter().enumerate() {
             let is_dragged = drag_handle.is_some_and(|(from, span, _)| {
                 row_idx >= from && row_idx < from + span
@@ -2149,7 +2539,7 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 .filter(|d| d.zone == HitZone::Handle)
                 .and_then(|d| d.row_y_anim.get(row_idx).copied())
                 .unwrap_or(0.0);
-            let y = slot_top(row_idx) + y_offset;
+            let y = layout.top(row_idx) + y_offset;
             let thumb = match &row.kind {
                 RowKind::Layer { flat_idx, .. } => {
                     thumbnails.get(*flat_idx).and_then(|o| o.as_ref())
@@ -2170,26 +2560,75 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             let is_adjustment = row_is_adjustment(&ui, row);
             let mask_active = is_adjustment && row_mask_active(&ui, row);
             let hover_zone = hover.and_then(|(hr, z)| (hr == row_idx).then_some(z));
-            draw_row(ctx, &palette, width, y, row, (row.depth + row.adjust_indent) as f64, is_active, is_multi, thumb, is_component, is_text, is_adjustment, mask_active, hover_zone);
+            let nest = box_depth(&rows, row_idx);
+            draw_row(ctx, &palette, width, y, row, count_f64(nest), is_active, is_multi, thumb, is_component, is_text, is_adjustment, mask_active, hover_zone, clip_info(&rows, row_idx), nest, nest == 0);
         }
 
         if let Some((from, span, _)) = drag_handle
             && let Some(d) = &drag {
                 let max_top = if count > span {
-                    slot_top(count - span)
+                    layout.top(count - span)
                 } else {
                     LIST_PADDING
                 };
                 let y_start = (d.pointer_y - d.grab_offset_y)
                     .clamp(LIST_PADDING, max_top);
                 let anim = d.animated_depth_offset;
+
+                // The dragged block is laid out on its own so its internal
+                // container padding survives the trip, then shifted so its
+                // first row lands under the pointer.
+                let block: Vec<VisibleRow> = rows[from..(from + span).min(count)].to_vec();
+                let block_layout = RowLayout::new(&block);
+                let shift = y_start - block_layout.top(0);
+                // Nesting *within* the block starts here: the block's own root
+                // level, which is the depth its first row sits at.
+                let block_base = tree_depth(&block[0]);
+
+                // Lift the block off the list. A folder is shadowed by its
+                // container's outline, a lone layer by its own row, so the
+                // shadow always traces what the user is actually holding.
+                {
+                    let level = (count_f64(tree_depth(&block[0])) + anim).max(0.0);
+                    let (sx, sy, sw, sh, radius) = if opens_box(&block, 0) {
+                        let top = shift + block_layout.top(0) - NEST_PAD;
+                        let bottom = shift + container_bottom(&block, &block_layout, 0);
+                        let x = nest_left_f(level);
+                        (x, top, nest_right(width) - x, bottom - top, NEST_RADIUS)
+                    } else {
+                        let clipped = clip_info(&block, 0).clipped;
+                        let x = nest_left_f(level)
+                            + if clipped { INDENT_STEP } else { 0.0 };
+                        let top = shift + block_layout.top(0);
+                        (x, top, nest_right(width) - x, ITEM_HEIGHT, ITEM_RADIUS)
+                    };
+                    draw_drop_shadow(ctx, sx, sy, sw, sh, radius);
+                }
+
+                // Containers inside the block, so a dragged folder keeps its
+                // surface instead of its rows going transparent over the page.
+                for (j, _) in block.iter().enumerate() {
+                    if !opens_box(&block, j) {
+                        continue;
+                    }
+                    let level = count_f64(tree_depth(&block[j])) + anim;
+                    draw_nest_box(
+                        ctx,
+                        level.max(0.0),
+                        width,
+                        shift + block_layout.top(j) - NEST_PAD,
+                        shift + container_bottom(&block, &block_layout, j),
+                        palette.surface(tree_depth(&block[j])),
+                    );
+                }
+
                 for i in 0..span {
                     let row_idx = from + i;
                     if row_idx >= count {
                         break;
                     }
                     let row = &rows[row_idx];
-                    let y = y_start + count_f64(i) * SLOT_HEIGHT;
+                    let y = shift + block_layout.top(i);
                     let thumb = match &row.kind {
                         RowKind::Layer { flat_idx, .. } => {
                             thumbnails.get(*flat_idx).and_then(|o| o.as_ref())
@@ -2200,12 +2639,27 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                         RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
                         RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
                     };
-                    let depth_f = ((row.depth + row.adjust_indent) as f64 + anim).max(0.0);
+                    // Indent still tracks the row's real depth (easing toward
+                    // the drop target), and the surface it sits on is still its
+                    // real level - but whether it paints its own fill is
+                    // decided *within the block*, measured from the block's own
+                    // root. A lone dragged layer has no container travelling
+                    // with it, however deeply nested it used to be, so it has
+                    // to paint its own.
+                    let nest = box_depth(&rows, row_idx);
+                    let depth_f = (count_f64(nest) + anim).max(0.0);
+                    let own_bg = box_depth(&block, i) == block_base;
                     let is_component = row_is_component(&ui, row);
                     let is_text = row_is_text(&ui, row);
                     let is_adjustment = row_is_adjustment(&ui, row);
                     let mask_active = is_adjustment && row_mask_active(&ui, row);
-                    draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text, is_adjustment, mask_active, None);
+                    // A floating row has no neighbours to connect to, so it
+                    // keeps its clip badge but drops the rod and terminus.
+                    let mut clip = clip_info(&rows, row_idx);
+                    clip.clipped_above = false;
+                    clip.clipped_below = false;
+                    clip.is_base = false;
+                    draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text, is_adjustment, mask_active, None, clip, nest, own_bg);
                 }
             }
     });
@@ -2229,6 +2683,50 @@ fn drag_span(rows: &[VisibleRow], from_row: usize) -> usize {
     span
 }
 
+/// The row list as it will be once a drag of `span` rows from `from` lands at
+/// `to`, `depth_delta` levels deeper or shallower than it started.
+///
+/// Built with the same [`displaced_row`] mapping the animation uses, so the two
+/// can never disagree about where a row ends up. The depth shift matters as
+/// much as the order: a drop that reparents changes which rows a folder
+/// contains, and therefore where every container's padding falls.
+fn reordered_rows(
+    rows: &[VisibleRow],
+    from: usize,
+    span: usize,
+    to: usize,
+    depth_delta: isize,
+) -> Vec<VisibleRow> {
+    let mut placed: Vec<Option<VisibleRow>> = vec![None; rows.len()];
+    for (r, row) in rows.iter().enumerate() {
+        let dragged = r >= from && r < from + span;
+        let new_idx = if dragged {
+            to + (r - from)
+        } else {
+            displaced_row(r, from, span, to)
+        };
+        let mut row = row.clone();
+        if dragged {
+            // The whole block shifts by the same delta, so rows inside a
+            // dragged folder keep their depth relative to its header.
+            row.depth = usize::try_from(
+                isize::try_from(row.depth).unwrap_or(0).saturating_add(depth_delta),
+            )
+            .unwrap_or(0);
+        }
+        if let Some(slot) = placed.get_mut(new_idx) {
+            *slot = Some(row);
+        }
+    }
+    // Any slot the mapping did not cover keeps its original row, so the layout
+    // is always over a complete list.
+    placed
+        .into_iter()
+        .enumerate()
+        .map(|(i, slot)| slot.unwrap_or_else(|| rows[i].clone()))
+        .collect()
+}
+
 // Where a non-dragged row should sit while a span of rows is being moved.
 fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     match from.cmp(&to) {
@@ -2242,8 +2740,15 @@ fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     }
 }
 
+/// Three tones carry the list's structure: the panel sits on `window_bg`, rows
+/// are `card` on top of it, and a container's fill sits between the two so a
+/// group reads as a surface holding cards rather than another card.
 #[derive(Clone, Copy)]
 struct Palette {
+    /// The panel's own background - the app's real window colour.
+    window_bg: Rgb,
+    /// A row's fill. libadwaita's card colour, which is what a raised surface
+    /// over the window background is supposed to be.
     row_bg: Rgb,
     accent_bg: Rgb,
     accent_fg: Rgb,
@@ -2252,19 +2757,58 @@ struct Palette {
 
 impl Palette {
     fn resolve(widget: &gtk::DrawingArea) -> Self {
+        let fg = lookup(widget, "view_fg_color").unwrap_or(FALLBACK_FG);
+        let window_bg = lookup(widget, "window_bg_color").unwrap_or(FALLBACK_WINDOW_BG);
+        // `card_bg_color` is translucent white in libadwaita's dark themes, so
+        // it has to be composited over the window colour rather than used raw -
+        // taking its RGB alone would paint every row near-white.
+        let row_bg = lookup_rgba(widget, "card_bg_color")
+            .map_or(FALLBACK_ROW_BG, |c| over(c, window_bg));
         Self {
-            row_bg: lookup(widget, "window_bg_color").unwrap_or(FALLBACK_ROW_BG),
+            window_bg,
+            row_bg,
             accent_bg: lookup(widget, "accent_bg_color").unwrap_or(FALLBACK_ACCENT_BG),
             accent_fg: lookup(widget, "accent_fg_color").unwrap_or(FALLBACK_ACCENT_FG),
-            fg: lookup(widget, "view_fg_color").unwrap_or(FALLBACK_FG),
+            fg,
         }
+    }
+
+    /// Fill for a surface at nesting `level`. Level 0 - a root row, or a
+    /// top-level container - is the plain card colour sitting on the window.
+    /// Deeper containers lean slightly toward the foreground so a container
+    /// inside a container still separates from its parent, which in a dark
+    /// theme lifts it and in a light one shades it.
+    fn surface(&self, level: usize) -> Rgb {
+        if level == 0 {
+            return self.row_bg;
+        }
+        let t = (0.06 * count_f64(level)).min(0.24);
+        lerp_rgb(self.row_bg, self.fg, t)
     }
 }
 
 fn lookup(widget: &gtk::DrawingArea, name: &str) -> Option<Rgb> {
+    lookup_rgba(widget, name).map(|(r, g, b, _)| (r, g, b))
+}
+
+fn lookup_rgba(widget: &gtk::DrawingArea, name: &str) -> Option<(f64, f64, f64, f64)> {
     #[allow(deprecated)]
     let rgba = widget.style_context().lookup_color(name)?;
-    Some((f64::from(rgba.red()), f64::from(rgba.green()), f64::from(rgba.blue())))
+    Some((
+        f64::from(rgba.red()),
+        f64::from(rgba.green()),
+        f64::from(rgba.blue()),
+        f64::from(rgba.alpha()),
+    ))
+}
+
+/// Composite a straight-alpha colour over an opaque one.
+fn over((r, g, b, a): (f64, f64, f64, f64), bg: Rgb) -> Rgb {
+    (
+        a.mul_add(r - bg.0, bg.0),
+        a.mul_add(g - bg.1, bg.1),
+        a.mul_add(b - bg.2, bg.2),
+    )
 }
 
 /// Whether a visible row maps to a component-instance layer (for the accent
@@ -2325,42 +2869,92 @@ fn draw_row(
     is_adjustment: bool,
     mask_active: bool,
     hover_zone: Option<HitZone>,
+    clip: ClipInfo,
+    // Nesting level the row sits at, which picks the surface it is drawn over.
+    nest: usize,
+    // Whether the row paints its own fill. Normally that is "it is not inside a
+    // container", but a row torn out of one by a drag has no container
+    // travelling with it and has to paint its own.
+    own_bg: bool,
 ) {
-    let indent = depth_f * INDENT_STEP;
-    let left = LIST_PADDING;
-    let row_w = (width - LIST_PADDING - LIST_PADDING_RIGHT).max(0.0);
-    let right = left + row_w;
+    // `depth_f` is the animated nesting level during a drag; it tracks `nest`
+    // except while a dragged row is easing between levels.
+    let left = LIST_PADDING + depth_f * NEST_INSET;
+    let right = nest_right(width);
+    // A clipped row spends one gutter column on its rod, inside the box.
+    let indent = if clip.clipped { INDENT_STEP } else { 0.0 };
+    let row_w = (right - left).max(0.0);
 
     let (visible, name) = match &row.kind {
         RowKind::Layer { visible, name, .. } | RowKind::Group { visible, name, .. } => (*visible, name.as_str()),
     };
+    let alpha_locked = matches!(row.kind, RowKind::Layer { alpha_locked: true, .. });
 
-    let dim = !visible;
+    // Dimmed either by its own eye, or because the thing it depends on is gone:
+    // a hidden base, or no base at all. The eye itself keeps full alpha in the
+    // latter cases, so "hidden by me" stays distinguishable from "hidden by
+    // something upstream" before the user clicks it.
+    let eye_dim = !visible;
+    let dim = eye_dim || clip.base_hidden || (clip.clipped && !clip.has_base);
 
+    // A row inside a container already sits on that container's surface, so it
+    // paints no fill of its own - stacking a second card on the first only
+    // muddies the nesting. Selection still paints, since that is the row
+    // standing out from its surroundings rather than describing structure.
+    let surface = palette.surface(nest);
     let bg = if is_active {
-        palette.accent_bg
+        Some(palette.accent_bg)
     } else if is_multi {
-        lerp_rgb(palette.row_bg, palette.accent_bg, 0.25)
+        Some(lerp_rgb(surface, palette.accent_bg, 0.25))
+    } else if own_bg {
+        Some(palette.row_bg)
     } else {
-        palette.row_bg
+        None
     };
     let text_color = if is_active { palette.accent_fg } else { palette.fg };
     let icon_color = text_color;
 
     let content_left = left + indent;
     let indented_w = (row_w - indent).max(0.0);
-    rounded_rect(ctx, content_left, top, indented_w, ITEM_HEIGHT, ITEM_RADIUS);
-    set_source(ctx, bg);
-    ctx.fill().ok();
+    if let Some(bg) = bg {
+        rounded_rect(ctx, content_left, top, indented_w, ITEM_HEIGHT, ITEM_RADIUS);
+        set_source(ctx, bg);
+        ctx.fill().ok();
+    }
+
+    // The clip rod runs in the gutter left of the row's fill, so it is drawn
+    // after it. Nesting itself is drawn as a box, under all the rows.
+    let (rod, rod_alpha) = if is_active {
+        (palette.accent_fg, 0.85)
+    } else {
+        (palette.fg, 0.55)
+    };
+    let rod_alpha = if dim { rod_alpha * 0.4 } else { rod_alpha };
+    if clip.is_base {
+        draw_clip_terminus(ctx, left, top, rod, rod_alpha);
+    }
 
     match &row.kind {
         RowKind::Layer { .. } => {
+            if clip.clipped {
+                // Hover brightens it, so the narrow gutter still reads as
+                // something you can click.
+                let alpha = if hover_zone == Some(HitZone::Clip) { 1.0 } else { rod_alpha };
+                draw_clip_rod(ctx, left, top, clip, rod, alpha);
+            }
+
             let sx = content_left + ITEM_INNER_PAD;
             let sy = top + (ITEM_HEIGHT - SWATCH_SIZE) / 2.0;
             if dim {
                 ctx.push_group();
             }
             draw_swatch(ctx, sx, sy, thumbnail);
+            if alpha_locked {
+                // The badge knocks its padlock out in whatever the row sits
+                // on, which is its own fill when it has one and the container's
+                // surface when it does not.
+                draw_alpha_lock_badge(ctx, sx, sy, icon_color, bg.unwrap_or(surface), 1.0);
+            }
             if dim {
                 ctx.pop_group_to_source().ok();
                 ctx.paint_with_alpha(0.4).ok();
@@ -2431,7 +3025,16 @@ fn draw_row(
             } else {
                 set_source(ctx, text_color);
             }
-            draw_label(ctx, name, text_left, top + ITEM_HEIGHT / 2.0, text_max_w);
+            draw_label_underlined(
+                ctx,
+                name,
+                text_left,
+                top + ITEM_HEIGHT / 2.0,
+                text_max_w,
+                // The active row already reads as the target through its accent
+                // fill; underlining it too is noise.
+                clip.is_base && !is_active,
+            );
             if dim {
                 ctx.restore().ok();
             }
@@ -2439,7 +3042,7 @@ fn draw_row(
             if hover_zone == Some(HitZone::Eye) {
                 draw_icon_hover_bg(ctx, eye_cx, eye_cy, EYE_RADIUS, palette.fg);
             }
-            draw_eye(ctx, eye_cx, eye_cy, EYE_RADIUS, visible, icon_color, dim);
+            draw_eye(ctx, eye_cx, eye_cy, EYE_RADIUS, visible, icon_color, eye_dim);
             if is_adjustment {
                 if hover_zone == Some(HitZone::Edit) {
                     draw_icon_hover_bg(ctx, sliders_cx, eye_cy, EDIT_RADIUS, palette.fg);
@@ -2520,6 +3123,144 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: f64) -> Rgb {
         a.1 + (b.1 - a.1) * t,
         a.2 + (b.2 - a.2) * t,
     )
+}
+
+/// The clip rod's x, given the left edge of the row's nesting level. The rod
+/// lives in the gutter a clipped row's extra indent frees up, which starts at
+/// exactly that edge.
+fn connector_x(nest_left: f64) -> f64 {
+    nest_left + CONNECTOR_INSET
+}
+
+/// The container surface behind a folder (or an adjustment layer) and
+/// everything it covers, including the container row itself. Drawn under the
+/// rows, so it reads as the thing holding them.
+///
+/// `first_top` / `last_top` are the y of the container row and of the last row
+/// it encloses, already in scroll space.
+/// Soft drop shadow behind a dragged block.
+///
+/// Cairo has no blur, so this stacks concentric rounded rects at a low constant
+/// alpha: the number of layers covering a pixel falls off with distance, which
+/// gives the gradient for the cost of a few fills. A real blur would mean an
+/// offscreen surface every frame, for something the pointer is moving anyway.
+fn draw_drop_shadow(ctx: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
+    if w <= 0.0 || h <= 0.0 {
+        return;
+    }
+    ctx.save().ok();
+    for i in (0..SHADOW_STEPS).rev() {
+        let grow = SHADOW_SPREAD * count_f64(i + 1) / count_f64(SHADOW_STEPS);
+        rounded_rect(
+            ctx,
+            x - grow,
+            y - grow + SHADOW_OFFSET_Y,
+            w + grow * 2.0,
+            h + grow * 2.0,
+            radius + grow,
+        );
+        ctx.set_source_rgba(0.0, 0.0, 0.0, SHADOW_STEP_ALPHA);
+        ctx.fill().ok();
+    }
+    ctx.restore().ok();
+}
+
+/// `top` / `bottom` are the container's own edges, padding already applied.
+fn draw_nest_box(ctx: &cairo::Context, level: f64, width: f64, top: f64, bottom: f64, color: Rgb) {
+    let left = nest_left_f(level);
+    let w = nest_right(width) - left;
+    if w <= 0.0 || bottom <= top {
+        return;
+    }
+    rounded_rect(ctx, left, top, w, bottom - top, NEST_RADIUS);
+    set_source(ctx, color);
+    ctx.fill().ok();
+}
+
+/// The clip rod: an inverted branch. A clipped layer's parent is the layer
+/// *below* it, so the rod runs down the column its clip indent freed up and is
+/// terminated by the base row itself (see [`draw_clip_terminus`]) rather than
+/// hooking back into the clipped row - which would read as clipping to itself.
+fn draw_clip_rod(ctx: &cairo::Context, nest_left: f64, top: f64, info: ClipInfo, color: Rgb, alpha: f64) {
+    let x = connector_x(nest_left);
+    ctx.save().ok();
+    ctx.set_source_rgba(color.0, color.1, color.2, alpha);
+    ctx.set_line_width(CONNECTOR_WIDTH);
+    ctx.set_line_cap(cairo::LineCap::Round);
+
+    // A run of clipped rows joins into one rod; the topmost starts inset so it
+    // reads as a beginning rather than a cut-off line.
+    let start = if info.clipped_above { top - ITEM_GAP } else { top + 10.0 };
+    ctx.move_to(x, start);
+    if info.has_base {
+        // Straight through to the row below - the base picks it up from there.
+        ctx.line_to(x, top + ITEM_HEIGHT);
+    } else {
+        // Nothing to land on: stop short, and the missing terminus *is* the
+        // "unresolved" state.
+        ctx.line_to(x, top + ITEM_HEIGHT - 10.0);
+    }
+    ctx.stroke().ok();
+    ctx.restore().ok();
+}
+
+/// The end of a clip rod, drawn by the base layer's own row: the rod enters
+/// from above and turns into the row, stopping just short of its thumbnail.
+fn draw_clip_terminus(ctx: &cairo::Context, nest_left: f64, top: f64, color: Rgb, alpha: f64) {
+    let x = connector_x(nest_left);
+    let cy = top + ITEM_HEIGHT / 2.0;
+    let content_left = nest_left;
+    ctx.save().ok();
+    ctx.set_source_rgba(color.0, color.1, color.2, alpha);
+    ctx.set_line_width(CONNECTOR_WIDTH);
+    ctx.move_to(x, top - ITEM_GAP);
+    ctx.line_to(x, cy - CONNECTOR_R);
+    ctx.arc_negative(
+        x + CONNECTOR_R,
+        cy - CONNECTOR_R,
+        CONNECTOR_R,
+        std::f64::consts::PI,
+        std::f64::consts::FRAC_PI_2,
+    );
+    ctx.line_to(content_left + ITEM_INNER_PAD - 1.0, cy);
+    ctx.stroke().ok();
+    ctx.restore().ok();
+}
+
+/// The alpha-lock badge, knocked out of the thumbnail's bottom-right corner.
+/// The ring is painted in the row's own background rather than a fixed colour,
+/// so the badge separates from any thumbnail behind it - checkerboard included -
+/// in both themes.
+fn draw_alpha_lock_badge(
+    ctx: &cairo::Context,
+    sx: f64,
+    sy: f64,
+    fg: Rgb,
+    bg: Rgb,
+    alpha: f64,
+) {
+    // Overhangs the swatch by 1px on each side so it never sits on the edge.
+    let cx = sx + SWATCH_SIZE - 12.0;
+    let cy = sy + SWATCH_SIZE - 12.0;
+
+    ctx.save().ok();
+    ctx.set_source_rgb(bg.0, bg.1, bg.2);
+    ctx.arc(cx, cy, LOCK_RING_D / 2.0, 0.0, TAU);
+    ctx.fill().ok();
+
+    ctx.set_source_rgba(fg.0, fg.1, fg.2, alpha);
+    ctx.arc(cx, cy, LOCK_DISC_D / 2.0, 0.0, TAU);
+    ctx.fill().ok();
+
+    // Padlock knocked back out in the row background: shackle arc over a body.
+    ctx.set_source_rgb(bg.0, bg.1, bg.2);
+    ctx.set_line_width(1.3);
+    ctx.new_path();
+    ctx.arc(cx, cy - 1.1, 2.1, std::f64::consts::PI, TAU);
+    ctx.stroke().ok();
+    rounded_rect(ctx, cx - 3.3, cy - 0.6, 6.6, 4.4, 1.0);
+    ctx.fill().ok();
+    ctx.restore().ok();
 }
 
 fn draw_swatch(ctx: &cairo::Context, x: f64, y: f64, thumbnail: Option<&cairo::ImageSurface>) {
@@ -2675,19 +3416,40 @@ fn draw_folder(ctx: &cairo::Context, cx: f64, cy: f64, w: f64, h: f64) {
 }
 
 fn draw_label(ctx: &cairo::Context, text: &str, x: f64, cy: f64, max_w: f64) {
+    draw_label_underlined(ctx, text, x, cy, max_w, false);
+}
+
+/// `underline` marks the base of a clip stack: 1px under the name only, so the
+/// elbow above it has something to land on. It also covers the two cases
+/// adjacency alone misses - a one-row stack, and a base scrolled to the edge of
+/// the viewport with its stack above the fold.
+fn draw_label_underlined(
+    ctx: &cairo::Context,
+    text: &str,
+    x: f64,
+    cy: f64,
+    max_w: f64,
+    underline: bool,
+) {
     if max_w <= 0.0 {
         return;
     }
     ctx.save().ok();
     ctx.select_font_face("Sans", cairo::FontSlant::Normal, cairo::FontWeight::Normal);
     ctx.set_font_size(13.0);
-    let baseline = ctx
-        .text_extents(text)
+    let extents = ctx.text_extents(text);
+    let baseline = extents
+        .as_ref()
         .map_or(cy, |e| cy - e.height() / 2.0 - e.y_bearing());
     ctx.rectangle(x, cy - ITEM_HEIGHT / 2.0, max_w, ITEM_HEIGHT);
     ctx.clip();
     ctx.move_to(x, baseline);
     ctx.show_text(text).ok();
+    if underline && let Ok(e) = extents {
+        let w = e.x_advance().min(max_w);
+        ctx.rectangle(x, baseline + 1.0, w, 1.0);
+        ctx.fill().ok();
+    }
     ctx.restore().ok();
 }
 
@@ -2728,14 +3490,16 @@ fn hit_zone(
     x: f64,
     y_in_row: f64,
     widget_width: f64,
-    depth: usize,
+    nest: usize,
     is_group: bool,
     has_edit: bool,
+    clipped: bool,
 ) -> HitZone {
-    let indent = count_f64(depth) * INDENT_STEP;
-    let content_left = LIST_PADDING + indent;
-    let row_w = (widget_width - LIST_PADDING - LIST_PADDING_RIGHT).max(0.0);
-    let right = LIST_PADDING + row_w;
+    // Must mirror `draw_row`: nesting insets both sides, and a clipped row
+    // spends one further gutter column on its rod.
+    let nest_left = nest_left(nest);
+    let content_left = nest_left + if clipped { INDENT_STEP } else { 0.0 };
+    let right = nest_right(widget_width);
 
     // Handle (rightmost).
     let handle_left = right - ITEM_INNER_PAD - HANDLE_WIDTH;
@@ -2762,6 +3526,14 @@ fn hit_zone(
         }
     }
 
+    // Clip gutter, left of the row's content. Deliberately narrow: 20px is
+    // below a comfortable stylus target, so this is the secondary path and the
+    // context menu / keybind carry the feature. Widening it would come
+    // straight out of the name column.
+    if clipped && x >= nest_left && x <= nest_left + CLIP_GUTTER_W {
+        return HitZone::Clip;
+    }
+
     // Chevron or swatch (leftmost content).
     if is_group {
         let chevron_right = content_left + ITEM_INNER_PAD + CHEVRON_SIZE + 4.0;
@@ -2783,6 +3555,51 @@ fn hit_zone(
     }
 
     HitZone::Body
+}
+
+// A part-locked selection reads as neither on nor off: a faint accent wash with
+// a bar under the glyph, distinct from the solid accent of a fully locked one.
+// Clicking it locks the whole selection.
+fn load_lock_toggle_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        "togglebutton.mixed {
+            background: alpha(@accent_bg_color, 0.22);
+            color: @accent_color;
+            box-shadow: inset 0 -2px 0 0 @accent_color;
+        }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
+
+/// Set the clipping-mask flag on one layer and record it as its own undo step.
+/// Shared by the gutter click, the context menu and the keybind.
+pub(super) fn set_layer_clipped(
+    canvas: &Rc<RefCell<Canvas>>,
+    history: &Rc<RefCell<HistoryStack>>,
+    id: &str,
+    flat_idx: usize,
+    clipped: bool,
+) {
+    let old = canvas.borrow().layers().clipped(flat_idx).unwrap_or(false);
+    if old == clipped {
+        return;
+    }
+    if let Err(e) = canvas.borrow_mut().set_layer_clipped(flat_idx, clipped) {
+        tracing::error!(error = %e, "set_layer_clipped failed");
+        return;
+    }
+    history.borrow_mut().record(HistoryAction::LayerClip {
+        id: id.to_string(),
+        old,
+        new: clipped,
+    });
 }
 
 /// Make `flat_idx` the active layer and open the adjustment editor on it. The
@@ -2889,20 +3706,29 @@ fn install_list_input(
             }
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            let Some(row_idx) = item_at(y, rows.len()) else { return };
+            let layout = RowLayout::new(&rows);
+            let Some(row_idx) = layout.at(y) else { return };
             let row = &rows[row_idx];
             #[allow(deprecated)]
             let width = f64::from(area_w.allocated_width());
-            let y_in_row = y - slot_top(row_idx);
+            let y_in_row = y - layout.top(row_idx);
             let is_group = matches!(row.kind, RowKind::Group { .. });
             let has_edit = row_is_adjustment(&ui, row);
-            let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group, has_edit);
+            let zone = hit_zone(
+                x,
+                y_in_row,
+                width,
+                box_depth(&rows, row_idx),
+                is_group,
+                has_edit,
+                clip_info(&rows, row_idx).clipped,
+            );
 
             *ui.drag.borrow_mut() = Some(Drag {
                 from_row: row_idx,
                 current_row: row_idx,
                 pointer_y: y,
-                grab_offset_y: y - slot_top(row_idx),
+                grab_offset_y: y - layout.top(row_idx),
                 zone,
                 animated_depth_offset: 0.0,
                 row_y_anim: vec![0.0; rows.len()],
@@ -2965,22 +3791,26 @@ fn install_list_input(
                                 // Keep the drop indicator under the stationary pointer
                                 // as content scrolls beneath it.
                                 let snapshot = tick_ui.state.snapshot();
-                                let count =
-                                    compute_visible_rows(&tick_ui.tree.borrow(), &snapshot).len();
+                                let scroll_rows =
+                                    compute_visible_rows(&tick_ui.tree.borrow(), &snapshot);
+                                let scroll_layout = RowLayout::new(&scroll_rows);
                                 let mut d = tick_ui.drag.borrow_mut();
                                 if let Some(d) = d.as_mut() {
                                     d.pointer_y += applied;
-                                    d.current_row =
-                                        insertion_index(d.pointer_y - d.grab_offset_y, count);
+                                    d.current_row = insertion_index(
+                                        &scroll_layout,
+                                        d.pointer_y - d.grab_offset_y,
+                                    );
                                     current_row = d.current_row;
                                 }
                             }
                         }
                     }
 
-                    let (target_depth_offset, span, clamped_to) = {
+                    let (target_depth_offset, span, clamped_to, layout, after_layout) = {
                         let snapshot = tick_ui.state.snapshot();
                         let rows = compute_visible_rows(&tick_ui.tree.borrow(), &snapshot);
+                        let layout = RowLayout::new(&rows);
                         let count = rows.len();
                         let span = drag_span(&rows, from_row);
                         let to = current_row.min(count.saturating_sub(span));
@@ -2998,7 +3828,22 @@ fn install_list_input(
                                 .find(|r| matches!(&r.kind, RowKind::Group { id, .. } if id == gid))
                                 .map_or(1, |r| r.depth + 1)
                         });
-                        (target_depth as f64 - orig_depth as f64, span, to)
+                        // Rows as they will be once dropped, reparenting
+                        // included. The animation has to aim at *that* layout:
+                        // container padding moves with the reorder, so easing
+                        // toward the current layout's slots would leave rows a
+                        // pad out of place and snap on drop.
+                        let depth_delta = isize::try_from(target_depth).unwrap_or(0)
+                            - isize::try_from(orig_depth).unwrap_or(0);
+                        let after = reordered_rows(&rows, from_row, span, to, depth_delta);
+                        let after_layout = RowLayout::new(&after);
+                        (
+                            target_depth as f64 - orig_depth as f64,
+                            span,
+                            to,
+                            layout,
+                            after_layout,
+                        )
                     };
 
                     // Exponential smoothing, ~95% in 0.1s.
@@ -3016,7 +3861,7 @@ fn install_list_input(
                                 }
                                 let target_slot =
                                     displaced_row(r, from_row, span, clamped_to);
-                                let target_y = slot_top(target_slot) - slot_top(r);
+                                let target_y = after_layout.top(target_slot) - layout.top(r);
                                 *anim_y += (target_y - *anim_y) * alpha;
                             }
 
@@ -3044,8 +3889,9 @@ fn install_list_input(
             }
             d.pointer_y = pointer_y;
             let snapshot = ui.state.snapshot();
-            let count = compute_visible_rows(&ui.tree.borrow(), &snapshot).len();
-            d.current_row = insertion_index(pointer_y - d.grab_offset_y, count);
+            let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
+            d.current_row =
+                insertion_index(&RowLayout::new(&rows), pointer_y - d.grab_offset_y);
             drop(drag_ref);
             area_w.queue_draw();
         })
@@ -3100,6 +3946,22 @@ fn install_list_input(
                                 redraw.request();
                             }
                         }
+                    }
+                }
+                HitZone::Clip => {
+                    if is_click
+                        && d.from_row < rows.len()
+                        && let RowKind::Layer { id, flat_idx, .. } = &rows[d.from_row].kind
+                    {
+                        set_layer_clipped(
+                            &canvas,
+                            &history,
+                            id,
+                            *flat_idx,
+                            false,
+                        );
+                        area_w.queue_draw();
+                        redraw.request();
                     }
                 }
                 HitZone::Edit => {
@@ -3441,7 +4303,8 @@ fn install_list_input(
             let cy = y + ui_c.scroll_offset();
             let snapshot = ui_c.state.snapshot();
             let rows = compute_visible_rows(&ui_c.tree.borrow(), &snapshot);
-            let Some(row_idx) = item_at(cy, rows.len()) else { return };
+            let layout = RowLayout::new(&rows);
+            let Some(row_idx) = layout.at(cy) else { return };
             let row = &rows[row_idx];
             // Double-clicking a component layer opens the component for editing
             // instead of renaming the layer.
@@ -3462,7 +4325,7 @@ fn install_list_input(
                 is_layer,
                 &ui_c,
                 &canvas_c,
-                slot_top(row_idx) - ui_c.scroll_offset(),
+                layout.top(row_idx) - ui_c.scroll_offset(),
                 &history,
             );
         });
@@ -3482,12 +4345,21 @@ fn install_list_input(
             let cy = y + ui.scroll_offset();
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            let hit = item_at(cy, rows.len()).map(|row_idx| {
+            let layout = RowLayout::new(&rows);
+            let hit = layout.at(cy).map(|row_idx| {
                 let row = &rows[row_idx];
-                let y_in_row = cy - slot_top(row_idx);
+                let y_in_row = cy - layout.top(row_idx);
                 let is_group = matches!(row.kind, RowKind::Group { .. });
                 let has_edit = row_is_adjustment(&ui, row);
-                let zone = hit_zone(x, y_in_row, width, row.depth + row.adjust_indent, is_group, has_edit);
+                let zone = hit_zone(
+                x,
+                y_in_row,
+                width,
+                box_depth(&rows, row_idx),
+                is_group,
+                has_edit,
+                clip_info(&rows, row_idx).clipped,
+            );
                 (row_idx, zone)
             });
             // The handle previews the drag (row-resize); the other clickable
@@ -3497,6 +4369,7 @@ fn install_list_input(
                 HitZone::Eye
                 | HitZone::Edit
                 | HitZone::Mask
+                | HitZone::Clip
                 | HitZone::Chevron
                 | HitZone::Folder
                 | HitZone::Swatch => Some("pointer"),
@@ -3504,7 +4377,7 @@ fn install_list_input(
             });
             // Only the interactive (non-drag) icons take a hover highlight.
             let hover = hit.filter(|(_, zone)| {
-                matches!(zone, HitZone::Eye | HitZone::Edit | HitZone::Mask)
+                matches!(zone, HitZone::Eye | HitZone::Edit | HitZone::Mask | HitZone::Clip)
             });
             if *ui.hover.borrow() != hover {
                 *ui.hover.borrow_mut() = hover;
@@ -3526,6 +4399,68 @@ fn install_list_input(
         });
     }
     area.add_controller(motion);
+
+    // Cairo-drawn rows carry no widgets, so the clip gutter names its base (or
+    // says why it has none) through the drawing area's own tooltip query.
+    area.set_has_tooltip(true);
+    {
+        let ui = ui.clone();
+        area.connect_query_tooltip(move |area, x, _y, _keyboard, tooltip| {
+            #[allow(deprecated)]
+            let width = f64::from(area.allocated_width());
+            let Some(row_idx) = ui.hover.borrow().map(|(r, _)| r) else {
+                return false;
+            };
+            let snapshot = ui.state.snapshot();
+            let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
+            let Some(row) = rows.get(row_idx) else { return false };
+            let info = clip_info(&rows, row_idx);
+            if !info.clipped {
+                return false;
+            }
+            let is_group = matches!(row.kind, RowKind::Group { .. });
+            let has_edit = row_is_adjustment(&ui, row);
+            let zone = hit_zone(
+                f64::from(x),
+                0.0,
+                width,
+                box_depth(&rows, row_idx),
+                is_group,
+                has_edit,
+                true,
+            );
+            if zone != HitZone::Clip {
+                return false;
+            }
+            let text = if info.has_base {
+                let base = clip_base_name(&rows, row_idx).unwrap_or_default();
+                format!("Clipped to \"{base}\"")
+            } else {
+                "No layer below to clip to".to_string()
+            };
+            tooltip.set_text(Some(&text));
+            true
+        });
+    }
+}
+
+/// Name of the layer a clipped row binds to, for the gutter tooltip.
+fn clip_base_name(rows: &[VisibleRow], i: usize) -> Option<String> {
+    let row = rows.get(i)?;
+    for below in rows.iter().skip(i + 1) {
+        // Leaving the sibling list ends the search: a clip never reaches past
+        // its own folder.
+        if !same_sibling_list(row, below) {
+            return None;
+        }
+        match &below.kind {
+            // A clipped row is skipped: it shares the base being looked for.
+            RowKind::Layer { clipped: true, .. } => {}
+            RowKind::Layer { name, .. } => return Some(name.clone()),
+            RowKind::Group { .. } => return None,
+        }
+    }
+    None
 }
 
 // Toggling a group's eye must not overwrite per-leaf state. We record which
@@ -3719,35 +4654,12 @@ pub(super) fn begin_rename_active(
     let current_name = match &rows[row_idx].kind {
         RowKind::Layer { name, .. } | RowKind::Group { name, .. } => name.clone(),
     };
-    show_rename_popover(area, target_id, current_name, is_layer, ui, canvas, slot_top(row_idx) - ui.scroll_offset(), history);
+    let layout = RowLayout::new(&rows);
+    show_rename_popover(area, target_id, current_name, is_layer, ui, canvas, layout.top(row_idx) - ui.scroll_offset(), history);
 }
 
-pub(super) fn item_at(y: f64, count: usize) -> Option<usize> {
-    if count == 0 || y < LIST_PADDING {
-        return None;
-    }
-    let rel = y - LIST_PADDING;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let slot = (rel / SLOT_HEIGHT).floor() as usize;
-    if slot >= count {
-        return None;
-    }
-    let within = count_f64(slot).mul_add(-SLOT_HEIGHT, rel);
-    if within > ITEM_HEIGHT {
-        return None;
-    }
-    Some(slot)
-}
-
-fn insertion_index(top_y: f64, count: usize) -> usize {
-    if count == 0 {
-        return 0;
-    }
-    let rel = (top_y - LIST_PADDING) / SLOT_HEIGHT;
-    let max = count_f64(count - 1);
-    let clamped = rel.round().clamp(0.0, max);
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    { clamped as usize }
+fn insertion_index(layout: &RowLayout, top_y: f64) -> usize {
+    layout.slot_nearest(top_y)
 }
 
 // Picks the parent/index where a dragged node should land, given the row
@@ -3791,18 +4703,363 @@ mod tests {
     use super::*;
 
     fn layer_row(parent_id: Option<&str>, idx_in_parent: usize, depth: usize) -> VisibleRow {
+        named_layer_row("l", parent_id, idx_in_parent, depth, false, true)
+    }
+
+    fn named_layer_row(
+        id: &str,
+        parent_id: Option<&str>,
+        idx_in_parent: usize,
+        depth: usize,
+        clipped: bool,
+        visible: bool,
+    ) -> VisibleRow {
         VisibleRow {
             kind: RowKind::Layer {
-                id: "l".into(),
-                name: "Layer".into(),
-                visible: true,
+                id: id.into(),
+                name: id.into(),
+                visible,
                 flat_idx: 0,
+                clipped,
+                alpha_locked: false,
             },
             depth,
             adjust_indent: 0,
             parent_id: parent_id.map(str::to_owned),
             idx_in_parent,
         }
+    }
+
+    // Mirrors `tree`: a row hangs off its parent by a tee unless it is the last
+    // child, and each ancestor keeps a bar in its own column only while that
+    // ancestor still has siblings to come.
+    #[test]
+    fn a_container_shares_a_nesting_level_with_what_it_holds() {
+        // Group
+        //   a
+        //   Subgroup
+        //     b
+        // Group2
+        //   c
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("a", Some("g"), 0, 1, false, true),
+            group_row("sub", true, Some("g"), 1, 1),
+            named_layer_row("b", Some("sub"), 0, 2, false, true),
+            group_row("g2", true, None, 1, 0),
+            named_layer_row("c", Some("g2"), 0, 1, false, true),
+        ];
+
+        // The header sits inside its own box, level with its contents: the box
+        // is what shows the nesting, so there is no indent step between them.
+        assert_eq!(box_depth(&rows, 0), 1, "Group is inside its own box");
+        assert_eq!(box_depth(&rows, 1), 1, "and so is what it holds");
+        assert_eq!(contained_rows(&rows, 0), 3, "a, Subgroup and b");
+
+        assert_eq!(box_depth(&rows, 2), 2, "Subgroup opens a box inside Group's");
+        assert_eq!(box_depth(&rows, 3), 2);
+        assert_eq!(contained_rows(&rows, 2), 1);
+
+        assert_eq!(box_depth(&rows, 4), 1);
+        assert_eq!(contained_rows(&rows, 4), 1, "Group2 stops before nothing");
+        assert_eq!(box_depth(&rows, 5), 1);
+    }
+
+    // Container padding has to come out of the vertical rhythm, so the row
+    // pitch is not uniform. Everything that places or hit-tests a row goes
+    // through RowLayout for exactly this reason.
+    #[test]
+    fn a_container_adds_its_padding_to_the_rows_it_wraps() {
+        let flat = vec![
+            named_layer_row("a", None, 0, 0, false, true),
+            named_layer_row("b", None, 1, 0, false, true),
+        ];
+        let flat_layout = RowLayout::new(&flat);
+        let pitch = flat_layout.top(1) - flat_layout.top(0);
+        assert!(
+            (pitch - (ITEM_HEIGHT + ITEM_GAP)).abs() < f64::EPSILON,
+            "ungrouped rows keep the plain pitch"
+        );
+
+        // Same two rows, now inside a folder: the header's own padding pushes
+        // it down, and the folder's bottom padding pushes anything after it.
+        let nested = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("a", Some("g"), 0, 1, false, true),
+            named_layer_row("after", None, 1, 0, false, true),
+        ];
+        let layout = RowLayout::new(&nested);
+        assert!(
+            (layout.top(0) - (LIST_PADDING + NEST_PAD)).abs() < f64::EPSILON,
+            "the container's top padding sits above its header"
+        );
+        let after_gap = layout.top(2) - layout.bottom(1);
+        assert!(
+            (after_gap - (ITEM_GAP + NEST_PAD)).abs() < f64::EPSILON,
+            "the container's bottom padding clears the row after it"
+        );
+    }
+
+    // The reorder animation eases each row toward where it will actually be.
+    // Aiming at the *current* layout's slots instead leaves rows a container
+    // pad out of place, which shows up as a jump the moment the drag is
+    // dropped and the real positions take over.
+    #[test]
+    fn the_drag_animation_lands_where_the_drop_will_put_things() {
+        // A folder, then a root row below it - drag that root row to the top.
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("Layer 3", Some("g"), 0, 1, false, true),
+            named_layer_row("Layer 2", Some("g"), 1, 1, false, true),
+            named_layer_row("Background", None, 1, 0, false, true),
+        ];
+        let (from, span, to) = (3usize, 1usize, 0usize);
+        let before = RowLayout::new(&rows);
+        let after = RowLayout::new(&reordered_rows(&rows, from, span, to, 0));
+
+        // Every row the drag pushes down moves by exactly one row pitch: the
+        // folder's padding travels with it, so nothing shifts by more.
+        let pitch = ITEM_HEIGHT + ITEM_GAP;
+        for r in 0..from {
+            let slot = displaced_row(r, from, span, to);
+            let target = after.top(slot) - before.top(r);
+            assert!(
+                (target - pitch).abs() < f64::EPSILON,
+                "row {r} eases by {target}, expected {pitch}"
+            );
+        }
+
+        // And the dragged row's own resting place is the top of the list.
+        assert!((after.top(to) - LIST_PADDING).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn reordering_moves_the_block_and_closes_the_hole() {
+        let rows = vec![
+            named_layer_row("a", None, 0, 0, false, true),
+            named_layer_row("b", None, 1, 0, false, true),
+            named_layer_row("c", None, 2, 0, false, true),
+        ];
+        let names = |rs: &[VisibleRow]| -> Vec<String> {
+            rs.iter()
+                .map(|r| match &r.kind {
+                    RowKind::Layer { name, .. } | RowKind::Group { name, .. } => name.clone(),
+                })
+                .collect()
+        };
+        assert_eq!(names(&reordered_rows(&rows, 2, 1, 0, 0)), ["c", "a", "b"]);
+        assert_eq!(names(&reordered_rows(&rows, 0, 1, 2, 0)), ["b", "c", "a"]);
+        assert_eq!(names(&reordered_rows(&rows, 0, 2, 1, 0)), ["c", "a", "b"]);
+    }
+
+    // Dropping a row *into* a folder changes its depth, and therefore which
+    // rows that folder contains - so the predicted layout has to reparent too.
+    // Without it the folder looks empty in the prediction, its padding lands in
+    // the wrong place, and every row under it eases to a wrong target and then
+    // snaps back on drop.
+    #[test]
+    fn the_drag_animation_accounts_for_dropping_into_a_folder() {
+        let rows = vec![
+            named_layer_row("Layer 5", None, 0, 0, false, true),
+            group_row("g", true, None, 1, 0),
+            named_layer_row("Layer 4", Some("g"), 0, 1, false, true),
+            named_layer_row("Layer 3", Some("g"), 1, 1, false, true),
+            named_layer_row("Layer 2", Some("g"), 2, 1, false, true),
+            named_layer_row("Background", None, 2, 0, false, true),
+        ];
+        // Layer 5 moves from the root down one slot, becoming the folder's
+        // first child: one level deeper.
+        let (from, span, to, delta) = (0usize, 1usize, 1usize, 1isize);
+        let before = RowLayout::new(&rows);
+        let after_rows = reordered_rows(&rows, from, span, to, delta);
+        assert_eq!(
+            contained_rows(&after_rows, 0),
+            4,
+            "the folder must be seen to hold the dropped row plus its own three"
+        );
+
+        let after = RowLayout::new(&after_rows);
+        // The folder header rises by one pitch; everything already inside it
+        // stays exactly where it is.
+        let header = after.top(displaced_row(1, from, span, to)) - before.top(1);
+        assert!(
+            (header + ITEM_HEIGHT + ITEM_GAP).abs() < f64::EPSILON,
+            "folder header eases by {header}"
+        );
+        for r in [2usize, 3, 4, 5] {
+            let target = after.top(displaced_row(r, from, span, to)) - before.top(r);
+            assert!(
+                target.abs() < f64::EPSILON,
+                "row {r} should not move at all, but eases by {target}"
+            );
+        }
+    }
+
+    // Folders that end on the same row must not land their bottom edges on top
+    // of each other - each still owes a full pad, so the edges nest.
+    #[test]
+    fn containers_ending_together_stagger_their_bottoms() {
+        let rows = vec![
+            group_row("outer", true, None, 0, 0),
+            group_row("mid", true, Some("outer"), 0, 1),
+            group_row("inner", true, Some("mid"), 0, 2),
+            named_layer_row("leaf", Some("inner"), 0, 3, false, true),
+        ];
+        let layout = RowLayout::new(&rows);
+        let leaf_bottom = layout.bottom(3);
+        // Innermost first, each one a pad further down than the last.
+        for (i, expected_pads) in [(2usize, 1.0_f64), (1, 2.0), (0, 3.0)] {
+            let got = container_bottom(&rows, &layout, i);
+            let want = expected_pads.mul_add(NEST_PAD, leaf_bottom);
+            assert!(
+                (got - want).abs() < f64::EPSILON,
+                "container {i}: bottom {got} but expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_containers_each_pay_their_own_padding() {
+        // Two containers close on the same row, so the row after clears both.
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            group_row("sub", true, Some("g"), 0, 1),
+            named_layer_row("deep", Some("sub"), 0, 2, false, true),
+            named_layer_row("after", None, 1, 0, false, true),
+        ];
+        let layout = RowLayout::new(&rows);
+        let after_gap = layout.top(3) - layout.bottom(2);
+        assert!(
+            (after_gap - (ITEM_GAP + NEST_PAD * 2.0)).abs() < f64::EPSILON,
+            "both the inner and outer folder end on `deep`"
+        );
+    }
+
+    // Hit-testing has to agree with what was drawn, padding included.
+    #[test]
+    fn the_gap_between_rows_belongs_to_no_row() {
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("a", Some("g"), 0, 1, false, true),
+        ];
+        let layout = RowLayout::new(&rows);
+        assert_eq!(layout.at(layout.top(0) + 1.0), Some(0));
+        assert_eq!(layout.at(layout.top(1) + 1.0), Some(1));
+        assert_eq!(
+            layout.at(layout.bottom(0) + ITEM_GAP / 2.0),
+            None,
+            "a click in the gap hits nothing"
+        );
+        assert_eq!(layout.at(LIST_PADDING / 2.0), None, "nor does one above the list");
+    }
+
+    // A folder is a container whether or not you can see inside it, so it keeps
+    // its surface when collapsed - otherwise the row would change shape on
+    // every expand.
+    #[test]
+    fn a_collapsed_folder_keeps_its_container() {
+        let rows = vec![
+            group_row("collapsed", false, None, 0, 0),
+            named_layer_row("after", None, 1, 0, false, true),
+        ];
+        assert_eq!(contained_rows(&rows, 0), 0, "nothing visible inside it");
+        assert!(opens_box(&rows, 0), "but it is still a container");
+        assert_eq!(box_depth(&rows, 0), 1);
+        assert_eq!(box_depth(&rows, 1), 0, "the row after it is not inside");
+    }
+
+    // An adjustment layer is a plain layer until it actually covers something.
+    #[test]
+    fn an_adjustment_covering_nothing_gets_no_container() {
+        let mut adjustment = named_layer_row("adj", None, 0, 0, false, true);
+        adjustment.adjust_indent = 0;
+        let rows = vec![adjustment];
+        assert!(!opens_box(&rows, 0));
+        assert_eq!(box_depth(&rows, 0), 0);
+    }
+
+    #[test]
+    fn a_box_stops_at_the_end_of_its_own_nesting() {
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("inside", Some("g"), 0, 1, false, true),
+            named_layer_row("outside", None, 1, 0, false, true),
+        ];
+        assert_eq!(contained_rows(&rows, 0), 1, "the root row below is not held");
+        assert_eq!(box_depth(&rows, 2), 0);
+    }
+
+    // An adjustment layer indents the rows it affects, and that reads as the
+    // same relationship a folder has, so it draws the same connector.
+    #[test]
+    fn adjustment_scope_nests_like_a_folder() {
+        let mut adjustment = named_layer_row("adj", None, 0, 0, false, true);
+        adjustment.adjust_indent = 0;
+        let mut affected = named_layer_row("below", None, 1, 0, false, true);
+        affected.adjust_indent = 1;
+        let rows = vec![adjustment, affected];
+
+        assert_eq!(contained_rows(&rows, 0), 1, "the adjustment covers the row below");
+        assert_eq!(box_depth(&rows, 0), 1, "and is boxed together with it");
+        assert_eq!(box_depth(&rows, 1), 1);
+    }
+
+    // Rows are in display order: index 0 is the topmost, so a clipped row binds
+    // to the row *after* it.
+    #[test]
+    fn clip_bracket_spans_a_stack_and_corners_once() {
+        let rows = vec![
+            named_layer_row("c1", None, 0, 0, true, true),
+            named_layer_row("c2", None, 1, 0, true, true),
+            named_layer_row("base", None, 2, 0, false, true),
+        ];
+
+        let top = clip_info(&rows, 0);
+        assert!(top.clipped && !top.clipped_above);
+        assert!(top.clipped_below, "the run continues into c2");
+        assert!(top.has_base);
+
+        let bottom = clip_info(&rows, 1);
+        assert!(bottom.clipped_above);
+        assert!(!bottom.clipped_below, "c2 is the row that turns the corner");
+        assert!(bottom.has_base);
+
+        let base = clip_info(&rows, 2);
+        assert!(!base.clipped);
+        assert!(base.is_base, "the base underlines its name");
+    }
+
+    #[test]
+    fn clip_without_a_base_is_inactive() {
+        // Bottom-most row is clipped: nothing below to bind to.
+        let rows = vec![named_layer_row("lonely", None, 0, 0, true, true)];
+        let info = clip_info(&rows, 0);
+        assert!(info.clipped);
+        assert!(!info.has_base, "no corner is drawn without a base");
+    }
+
+    #[test]
+    fn a_hidden_base_is_reported_so_its_stack_dims() {
+        let rows = vec![
+            named_layer_row("shade", None, 0, 0, true, true),
+            named_layer_row("base", None, 1, 0, false, false),
+        ];
+        let info = clip_info(&rows, 0);
+        assert!(info.has_base);
+        assert!(info.base_hidden);
+    }
+
+    #[test]
+    fn clipping_does_not_reach_across_sibling_lists() {
+        // The clipped row is inside a folder; the row below it is not a sibling.
+        let rows = vec![
+            named_layer_row("inside", Some("g"), 0, 1, true, true),
+            named_layer_row("outside", None, 1, 0, false, true),
+        ];
+        let info = clip_info(&rows, 0);
+        assert!(info.clipped);
+        assert!(!info.has_base);
+        assert!(!clip_info(&rows, 1).is_base);
     }
 
     fn group_row(

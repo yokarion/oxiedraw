@@ -60,6 +60,8 @@ pub fn snapshot(
             kind: l.kind.clone(),
             blend: l.blend,
             opacity: l.opacity,
+            clipped: l.clipped,
+            alpha_locked: l.alpha_locked,
         })
         .collect();
 
@@ -401,6 +403,8 @@ mod tests {
                     kind: LayerKind::default(),
                     blend: BlendMode::default(),
                     opacity: 1.0,
+                    clipped: false,
+                    alpha_locked: false,
                 })
                 .collect(),
             layer_tree: Vec::new(),

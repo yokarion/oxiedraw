@@ -55,6 +55,10 @@ struct Inner {
     /// Bumped by every `show`. A [`PendingToast`] only dismisses the toast it
     /// posted, so a later message can't be cut short by a stale handle.
     generation: u64,
+    /// Layers already told why their paint went nowhere. The alpha-lock
+    /// explanation is worth showing once per layer - after that the user knows,
+    /// and repeating it on every stroke would nag.
+    alpha_lock_explained: std::collections::HashSet<String>,
 }
 
 /// Handle to a toast with no auto-dismiss, returned by [`Toaster::pending`].
@@ -86,6 +90,7 @@ impl Toaster {
             active: false,
             alpha: 0.0,
             generation: 0,
+            alpha_lock_explained: std::collections::HashSet::new(),
         })))
     }
 
@@ -128,6 +133,19 @@ impl Toaster {
             toaster: self.clone(),
             generation: self.0.borrow().generation,
         }
+    }
+
+    /// Explain that alpha lock swallowed an operation, once per layer.
+    ///
+    /// Alpha lock changes nothing on screen, so a stroke that lands on empty
+    /// pixels simply does nothing and reads as a broken app. The pill carries
+    /// the fix in its text because the canvas-drawn pill has no room for a
+    /// button.
+    pub(crate) fn alpha_lock_blocked(&self, layer_id: &str) {
+        if !self.0.borrow_mut().alpha_lock_explained.insert(layer_id.to_string()) {
+            return;
+        }
+        self.info("Alpha lock is on. Press / to turn it off.");
     }
 
     /// Show the standard "layer limit reached" toast. Kept here so every

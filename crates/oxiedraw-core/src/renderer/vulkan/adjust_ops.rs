@@ -86,10 +86,7 @@ fn scoped_group_spans(
     let target_steps: Vec<usize> = steps
         .iter()
         .enumerate()
-        .filter_map(|(i, s)| match s {
-            CompositeStep::Layer(idx) if is_target(*idx) => Some(i),
-            _ => None,
-        })
+        .filter_map(|(i, s)| s.layer_index().filter(|&idx| is_target(idx)).map(|_| i))
         .collect();
     let mut spans = vec![None; steps.len()];
     let mut open: Vec<(usize, usize)> = Vec::new(); // (enter index, ordinal)
@@ -110,7 +107,7 @@ fn scoped_group_spans(
                     });
                 }
             }
-            CompositeStep::Layer(_) => {}
+            CompositeStep::Layer { .. } => {}
         }
     }
     spans
@@ -268,12 +265,12 @@ impl VulkanRenderer {
         let mut depth = 0usize;
         for step in steps {
             match *step {
-                CompositeStep::Layer(idx) => {
+                CompositeStep::Layer { idx, clip_base } => {
                     let acc = *stack.last().expect("non-empty accumulator stack");
                     if self.layer_stack.slots[idx].adjustment.is_some() {
-                        self.apply_adjustment_to(acc, idx)?;
+                        self.apply_adjustment_clipped_to(acc, idx, clip_base)?;
                     } else {
-                        self.compose_layer_into(acc, idx)?;
+                        self.compose_layer_clipped_into(acc, idx, clip_base)?;
                     }
                 }
                 CompositeStep::EnterGroup => {
@@ -390,7 +387,7 @@ impl VulkanRenderer {
         let mut i = 0usize;
         while i < steps.len() {
             match steps[i] {
-                CompositeStep::Layer(idx) => {
+                CompositeStep::Layer { idx, clip_base } => {
                     let acc = frames.last().expect("non-empty accumulator stack").acc;
                     if let Some(target) = find_target(idx) {
                         // A filtered target runs its own multi-submit pass chain
@@ -406,6 +403,10 @@ impl VulkanRenderer {
                                 // filtered mask, as apply + recomposite will.
                                 if self.layer_stack.slots[idx].adjustment.is_some() {
                                     let (view, img) = self.park_filtered_mask(scratch)?;
+                                    let (view, img) = match clip_base {
+                                        Some(base) => self.clip_mask(view, img, base)?,
+                                        None => (view, img),
+                                    };
                                     self.apply_adjustment_with_mask(acc, idx, view, img)?;
                                     i += 1;
                                     continue;
@@ -414,14 +415,16 @@ impl VulkanRenderer {
                             }
                             other => other,
                         };
+                        let clip_set =
+                            clip_base.map(|b| self.layer_stack.slots[b].descriptor_set);
                         self.record_and_submit(|this| {
-                            this.cmd_compose_preview_target(acc, idx, target);
+                            this.cmd_compose_preview_target(acc, idx, target, clip_set);
                             Ok(())
                         })?;
                     } else if self.layer_stack.slots[idx].adjustment.is_some() {
-                        self.apply_adjustment_to(acc, idx)?;
+                        self.apply_adjustment_clipped_to(acc, idx, clip_base)?;
                     } else {
-                        self.compose_layer_into(acc, idx)?;
+                        self.compose_layer_clipped_into(acc, idx, clip_base)?;
                     }
                     i += 1;
                 }
@@ -537,6 +540,7 @@ impl VulkanRenderer {
         acc: Accumulator,
         target_idx: usize,
         target: PreviewTarget,
+        clip_set: Option<vk::DescriptorSet>,
     ) {
         match target {
             PreviewTarget::Stroke { push, erase } => {
@@ -546,6 +550,7 @@ impl VulkanRenderer {
                     target_idx,
                     push,
                     erase,
+                    clip_set,
                 );
             }
             PreviewTarget::Warp { set, mode, opacity, visible } => {
@@ -555,9 +560,23 @@ impl VulkanRenderer {
                 // warped source over it.
                 let (lmode, lopacity) = self.layer_stack.blend(target_idx);
                 let lset = self.layer_stack.slots[target_idx].descriptor_set;
-                self.cmd_compose_layer_blended(acc.image, acc.framebuffer, lset, lmode, lopacity);
+                self.cmd_compose_layer_clipped(
+                    acc.image,
+                    acc.framebuffer,
+                    lset,
+                    lmode,
+                    lopacity,
+                    clip_set,
+                );
                 if visible {
-                    self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
+                    self.cmd_compose_layer_clipped(
+                        acc.image,
+                        acc.framebuffer,
+                        set,
+                        mode,
+                        opacity,
+                        clip_set,
+                    );
                 }
             }
             PreviewTarget::Gradient { endpoints, extra } => {
@@ -567,12 +586,20 @@ impl VulkanRenderer {
                     target_idx,
                     endpoints,
                     extra,
+                    clip_set,
                 );
             }
             PreviewTarget::Replace { src_img, set, mode, opacity, visible } => {
                 self.barrier(src_img, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
                 if visible {
-                    self.cmd_compose_layer_blended(acc.image, acc.framebuffer, set, mode, opacity);
+                    self.cmd_compose_layer_clipped(
+                        acc.image,
+                        acc.framebuffer,
+                        set,
+                        mode,
+                        opacity,
+                        clip_set,
+                    );
                 }
             }
             // The walk runs the filter chain and hands us the resulting scratch
@@ -580,6 +607,21 @@ impl VulkanRenderer {
             PreviewTarget::Filtered { .. } => {
                 unreachable!("filtered targets are resolved before compositing")
             }
+        }
+    }
+
+    /// The `Replace` target that composites the erase-preview scratch in place
+    /// of layer `idx`'s stored pixels. The fill and shape previews build
+    /// (layer + overlay) into that scratch, then hand it to the scoped walk so
+    /// folder scope and clipping apply to the live preview.
+    pub(super) fn replace_target_from_erase_scratch(&self, idx: usize) -> PreviewTarget {
+        let (mode, opacity) = self.layer_stack.blend(idx);
+        PreviewTarget::Replace {
+            src_img: self.erase_preview.scratch.handle,
+            set: self.erase_preview.composite_set,
+            mode,
+            opacity,
+            visible: true,
         }
     }
 
@@ -1278,10 +1320,29 @@ impl VulkanRenderer {
     /// Blend one plain layer image into `acc` at its blend mode + opacity, on
     /// its own submission. Adjustment slots are skipped (handled separately).
     fn compose_layer_into(&mut self, acc: Accumulator, idx: usize) -> Result<(), RendererError> {
+        self.compose_layer_clipped_into(acc, idx, None)
+    }
+
+    /// Compose layer `idx` into `acc`, masked by `clip_base`'s alpha when the
+    /// layer carries a clipping mask.
+    fn compose_layer_clipped_into(
+        &mut self,
+        acc: Accumulator,
+        idx: usize,
+        clip_base: Option<usize>,
+    ) -> Result<(), RendererError> {
         let descriptor_set = self.layer_stack.slots[idx].descriptor_set;
+        let clip_set = clip_base.map(|b| self.layer_stack.slots[b].descriptor_set);
         let (mode, opacity) = self.layer_stack.blend(idx);
         self.record_and_submit(|this| {
-            this.cmd_compose_layer_blended(acc.image, acc.framebuffer, descriptor_set, mode, opacity);
+            this.cmd_compose_layer_clipped(
+                acc.image,
+                acc.framebuffer,
+                descriptor_set,
+                mode,
+                opacity,
+                clip_set,
+            );
             Ok(())
         })
     }
@@ -1296,6 +1357,18 @@ impl VulkanRenderer {
     /// effect previews the mask the user is painting without ever showing the
     /// grayscale mask itself.
     fn apply_adjustment_to(&mut self, acc: Accumulator, idx: usize) -> Result<(), RendererError> {
+        self.apply_adjustment_clipped_to(acc, idx, None)
+    }
+
+    /// As [`Self::apply_adjustment_to`], but a clipped adjustment layer narrows
+    /// its gate to the intersection of its own mask and `clip_base`'s alpha, so
+    /// the effect lands on the base layer alone instead of everything below.
+    fn apply_adjustment_clipped_to(
+        &mut self,
+        acc: Accumulator,
+        idx: usize,
+        clip_base: Option<usize>,
+    ) -> Result<(), RendererError> {
         let (mask_view, mask_img) = match self.mask_edit {
             Some(me) if me.target_idx == idx => self.stroked_mask(idx, me.push, me.erase)?,
             _ => {
@@ -1303,7 +1376,64 @@ impl VulkanRenderer {
                 (slot.image.view, slot.image.handle)
             }
         };
+        let (mask_view, mask_img) = match clip_base {
+            Some(base) => self.clip_mask(mask_view, mask_img, base)?,
+            None => (mask_view, mask_img),
+        };
         self.apply_adjustment_with_mask(acc, idx, mask_view, mask_img)
+    }
+
+    /// Intersect `mask_view` with the alpha of layer `base` into the lazily
+    /// allocated clip scratch, returning that scratch's (view, image). The
+    /// scratch is only live until the effect chain consumes it, and the chain
+    /// runs immediately after, so one buffer serves every clipped adjustment.
+    fn clip_mask(
+        &mut self,
+        mask_view: vk::ImageView,
+        mask_img: vk::Image,
+        base: usize,
+    ) -> Result<(vk::ImageView, vk::Image), RendererError> {
+        let scratch = self.ensure_clip_mask_scratch()?;
+        let base_slot = &self.layer_stack.slots[base];
+        let (base_view, base_img) = (base_slot.image.view, base_slot.image.handle);
+        let set = self.filter_resources.input_set(0);
+        self.filter_resources
+            .write_input(&self.device, set, mask_view, base_view, base_view);
+        let layout = self.filter_resources.pipeline_layout;
+        let pipeline = self.clip_mask_pipeline.pipeline;
+        let render_pass = self.canvas_target.render_pass;
+        self.record_and_submit(|this| {
+            this.cmd_filter_pass3(
+                set,
+                layout,
+                pipeline,
+                render_pass,
+                scratch.framebuffer,
+                mask_img,
+                base_img,
+                base_img,
+                [0.0; 4],
+            );
+            this.barrier(
+                scratch.image,
+                vk::ImageLayout::GENERAL,
+                vk::ImageLayout::GENERAL,
+            );
+            Ok(())
+        })?;
+        Ok((scratch.view, scratch.image))
+    }
+
+    fn ensure_clip_mask_scratch(&mut self) -> Result<Accumulator, RendererError> {
+        if self.clip_mask_scratch.is_none() {
+            self.clip_mask_scratch = Some(self.create_group_accumulator()?);
+        }
+        let ga = self.clip_mask_scratch.as_ref().expect("just allocated");
+        Ok(Accumulator {
+            image: ga.image.handle,
+            view: ga.image.view,
+            framebuffer: ga.framebuffer,
+        })
     }
 
     /// Move a filtered result out of the two filter scratches into the

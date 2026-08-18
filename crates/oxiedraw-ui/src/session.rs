@@ -253,6 +253,8 @@ fn snapshot_crop_layers(canvas: &Rc<RefCell<Canvas>>) -> ((u32, u32), Vec<CropLa
                 kind: l.kind.clone(),
                 blend: l.blend,
                 opacity: l.opacity,
+                clipped: l.clipped,
+                alpha_locked: l.alpha_locked,
             })
         })
         .collect();
@@ -890,6 +892,11 @@ impl DocumentSession {
         // these slots, which are filled once the panel-derived handles exist.
         let enter_slot: Rc<RefCell<Option<Rc<dyn Fn(String)>>>> = Rc::new(RefCell::new(None));
         let component_exit: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        // Same late-bound shape: the layers panel reports the active layer's
+        // alpha-lock state through this, and the info bar below the canvas
+        // fills it once it exists.
+        let alpha_lock_observer: Rc<RefCell<Option<Rc<dyn Fn(bool)>>>> =
+            Rc::new(RefCell::new(None));
 
         let on_edit_component: Rc<dyn Fn(String)> = {
             let enter_slot = Rc::clone(&enter_slot);
@@ -986,6 +993,7 @@ impl DocumentSession {
             &global.font_previews,
             &prepare_delete,
             &prepare_reorder,
+            &alpha_lock_observer,
         );
 
         // -- Wire component enter/exit now the panel handles exist --------
@@ -1131,6 +1139,11 @@ impl DocumentSession {
         // Weak-capturing observer: it must not strong-hold the bar, or the
         // dial gesture's viewport handle would close a leak cycle on tab close.
         viewport.set_info_observer(info_bar.observer());
+        {
+            let bar = info_bar.clone();
+            *alpha_lock_observer.borrow_mut() =
+                Some(Rc::new(move |locked: bool| bar.set_alpha_locked(locked)));
+        }
         let canvas_root = {
             let column = gtk::Box::builder()
                 .orientation(gtk::Orientation::Vertical)

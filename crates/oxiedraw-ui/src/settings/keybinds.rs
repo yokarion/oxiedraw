@@ -291,6 +291,16 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
                 default_accel: Some("<Primary>g"),
             },
             ActionInfo {
+                id: "layer-clip",
+                label: "Clip to Layer Below",
+                default_accel: Some("<Primary><Alt>g"),
+            },
+            ActionInfo {
+                id: "layer-alpha-lock",
+                label: "Lock Alpha",
+                default_accel: Some("slash"),
+            },
+            ActionInfo {
                 id: "layers-merge",
                 label: "Merge Selected Layers",
                 default_accel: None,

@@ -250,6 +250,8 @@ fn apply_direction(
             pixels,
         } => match direction {
             Direction::Forward => {
+                // Redoing an add: the layer never carried either flag when it
+                // was first created.
                 recreate_layer(
                     canvas,
                     *idx,
@@ -260,6 +262,7 @@ fn apply_direction(
                     *blend,
                     *opacity,
                     pixels,
+                    (false, false),
                 )?;
                 Ok(())
             }
@@ -279,6 +282,8 @@ fn apply_direction(
             blend,
             opacity,
             pixels,
+            clipped,
+            alpha_locked,
         } => match direction {
             Direction::Forward => {
                 if let Some(cur) = find_layer_idx(canvas, id) {
@@ -297,6 +302,7 @@ fn apply_direction(
                     *blend,
                     *opacity,
                     pixels,
+                    (*clipped, *alpha_locked),
                 )?;
                 Ok(())
             }
@@ -326,6 +332,26 @@ fn apply_direction(
                     Direction::Backward => *old,
                 };
                 canvas.set_layer_visible(idx, v)?;
+            }
+            Ok(())
+        }
+        HistoryAction::LayerClip { id, old, new } => {
+            if let Some(idx) = find_layer_idx(canvas, id) {
+                let v = match direction {
+                    Direction::Forward => *new,
+                    Direction::Backward => *old,
+                };
+                canvas.set_layer_clipped(idx, v)?;
+            }
+            Ok(())
+        }
+        HistoryAction::LayerAlphaLock { id, old, new } => {
+            if let Some(idx) = find_layer_idx(canvas, id) {
+                let v = match direction {
+                    Direction::Forward => *new,
+                    Direction::Backward => *old,
+                };
+                canvas.set_layer_alpha_locked(idx, v);
             }
             Ok(())
         }
@@ -368,6 +394,8 @@ fn apply_direction(
             blend,
             opacity,
             pixels,
+            clipped,
+            alpha_locked,
         } => match direction {
             Direction::Forward => {
                 recreate_layer(
@@ -380,6 +408,7 @@ fn apply_direction(
                     *blend,
                     *opacity,
                     pixels,
+                    (*clipped, *alpha_locked),
                 )?;
                 Ok(())
             }
@@ -414,6 +443,8 @@ fn apply_direction(
                 // Restore folded layers at their original indices. Merge bakes to
                 // raster, so folded layers come back as plain raster layers.
                 for f in folded {
+                    // Merge bakes to raster; a merged-away layer's clip / lock
+                    // state does not survive the fold either way.
                     recreate_layer(
                         canvas,
                         f.idx,
@@ -424,6 +455,7 @@ fn apply_direction(
                         f.blend,
                         f.opacity,
                         &f.pixels,
+                        (false, false),
                     )?;
                 }
                 canvas.restore_layer(*survivor_idx, survivor_pre)?;
@@ -487,10 +519,16 @@ fn apply_direction(
                 })
                 .collect();
             canvas.replace_all_layers(&layers)?;
-            // replace_all_layers resets kinds to Raster; restore the snapshot's
-            // kinds (geometry already in the target coordinate space).
+            // replace_all_layers resets kinds to Raster and clears the clip /
+            // alpha-lock flags; restore the snapshot's (geometry already in the
+            // target coordinate space).
             let kinds: Vec<_> = target_layers.iter().map(|l| l.kind.clone()).collect();
             canvas.restore_layer_kinds(&kinds)?;
+            let flags: Vec<(bool, bool)> = target_layers
+                .iter()
+                .map(|l| (l.clipped, l.alpha_locked))
+                .collect();
+            canvas.restore_layer_flags(&flags)?;
             if let Some(idx) = active_layer
                 && *idx < canvas.layers().len()
             {
@@ -567,27 +605,36 @@ fn recreate_layer(
     blend: BlendMode,
     opacity: f32,
     pixels: &[u8],
+    // `(clipped, alpha_locked)` the layer carried before it went away.
+    flags: (bool, bool),
 ) -> Result<(), RendererError> {
     // Rebuild the whole stack with the layer reinserted at target_idx.
-    // `replace_all_layers` resets every kind to Raster, so we capture the
-    // existing kinds (and the recreated layer's) and re-apply them after.
+    // `replace_all_layers` resets every kind to Raster and clears the clip /
+    // alpha-lock flags, so we capture the existing ones (and the recreated
+    // layer's) and re-apply them after. Missing either would silently wipe the
+    // whole document's flags on any undo that recreates a layer.
     let snap = canvas.layers().snapshot();
     let mut entries: Vec<(String, String, bool, BlendMode, f32, Vec<u8>)> =
         Vec::with_capacity(snap.len() + 1);
     let mut kinds: Vec<LayerKind> = Vec::with_capacity(snap.len() + 1);
+    let mut all_flags: Vec<(bool, bool)> = Vec::with_capacity(snap.len() + 1);
     for (i, l) in snap.iter().enumerate() {
         if i == target_idx {
             entries.push((id.to_string(), name.to_string(), visible, blend, opacity, pixels.to_vec()));
             kinds.push(kind.clone());
+            all_flags.push(flags);
         }
         let px = canvas.read_layer(i)?;
         entries.push((l.id.clone(), l.name.clone(), l.visible, l.blend, l.opacity, px));
         kinds.push(l.kind.clone());
+        all_flags.push((l.clipped, l.alpha_locked));
     }
     if target_idx >= snap.len() {
         entries.push((id.to_string(), name.to_string(), visible, blend, opacity, pixels.to_vec()));
         kinds.push(kind.clone());
+        all_flags.push(flags);
     }
     canvas.replace_all_layers(&entries)?;
-    canvas.restore_layer_kinds(&kinds)
+    canvas.restore_layer_kinds(&kinds)?;
+    canvas.restore_layer_flags(&all_flags)
 }

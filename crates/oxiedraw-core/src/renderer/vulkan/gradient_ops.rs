@@ -118,7 +118,16 @@ impl VulkanRenderer {
             this.cmd_clear_image(this.preview.handle, [0.0, 0.0, 0.0, 0.0]);
             for &idx in &visible_indices {
                 if overlay_at == Some(idx) {
-                    this.compose_gradient_target_into(preview_img, preview_fb, idx, endpoints, extra);
+                    // Flat path: only reached when nothing needs scoping, and a
+                    // clipped layer always forces the scoped walk instead.
+                    this.compose_gradient_target_into(
+                        preview_img,
+                        preview_fb,
+                        idx,
+                        endpoints,
+                        extra,
+                        None,
+                    );
                 } else {
                     this.preview_compose_layer(preview_img, preview_fb, idx);
                 }
@@ -152,6 +161,7 @@ impl VulkanRenderer {
         target_idx: usize,
         endpoints: [f32; 4],
         extra: [f32; 4],
+        clip_set: Option<vk::DescriptorSet>,
     ) {
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
@@ -161,7 +171,7 @@ impl VulkanRenderer {
         self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
         let (mode, opacity) = self.layer_stack.blend(target_idx);
         let set = self.erase_preview.composite_set;
-        self.cmd_compose_layer_blended(acc_img, acc_fb, set, mode, opacity);
+        self.cmd_compose_layer_clipped(acc_img, acc_fb, set, mode, opacity, clip_set);
     }
 
     /// Final commit: render the gradient directly into the layer's
@@ -202,7 +212,11 @@ impl VulkanRenderer {
         extra: [f32; 4],
     ) {
         let render_pass = self.canvas_target.render_pass;
-        let pipeline = self.gradient_overlay.pipeline;
+        let pipeline = if self.alpha_lock {
+            self.gradient_overlay.pipeline_alpha_lock
+        } else {
+            self.gradient_overlay.pipeline
+        };
         let layout = self.gradient_overlay.layout;
         let descriptor_set = self.gradient_overlay.descriptor_set;
 

@@ -23,10 +23,11 @@ use crate::effects::AdjustmentData;
 const VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/layer_composite.frag.spv"));
 const BLEND_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/layer_blend.frag.spv"));
+const CLIP_MASK_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/clip_mask.frag.spv"));
 
-/// Push constant for the blend pipeline: blend-mode index + layer opacity.
-/// 8 bytes (`uint` + `float`), fragment stage.
-pub(super) const BLEND_PUSH_BYTES: u32 = 8;
+/// Push constant for the blend pipeline: blend-mode index, layer opacity and
+/// the clipping-mask flag. 12 bytes (`uint` + `float` + `uint`), fragment stage.
+pub(super) const BLEND_PUSH_BYTES: u32 = 12;
 
 /// Maximum number of layers per document. Fixed-size descriptor pool -
 /// keeps the allocator dead-simple; can be made elastic later. Each layer
@@ -80,11 +81,11 @@ impl LayerCompositePipeline {
     }
 }
 
-/// Pipeline that samples a premultiplied layer (set 0) and an accumulator
-/// (set 1) and writes the src-over-dst result of the layer's blend mode +
-/// opacity. Blending is disabled (replace); callers ping-pong the accumulator
-/// through a scratch copy. Reuses [`LayerCompositePipeline`]'s single-sampler
-/// set layout for both descriptor slots.
+/// Pipeline that samples a premultiplied layer (set 0), an accumulator (set 1)
+/// and a clipping-mask base (set 2), and writes the src-over-dst result of the
+/// layer's blend mode + opacity. Blending is disabled (replace); callers
+/// ping-pong the accumulator through a scratch copy. Reuses
+/// [`LayerCompositePipeline`]'s single-sampler set layout for all three slots.
 pub(super) struct LayerBlendPipeline {
     pub layout: vk::PipelineLayout,
     pub pipeline: vk::Pipeline,
@@ -115,6 +116,40 @@ impl LayerBlendPipeline {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
+/// Pipeline that intersects an adjustment layer's mask (binding 0) with a
+/// clipping base's alpha (binding 1). Rides the shared three-input filter set
+/// layout, so it owns no descriptor resources of its own - only the pipeline.
+pub(super) struct ClipMaskPipeline {
+    pub pipeline: vk::Pipeline,
+}
+
+impl ClipMaskPipeline {
+    pub(super) fn new(
+        device: &Device,
+        canvas_render_pass: vk::RenderPass,
+        filter_pipeline_layout: vk::PipelineLayout,
+    ) -> Result<Self, RendererError> {
+        let pipeline = FullscreenPass {
+            vert_spv: VERT_SPV,
+            frag_spv: CLIP_MASK_FRAG_SPV,
+            render_pass: canvas_render_pass,
+            layout: filter_pipeline_layout,
+            blend: replace_blend(),
+        }
+        .build(device)?;
+        Ok(Self { pipeline })
+    }
+
+    /// # Safety
+    /// Caller must ensure no GPU work referencing this pipeline is in flight.
+    /// The pipeline layout belongs to the filter resources, which destroy it.
+    pub(super) unsafe fn destroy(self, device: &Device) {
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
         }
     }
 }
@@ -300,9 +335,9 @@ fn create_blend_pipeline_layout(
     device: &Device,
     set_layout: vk::DescriptorSetLayout,
 ) -> Result<vk::PipelineLayout, RendererError> {
-    // Two descriptor sets (src layer, dst accumulator) reusing the same
-    // single-sampler layout, plus the mode/opacity push constant.
-    let set_layouts = [set_layout, set_layout];
+    // Three descriptor sets (src layer, dst accumulator, clip base) reusing the
+    // same single-sampler layout, plus the mode/opacity/clip push constant.
+    let set_layouts = [set_layout, set_layout, set_layout];
     let push_ranges = [vk::PushConstantRange::default()
         .stage_flags(vk::ShaderStageFlags::FRAGMENT)
         .offset(0)

@@ -41,6 +41,13 @@ impl VulkanRenderer {
         self.stroke_erase = erase;
     }
 
+    /// Set whether the layer being painted is alpha-locked. While set, every
+    /// pass that writes into a layer keeps that layer's alpha exactly as it
+    /// was, so paint can only recolour pixels that already exist.
+    pub fn set_alpha_lock(&mut self, locked: bool) {
+        self.alpha_lock = locked;
+    }
+
     /// Set whether the in-flight stroke accumulates coverage (build-up,
     /// OVER blend) instead of saturating (MAX). Call at the start of a
     /// stroke. Reset to false by `begin_stroke` for ordinary brushes.

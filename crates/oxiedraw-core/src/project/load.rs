@@ -240,6 +240,15 @@ pub fn apply(project: &OxieProject, canvas: &mut Canvas) -> Result<(), ProjectEr
     let kinds: Vec<_> = doc.layers.iter().map(|e| e.kind.clone()).collect();
     canvas.restore_layer_kinds(&kinds)?;
 
+    // Same story for the clipping / alpha-lock flags: replace_all_layers
+    // cleared them, and clipping needs the kinds in place before it recomposites.
+    let flags: Vec<(bool, bool)> = doc
+        .layers
+        .iter()
+        .map(|e| (e.clipped, e.alpha_locked))
+        .collect();
+    canvas.restore_layer_flags(&flags)?;
+
     if let Some(active) = doc.active_layer
         && active < canvas.layers().len()
     {

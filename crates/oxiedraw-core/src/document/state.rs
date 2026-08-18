@@ -146,6 +146,38 @@ impl LayerState {
         self.layers.borrow().get(index).map(|l| (l.blend, l.opacity))
     }
 
+    /// Set the clipping-mask flag on the layer at `index`. No-op if out of
+    /// range. The base is resolved positionally at composite time, so nothing
+    /// else has to be updated here.
+    pub fn set_clipped(&self, index: usize, clipped: bool) {
+        if let Some(layer) = self.layers.borrow_mut().get_mut(index) {
+            layer.clipped = clipped;
+        }
+    }
+
+    /// Clipping-mask flag of the layer at `index`, or `None` if out of range.
+    pub fn clipped(&self, index: usize) -> Option<bool> {
+        self.layers.borrow().get(index).map(|l| l.clipped)
+    }
+
+    /// Set the alpha-lock flag on the layer at `index`. Ignored for layer
+    /// kinds that cannot be locked (adjustment slots hold an opaque mask).
+    pub fn set_alpha_locked(&self, index: usize, locked: bool) {
+        if let Some(layer) = self.layers.borrow_mut().get_mut(index)
+            && layer.can_alpha_lock()
+        {
+            layer.alpha_locked = locked;
+        }
+    }
+
+    /// `true` when the layer at `index` is alpha-locked *and* the flag applies.
+    pub fn alpha_lock_active(&self, index: usize) -> bool {
+        self.layers
+            .borrow()
+            .get(index)
+            .is_some_and(Layer::alpha_lock_active)
+    }
+
     /// Move layer at `from` to position `to`. Adjusts the active
     /// index so the *same* layer stays selected after the move.
     /// No-op when either index is out of range.

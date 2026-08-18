@@ -825,6 +825,22 @@ impl PrimaryDragHandler {
             })
         });
 
+        // Erasing can only remove alpha, which alpha lock forbids. Refuse the
+        // stroke up front and explain, rather than letting the user scrub at a
+        // layer that will never change.
+        if erase && canvas.alpha_lock_refuses(true) {
+            let id = self
+                .pending_capture
+                .borrow()
+                .as_ref()
+                .map(|p| p.id.clone())
+                .unwrap_or_default();
+            *self.pending_capture.borrow_mut() = None;
+            drop(canvas);
+            self.toaster.alpha_lock_blocked(&id);
+            return;
+        }
+
         if let Err(e) = canvas.begin_stroke(color, opacity, erase) {
             tracing::error!(error = %e, "canvas.begin_stroke failed");
             return;
@@ -1006,6 +1022,10 @@ impl PrimaryDragHandler {
                 layer_id: pending.id.clone(),
                 patch,
             });
+        } else if canvas.layer_alpha_locked(pending.idx) {
+            // No diff over the region the dabs covered: the lock swallowed the
+            // whole stroke. Say so, or the app just looks broken.
+            self.toaster.alpha_lock_blocked(&pending.id);
         }
     }
 

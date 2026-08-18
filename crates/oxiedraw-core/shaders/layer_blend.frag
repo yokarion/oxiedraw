@@ -15,10 +15,14 @@ layout(location = 0) out vec4 out_color;
 
 layout(set = 0, binding = 0) uniform sampler2D u_src;
 layout(set = 1, binding = 0) uniform sampler2D u_dst;
+// Clipping-mask base. Only read when pc.clip is set; callers still bind a
+// valid image (the source layer) otherwise so the set is never dangling.
+layout(set = 2, binding = 0) uniform sampler2D u_clip;
 
 layout(push_constant) uniform Push {
     uint mode;
     float opacity;
+    uint clip;
 } pc;
 
 vec3 blend_overlay(vec3 cb, vec3 cs) {
@@ -43,6 +47,12 @@ vec3 srgb_to_lin(vec3 c) {
 
 void main() {
     vec4 s = texture(u_src, v_uv) * pc.opacity;
+    // A clipped layer is confined to the base layer's silhouette. Scaling the
+    // premultiplied source by the base's alpha is exactly that, and it keeps
+    // the layer's own blend mode working against the backdrop underneath.
+    if (pc.clip != 0u) {
+        s *= texture(u_clip, v_uv).a;
+    }
     vec4 d = texture(u_dst, v_uv);
 
     // Unpremultiply for the blend math; guard against divide-by-zero.

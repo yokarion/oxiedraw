@@ -203,7 +203,7 @@ fn layer_remove_round_trip() {
     let (id, name, visible, _, _, _, _) = capture_layer(&mut c, extra).expect("capture");
 
     c.remove_layer(extra).expect("remove_layer");
-    s.record(HistoryAction::LayerRemove { idx: extra, id: id.clone(), name, visible, layer_kind: crate::document::LayerKind::Raster, blend: crate::document::BlendMode::Normal, opacity: 1.0, pixels: pixels.clone() });
+    s.record(HistoryAction::LayerRemove { idx: extra, id: id.clone(), name, visible, layer_kind: crate::document::LayerKind::Raster, blend: crate::document::BlendMode::Normal, opacity: 1.0, pixels: pixels.clone(), clipped: false, alpha_locked: false });
     assert_eq!(c.layers().len(), 1);
 
     s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
@@ -336,6 +336,171 @@ fn transform_preview_identity_matches_committed_blend() {
         );
     }
     c.clear_transform_preview();
+}
+
+/// Deleting the last layer in a group and undoing must put it back *inside*
+/// that group. The delete drops the leaf from the folder tree, so without the
+/// tree edit riding along in the same undo step the layer comes back at the
+/// root - taking any clip relationship with it.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn undoing_a_delete_restores_the_layer_inside_its_group() {
+    use crate::document::{LayerGroup, LayerTreeNode};
+
+    let mut c = canvas();
+    let inner = c.add_layer("Inner").expect("add");
+    let inner_id = layer_id(&c, inner);
+    let base_id = layer_id(&c, 0);
+
+    // Root: [base, Group{ inner }].
+    let tree_before = vec![
+        LayerTreeNode::layer(base_id.clone()),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g".into(),
+            name: "Group".into(),
+            expanded: true,
+            children: vec![LayerTreeNode::layer(inner_id.clone())],
+        }),
+    ];
+    c.set_layer_tree(tree_before.clone()).expect("set tree");
+    c.set_layer_clipped(inner, true).expect("clip");
+
+    let pixels = c.read_layer(inner).expect("read");
+    // The group is left empty, mirroring what the panel does on delete.
+    let tree_after = vec![
+        LayerTreeNode::layer(base_id),
+        LayerTreeNode::Group(LayerGroup {
+            id: "g".into(),
+            name: "Group".into(),
+            expanded: true,
+            children: Vec::new(),
+        }),
+    ];
+    c.remove_layer(inner).expect("remove");
+    c.set_layer_tree(tree_after.clone()).expect("set tree");
+
+    let mut s = stack();
+    s.record(HistoryAction::Batch {
+        label: "Delete layer".into(),
+        actions: vec![
+            HistoryAction::LayerRemove {
+                idx: inner,
+                id: inner_id.clone(),
+                name: "Inner".into(),
+                visible: true,
+                layer_kind: crate::document::LayerKind::Raster,
+                blend: crate::document::BlendMode::Normal,
+                opacity: 1.0,
+                pixels,
+                clipped: true,
+                alpha_locked: false,
+            },
+            HistoryAction::LayerTreeEdit {
+                before: tree_before.clone(),
+                after: tree_after,
+            },
+        ],
+    });
+
+    s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
+
+    assert_eq!(c.layer_tree(), tree_before, "layer came back outside its group");
+    let snap = c.layers().snapshot();
+    let restored = snap.iter().find(|l| l.id == inner_id).expect("layer restored");
+    assert!(restored.clipped, "undo dropped the clipping mask");
+}
+
+/// Two layers: an opaque base covering the left half, and an opaque blue layer
+/// above it that is clipped to it. Anything on the right half of the composite
+/// means the clip was dropped.
+fn clipped_over_half_base() -> Canvas {
+    let (w, h) = (W as usize, H as usize);
+    let mut base = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w / 2 {
+            let i = (y * w + x) * 4;
+            base[i + 2] = 255;
+            base[i + 3] = 255;
+        }
+    }
+    let blue: Vec<u8> = (0..w * h).flat_map(|_| [255u8, 0, 0, 255]).collect();
+
+    let mut c = canvas();
+    c.replace_all_layers(&[(
+        "base".into(),
+        "Base".into(),
+        true,
+        crate::document::BlendMode::Normal,
+        1.0,
+        base,
+    )])
+    .expect("base layer");
+    let top = c.add_layer_with_pixels("Shade", &blue).expect("top layer");
+    c.set_layer_clipped(top, true).expect("clip");
+    c
+}
+
+/// The live transform preview must honour a clipping mask. The flat preview
+/// path has no clip mask, so routing on adjustment layers alone made a clipped
+/// layer flash over the whole canvas for the length of the drag.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn transform_preview_keeps_the_clipping_mask() {
+    use oxiedraw_utils::geometry::TransformRect;
+
+    let mut c = clipped_over_half_base();
+    let top = 1;
+
+    // Drive an identity transform of the clipped layer.
+    let src = c.read_layer(top).expect("read top");
+    c.clear_layer_at(top, [0.0, 0.0, 0.0, 0.0]).expect("clear top");
+    let mut above = Vec::new();
+    c.begin_transform_preview(top, &mut above).expect("begin preview base");
+    c.begin_transform_preview_gpu(&[(top, &src, W, H)]).expect("begin gpu preview");
+    #[allow(clippy::cast_precision_loss)]
+    let rect = TransformRect::new(W as f32 / 2.0, H as f32 / 2.0, W as f32, H as f32, 0.0);
+    c.set_transform_preview(rect, rect, W, H);
+
+    let preview = c.read_transform_preview().expect("read preview");
+    let at = |x: u32, y: u32| {
+        let i = ((y * W + x) * 4) as usize;
+        [preview[i], preview[i + 1], preview[i + 2], preview[i + 3]]
+    };
+    assert_eq!(at(2, 8)[3], 255, "clipped layer should draw inside the base");
+    assert_eq!(
+        at(13, 8),
+        [0, 0, 0, 0],
+        "transform preview leaked the clipped layer past its base"
+    );
+    c.clear_transform_preview();
+}
+
+/// Same hole in the filter preview: it routed on `has_adjustment_layers`, so a
+/// clipped layer previewed a Hue/Saturation change across the whole canvas.
+#[test]
+#[ignore = "requires vulkan loader and device"]
+fn filter_preview_keeps_the_clipping_mask() {
+    use crate::filters::FilterSpec;
+
+    let mut c = clipped_over_half_base();
+    let top = 1;
+
+    c.begin_filter(
+        &[top],
+        FilterSpec::Hsv {
+            hue_degrees: 180.0,
+            saturation: 1.0,
+            value: 1.0,
+        },
+    );
+    let preview = c.read_filter_preview().expect("read filter preview");
+    let i = ((8 * W + 13) * 4) as usize;
+    assert_eq!(
+        [preview[i], preview[i + 1], preview[i + 2], preview[i + 3]],
+        [0, 0, 0, 0],
+        "filter preview leaked the clipped layer past its base"
+    );
+    c.cancel_filter();
 }
 
 #[test]
@@ -843,6 +1008,8 @@ fn layer_duplicate_round_trip() {
         blend: crate::document::BlendMode::Normal,
         opacity: 1.0,
         pixels: dup_pixels.clone(),
+        clipped: false,
+        alpha_locked: false,
     });
     assert_eq!(c.layers().len(), 2);
 
@@ -894,6 +1061,8 @@ fn layer_duplicate_blend_survives_redo() {
         blend,
         opacity,
         pixels: dup_pixels,
+        clipped: false,
+        alpha_locked: false,
     });
 
     s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
@@ -1065,6 +1234,8 @@ fn crop_canvas_round_trip() {
                 kind,
                 blend,
                 opacity,
+                clipped: false,
+                alpha_locked: false,
             })
         })
         .collect();
@@ -1084,6 +1255,8 @@ fn crop_canvas_round_trip() {
                 kind,
                 blend,
                 opacity,
+                clipped: false,
+                alpha_locked: false,
             })
         })
         .collect();

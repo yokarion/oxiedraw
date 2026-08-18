@@ -327,6 +327,7 @@ impl VulkanRenderer {
             target_idx,
             push,
             erase,
+            None,
         );
     }
 
@@ -341,6 +342,7 @@ impl VulkanRenderer {
         target_idx: usize,
         push: [f32; 4],
         erase: bool,
+        clip_set: Option<vk::DescriptorSet>,
     ) {
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
@@ -354,6 +356,6 @@ impl VulkanRenderer {
         self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
         let (mode, opacity) = self.layer_stack.blend(target_idx);
         let set = self.erase_preview.composite_set;
-        self.cmd_compose_layer_blended(acc_img, acc_fb, set, mode, opacity);
+        self.cmd_compose_layer_clipped(acc_img, acc_fb, set, mode, opacity, clip_set);
     }
 }

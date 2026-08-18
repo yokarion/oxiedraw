@@ -6,6 +6,7 @@ use ash::vk;
 use super::super::RendererError;
 use super::super::fill_overlay::FILL_OVERLAY_PUSH_BYTES;
 use super::VulkanRenderer;
+use crate::document::CompositeStep;
 
 impl VulkanRenderer {
     /// Upload the distance + coverage planes produced by `flood_fill`
@@ -124,6 +125,33 @@ impl VulkanRenderer {
         })
     }
 
+    /// Folder- and clip-aware fill preview: build (target layer + overlay) into
+    /// the shared scratch, then walk the composite tree with that scratch
+    /// standing in for the target. Without this the reveal sweep would draw a
+    /// clipped layer over the whole canvas until the animation finished.
+    pub fn render_fill_preview_scoped(
+        &mut self,
+        steps: &[CompositeStep],
+    ) -> Result<(), RendererError> {
+        let target_idx = self.fill_layer_idx;
+        if target_idx >= self.layer_stack.slots.len() {
+            return Ok(());
+        }
+        let push_color = self.fill_color_premul;
+        let reveal = self.fill_reveal;
+        let scratch = self.erase_preview.scratch.handle;
+        let scratch_fb = self.erase_preview.framebuffer;
+        let layer_image = self.layer_stack.slots[target_idx].image.handle;
+        self.record_and_submit(|this| {
+            this.cmd_copy_image_full(layer_image, scratch);
+            this.cmd_compose_fill_overlay(scratch_fb, push_color, reveal);
+            this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+            Ok(())
+        })?;
+        let target = self.replace_target_from_erase_scratch(target_idx);
+        self.build_preview_scoped_multi(steps, &[(target_idx, target)])
+    }
+
     /// Fill overlay pass - binds the overlay descriptor set, pushes
     /// the colour + reveal radius, draws the fullscreen triangle into
     /// `framebuffer` (the target-plus-overlay scratch).
@@ -134,7 +162,12 @@ impl VulkanRenderer {
         reveal: f32,
     ) {
         let render_pass = self.canvas_target.render_pass;
-        let pipeline = if self.fill_behind {
+        // Behind-fill only writes where there is no alpha, which is exactly
+        // what alpha lock forbids; the canvas refuses that pairing before it
+        // gets here, so lock wins over behind if both are somehow set.
+        let pipeline = if self.alpha_lock {
+            self.fill_overlay.pipeline_alpha_lock
+        } else if self.fill_behind {
             self.fill_overlay.pipeline_behind
         } else {
             self.fill_overlay.pipeline

@@ -54,6 +54,7 @@ pub(crate) fn build(
     font_previews: &crate::font_previews::FontPreviews,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
+    alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Widget,
     Rc<dyn Fn(Tool)>,
@@ -113,6 +114,7 @@ pub(crate) fn build(
         component_exit,
         prepare_delete,
         prepare_reorder,
+        alpha_lock_observer,
     );
     normal_pane.set_end_child(Some(&layers_widget));
 

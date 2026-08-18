@@ -5,8 +5,8 @@ use ash::{Device, vk};
 
 use super::RendererError;
 use super::pass::{
-    FullscreenPass, allocate_sampler_set, dst_out_blend, linear_clamp_sampler, over_blend,
-    pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
+    FullscreenPass, allocate_sampler_set, alpha_lock_blend, dst_out_blend, linear_clamp_sampler,
+    over_blend, pipeline_layout, sampler_descriptor_pool, sampler_set_layout,
 };
 
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
@@ -23,6 +23,9 @@ pub(super) struct CompositePipeline {
     /// the stroke coverage from the target instead of adding tinted color.
     /// Used by the eraser to punch a hole in the target layer.
     pub erase_pipeline: vk::Pipeline,
+    /// Same shaders/layout as `pipeline` but an alpha-preserving blend, for
+    /// painting on an alpha-locked layer.
+    pub alpha_lock_pipeline: vk::Pipeline,
     pub descriptor_set_layout: vk::DescriptorSetLayout,
     pub descriptor_pool: vk::DescriptorPool,
     pub descriptor_set: vk::DescriptorSet,
@@ -49,6 +52,8 @@ impl CompositePipeline {
         let pipeline = pass.build(device)?;
         pass.blend = dst_out_blend();
         let erase_pipeline = pass.build(device)?;
+        pass.blend = alpha_lock_blend();
+        let alpha_lock_pipeline = pass.build(device)?;
 
         // Linear filtering on the stroke buffer.
         let sampler = linear_clamp_sampler(device)?;
@@ -65,6 +70,7 @@ impl CompositePipeline {
             layout,
             pipeline,
             erase_pipeline,
+            alpha_lock_pipeline,
             descriptor_set_layout,
             descriptor_pool,
             descriptor_set,
@@ -78,6 +84,7 @@ impl CompositePipeline {
         unsafe {
             device.destroy_pipeline(self.pipeline, None);
             device.destroy_pipeline(self.erase_pipeline, None);
+            device.destroy_pipeline(self.alpha_lock_pipeline, None);
             device.destroy_pipeline_layout(self.layout, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_descriptor_set_layout(self.descriptor_set_layout, None);

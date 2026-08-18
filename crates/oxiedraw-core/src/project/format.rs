@@ -28,8 +28,10 @@ use crate::text::fonts::FontMeta;
 /// v11 adds guide line colours (a position along the guide colour ramp): a
 /// `color` on the guide and a per-vanishing-point `color`. Absent in pre-v11
 /// files (both default to the ramp's blue).
-pub const SCHEMA_VERSION: u32 = 11;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+/// v12 adds the per-layer `clipped` (clipping mask) and `alpha_locked` flags.
+/// Absent in pre-v12 files (both off).
+pub const SCHEMA_VERSION: u32 = 12;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -57,6 +59,13 @@ pub struct LayerEntry {
     /// Layer opacity in `0.0..=1.0`. Absent in pre-v5 files (defaults to 1.0).
     #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
+    /// Clipping mask: render only where the layer below has alpha. Absent in
+    /// pre-v12 files (off).
+    #[serde(default)]
+    pub clipped: bool,
+    /// Lock transparent pixels. Absent in pre-v12 files (off).
+    #[serde(default)]
+    pub alpha_locked: bool,
 }
 
 /// One raster layer inside a component (in `components.json`). Its pixels live

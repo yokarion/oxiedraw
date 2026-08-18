@@ -305,8 +305,12 @@ impl VulkanRenderer {
         let selection_active: f32 = if self.selection_active { 1.0 } else { 0.0 };
         let push_full: [f32; 5] = [push[0], push[1], push[2], push[3], selection_active];
         let render_pass = self.canvas_target.render_pass;
+        // Erase is refused outright on a locked layer (it could only remove
+        // alpha), so the two flags never both apply.
         let pipeline = if erase {
             self.composite_pipeline.erase_pipeline
+        } else if self.alpha_lock {
+            self.composite_pipeline.alpha_lock_pipeline
         } else {
             self.composite_pipeline.pipeline
         };

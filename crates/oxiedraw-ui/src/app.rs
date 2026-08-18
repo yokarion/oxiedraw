@@ -114,6 +114,7 @@ impl SimpleComponent for AppModel {
             gtk::IconTheme::for_display(&display).add_resource_path(crate::ICON_RESOURCE_PATH);
         }
         gtk::Window::set_default_icon_name(crate::APP_ID);
+        load_chrome_css();
         preferences_window::load_keybind_css();
 
         let history_capacity = crate::settings::AppSettings::load().history.capacity;
@@ -467,4 +468,27 @@ fn install_key_handler(
         glib::Propagation::Proceed
     });
     root.add_controller(key_ctrl);
+}
+
+/// Put every chrome panel on the app's real window colour.
+///
+/// libadwaita's `.sidebar` exists to tint a sidebar away from the window, which
+/// left the panels a different shade from the background their content sits on.
+/// The layers list draws rows in `card_bg_color` on top of this, so the two
+/// tones have to be the window/card pair to read as surfaces stacked on a
+/// background rather than two arbitrary greys.
+fn load_chrome_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        ".sidebar {
+            background-color: @window_bg_color;
+        }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
 }
