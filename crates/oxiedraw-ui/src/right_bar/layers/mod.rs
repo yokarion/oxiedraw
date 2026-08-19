@@ -65,6 +65,10 @@ const SHADOW_SPREAD: f64 = 9.0;
 const SHADOW_OFFSET_Y: f64 = 2.0;
 const SHADOW_STEP_ALPHA: f64 = 0.05;
 
+// How long a dropped block takes to travel from where the pointer let go of it
+// to the slot it landed in.
+const DROP_SETTLE_SECS: f64 = 0.16;
+
 // The clip rod sits near the left of its own 10px gutter column, so the hook
 // that turns into the base row has room to read.
 const CONNECTOR_INSET: f64 = 3.0;
@@ -219,12 +223,80 @@ pub(super) struct Drag {
     last_frame_time_us: i64,
 }
 
+/// The drop landing: the reorder is already committed, and this eases the rows
+/// from where they were drawn when the pointer came up into where they now
+/// belong, so nothing teleports on release.
+///
+/// Offsets are stored against the *post*-drop layout and scaled by the
+/// remaining fraction of the animation, which makes the resting state - and so
+/// the state after any interruption - simply "no offset at all".
+#[derive(Clone, Debug)]
+pub(super) struct DropSettle {
+    // The dropped block's position in the post-drop list, plus the id it should
+    // be at: any edit that moves it invalidates the whole animation.
+    from_row: usize,
+    span: usize,
+    id: String,
+    // Release position of the block, relative to the slot it landed in.
+    offset_y: f64,
+    // Release indent of the block, relative to its landed depth, in depth units.
+    depth_offset: f64,
+    // Same, per row, for everything that was still sliding out of the way.
+    row_y: Vec<f64>,
+    // 0 at release, 1 once landed.
+    progress: f64,
+    last_frame_time_us: i64,
+}
+
+impl DropSettle {
+    /// Fraction of the release offsets still to be travelled.
+    fn remaining(&self) -> f64 {
+        let t = self.progress.clamp(0.0, 1.0);
+        // Ease-out cubic: leaves the pointer at full speed and decelerates in.
+        (1.0 - t).powi(3)
+    }
+
+    /// Whether this still describes the list it was built for. A drop lands
+    /// during a live redraw loop, so an undo or a layer edit can land on top of
+    /// it; those re-lay-out the rows and the stored offsets stop meaning
+    /// anything.
+    fn matches(&self, rows: &[VisibleRow]) -> bool {
+        self.span > 0
+            && self.row_y.len() == rows.len()
+            && self.from_row + self.span <= rows.len()
+            && rows.get(self.from_row).is_some_and(|r| row_id(r) == self.id)
+    }
+}
+
+/// A block lifted above the list: the rows the pointer is holding, or the ones
+/// it just dropped and that are still settling. Both draw the same way - offset
+/// from their slot, indented off their real depth, and casting a shadow - so
+/// both go through this.
+struct FloatBlock {
+    from: usize,
+    span: usize,
+    // Y the block's first row is drawn at.
+    top: f64,
+    // Indent offset from the row's real depth, in depth units.
+    depth_offset: f64,
+    // How far off the list the block is held: 1 while the pointer has it, easing
+    // to 0 as a dropped block lands. Drives everything that says "this is not
+    // part of the list right now" - the shadow, and the card a row carries
+    // while it has no container of its own.
+    lift: f64,
+}
+
 // --- Ui ---
 #[derive(Clone)]
 pub(super) struct Ui {
     pub(super) state: LayerState,
     pub(super) tree: Rc<RefCell<Vec<LayerNode>>>,
     pub(super) drag: Rc<RefCell<Option<Drag>>>,
+    // Set for the moment between a drop and the rows reaching their new slots.
+    pub(super) drop_settle: Rc<RefCell<Option<DropSettle>>>,
+    // Whether a tick callback is already driving `drop_settle`, so back-to-back
+    // drops replace the animation instead of stacking a second one on it.
+    pub(super) settle_ticking: Rc<Cell<bool>>,
     pub(super) thumbnails: Rc<RefCell<Vec<Option<cairo::ImageSurface>>>>,
     pub(super) multi_selected: Rc<RefCell<HashSet<String>>>,
     // Mutually exclusive with `state.active()`: only one of layer/group is primary.
@@ -262,6 +334,8 @@ impl Ui {
             state,
             tree: Rc::new(RefCell::new(tree)),
             drag: Rc::new(RefCell::new(None)),
+            drop_settle: Rc::new(RefCell::new(None)),
+            settle_ticking: Rc::new(Cell::new(false)),
             thumbnails: Rc::new(RefCell::new(Vec::new())),
             multi_selected: Rc::new(RefCell::new(HashSet::new())),
             active_group: Rc::new(RefCell::new(None)),
@@ -549,6 +623,14 @@ fn collect_rows(
 /// sibling of its base, it just borrows a gutter to draw its rod in.
 fn tree_depth(row: &VisibleRow) -> usize {
     row.depth + row.adjust_indent
+}
+
+/// Layers and folders share one id space, so a row is identified the same way
+/// whichever it is.
+fn row_id(row: &VisibleRow) -> &str {
+    match &row.kind {
+        RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.as_str(),
+    }
 }
 
 /// The rows a container row encloses: everything after it, up to the first row
@@ -2459,6 +2541,7 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         ui.sync_selection_to_state();
         let snapshot = ui.state.snapshot();
         let drag = ui.drag.borrow().clone();
+        let settle = ui.drop_settle.borrow().clone();
         let active_id = ui.active_id();
         let active_group = ui.active_group.borrow().clone();
         let multi = ui.multi_selected.borrow();
@@ -2483,63 +2566,87 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         // No hover highlight mid-drag (rows are sliding around).
         let hover = if drag.is_none() { *ui.hover.borrow() } else { None };
 
-        // Span covers a group header plus its expanded children when one is being dragged.
-        let drag_handle = drag.as_ref().and_then(|d| {
-            if d.zone == HitZone::Handle && d.from_row < count {
+        // The block held above the list. A live drag owns it; once the pointer
+        // is up the drop animation takes over and flies it into its new slot,
+        // so the same rows keep the same treatment across the release.
+        let float = drag
+            .as_ref()
+            .filter(|d| d.zone == HitZone::Handle && d.from_row < count)
+            .map(|d| {
+                // Span covers a group header plus its expanded children.
                 let span = drag_span(&rows, d.from_row);
-                let to = d.current_row.min(count.saturating_sub(span));
-                Some((d.from_row, span, to))
-            } else {
-                None
+                let max_top = if count > span {
+                    layout.top(count - span)
+                } else {
+                    LIST_PADDING
+                };
+                FloatBlock {
+                    from: d.from_row,
+                    span,
+                    top: (d.pointer_y - d.grab_offset_y).clamp(LIST_PADDING, max_top),
+                    depth_offset: d.animated_depth_offset,
+                    lift: 1.0,
+                }
+            })
+            .or_else(|| {
+                let s = settle.as_ref().filter(|s| s.matches(&rows))?;
+                let left = s.remaining();
+                Some(FloatBlock {
+                    from: s.from_row,
+                    span: s.span,
+                    top: layout.top(s.from_row) + s.offset_y * left,
+                    depth_offset: s.depth_offset * left,
+                    lift: left,
+                })
+            });
+
+        // Y nudge from a row's natural slot: rows make room for the block while
+        // it is dragged, then close the last of that gap as it lands.
+        let row_offset = |r: usize| -> f64 {
+            if let Some(d) = drag.as_ref().filter(|d| d.zone == HitZone::Handle) {
+                return d.row_y_anim.get(r).copied().unwrap_or(0.0);
             }
-        });
+            settle
+                .as_ref()
+                .filter(|s| s.matches(&rows))
+                .map_or(0.0, |s| s.row_y.get(r).copied().unwrap_or(0.0) * s.remaining())
+        };
 
         // Nesting surfaces go down first so every row sits on top of its own
-        // container. Containers wholly inside the dragged block are skipped
-        // here and drawn with the floating stack instead, so the block keeps
-        // its appearance while it moves.
+        // container. Containers wholly inside the floating block are skipped
+        // here and drawn with it instead, so the block keeps its appearance
+        // while it moves.
         for (row_idx, _) in rows.iter().enumerate() {
             if !opens_box(&rows, row_idx) {
                 continue;
             }
             let held = contained_rows(&rows, row_idx);
-            if drag_handle.is_some_and(|(from, span, _)| {
-                row_idx >= from && row_idx + held < from + span
+            if float.as_ref().is_some_and(|f| {
+                row_idx >= f.from && row_idx + held < f.from + f.span
             }) {
                 continue;
             }
             let level = tree_depth(&rows[row_idx]);
             // Follow the reorder animation: the first and last rows carry the
             // container's edges with them.
-            let anim_at = |r: usize| {
-                drag.as_ref()
-                    .filter(|d| d.zone == HitZone::Handle)
-                    .and_then(|d| d.row_y_anim.get(r).copied())
-                    .unwrap_or(0.0)
-            };
             draw_nest_box(
                 ctx,
                 count_f64(level),
                 width,
-                layout.top(row_idx) - NEST_PAD + anim_at(row_idx),
-                container_bottom(&rows, &layout, row_idx) + anim_at(row_idx + held),
+                layout.top(row_idx) - NEST_PAD + row_offset(row_idx),
+                container_bottom(&rows, &layout, row_idx) + row_offset(row_idx + held),
                 palette.surface(level),
             );
         }
 
         for (row_idx, row) in rows.iter().enumerate() {
-            let is_dragged = drag_handle.is_some_and(|(from, span, _)| {
-                row_idx >= from && row_idx < from + span
-            });
-            if is_dragged {
+            let is_floating = float
+                .as_ref()
+                .is_some_and(|f| row_idx >= f.from && row_idx < f.from + f.span);
+            if is_floating {
                 continue;
             }
-            let y_offset = drag
-                .as_ref()
-                .filter(|d| d.zone == HitZone::Handle)
-                .and_then(|d| d.row_y_anim.get(row_idx).copied())
-                .unwrap_or(0.0);
-            let y = layout.top(row_idx) + y_offset;
+            let y = layout.top(row_idx) + row_offset(row_idx);
             let thumb = match &row.kind {
                 RowKind::Layer { flat_idx, .. } => {
                     thumbnails.get(*flat_idx).and_then(|o| o.as_ref())
@@ -2561,107 +2668,102 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             let mask_active = is_adjustment && row_mask_active(&ui, row);
             let hover_zone = hover.and_then(|(hr, z)| (hr == row_idx).then_some(z));
             let nest = box_depth(&rows, row_idx);
-            draw_row(ctx, &palette, width, y, row, count_f64(nest), is_active, is_multi, thumb, is_component, is_text, is_adjustment, mask_active, hover_zone, clip_info(&rows, row_idx), nest, nest == 0);
+            let own_bg = if nest == 0 { 1.0 } else { 0.0 };
+            draw_row(ctx, &palette, width, y, row, count_f64(nest), is_active, is_multi, thumb, is_component, is_text, is_adjustment, mask_active, hover_zone, clip_info(&rows, row_idx), nest, own_bg);
         }
 
-        if let Some((from, span, _)) = drag_handle
-            && let Some(d) = &drag {
-                let max_top = if count > span {
-                    layout.top(count - span)
+        if let Some(f) = &float {
+            let (from, span) = (f.from, f.span);
+            let anim = f.depth_offset;
+
+            // The floating block is laid out on its own so its internal
+            // container padding survives the trip, then shifted so its first
+            // row lands where the block is currently drawn.
+            let block: Vec<VisibleRow> = rows[from..(from + span).min(count)].to_vec();
+            let block_layout = RowLayout::new(&block);
+            let shift = f.top - block_layout.top(0);
+            // Nesting *within* the block starts here: the block's own root
+            // level, which is the depth its first row sits at.
+            let block_base = tree_depth(&block[0]);
+
+            // Lift the block off the list. A folder is shadowed by its
+            // container's outline, a lone layer by its own row, so the shadow
+            // always traces what the user is actually holding.
+            {
+                let level = (count_f64(tree_depth(&block[0])) + anim).max(0.0);
+                let (sx, sy, sw, sh, radius) = if opens_box(&block, 0) {
+                    let top = shift + block_layout.top(0) - NEST_PAD;
+                    let bottom = shift + container_bottom(&block, &block_layout, 0);
+                    let x = nest_left_f(level);
+                    (x, top, nest_right(width) - x, bottom - top, NEST_RADIUS)
                 } else {
-                    LIST_PADDING
+                    let clipped = clip_info(&block, 0).clipped;
+                    let x = nest_left_f(level) + if clipped { INDENT_STEP } else { 0.0 };
+                    let top = shift + block_layout.top(0);
+                    (x, top, nest_right(width) - x, ITEM_HEIGHT, ITEM_RADIUS)
                 };
-                let y_start = (d.pointer_y - d.grab_offset_y)
-                    .clamp(LIST_PADDING, max_top);
-                let anim = d.animated_depth_offset;
-
-                // The dragged block is laid out on its own so its internal
-                // container padding survives the trip, then shifted so its
-                // first row lands under the pointer.
-                let block: Vec<VisibleRow> = rows[from..(from + span).min(count)].to_vec();
-                let block_layout = RowLayout::new(&block);
-                let shift = y_start - block_layout.top(0);
-                // Nesting *within* the block starts here: the block's own root
-                // level, which is the depth its first row sits at.
-                let block_base = tree_depth(&block[0]);
-
-                // Lift the block off the list. A folder is shadowed by its
-                // container's outline, a lone layer by its own row, so the
-                // shadow always traces what the user is actually holding.
-                {
-                    let level = (count_f64(tree_depth(&block[0])) + anim).max(0.0);
-                    let (sx, sy, sw, sh, radius) = if opens_box(&block, 0) {
-                        let top = shift + block_layout.top(0) - NEST_PAD;
-                        let bottom = shift + container_bottom(&block, &block_layout, 0);
-                        let x = nest_left_f(level);
-                        (x, top, nest_right(width) - x, bottom - top, NEST_RADIUS)
-                    } else {
-                        let clipped = clip_info(&block, 0).clipped;
-                        let x = nest_left_f(level)
-                            + if clipped { INDENT_STEP } else { 0.0 };
-                        let top = shift + block_layout.top(0);
-                        (x, top, nest_right(width) - x, ITEM_HEIGHT, ITEM_RADIUS)
-                    };
-                    draw_drop_shadow(ctx, sx, sy, sw, sh, radius);
-                }
-
-                // Containers inside the block, so a dragged folder keeps its
-                // surface instead of its rows going transparent over the page.
-                for (j, _) in block.iter().enumerate() {
-                    if !opens_box(&block, j) {
-                        continue;
-                    }
-                    let level = count_f64(tree_depth(&block[j])) + anim;
-                    draw_nest_box(
-                        ctx,
-                        level.max(0.0),
-                        width,
-                        shift + block_layout.top(j) - NEST_PAD,
-                        shift + container_bottom(&block, &block_layout, j),
-                        palette.surface(tree_depth(&block[j])),
-                    );
-                }
-
-                for i in 0..span {
-                    let row_idx = from + i;
-                    if row_idx >= count {
-                        break;
-                    }
-                    let row = &rows[row_idx];
-                    let y = shift + block_layout.top(i);
-                    let thumb = match &row.kind {
-                        RowKind::Layer { flat_idx, .. } => {
-                            thumbnails.get(*flat_idx).and_then(|o| o.as_ref())
-                        }
-                        RowKind::Group { .. } => None,
-                    };
-                    let is_active = match &row.kind {
-                        RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
-                        RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
-                    };
-                    // Indent still tracks the row's real depth (easing toward
-                    // the drop target), and the surface it sits on is still its
-                    // real level - but whether it paints its own fill is
-                    // decided *within the block*, measured from the block's own
-                    // root. A lone dragged layer has no container travelling
-                    // with it, however deeply nested it used to be, so it has
-                    // to paint its own.
-                    let nest = box_depth(&rows, row_idx);
-                    let depth_f = (count_f64(nest) + anim).max(0.0);
-                    let own_bg = box_depth(&block, i) == block_base;
-                    let is_component = row_is_component(&ui, row);
-                    let is_text = row_is_text(&ui, row);
-                    let is_adjustment = row_is_adjustment(&ui, row);
-                    let mask_active = is_adjustment && row_mask_active(&ui, row);
-                    // A floating row has no neighbours to connect to, so it
-                    // keeps its clip badge but drops the rod and terminus.
-                    let mut clip = clip_info(&rows, row_idx);
-                    clip.clipped_above = false;
-                    clip.clipped_below = false;
-                    clip.is_base = false;
-                    draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text, is_adjustment, mask_active, None, clip, nest, own_bg);
-                }
+                draw_drop_shadow(ctx, sx, sy, sw, sh, radius, f.lift);
             }
+
+            // Containers inside the block, so a dragged folder keeps its
+            // surface instead of its rows going transparent over the page.
+            for (j, _) in block.iter().enumerate() {
+                if !opens_box(&block, j) {
+                    continue;
+                }
+                let level = count_f64(tree_depth(&block[j])) + anim;
+                draw_nest_box(
+                    ctx,
+                    level.max(0.0),
+                    width,
+                    shift + block_layout.top(j) - NEST_PAD,
+                    shift + container_bottom(&block, &block_layout, j),
+                    palette.surface(tree_depth(&block[j])),
+                );
+            }
+
+            for i in 0..span {
+                let row_idx = from + i;
+                if row_idx >= count {
+                    break;
+                }
+                let row = &rows[row_idx];
+                let y = shift + block_layout.top(i);
+                let thumb = match &row.kind {
+                    RowKind::Layer { flat_idx, .. } => {
+                        thumbnails.get(*flat_idx).and_then(|o| o.as_ref())
+                    }
+                    RowKind::Group { .. } => None,
+                };
+                let is_active = match &row.kind {
+                    RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
+                    RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
+                };
+                // Indent still tracks the row's real depth (easing toward the
+                // drop target), and the surface it sits on is still its real
+                // level - but whether it paints its own fill is decided
+                // *within the block*, measured from the block's own root. A
+                // lone dragged layer has no container travelling with it,
+                // however deeply nested it used to be, so it has to paint its
+                // own, and give it back as it lands.
+                let nest = box_depth(&rows, row_idx);
+                let depth_f = (count_f64(nest) + anim).max(0.0);
+                let lifted_bg = if box_depth(&block, i) == block_base { 1.0 } else { 0.0 };
+                let resting_bg = if nest == 0 { 1.0 } else { 0.0 };
+                let own_bg = resting_bg + (lifted_bg - resting_bg) * f.lift;
+                let is_component = row_is_component(&ui, row);
+                let is_text = row_is_text(&ui, row);
+                let is_adjustment = row_is_adjustment(&ui, row);
+                let mask_active = is_adjustment && row_mask_active(&ui, row);
+                // A floating row has no neighbours to connect to, so it keeps
+                // its clip badge but drops the rod and terminus.
+                let mut clip = clip_info(&rows, row_idx);
+                clip.clipped_above = false;
+                clip.clipped_below = false;
+                clip.is_base = false;
+                draw_row(ctx, &palette, width, y, row, depth_f, is_active, false, thumb, is_component, is_text, is_adjustment, mask_active, None, clip, nest, own_bg);
+            }
+        }
     });
 }
 
@@ -2740,6 +2842,148 @@ fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     }
 }
 
+/// Where the list was actually drawn at the instant the pointer came up, keyed
+/// by row id so it survives the reorder that follows.
+struct ReleaseVisual {
+    row_tops: HashMap<String, f64>,
+    block_top: f64,
+    block_depth: f64,
+}
+
+/// Sample [`ReleaseVisual`] from a drag about to end. Mirrors what the draw
+/// function was putting on screen for that same frame - the eased per-row
+/// nudges, and the block hanging off the pointer - so the settle animation
+/// starts from exactly where the user last saw things.
+fn release_visual(rows: &[VisibleRow], drag: &Drag, span: usize) -> ReleaseVisual {
+    let layout = RowLayout::new(rows);
+    let count = rows.len();
+    let row_tops = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            let nudge = drag.row_y_anim.get(r).copied().unwrap_or(0.0);
+            (row_id(row).to_string(), layout.top(r) + nudge)
+        })
+        .collect();
+    let max_top = if count > span {
+        layout.top(count - span)
+    } else {
+        LIST_PADDING
+    };
+    let depth = rows.get(drag.from_row).map_or(0, tree_depth);
+    ReleaseVisual {
+        row_tops,
+        block_top: (drag.pointer_y - drag.grab_offset_y).clamp(LIST_PADDING, max_top),
+        block_depth: count_f64(depth) + drag.animated_depth_offset,
+    }
+}
+
+/// The gap between where the list was drawn at release and where the drop put
+/// it, expressed as offsets to unwind. `rows` is the *final* list, so this runs
+/// after the reorder is committed. `None` when nothing moved far enough to be
+/// worth animating - a plain click on the handle, or a drag that ended on its
+/// own slot.
+///
+/// Rows the drag never touched get an offset too: their make-room easing was
+/// interrupted wherever the pointer happened to come up.
+fn settle_from_release(
+    rows: &[VisibleRow],
+    before: &ReleaseVisual,
+    dragged_id: &str,
+) -> Option<DropSettle> {
+    let from_row = rows.iter().position(|r| row_id(r) == dragged_id)?;
+    let layout = RowLayout::new(rows);
+    let span = drag_span(rows, from_row);
+
+    let row_y: Vec<f64> = rows
+        .iter()
+        .enumerate()
+        .map(|(r, row)| {
+            if r >= from_row && r < from_row + span {
+                return 0.0; // the block travels as a unit, via `offset_y`
+            }
+            before
+                .row_tops
+                .get(row_id(row))
+                .map_or(0.0, |was| was - layout.top(r))
+        })
+        .collect();
+
+    let offset_y = before.block_top - layout.top(from_row);
+    let depth_offset = before.block_depth - count_f64(tree_depth(&rows[from_row]));
+
+    let still = offset_y.abs() < 0.5
+        && depth_offset.abs() < 0.01
+        && row_y.iter().all(|y| y.abs() < 0.5);
+    if still {
+        return None;
+    }
+
+    Some(DropSettle {
+        from_row,
+        span,
+        id: dragged_id.to_string(),
+        offset_y,
+        depth_offset,
+        row_y,
+        progress: 0.0,
+        last_frame_time_us: 0,
+    })
+}
+
+/// Run [`settle_from_release`] as an animation, so the dropped block flies into
+/// its slot rather than appearing there.
+fn start_drop_settle(
+    ui: &Ui,
+    area: &gtk::DrawingArea,
+    before: &ReleaseVisual,
+    dragged_id: &str,
+) {
+    let settle = {
+        let snapshot = ui.state.snapshot();
+        let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
+        settle_from_release(&rows, before, dragged_id)
+    };
+    let Some(settle) = settle else {
+        *ui.drop_settle.borrow_mut() = None;
+        return;
+    };
+    *ui.drop_settle.borrow_mut() = Some(settle);
+
+    // One tick callback drives however many drops happen: a second drop while
+    // the first is still landing replaces the state under it.
+    if ui.settle_ticking.replace(true) {
+        return;
+    }
+    let tick_ui = ui.clone();
+    area.add_tick_callback(move |widget, clock| {
+        let now = clock.frame_time();
+        let done = {
+            let mut settle = tick_ui.drop_settle.borrow_mut();
+            let Some(s) = settle.as_mut() else {
+                tick_ui.settle_ticking.set(false);
+                return glib::ControlFlow::Break;
+            };
+            let dt = if s.last_frame_time_us == 0 {
+                0.0
+            } else {
+                ((now - s.last_frame_time_us) as f64 * 1e-6).clamp(0.0, 0.1)
+            };
+            s.last_frame_time_us = now;
+            s.progress += dt / DROP_SETTLE_SECS;
+            s.progress >= 1.0
+        };
+        if done {
+            *tick_ui.drop_settle.borrow_mut() = None;
+            tick_ui.settle_ticking.set(false);
+            widget.queue_draw();
+            return glib::ControlFlow::Break;
+        }
+        widget.queue_draw();
+        glib::ControlFlow::Continue
+    });
+}
+
 /// Three tones carry the list's structure: the panel sits on `window_bg`, rows
 /// are `card` on top of it, and a container's fill sits between the two so a
 /// group reads as a surface holding cards rather than another card.
@@ -2784,6 +3028,15 @@ impl Palette {
         }
         let t = (0.06 * count_f64(level)).min(0.24);
         lerp_rgb(self.row_bg, self.fg, t)
+    }
+
+    /// What is already painted behind a row at nesting level `nest`: the
+    /// enclosing container's fill, or the panel itself at the root. A row that
+    /// paints no card of its own is showing exactly this, which is what lets a
+    /// dropped row fade its card out into place instead of dropping it.
+    fn backdrop(&self, nest: usize) -> Rgb {
+        nest.checked_sub(1)
+            .map_or(self.window_bg, |level| self.surface(level))
     }
 }
 
@@ -2872,10 +3125,11 @@ fn draw_row(
     clip: ClipInfo,
     // Nesting level the row sits at, which picks the surface it is drawn over.
     nest: usize,
-    // Whether the row paints its own fill. Normally that is "it is not inside a
-    // container", but a row torn out of one by a drag has no container
-    // travelling with it and has to paint its own.
-    own_bg: bool,
+    // How much of its own card the row paints. Normally all or nothing - a row
+    // inside a container sits on that container's surface and paints none - but
+    // a row torn out of one by a drag has no container travelling with it and
+    // carries its own, then fades it back out as it lands.
+    own_bg: f64,
 ) {
     // `depth_f` is the animated nesting level during a drag; it tracks `nest`
     // except while a dragged row is easing between levels.
@@ -2901,13 +3155,16 @@ fn draw_row(
     // paints no fill of its own - stacking a second card on the first only
     // muddies the nesting. Selection still paints, since that is the row
     // standing out from its surroundings rather than describing structure.
+    //
+    // A partial card is mixed against what is already behind the row, so at
+    // zero it is indistinguishable from painting nothing at all.
     let surface = palette.surface(nest);
     let bg = if is_active {
         Some(palette.accent_bg)
     } else if is_multi {
         Some(lerp_rgb(surface, palette.accent_bg, 0.25))
-    } else if own_bg {
-        Some(palette.row_bg)
+    } else if own_bg > 0.0 {
+        Some(lerp_rgb(palette.backdrop(nest), palette.row_bg, own_bg))
     } else {
         None
     };
@@ -3144,8 +3401,16 @@ fn connector_x(nest_left: f64) -> f64 {
 /// alpha: the number of layers covering a pixel falls off with distance, which
 /// gives the gradient for the cost of a few fills. A real blur would mean an
 /// offscreen surface every frame, for something the pointer is moving anyway.
-fn draw_drop_shadow(ctx: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius: f64) {
-    if w <= 0.0 || h <= 0.0 {
+fn draw_drop_shadow(
+    ctx: &cairo::Context,
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    radius: f64,
+    alpha: f64,
+) {
+    if w <= 0.0 || h <= 0.0 || alpha <= 0.0 {
         return;
     }
     ctx.save().ok();
@@ -3159,7 +3424,7 @@ fn draw_drop_shadow(ctx: &cairo::Context, x: f64, y: f64, w: f64, h: f64, radius
             h + grow * 2.0,
             radius + grow,
         );
-        ctx.set_source_rgba(0.0, 0.0, 0.0, SHADOW_STEP_ALPHA);
+        ctx.set_source_rgba(0.0, 0.0, 0.0, SHADOW_STEP_ALPHA * alpha);
         ctx.fill().ok();
     }
     ctx.restore().ok();
@@ -3704,6 +3969,9 @@ fn install_list_input(
             if ui.drag.borrow().is_some() {
                 return;
             }
+            // Any press lands a still-settling drop at once: the new gesture
+            // has to act on where the rows really are.
+            ui.drop_settle.borrow_mut().take();
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
             let layout = RowLayout::new(&rows);
@@ -4003,6 +4271,13 @@ fn install_list_input(
                         }
                 }
                 HitZone::Handle => {
+                    // Where the list was drawn on the last frame of the drag.
+                    // Sampled before the reorder, since that is what the drop
+                    // animation has to start from.
+                    let span = drag_span(&rows, d.from_row);
+                    let released = release_visual(&rows, &d, span);
+                    let held_id = rows.get(d.from_row).map(|r| row_id(r).to_string());
+
                     if d.from_row != d.current_row {
                         // A reorder mutates the layer stack; commit any in-progress
                         // transform first so it can't write onto a shifted index.
@@ -4078,6 +4353,11 @@ fn install_list_input(
                             sync_height(&area_w, &ui);
                             redraw.request();
                         }
+                    }
+                    // Fly the block from the pointer into the slot it landed
+                    // in, instead of having it appear there.
+                    if let Some(id) = held_id {
+                        start_drop_settle(&ui, &area_w, &released, &id);
                     }
                     area_w.set_cursor(None);
                     area_w.queue_draw();
@@ -4893,6 +5173,188 @@ mod tests {
                 "row {r} should not move at all, but eases by {target}"
             );
         }
+    }
+
+    // --- drop settle ---
+    fn drag_mid_flight(from_row: usize, to: usize, block_top: f64, eased: &[f64]) -> Drag {
+        Drag {
+            from_row,
+            current_row: to,
+            // The draw function reads `pointer_y - grab_offset_y` as the block's
+            // top edge, so this is one degree of freedom, not two.
+            pointer_y: block_top,
+            grab_offset_y: 0.0,
+            zone: HitZone::Handle,
+            animated_depth_offset: 0.0,
+            row_y_anim: eased.to_vec(),
+            last_frame_time_us: 0,
+        }
+    }
+
+    // The point of the whole animation: at the instant the pointer comes up,
+    // every row is drawn exactly where the drag had it. Anything else is the
+    // snap the animation exists to remove.
+    #[test]
+    fn the_drop_settle_starts_from_where_the_drag_left_off() {
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            named_layer_row("Layer 3", Some("g"), 0, 1, false, true),
+            named_layer_row("Layer 2", Some("g"), 1, 1, false, true),
+            named_layer_row("Background", None, 1, 0, false, true),
+        ];
+        // Background dragged to the top and released mid-slide: the block is
+        // short of its slot, and the rows making room for it are short of
+        // theirs (30px of the 48 they owe).
+        let (from, span, to) = (3usize, 1usize, 0usize);
+        let drag = drag_mid_flight(from, to, 20.0, &[30.0, 30.0, 30.0, 0.0]);
+        let released = release_visual(&rows, &drag, span);
+
+        let after_rows = reordered_rows(&rows, from, span, to, 0);
+        let settle = settle_from_release(&after_rows, &released, "Background")
+            .expect("the release was mid-slide, so there is a gap to close");
+        let after = RowLayout::new(&after_rows);
+
+        assert_eq!(settle.from_row, 0, "Background landed at the top");
+        assert!(
+            (after.top(settle.from_row) + settle.offset_y - released.block_top).abs() < 1e-9,
+            "the block would jump {}px on release",
+            after.top(settle.from_row) + settle.offset_y - released.block_top
+        );
+        for (r, row) in after_rows.iter().enumerate() {
+            if r == settle.from_row {
+                continue;
+            }
+            let drawn = after.top(r) + settle.row_y[r];
+            let was = released.row_tops[row_id(row)];
+            assert!((drawn - was).abs() < 1e-9, "row {r} jumps {}px", drawn - was);
+        }
+
+        // ...and once it has run, every offset is spent, so the rows are simply
+        // where the layout says.
+        let mut landed = settle;
+        landed.progress = 1.0;
+        assert!(landed.remaining().abs() < f64::EPSILON);
+    }
+
+    // A drag that reparents is still easing its indent when the pointer comes
+    // up; the block has to carry that remainder into its landing rather than
+    // popping a level sideways.
+    #[test]
+    fn the_drop_settle_carries_an_unfinished_reparent_indent() {
+        let rows = vec![
+            named_layer_row("Layer 5", None, 0, 0, false, true),
+            group_row("g", true, None, 1, 0),
+            named_layer_row("Layer 4", Some("g"), 0, 1, false, true),
+        ];
+        let (from, span, to) = (0usize, 1usize, 1usize);
+        let mut drag = drag_mid_flight(from, to, 8.0, &[0.0, 0.0, 0.0]);
+        // 70% of the way from root to inside the folder.
+        drag.animated_depth_offset = 0.7;
+        let released = release_visual(&rows, &drag, span);
+
+        let after_rows = reordered_rows(&rows, from, span, to, 1);
+        let settle = settle_from_release(&after_rows, &released, "Layer 5")
+            .expect("the indent is still 0.3 of a level short");
+        assert!(
+            (settle.depth_offset + 0.3).abs() < 1e-9,
+            "indent offset was {}, expected -0.3",
+            settle.depth_offset
+        );
+    }
+
+    // Pressing the handle without moving is not a drop, and must not kick off
+    // an animation of nothing.
+    #[test]
+    fn a_handle_press_that_moved_nothing_does_not_animate() {
+        let rows = vec![
+            named_layer_row("a", None, 0, 0, false, true),
+            named_layer_row("b", None, 1, 0, false, true),
+        ];
+        let layout = RowLayout::new(&rows);
+        let drag = drag_mid_flight(0, 0, layout.top(0), &[0.0, 0.0]);
+        let released = release_visual(&rows, &drag, 1);
+        assert!(settle_from_release(&rows, &released, "a").is_none());
+    }
+
+    fn test_palette() -> Palette {
+        Palette {
+            window_bg: (0.10, 0.10, 0.11),
+            row_bg: (0.18, 0.18, 0.19),
+            accent_bg: (0.21, 0.52, 0.89),
+            accent_fg: (1.0, 1.0, 1.0),
+            fg: (0.90, 0.90, 0.92),
+        }
+    }
+
+    fn rgb_eq(a: Rgb, b: Rgb) -> bool {
+        (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9 && (a.2 - b.2).abs() < 1e-9
+    }
+
+    // The container whose box is painted directly behind a row: itself when it
+    // opens one, otherwise the innermost container covering it.
+    fn painter_of(rows: &[VisibleRow], i: usize) -> Option<usize> {
+        if opens_box(rows, i) {
+            return Some(i);
+        }
+        (0..i)
+            .rev()
+            .find(|&j| opens_box(rows, j) && j + contained_rows(rows, j) >= i)
+    }
+
+    // A landing row gives its card back by mixing it into what is behind it, so
+    // the colour it ends on has to be the colour that is already there. Get the
+    // level wrong by one and every drop into a folder finishes on a flash.
+    #[test]
+    fn a_lifted_card_fades_into_whatever_is_actually_behind_the_row() {
+        // Group
+        //   Subgroup
+        //     b
+        //   a
+        // root
+        let rows = vec![
+            group_row("g", true, None, 0, 0),
+            group_row("sub", true, Some("g"), 0, 1),
+            named_layer_row("b", Some("sub"), 0, 2, false, true),
+            named_layer_row("a", Some("g"), 1, 1, false, true),
+            named_layer_row("root", None, 1, 0, false, true),
+        ];
+        let palette = test_palette();
+        for i in 0..rows.len() {
+            let painted = painter_of(&rows, i)
+                .map_or(palette.window_bg, |j| palette.surface(tree_depth(&rows[j])));
+            let faded = palette.backdrop(box_depth(&rows, i));
+            assert!(
+                rgb_eq(faded, painted),
+                "row {i} fades to {faded:?} but sits on {painted:?}"
+            );
+        }
+    }
+
+    // The animation is described against the post-drop list, so any edit that
+    // relays out the rows underneath it has to void it rather than offset the
+    // wrong rows by the old numbers.
+    #[test]
+    fn a_stale_drop_settle_is_ignored() {
+        let rows = vec![
+            named_layer_row("a", None, 0, 0, false, true),
+            named_layer_row("b", None, 1, 0, false, true),
+        ];
+        let settle = DropSettle {
+            from_row: 0,
+            span: 1,
+            id: "a".into(),
+            offset_y: 20.0,
+            depth_offset: 0.0,
+            row_y: vec![0.0, 12.0],
+            progress: 0.0,
+            last_frame_time_us: 0,
+        };
+        assert!(settle.matches(&rows));
+        assert!(!settle.matches(&rows[..1]), "a row went away");
+        assert!(
+            !settle.matches(&[rows[1].clone(), rows[0].clone()]),
+            "the block is no longer the row it was animating"
+        );
     }
 
     // Folders that end on the same row must not land their bottom edges on top
