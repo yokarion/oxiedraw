@@ -1530,7 +1530,7 @@ pub(super) fn full_image_barrier(
         .subresource_range(full_subresource_range())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu-tests"))]
 mod tests {
     use super::super::dab::DabInstance;
     use super::*;
@@ -1554,14 +1554,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn construct_and_drop() {
         let r = VulkanRenderer::new(Size::new(64, 64)).expect("renderer init");
         drop(r);
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn clear_and_read_white() {
         let mut r = VulkanRenderer::new(Size::new(64, 64)).expect("renderer init");
         let bytes = r.clear_and_read([1.0, 1.0, 1.0, 1.0]).expect("clear");
@@ -1570,7 +1568,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn clear_and_read_black() {
         let mut r = VulkanRenderer::new(Size::new(64, 64)).expect("renderer init");
         let bytes = r.clear_and_read([0.0, 0.0, 0.0, 1.0]).expect("clear");
@@ -1578,7 +1575,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn paint_one_dab() {
         let size = Size::new(64, 64);
         let mut r = VulkanRenderer::new(size).expect("renderer init");
@@ -1596,7 +1592,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn composite_stroke_red() {
         let size = Size::new(64, 64);
         let mut r = VulkanRenderer::new(size).expect("renderer init");
@@ -1616,7 +1611,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn select_all_fills_mask() {
         let mut r = VulkanRenderer::new(Size::new(32, 32)).expect("renderer init");
         r.select_all().expect("select_all");
@@ -1627,7 +1621,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn rect_shape_selects_interior_only() {
         use crate::renderer::selection::SelectionBlendMode;
         let mut r = VulkanRenderer::new(Size::new(32, 32)).expect("renderer init");
@@ -1648,7 +1641,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn invert_flips_mask() {
         use crate::renderer::selection::SelectionBlendMode;
         let mut r = VulkanRenderer::new(Size::new(16, 16)).expect("renderer init");
@@ -1671,7 +1663,6 @@ mod tests {
     // instance buffer before the previous async draw has run, dabs get dropped
     // and the row shows a hole. Repro for the fast-stroke end gaps.
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn burst_stamp_no_dropped_dabs() {
         let size = Size::new(256, 8);
         let mut r = VulkanRenderer::new(size).expect("renderer init");
@@ -1708,7 +1699,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn stamp_mask_saturates() {
         let size = Size::new(64, 64);
         let mut r = VulkanRenderer::new(size).expect("renderer init");

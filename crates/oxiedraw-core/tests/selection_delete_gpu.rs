@@ -1,7 +1,5 @@
 //! GPU integration tests for deleting the pixels inside a selection, driven
-//! through the public `Canvas` API. Each test is `#[ignore]` because it needs a
-//! working Vulkan loader + device; run with `cargo test -p oxiedraw-core --test
-//! selection_delete_gpu -- --ignored`.
+//! through the public `Canvas` API.
 
 #![allow(clippy::unwrap_used)]
 
@@ -38,7 +36,6 @@ fn select_left_half(canvas: &mut Canvas, size: Size) {
 // Bug 1: Delete erases only the selected pixels and the selection must stay
 // active afterwards (the marquee should not disappear).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn erase_selection_clears_pixels_but_keeps_selection() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -66,7 +63,6 @@ fn erase_selection_clears_pixels_but_keeps_selection() {
 // Contrast: the cut path's clear_selection_from_layer drops the selection,
 // whereas erase_selection_in_layer keeps it. Locks in the difference.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn clear_selection_from_layer_deselects() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();

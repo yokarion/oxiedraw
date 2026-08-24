@@ -1,8 +1,7 @@
-//! GPU integration tests for the colour-smudge (Real Brush) path. Run with
-//! `cargo test -p oxiedraw-core --test smudge_gpu -- --ignored --nocapture`.
+//! GPU integration tests for the colour-smudge (Real Brush) path.
 
 #![allow(clippy::unwrap_used)]
-// Diagnostic prints for the --nocapture runs of these ignored GPU tests.
+// Diagnostic prints for the --nocapture runs of these GPU tests.
 #![allow(clippy::print_stdout)]
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
@@ -71,7 +70,6 @@ fn smudge_line_p(
 /// White smudge over transparent must stay light - premultiplied-black pickup
 /// used to smear dark. Reads the active layer's alpha + luma along the stroke.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn white_smudge_over_transparent_is_not_dark() {
     let size = Size::new(200, 40);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -115,7 +113,6 @@ fn white_smudge_over_transparent_is_not_dark() {
 /// with no paint colour (colour rate ~0 via zero pressure keeps it a pure
 /// smear) drags red into blue at the boundary.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn smudge_drags_colour_across_a_boundary() {
     let size = Size::new(200, 40);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -158,7 +155,6 @@ fn smudge_drags_colour_across_a_boundary() {
 /// lighter dots along the stroke (the user's report). Measure the luma
 /// variance along the centre line.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn white_smudge_on_black_is_not_dotty() {
     let size = Size::new(300, 40);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -194,7 +190,6 @@ fn white_smudge_on_black_is_not_dotty() {
 /// The opacity slider must scale the smudge deposit: a low-opacity white
 /// smudge on black stays much darker than a full-opacity one.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn opacity_scales_smudge_deposit() {
     let mean_luma_at = |opacity: f32| -> i32 {
         let size = Size::new(240, 40);
@@ -226,7 +221,6 @@ fn opacity_scales_smudge_deposit() {
 /// The pre-stroke smudge snapshot (used for undo) must hold the PRISTINE layer
 /// content, even though the layer itself is mutated live during the stroke.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn smudge_before_snapshot_is_pristine() {
     let size = Size::new(120, 40);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -271,7 +265,6 @@ fn vec_black(size: Size) -> Vec<u8> {
 /// Smudge over a solid colour should smear it, and the deposited alpha along
 /// the stroke centre should be reasonably even (no strong per-dab beading).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn smudge_stroke_alpha_is_even() {
     let size = Size::new(240, 40);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -306,7 +299,6 @@ fn smudge_stroke_alpha_is_even() {
 /// Low-pressure white smudge over transparent: the classic OVER-of-soft-dabs
 /// beading case. Report the centre-row alpha variance so we can see beads.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn low_pressure_smudge_beading_profile() {
     let size = Size::new(240, 40);
     let mut canvas = Canvas::headless(size).unwrap();

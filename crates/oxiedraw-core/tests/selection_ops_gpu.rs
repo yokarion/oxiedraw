@@ -1,7 +1,5 @@
 //! GPU integration tests for the selection mask's boolean operations, driven
-//! through the public `Canvas` API. Each test is `#[ignore]` because it needs a
-//! working Vulkan loader + device; run with
-//! `cargo test -p oxiedraw-core --test selection_ops_gpu -- --ignored`.
+//! through the public `Canvas` API.
 //!
 //! The four mask ops (Replace / Add / Subtract / Intersect) are separate
 //! pipelines that differ only in their colour blend state, and they write the
@@ -49,7 +47,6 @@ fn erase_and_probe(canvas: &mut Canvas, idx: usize) -> impl Fn(usize, usize) -> 
 
 /// Add: left half OR right half covers everything, so the whole layer erases.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn add_unions_two_regions() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &opaque()).unwrap();
@@ -68,7 +65,6 @@ fn add_unions_two_regions() {
 
 /// Subtract: whole canvas minus the left half leaves only the right selected.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn subtract_removes_a_region() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &opaque()).unwrap();
@@ -87,7 +83,6 @@ fn subtract_removes_a_region() {
 
 /// Intersect: left half AND top half leaves only the top-left quadrant.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn intersect_keeps_only_the_overlap() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &opaque()).unwrap();
@@ -109,7 +104,6 @@ fn intersect_keeps_only_the_overlap() {
 /// The folder-icon path (`select_from_layers_alpha`) must select the union of
 /// the layers' actual painted alpha, not their bounding box or the whole canvas.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn select_from_layers_alpha_follows_the_painted_shape() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
 
@@ -151,7 +145,6 @@ fn select_from_layers_alpha_follows_the_painted_shape() {
 /// artwork. An adjustment layer's slot is a grayscale mask that starts fully
 /// opaque, so unioning its alpha in would select the entire canvas.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn adjustment_layer_in_the_set_does_not_select_everything() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
 
@@ -199,7 +192,6 @@ fn mask_at(mask: &[u8], x: usize, y: usize) -> u8 {
 /// Add paints coverage into the mask with no prior selection: the mask starts
 /// from empty rather than from whatever stale bytes it happened to hold.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_add_paints_from_empty() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.begin_mask_brush().unwrap();
@@ -216,7 +208,6 @@ fn mask_brush_add_paints_from_empty() {
 
 /// Erase takes coverage back out of a live selection.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_erase_cuts_a_hole() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.select_all().unwrap();
@@ -235,7 +226,6 @@ fn mask_brush_erase_cuts_a_hole() {
 /// toward fully selected, like Blender's weight brush. A pass that only ever
 /// reached `strength` would stall after the first event.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_add_builds_up_over_time() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.begin_mask_brush().unwrap();
@@ -265,7 +255,6 @@ fn mask_brush_add_builds_up_over_time() {
 /// Same for Erase, in the other direction: repeated passes walk the mask down
 /// to nothing rather than stopping at `1 - strength`.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_erase_builds_up_over_time() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.select_all().unwrap();
@@ -298,7 +287,6 @@ fn mask_brush_erase_builds_up_over_time() {
 /// stroke, fill and filter would be silently clipped away with only the ants
 /// to explain it, and they draw nothing for an empty mask.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_erase_without_a_selection_stays_inactive() {
     for mode in [MaskBrushMode::Erase, MaskBrushMode::Feather] {
         let mut canvas = Canvas::headless(SIZE).unwrap();
@@ -329,7 +317,6 @@ fn mask_brush_erase_without_a_selection_stays_inactive() {
 /// down, or its coverage (and so the strength slider) depends on which brush
 /// preset the user last painted with.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_ignores_the_last_paint_preset() {
     // A short drag, so its dabs overlap heavily. A single dab can't tell the
     // two blends apart - they only differ where dabs stack.
@@ -377,7 +364,6 @@ fn mask_brush_ignores_the_last_paint_preset() {
 /// deposits several times the coverage of a fast one over the same pixels, and
 /// every segment boundary gets stamped twice.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_coverage_is_independent_of_event_rate() {
     let (from, to) = (Point::new(2.0, 8.0), Point::new(14.0, 8.0));
     let walk = |segments: usize| {
@@ -406,7 +392,6 @@ fn mask_brush_coverage_is_independent_of_event_rate() {
 /// Blur softens whatever edge the brush covers, and keeps softening it while
 /// the brush is held there: each pass blurs the mask the last one produced.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_blur_feathers_an_edge() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -457,7 +442,6 @@ fn mask_brush_blur_feathers_an_edge() {
 /// used to tap several pixels apart, which stamped visible blocks into the
 /// gradient; the profile across a blurred edge has to stay monotonic.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_brush_blur_leaves_a_smooth_gradient() {
     let size = Size { width: 64, height: 64 };
     let mut canvas = Canvas::headless(size).unwrap();
@@ -539,7 +523,6 @@ fn nonzero_bounds(buf: &[u8], w: u32) -> (f32, f32, f32, f32) {
 /// has to reflect the pass that just ran: it is read mid-stroke, one submit
 /// after the blend wrote the mask.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_edges_track_the_brush_mid_stroke() {
     let size = Size { width: 64, height: 64 };
     let mut canvas = Canvas::headless(size).unwrap();
@@ -605,7 +588,6 @@ fn selection_edges_track_the_brush_mid_stroke() {
 /// tap only covers the middle 2x2, so a mask thinner than the block can miss
 /// every sampled texel and leave the live outline blank for the whole stroke.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_edges_keep_thin_features() {
     let size = Size { width: 64, height: 64 };
     let mut canvas = Canvas::headless(size).unwrap();
@@ -688,7 +670,6 @@ fn stepped_mask() -> SelectionShape {
 /// Marching ants only mark the 50% boundary, so the heatmap is what makes a
 /// partial mask legible: coverage tints transparent -> blue -> green -> red.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn heatmap_tints_the_display_by_coverage() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.add_layer_with_pixels("t", &white()).unwrap();
@@ -729,7 +710,6 @@ fn heatmap_tints_the_display_by_coverage() {
 /// never lit together: no magenta or purple anywhere in it. Lerping blue
 /// straight to red (or blue to green to red) breaks exactly this.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn heatmap_ramp_never_goes_purple() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.add_layer_with_pixels("t", &black()).unwrap();
@@ -770,7 +750,6 @@ fn heatmap_ramp_never_goes_purple() {
 /// The mask image keeps its bytes after a deselect (they are don't-care), so
 /// the overlay has to gate on the selection being live or it paints a ghost.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn heatmap_needs_a_live_selection() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas.add_layer_with_pixels("t", &white()).unwrap();
@@ -797,7 +776,6 @@ fn heatmap_needs_a_live_selection() {
 
 /// Replace really replaces rather than accumulating with what came before.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn replace_discards_the_previous_mask() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &opaque()).unwrap();

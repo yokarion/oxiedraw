@@ -1,7 +1,5 @@
 //! GPU integration tests for the layer filters, driven through the public
-//! `Canvas` API. Each test is `#[ignore]` because it needs a working Vulkan
-//! loader + device; run with `cargo test -p oxiedraw-core --test filters_gpu
-//! -- --ignored`.
+//! `Canvas` API.
 
 #![allow(clippy::unwrap_used)]
 
@@ -26,7 +24,6 @@ fn near(a: u8, b: u8, tol: i32) -> bool {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn invert_opaque_red_to_cyan() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -43,7 +40,6 @@ fn invert_opaque_red_to_cyan() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn invert_twice_restores_original() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -60,7 +56,6 @@ fn invert_twice_restores_original() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn hsv_value_zero_blackens() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -83,7 +78,6 @@ fn hsv_value_zero_blackens() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn blur_spreads_a_spike() {
     let size = Size::new(8, 8);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -110,7 +104,6 @@ fn blur_spreads_a_spike() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn sharpen_flat_color_is_identity() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -126,7 +119,6 @@ fn sharpen_flat_color_is_identity() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_respects_selection_mask() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -160,7 +152,6 @@ fn filter_respects_selection_mask() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn live_preview_then_apply_and_cancel() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -190,7 +181,6 @@ fn live_preview_then_apply_and_cancel() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_applies_to_multiple_layers() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -207,7 +197,6 @@ fn filter_applies_to_multiple_layers() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn brightness_lifts_a_fully_saturated_pixel() {
     // Regression: HSV value-multiply could not brighten a pixel already at
     // full value (e.g. pure red). Brightness > 1 now lifts additively, so a
@@ -234,7 +223,6 @@ fn brightness_lifts_a_fully_saturated_pixel() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn brightness_one_is_identity() {
     let size = Size::new(8, 8);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -257,7 +245,6 @@ fn brightness_one_is_identity() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn sharpen_is_visible_on_a_soft_edge() {
     // A smooth horizontal gradient (the kind of soft edge digital art has).
     // Unsharp must visibly change it, not only hard pixel steps.

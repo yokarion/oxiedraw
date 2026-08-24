@@ -1,7 +1,5 @@
 //! GPU integration tests for the Liquify tool, driven through the public
-//! `Canvas` API. Each test is `#[ignore]` because it needs a working Vulkan
-//! loader + device; run with `cargo test -p oxiedraw-core --test liquify_gpu
-//! -- --ignored`.
+//! `Canvas` API.
 
 #![allow(clippy::unwrap_used)]
 
@@ -79,7 +77,6 @@ fn push_horizontal(canvas: &mut Canvas, y: f32, from: f32, to: f32, radius: f32)
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn forward_warp_pushes_the_edge_along_the_drag() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -97,7 +94,6 @@ fn forward_warp_pushes_the_edge_along_the_drag() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn ending_without_baking_drops_only_the_pending_stroke() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let src = half_red(64);
@@ -117,7 +113,6 @@ fn ending_without_baking_drops_only_the_pending_stroke() {
 /// across the baked strokes rather than being re-taken from the warped layer,
 /// which is what would make successive strokes stack resampling blur.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn restore_all_returns_to_the_pristine_pixels_bit_exact() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -143,7 +138,6 @@ fn restore_all_returns_to_the_pristine_pixels_bit_exact() {
 /// Each stroke bakes on its own, so the layer advances once per stroke and the
 /// UI has a distinct before/after to record per warp.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn each_stroke_bakes_separately() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -169,7 +163,6 @@ fn each_stroke_bakes_separately() {
 /// The dirty bounds a bake reports must actually cover everything it changed -
 /// the UI trusts them to size the history patch.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn dirty_bounds_cover_every_changed_pixel() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -199,7 +192,6 @@ fn dirty_bounds_cover_every_changed_pixel() {
 /// Repeated pushes must compose, not merely add: dragging twice as far in two
 /// strokes has to move the edge further than one stroke of the same length.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn successive_pushes_compose() {
     let one = {
         let mut canvas = Canvas::headless(size()).unwrap();
@@ -227,7 +219,6 @@ fn successive_pushes_compose() {
 /// exactly that: a first push that cannot reach the marker under addition still
 /// changes where the marker lands under composition.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn composition_reads_the_old_field_at_the_displaced_position() {
     // A thin red marker bar at x in [46, 50) on black.
     let marker = {
@@ -284,7 +275,6 @@ fn composition_reads_the_old_field_at_the_displaced_position() {
 /// cannot cover the first stroke: those pixels have to survive from the earlier
 /// frame rather than being redrawn.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn an_incrementally_updated_preview_matches_a_full_rebuild() {
     let stroke_a = |c: &mut Canvas| push_horizontal(c, 20.0, 50.0, 86.0, 18.0);
     let stroke_b = |c: &mut Canvas| push_horizontal(c, 108.0, 50.0, 20.0, 18.0);
@@ -332,7 +322,6 @@ fn an_incrementally_updated_preview_matches_a_full_rebuild() {
 /// restore `warp(snapshot)` everywhere and silently revert that edit, without
 /// it appearing in the bounded history patch either.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn baking_preserves_edits_made_outside_the_warped_region() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -371,7 +360,6 @@ fn baking_preserves_edits_made_outside_the_warped_region() {
 /// shifts. Without that, inserting a layer underneath would make the next bake
 /// write one layer's warp over another.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn the_session_follows_its_layer_through_a_stack_insert() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let bottom = canvas.add_layer_with_pixels("bottom", &half_red(64)).unwrap();
@@ -406,7 +394,6 @@ fn the_session_follows_its_layer_through_a_stack_insert() {
 /// The selection is the mask: pixels outside it are protected from every mode,
 /// so a push that straddles the selection boundary only moves what is inside.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn a_selection_confines_the_warp_to_itself() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -445,7 +432,6 @@ fn a_selection_confines_the_warp_to_itself() {
 /// property the `SymElement::linear` vector transform exists for - mirroring
 /// only the dab centre would push both halves the same way.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn axis_symmetry_mirrors_the_push_direction() {
     let mut canvas = Canvas::headless(size()).unwrap();
     // Two vertical red bars, symmetric about x = 64: [24, 40) and [88, 104).
@@ -492,7 +478,6 @@ fn axis_symmetry_mirrors_the_push_direction() {
 /// field has zero displacement at its own centre, so a dab centred exactly on
 /// the edge leaves it where it is under both modes.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn bloat_and_pucker_move_content_in_opposite_directions() {
     let run = |mode: LiquifyMode| {
         let mut canvas = Canvas::headless(size()).unwrap();
@@ -513,7 +498,6 @@ fn bloat_and_pucker_move_content_in_opposite_directions() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn reconstruct_eases_a_warp_back_out() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();
@@ -571,7 +555,6 @@ fn bake_stroke_into_history(
 /// underneath. Reproduces the reported bug, where the whole session stayed
 /// unrecorded and the first Ctrl+Z popped the brush stroke instead.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn undo_steps_back_one_warp_stroke_at_a_time() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let mut history = HistoryStack::new(HistoryConfig::default());
@@ -630,7 +613,6 @@ fn undo_steps_back_one_warp_stroke_at_a_time() {
 /// A session the user opened but never warped bakes nothing, so there is no
 /// empty history entry for Ctrl+Z to swallow.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn an_untouched_session_records_nothing() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let src = half_red(64);
@@ -650,7 +632,6 @@ fn an_untouched_session_records_nothing() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn commit_bakes_exactly_what_the_preview_showed() {
     let mut canvas = Canvas::headless(size()).unwrap();
     let idx = canvas.add_layer_with_pixels("t", &half_red(64)).unwrap();

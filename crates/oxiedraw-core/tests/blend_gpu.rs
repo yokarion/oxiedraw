@@ -1,7 +1,5 @@
 //! GPU integration tests for per-layer blend modes, driven through the public
-//! `Canvas` API. Each test is `#[ignore]` because it needs a working Vulkan
-//! loader + device; run with
-//! `cargo test -p oxiedraw-core --test blend_gpu -- --ignored`.
+//! `Canvas` API.
 //!
 //! These pin down stack ordering: a layer with a non-Normal blend mode must
 //! still composite at its own position in the stack, not sink below the layers
@@ -39,7 +37,6 @@ fn composite_centre(canvas: &mut Canvas) -> (u8, u8, u8, u8) {
 /// A Normal top layer that is fully opaque hides the layer below it. This is
 /// the control: it isolates stack ordering from any blend maths.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn opaque_normal_top_layer_hides_the_one_below() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -64,7 +61,6 @@ fn opaque_normal_top_layer_hides_the_one_below() {
 /// must NOT leave the bottom layer's red showing through unchanged - that is
 /// the "non-Normal layer sinks to the bottom" symptom.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn multiply_top_layer_stays_on_top() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -90,7 +86,6 @@ fn multiply_top_layer_stays_on_top() {
 /// Screen lightens, Addition lightens at least as much, and both must differ
 /// from Normal. Covers the two modes that also round-trip through sRGB.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn screen_and_addition_lighten() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -120,7 +115,6 @@ fn screen_and_addition_lighten() {
 /// `min` is monotonic, so converting to sRGB and back would be a no-op - and
 /// this pins that the result really is the darker of the two inputs.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn darken_picks_the_darker_input() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -147,7 +141,6 @@ fn darken_picks_the_darker_input() {
 /// nothing. Dark backdrop + light source gives three distinct outcomes -
 /// backdrop-alone, Normal, and Overlay.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn overlay_top_layer_changes_the_result() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas

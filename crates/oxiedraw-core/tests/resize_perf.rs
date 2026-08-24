@@ -1,9 +1,7 @@
 //! Timed reproduction of the "stylus drawing is laggy only after an in-session
 //! canvas resize" bug. Drives the real `Canvas` draw path (stamp + present, the
 //! per-motion-event hot loop) and measures throughput before vs after an
-//! `apply_crop` resize. GPU-gated; run with:
-//!
-//!   cargo test -p oxiedraw-core --test resize_perf -- --ignored --nocapture
+//! `apply_crop` resize.
 //!
 //! These print per-iteration timings so the regression is visible, and assert
 //! that the post-resize draw loop is not dramatically slower than before.
@@ -72,7 +70,6 @@ fn new_brush() -> BrushEngine {
 /// `Canvas`. If the bug lives in the core present/composite path, the
 /// post-resize loop is measurably slower here.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn draw_loop_before_vs_after_resize() {
     let brush = new_brush();
     let mut canvas = Canvas::headless(oxiedraw_utils::geometry::Size::new(2048, 2048)).unwrap();
@@ -110,7 +107,6 @@ fn draw_loop_before_vs_after_resize() {
 /// Same final dimensions; if only the *resized* one is slow, the resize itself
 /// (not the size) is the culprit. This is the precise shape of the bug report.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn resized_vs_fresh_same_size() {
     let brush = new_brush();
     let iters = 240;

@@ -2619,8 +2619,10 @@ impl std::fmt::Debug for Canvas {
 
 #[cfg(test)]
 mod tests {
+    // Only the GPU stroke tests use these.
+    #[cfg(feature = "gpu-tests")]
     use oxiedraw_utils::geometry::Point;
-
+    #[cfg(feature = "gpu-tests")]
     use crate::brush_engine::{BrushEngine, InputSample};
 
     use super::*;
@@ -2663,6 +2665,7 @@ mod tests {
         assert_eq!(new, vec![10, 20, 30, 200]);
     }
 
+    #[cfg(feature = "gpu-tests")]
     fn sample(x: f32, y: f32, t: u64) -> InputSample {
         InputSample {
             position: Point::new(x, y),
@@ -2680,6 +2683,7 @@ mod tests {
     /// around 0.93 between dab centres and never saturate. The tests below are
     /// about compositing rather than falloff, so they pin the edge instead of
     /// tracking whatever the default preset is tuned to.
+    #[cfg(feature = "gpu-tests")]
     fn crisp_brush(size: f32) -> BrushEngine {
         let brush = BrushEngine::new();
         for preset in brush.brushes.borrow_mut().iter_mut() {
@@ -2723,8 +2727,8 @@ mod tests {
     /// the full path: `BrushEngine` -> `PaintTarget` adapter ->
     /// `stamp_mask` -> `composite_stroke_into_layer` -> recomposite ->
     /// readback.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn end_to_end_stroke() {
         let size = Size::new(128, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -2784,8 +2788,8 @@ mod tests {
     /// Base: an opaque red square in the left half. Clipped layer: opaque blue
     /// over the whole canvas. The composite must be blue where the base was and
     /// transparent everywhere else - the blue outside the base is discarded.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn clipped_layer_is_confined_to_its_base() {
         let (w, h) = (32_usize, 16_usize);
         let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
@@ -2841,8 +2845,8 @@ mod tests {
     /// Painting an alpha-locked layer recolours the pixels that exist and adds
     /// none. The lock rides a blend-state variant, so this exercises the real
     /// GPU path rather than the CPU helper the fill tool uses.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn alpha_lock_recolours_without_growing_the_layer() {
         let (w, h) = (32_usize, 16_usize);
         let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
@@ -2909,8 +2913,8 @@ mod tests {
     /// Crop rebuilds the whole layer stack, which resets per-layer state. The
     /// clip / lock flags have to be restored with the kinds, or a crop silently
     /// unclips the document.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn crop_preserves_clip_and_lock_flags() {
         let mut canvas = Canvas::headless(Size::new(16, 16)).expect("canvas init");
         canvas.add_layer("Top").expect("add layer");
@@ -2928,8 +2932,8 @@ mod tests {
 
     /// Hiding the base takes its clipped layers with it: they have nothing to
     /// render against.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn hiding_the_base_hides_its_clipped_layer() {
         let (w, h) = (16_usize, 16_usize);
         let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
@@ -2958,8 +2962,8 @@ mod tests {
     /// reused, so the post-resize renderer paints correctly and the original
     /// content survives the crop. Regression test for stylus-draw lag that
     /// only appeared after an in-session canvas resize.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn draw_after_resize_paints() {
         let mut canvas = Canvas::headless(Size::new(128, 64)).expect("canvas init");
         let brush = crisp_brush(8.0);
@@ -3031,8 +3035,8 @@ mod tests {
     /// The incremental (dab-region-clipped) preview must produce the same image
     /// as a full rebuild: dabs from earlier frames are retained outside the
     /// current dab region, and the current region is recomposited correctly.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn incremental_preview_matches_full_rebuild() {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("init");
@@ -3082,8 +3086,8 @@ mod tests {
     /// An eraser stroke on the top layer removes its coverage and reveals
     /// the layer below, without touching the layer below. Drives the same
     /// brush path with `erase = true`.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn end_to_end_eraser_reveals_lower_layer() {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -3134,8 +3138,8 @@ mod tests {
     /// original pixels back on the layer. Proves Apply OVER-blends the
     /// transformed pixels onto the unmasked region instead of replacing
     /// it.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn transform_apply_preserves_unmasked_pixels() {
         use crate::selection::{RectShape, SelectionShape};
         use crate::tools::SelectionMode;
@@ -3197,8 +3201,8 @@ mod tests {
     /// (a) place the moved pixels exactly at the new position with no
     /// fractional bleeding, and (b) leave the rest of the layer alone
     /// (i.e. the unmasked region must survive Apply).
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn translate_selection_lands_on_pixel_grid() {
         use crate::selection::{RectShape, SelectionShape};
         use crate::tools::SelectionMode;
@@ -3279,8 +3283,8 @@ mod tests {
 
     /// extract_selection_pixels lifts the masked pixels off the layer
     /// and leaves the unmasked region behind.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn extract_selection_lifts_masked_pixels() {
         use crate::selection::{RectShape, SelectionShape};
         use crate::tools::SelectionMode;
@@ -3345,8 +3349,8 @@ mod tests {
 
     /// select_from_layer_alpha turns an arbitrary layer's non-zero alpha
     /// region into a selection mask.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn select_from_layer_alpha_builds_mask() {
         let size = Size::new(32, 32);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -3374,8 +3378,8 @@ mod tests {
     /// Brush stroke composited through a selection mask gets clipped:
     /// pixels inside the mask receive the stroke colour; pixels outside
     /// stay transparent.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn brush_stroke_clipped_to_selection() {
         use crate::selection::{RectShape, SelectionShape};
         use crate::tools::SelectionMode;
@@ -3429,8 +3433,8 @@ mod tests {
     /// During a stroke, `read_pixels` should return the preview
     /// (canvas + tinted stroke). Discarding then reading should show
     /// the canvas untouched.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn preview_during_stroke() {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -3469,8 +3473,8 @@ mod tests {
     /// Multi-layer test: bottom layer red, top layer green at a
     /// different position. Composite should show both colors at
     /// their respective positions.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn two_layers_composite() {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -3522,8 +3526,8 @@ mod tests {
     /// The stack must actually reach MAX_LAYERS - the descriptor pool is sized
     /// off that constant, so a mismatch would surface as an allocation failure
     /// somewhere below the cap instead of a clean LayerLimit at it.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn layer_stack_fills_to_max_layers() {
         use crate::renderer::MAX_LAYERS;
 
@@ -3542,8 +3546,8 @@ mod tests {
     /// In-flight preview with the stroke on a *lower* layer and an opaque
     /// layer above it. Exercises the cached below-stack composite, the
     /// above-layer re-composite, and (by reading twice) cache reuse.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn region_upload_changes_only_region_and_bumps_version() {
         let size = Size::new(16, 8);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -3576,8 +3580,8 @@ mod tests {
         assert_eq!(px(6, 1), [0, 0, 255, 255], "just past region stays red");
     }
 
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn preview_composites_above_layer_over_lower_stroke() {
         use crate::brush_engine::Dab;
 
@@ -3628,8 +3632,8 @@ mod tests {
     /// the target (where erased) while leaving the rest of the target on
     /// top. Exercises the `record_layered_preview` erase branch (scratch
     /// build + below-cache exclude) without committing.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn preview_eraser_reveals_lower_layer() {
         use crate::brush_engine::Dab;
 
@@ -3675,8 +3679,8 @@ mod tests {
     /// The fused stamp+present path must actually deposit the dab into the
     /// stroke buffer (visible in the preview readback) and accumulate the
     /// dirty rect, just like the separate stamp + present calls.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn stamp_and_present_lands_in_stroke() {
         use crate::brush_engine::Dab;
 
@@ -3707,8 +3711,8 @@ mod tests {
     /// built from just that region must equal the canonical full-canvas
     /// diff. This is the correctness guarantee behind the bounded history
     /// capture that replaces the full readback + full diff on pen-up.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn stroke_dirty_bounds_patch_matches_full_diff() {
         use crate::brush_engine::Dab;
         use crate::history::{LayerPatch, PatchBounds};

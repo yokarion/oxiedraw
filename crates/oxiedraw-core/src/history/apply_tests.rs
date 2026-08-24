@@ -1,8 +1,7 @@
 //! Undo/redo round-trip tests - one per [`HistoryAction`] variant.
 //!
-//! Each test drives a real [`Canvas`] (so they require a Vulkan loader +
-//! device and are `#[ignore]`d by default, matching the rest of the GPU
-//! suite). The pattern is always the same:
+//! Each test drives a real [`Canvas`], so the module is `gpu-tests` only. The
+//! pattern is always the same:
 //!
 //! 1. Set up a known *before* state.
 //! 2. Perform the real mutation to reach the *after* state and record the
@@ -132,25 +131,21 @@ fn patch_round_trip(make: impl Fn(String, LayerPatch) -> HistoryAction) {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn stroke_round_trip() {
     patch_round_trip(|layer_id, patch| HistoryAction::Stroke { layer_id, patch });
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn fill_round_trip() {
     patch_round_trip(|layer_id, patch| HistoryAction::Fill { layer_id, patch });
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn clear_round_trip() {
     patch_round_trip(|layer_id, patch| HistoryAction::Clear { layer_id, patch });
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_round_trip() {
     patch_round_trip(|layer_id, patch| HistoryAction::Transform {
         layer_id,
@@ -161,7 +156,6 @@ fn transform_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn liquify_round_trip() {
     patch_round_trip(|layer_id, patch| HistoryAction::Liquify { layer_id, patch });
 }
@@ -171,7 +165,6 @@ fn liquify_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_add_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -194,7 +187,6 @@ fn layer_add_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_remove_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -217,7 +209,6 @@ fn layer_remove_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_blend_round_trip() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -250,7 +241,6 @@ fn canvas_center_bgra(c: &mut Canvas) -> [u8; 4] {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn multiply_blend_darkens_canvas() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -278,7 +268,6 @@ fn multiply_blend_darkens_canvas() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn zero_opacity_top_layer_is_invisible() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -297,7 +286,6 @@ fn zero_opacity_top_layer_is_invisible() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_identity_matches_committed_blend() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -343,7 +331,6 @@ fn transform_preview_identity_matches_committed_blend() {
 /// tree edit riding along in the same undo step the layer comes back at the
 /// root - taking any clip relationship with it.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn undoing_a_delete_restores_the_layer_inside_its_group() {
     use crate::document::{LayerGroup, LayerTreeNode};
 
@@ -444,7 +431,6 @@ fn clipped_over_half_base() -> Canvas {
 /// path has no clip mask, so routing on adjustment layers alone made a clipped
 /// layer flash over the whole canvas for the length of the drag.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_keeps_the_clipping_mask() {
     use oxiedraw_utils::geometry::TransformRect;
 
@@ -478,7 +464,6 @@ fn transform_preview_keeps_the_clipping_mask() {
 /// Same hole in the filter preview: it routed on `has_adjustment_layers`, so a
 /// clipped layer previewed a Hue/Saturation change across the whole canvas.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_preview_keeps_the_clipping_mask() {
     use crate::filters::FilterSpec;
 
@@ -504,7 +489,6 @@ fn filter_preview_keeps_the_clipping_mask() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_keeps_layers_below() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -545,7 +529,6 @@ fn transform_preview_keeps_layers_below() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_partial_layer_tight_bounds() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -586,7 +569,6 @@ fn transform_preview_partial_layer_tight_bounds() {
 // Deferring the recomposite over a batch of layer edits and flushing once must
 // yield the same canvas as compositing eagerly after each edit.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn deferred_recomposite_matches_eager() {
     use crate::document::BlendMode;
 
@@ -614,7 +596,6 @@ fn deferred_recomposite_matches_eager() {
 // to the same pixels as the committed canvas (the N-target preview walk keeps
 // every target in its z-slot).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_multi_target_identity_matches_committed() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -656,7 +637,6 @@ fn transform_preview_multi_target_identity_matches_committed() {
 // Multi-layer transform: translating the shared box moves every target together;
 // with both layers moved off-canvas and nothing left behind, the centre is clear.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_multi_target_moves_all() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -693,7 +673,6 @@ fn transform_preview_multi_target_moves_all() {
 // layer. Both the live preview and the committed apply must keep those
 // unselected pixels visible (bug: they vanished during/after transform).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_transform_keeps_unselected_pixels() {
     use crate::selection::{RectShape, SelectionShape};
     use crate::tools::SelectionMode;
@@ -745,7 +724,6 @@ fn selection_transform_keeps_unselected_pixels() {
 // dropped the unselected part). The correct before-state is the full pre-lift
 // layer, which the UI now stashes in `TransformTarget::history_before`.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_transform_undo_restores_full_layer() {
     use crate::selection::{RectShape, SelectionShape};
     use crate::tools::SelectionMode;
@@ -808,7 +786,6 @@ fn non_empty_bounds_of(px: &[u8]) -> oxiedraw_utils::geometry::TransformRect {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_bottom_layer_visible() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -837,7 +814,6 @@ fn transform_preview_bottom_layer_visible() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_warped_layer_moves() {
     use crate::document::BlendMode;
     use oxiedraw_utils::geometry::TransformRect;
@@ -894,7 +870,6 @@ fn transform_preview_warped_layer_moves() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_reorder_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -915,7 +890,6 @@ fn layer_reorder_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_tree_edit_round_trip() {
     use crate::document::{LayerGroup, LayerTreeNode};
 
@@ -948,7 +922,6 @@ fn layer_tree_edit_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_rename_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -970,7 +943,6 @@ fn layer_rename_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_visibility_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -989,7 +961,6 @@ fn layer_visibility_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_duplicate_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1024,7 +995,6 @@ fn layer_duplicate_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_duplicate_inherits_blend() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -1040,7 +1010,6 @@ fn layer_duplicate_inherits_blend() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_duplicate_blend_survives_redo() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -1079,7 +1048,6 @@ fn layer_duplicate_blend_survives_redo() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_merge_bakes_blend() {
     use crate::document::BlendMode;
     let mut c = canvas();
@@ -1112,7 +1080,6 @@ fn layer_merge_bakes_blend() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn layer_merge_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1160,7 +1127,6 @@ fn layer_merge_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_change_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1184,7 +1150,6 @@ fn selection_change_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn selection_change_mask_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1216,7 +1181,6 @@ fn selection_change_mask_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn crop_canvas_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1283,7 +1247,6 @@ fn crop_canvas_round_trip() {
 // ---------------------------------------------------------------------------
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn batch_round_trip() {
     let mut c = canvas();
     let mut s = stack();
@@ -1313,7 +1276,6 @@ fn batch_round_trip() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn batch_label_surfaces_through_undo() {
     let mut c = canvas();
     let mut s = stack();
@@ -1332,7 +1294,6 @@ fn batch_label_surfaces_through_undo() {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn component_actions_round_trip() {
     let mut c = canvas();
     let mut s = stack();

@@ -52,18 +52,23 @@ pub enum ProjectError {
 // exact by construction. Approximate checks nearby use an epsilon.
 #[allow(clippy::float_cmp)]
 mod tests {
+    // Only the GPU tests use these; the deserialization test needs none of them.
+    #[cfg(feature = "gpu-tests")]
     use oxiedraw_utils::geometry::Size;
 
+    #[cfg(feature = "gpu-tests")]
     use crate::canvas::Canvas;
+    #[cfg(feature = "gpu-tests")]
     use crate::document::{DocumentProperties, LayerState};
 
+    #[cfg(feature = "gpu-tests")]
     use super::{ProjectError, load, save};
 
     /// A text layer and the font it uses survive a save/load round-trip: the
     /// structured content reloads in the layer kind, and the font file bytes
     /// are embedded so it renders without the font installed.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn text_layer_and_fonts_round_trip() {
         use std::collections::HashSet;
 
@@ -129,8 +134,8 @@ mod tests {
     /// Save a headless canvas and reload it into a fresh one. Verifies that
     /// manifest fields, layer metadata, and raw pixel bytes all survive the
     /// full tar/JSON/PNG round-trip without modification.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn round_trip() {
         let size = Size::new(64, 64);
         let mut canvas = Canvas::headless(size).expect("canvas init");
@@ -173,8 +178,8 @@ mod tests {
 
     /// The folder tree (schema v7) survives a save/load round-trip and is
     /// re-applied to the reloaded canvas, so folder-scoped adjustments persist.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn folder_tree_round_trip() {
         use crate::document::{LayerGroup, LayerTreeNode};
 
@@ -237,8 +242,8 @@ mod tests {
 
     /// Loading a project saved at one canvas size into a canvas of a different
     /// size must fail with a clear `CanvasSizeMismatch` error.
+    #[cfg(feature = "gpu-tests")]
     #[test]
-    #[ignore = "requires vulkan loader and device"]
     fn canvas_size_mismatch() {
         let size_a = Size::new(64, 64);
         let size_b = Size::new(128, 128);

@@ -7,6 +7,11 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Tests needing a real device. Off by default: CI runs on lavapipe, which has
+# no VK_EXT_image_drm_format_modifier.
+gpu-tests = []
+
 [dependencies]
 oxiedraw-utils.workspace = true
 
@@ -26,3 +31,43 @@ jpeg-encoder = { workspace = true }
 image = { workspace = true }
 ravif = { workspace = true }
 rgb = { workspace = true }
+
+[[test]]
+name = "adjustment_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "blend_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "brushes_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "filters_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "liquify_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "present_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "resize_perf"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "selection_delete_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "selection_ops_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
+name = "smudge_gpu"
+required-features = ["gpu-tests"]

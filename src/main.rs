@@ -25,9 +25,9 @@
 //! image is exported as a dmabuf that GTK imports directly, so the GPU writes
 //! the displayed pixels once. That needs `VK_EXT_image_drm_format_modifier` and
 //! therefore a real GPU - it does not run on lavapipe, which is why the GPU
-//! tests are `#[ignore]`d and skipped in CI (run them locally with
-//! `cargo test -- --ignored`). Porting to another OS means writing a second
-//! present backend plus its display integration, not reworking the engine.
+//! tests sit behind the `gpu-tests` feature and are skipped in CI. Porting to
+//! another OS means writing a second present backend plus its display
+//! integration, not reworking the engine.
 //!
 //! # Latency-critical paths
 //!

@@ -1,7 +1,5 @@
 //! GPU integration tests for the present colour-space conversion, driven
-//! through the public `Canvas` API. Each test is `#[ignore]` because it needs a
-//! working Vulkan loader + device; run with
-//! `cargo test -p oxiedraw-core --test present_gpu -- --ignored`.
+//! through the public `Canvas` API.
 //!
 //! The canvas holds premultiplied linear; the display dmabuf has to hold
 //! premultiplied gamma for GSK to composite it over the checker correctly.
@@ -52,7 +50,6 @@ fn near(a: u8, b: u8, tol: i32) -> bool {
 /// At alpha 1 both premultiplication conventions agree, so the display byte
 /// should match the canvas byte.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn present_leaves_opaque_pixels_unchanged() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -70,7 +67,6 @@ fn present_leaves_opaque_pixels_unchanged() {
 
 /// Fully transparent pixels stay zeroed, so GTK shows the checker through them.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn present_keeps_transparent_pixels_zero() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -88,7 +84,6 @@ fn present_keeps_transparent_pixels_zero() {
 /// space, i.e. darker than the canvas byte. Revert the present to a plain copy
 /// and the byte stays put, which is what clamped to white over the checker.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn present_regamma_premultiplies_semitransparent_pixels() {
     // Half-alpha white as the GPU stores it: srgb(1.0 * 0.5) = 188.
     let canvas_byte = linear_to_srgb(0.5);
@@ -133,7 +128,6 @@ fn present_regamma_premultiplies_semitransparent_pixels() {
 /// Semi-transparent colour (not just grey) converts per channel, and alpha is
 /// carried through untouched.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn present_converts_each_channel_independently() {
     let (b, g, r, a) = (60u8, 190u8, 255u8, 90u8);
     let mut canvas = Canvas::headless(SIZE).unwrap();
@@ -163,7 +157,6 @@ fn present_converts_each_channel_independently() {
 /// Presenting twice must be stable - the render pass discards and fully
 /// redraws the buffer, so a second present cannot double-convert.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn present_is_idempotent() {
     let mut canvas = Canvas::headless(SIZE).unwrap();
     canvas
@@ -179,7 +172,6 @@ fn present_is_idempotent() {
 /// earlier present wrote outside the current clip must survive. A regression
 /// shows up as earlier dabs vanishing mid-stroke.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn incremental_present_preserves_pixels_outside_the_clip() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_core::color::Color;

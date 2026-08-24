@@ -1,7 +1,5 @@
 //! GPU integration tests for adjustment layers, driven through the public
-//! `Canvas` API. Each test is `#[ignore]` because it needs a working Vulkan
-//! loader + device; run with `cargo test -p oxiedraw-core --test adjustment_gpu
-//! -- --ignored`.
+//! `Canvas` API.
 //!
 //! Adjustment layers filter the composited backdrop (everything below them), so
 //! these read the composited canvas via `read_pixels`, not a single layer.
@@ -36,7 +34,6 @@ fn one_effect(kind: EffectKind) -> AdjustmentData {
 /// The incremental adjusted preview (local Hue/Sat/Bright effect) must match a
 /// full rebuild while painting a layer below the adjustment.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn incremental_adjusted_preview_matches_full() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_core::color::Color;
@@ -107,7 +104,6 @@ fn incremental_adjusted_preview_matches_full() {
 /// a full rebuild: the two-region (inner output / outer input) clip keeps the
 /// stroke band correct as the silhouette is painted.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn incremental_stroke_preview_matches_full() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_core::color::Color;
@@ -182,7 +178,6 @@ fn incremental_stroke_preview_matches_full() {
 /// A red backdrop with a brightness-0 adjustment on top should composite to
 /// black: the effect multiplies the whole backdrop down.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn adjustment_brightness_zero_blackens_backdrop() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -214,7 +209,6 @@ fn adjustment_brightness_zero_blackens_backdrop() {
 /// The identity adjustment (default Hue/Sat/Bright) must leave the backdrop
 /// untouched - proves the mask-mix + copy-back round-trips losslessly.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn identity_adjustment_preserves_backdrop() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -234,7 +228,6 @@ fn identity_adjustment_preserves_backdrop() {
 /// A fully black mask gates the effect off: the brightness-0 adjustment should
 /// have no visible result, leaving the red backdrop intact.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn black_mask_gates_off_effect() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -267,7 +260,6 @@ fn black_mask_gates_off_effect() {
 
 /// A disabled effect stays in the stack but must not change the backdrop.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn disabled_effect_is_noop() {
     let size = Size::new(16, 16);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -297,7 +289,6 @@ fn disabled_effect_is_noop() {
 /// adjustment's (white) mask in the in-stroke preview - the preview should be
 /// the unadjusted backdrop, not white.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn stroke_preview_below_adjustment_does_not_show_mask() {
     use oxiedraw_core::color::Color;
 
@@ -334,7 +325,6 @@ fn stroke_preview_below_adjustment_does_not_show_mask() {
 /// mask is never baked into the composite. (Regression: commit_stroke_into_layer
 /// used the non-adjustment composite, so pointer-up painted the mask.)
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn commit_stroke_below_adjustment_keeps_effect() {
     use oxiedraw_core::color::Color;
 
@@ -379,7 +369,6 @@ fn commit_stroke_below_adjustment_keeps_effect() {
 /// backdrop in the preview (the effect is baked into the cached below-stack),
 /// not the original un-effected layers.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn preview_above_adjustment_keeps_backdrop_adjusted() {
     use oxiedraw_core::color::Color;
 
@@ -425,7 +414,6 @@ fn preview_above_adjustment_keeps_backdrop_adjusted() {
 /// adjustment, the previewed canvas must already show the effect applied (the
 /// backdrop blackened), not the unadjusted layer.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn live_preview_below_adjustment_shows_effect() {
     use oxiedraw_core::color::Color;
 
@@ -464,7 +452,6 @@ fn live_preview_below_adjustment_shows_effect() {
 /// Same, but the adjustment is *below* the painted layer (exercises the
 /// cached below-stack path rather than the above-loop).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn stroke_preview_above_adjustment_does_not_show_mask() {
     use oxiedraw_core::color::Color;
 
@@ -503,7 +490,6 @@ fn stroke_preview_above_adjustment_does_not_show_mask() {
 /// offset, pixels just beyond the silhouette edge should pick up the stroke
 /// colour, while the far corners stay transparent.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn stroke_colours_the_silhouette_edge() {
     let size = Size::new(32, 32);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -557,7 +543,6 @@ fn stroke_colours_the_silhouette_edge() {
 /// must paint a ~16px-wide red band straddling that line, leaving the deep
 /// interior white and the far exterior transparent.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn thick_stroke_band_spans_silhouette_edge() {
     let size = Size::new(64, 64);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -625,7 +610,6 @@ fn left_half_red(size: Size) -> Vec<u8> {
 /// left-half B, brightness-0 adjustment }. Brightness 0 blackens the folder
 /// accumulator; A below the folder must stay blue where B is transparent.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn adjustment_is_clipped_to_its_folder() {
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
 
@@ -697,7 +681,6 @@ fn adjustment_is_clipped_to_its_folder() {
 /// painting on a layer inside a folder with a brightness-0 adjustment must not
 /// blacken a layer sitting below the folder.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn committed_stroke_respects_folder_scope() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
@@ -775,7 +758,6 @@ fn committed_stroke_respects_folder_scope() {
 /// inside a folder with a brightness-0 adjustment, the previewed canvas must not
 /// blacken a layer below the folder (matches what the commit will produce).
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn live_preview_respects_folder_scope() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
@@ -848,7 +830,6 @@ fn live_preview_respects_folder_scope() {
 /// transforming a layer inside a folder with a brightness-0 adjustment must
 /// blacken the transformed content but not a layer below the folder.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_respects_folder_scope() {
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
     use oxiedraw_utils::geometry::TransformRect;
@@ -919,7 +900,6 @@ fn transform_preview_respects_folder_scope() {
 /// adjustment above the transformed layer (flat stack) must adjust the warped
 /// content live.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_applies_flat_adjustment() {
     use oxiedraw_utils::geometry::TransformRect;
 
@@ -958,7 +938,6 @@ fn transform_preview_applies_flat_adjustment() {
 /// A multi-layer (group) transform must also run the adjustment chain live: an
 /// adjustment above two transformed layers adjusts the whole warped stack.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn transform_preview_applies_adjustment_multi_target() {
     use oxiedraw_utils::geometry::TransformRect;
 
@@ -1003,7 +982,6 @@ fn transform_preview_applies_adjustment_multi_target() {
 // Deleting a selection on an adjustment layer must refill the hole with white
 // (full effect), not leave transparency. Mask slots stay opaque black-gray-white.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn delete_selection_refills_adjustment_mask_white() {
     let (mut canvas, adj) = adjustment_with_left_selection();
     canvas.erase_selection_in_layer(adj).unwrap();
@@ -1012,7 +990,6 @@ fn delete_selection_refills_adjustment_mask_white() {
 
 // The cut path (clear_selection_from_layer) must also refill the hole white.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn cut_selection_refills_adjustment_mask_white() {
     let (mut canvas, adj) = adjustment_with_left_selection();
     canvas.clear_selection_from_layer(adj).unwrap();
@@ -1021,7 +998,6 @@ fn cut_selection_refills_adjustment_mask_white() {
 
 // The selection-move lift (extract_selection_pixels) must also refill white.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn lift_selection_refills_adjustment_mask_white() {
     let (mut canvas, adj) = adjustment_with_left_selection();
     canvas.extract_selection_pixels(adj).unwrap();
@@ -1069,7 +1045,6 @@ fn assert_mask_white(canvas: &mut Canvas, adj: usize) {
 /// a darkening effect over a red backdrop and the default white mask, stroking
 /// the mask should keep the canvas a darkened red - not flash the white mask.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn mask_edit_preview_shows_effect_not_mask() {
     use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
     use oxiedraw_utils::geometry::Point;
@@ -1148,7 +1123,6 @@ fn mask_edit_preview_shows_effect_not_mask() {
 /// used to bleed the effect onto everything below the adjustment). The second
 /// preview frame reuses the cached static folder and must match the first.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn live_scoped_preview_clips_folder_and_cache_matches() {
     use oxiedraw_core::color::Color;
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
@@ -1233,7 +1207,6 @@ fn live_scoped_preview_clips_folder_and_cache_matches() {
 /// the filter was applied. With scoped routing, C stays blue (identity HSV) and
 /// only the folder content B is blackened.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_preview_respects_folder_scope() {
     use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
     use oxiedraw_core::filters::FilterSpec;
@@ -1303,7 +1276,6 @@ fn filter_preview_respects_folder_scope() {
 /// and composited the adjustment's mask as if it were pixels, so arming the
 /// filter turned the canvas white until the filter was applied.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_preview_keeps_adjustment_with_several_targets() {
     use oxiedraw_core::filters::FilterSpec;
 
@@ -1349,7 +1321,6 @@ fn filter_preview_keeps_adjustment_with_several_targets() {
 /// the layer state alone left the effect off the GPU slot and composited the
 /// mask as pixels - a white sheet over the canvas.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn restored_adjustment_kind_still_composites() {
     let size = Size::new(64, 64);
     let mut canvas = Canvas::headless(size).unwrap();
@@ -1396,7 +1367,6 @@ fn restored_adjustment_kind_still_composites() {
 /// mask, the way apply + recomposite will. The flat preview instead dropped the
 /// effect and pushed the raw white mask on screen.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_preview_on_the_adjustment_layer_filters_its_mask() {
     use oxiedraw_core::filters::FilterSpec;
 
@@ -1451,7 +1421,6 @@ fn filter_preview_on_the_adjustment_layer_filters_its_mask() {
 /// on its layer must preview on the mask - not swap the canvas back to the
 /// composite while the user drags the sliders.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn filter_preview_with_the_mask_in_view_filters_what_is_on_screen() {
     use oxiedraw_core::filters::FilterSpec;
 
@@ -1513,7 +1482,6 @@ fn filter_preview_with_the_mask_in_view_filters_what_is_on_screen() {
 /// GPU slot too - otherwise the effect is gone and its white mask composites as
 /// pixels, whiting out the canvas.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn cropping_keeps_adjustment_layers_working() {
     use oxiedraw_core::tools::CropRect;
 

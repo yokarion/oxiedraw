@@ -30,7 +30,7 @@ jobs:
           restore-keys: cargo-lint-
 
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
   test:
     runs-on: ubuntu-latest
@@ -48,16 +48,11 @@ jobs:
           key: cargo-test-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-test-
 
-      # Only the non-ignored tests run here. The `#[ignore]` GPU tests need
-      # VK_EXT_image_drm_format_modifier for the dmabuf display path, which
-      # lavapipe does not implement, so they stay a local step on real hardware:
-      #   cargo nextest run --workspace --run-ignored ignored-only
       - name: Tests
-        run: cargo nextest run --workspace --locked
+        run: cargo test --workspace --locked
 
   build:
     needs: [lint, test]
-    # Only build (and release) on v* tags; branch/PR runs stop at lint + test.
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     container:
@@ -83,7 +78,6 @@ jobs:
           # The container user differs from the checkout owner, so git refuses to
           # run here until the workspace is marked safe.
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
-          # GITHUB_REF is the one thing every runner sets reliably.
           case "${GITHUB_REF}" in
             refs/tags/v*)
               version="${GITHUB_REF#refs/tags/v}"
@@ -116,11 +110,8 @@ jobs:
           tar -C stage -caf "dist/oxiedraw-${version}-x86_64-linux.tar.zst" \
             "oxiedraw-${version}-x86_64-linux"
 
-      # Runtime data the AppImage needs but the base image lacks. linuxdeploy
-      # only bundles what is installed here: the SVG pixbuf loader (every tool
-      # icon is SVG - without it they render as broken frames), the Cantarell UI
-      # font (libadwaita's look), and the desktop GSettings schemas (font,
-      # text-scaling, dark/light). The dconf backend is already in the image.
+      # linuxdeploy only bundles what is installed here. Without these the
+      # AppImage ships broken icons, no Cantarell, and no desktop schemas.
       - name: Install AppImage runtime deps
         run: |
           set -eu
@@ -130,9 +121,7 @@ jobs:
             fonts-cantarell \
             gsettings-desktop-schemas
 
-      # linuxdeploy bundles GTK4/libadwaita/glib/pango into the AppDir so the
-      # AppImage runs without GTK installed. No FUSE in the job container,
-      # hence APPIMAGE_EXTRACT_AND_RUN.
+      # No FUSE in the job container, hence APPIMAGE_EXTRACT_AND_RUN.
       - name: Build AppImage
         env:
           APPIMAGE_EXTRACT_AND_RUN: "1"
@@ -145,8 +134,7 @@ jobs:
           chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
           export PATH="${PWD}:${PATH}"
 
-          # Deploy + run the gtk plugin, but do NOT package yet. Split from the
-          # --output step so we can patch the hook the plugin writes.
+          # Deploy only; packaging waits until the plugin's hook is patched.
           VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --executable target/release/oxiedraw \
@@ -154,21 +142,15 @@ jobs:
             --icon-file data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg \
             --plugin gtk
 
-          # Strip two forced env exports the gtk plugin bakes into its AppRun hook:
-          #  - GDK_BACKEND=x11: a stale GTK3 workaround that forces the app onto
-          #    XWayland, where it ignores the compositor's monitor scale.
-          #  - GTK_THEME=Adwaita:<variant>: loads GTK's legacy built-in theme over
-          #    libadwaita's stylesheet, freezing the color-scheme and breaking the
-          #    system accent / named colors that the custom CSS builds on.
-          # Both were compensating for data we now bundle (Wayland libs,
-          # gsettings-desktop-schemas), so removing them makes the AppImage behave
-          # like the native binary.
+          # The gtk plugin forces GDK_BACKEND=x11 (XWayland, wrong monitor
+          # scale) and GTK_THEME=Adwaita (overrides libadwaita's stylesheet and
+          # the system accent). Both compensate for data we now bundle.
           hook="AppDir/apprun-hooks/linuxdeploy-plugin-gtk.sh"
           test -f "${hook}"
           sed -i '/export GDK_BACKEND=x11/d; /export GTK_THEME=/d' "${hook}"
           ! grep -qE 'GDK_BACKEND=x11|export GTK_THEME=' "${hook}"
 
-          # Package the patched AppDir (no --plugin, so the hook is not rewritten).
+          # No --plugin here, or the hook is rewritten and the patch undone.
           VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --output appimage

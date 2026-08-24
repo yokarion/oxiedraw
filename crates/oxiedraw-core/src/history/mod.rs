@@ -15,7 +15,7 @@ mod action;
 mod snapshot;
 mod stack;
 
-#[cfg(test)]
+#[cfg(all(test, feature = "gpu-tests"))]
 #[allow(clippy::unwrap_used)]
 mod apply_tests;
 

@@ -1,9 +1,8 @@
 //! GPU smoke tests for the built-in brushes' rendering paths (Krita-accurate
-//! Default Round + the Chalk image-tip/texture path). Run with
-//! `cargo test -p oxiedraw-core --test brushes_gpu -- --ignored --nocapture`.
+//! Default Round + the Chalk image-tip/texture path).
 
 #![allow(clippy::unwrap_used)]
-// Diagnostic prints for the --nocapture runs of these ignored GPU tests.
+// Diagnostic prints for the --nocapture runs of these GPU tests.
 #![allow(clippy::print_stdout)]
 
 use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
@@ -94,7 +93,6 @@ fn covered_pixels(buf: &[u8]) -> usize {
 }
 
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn default_round_deposits_a_solid_stroke() {
     let size = Size::new(200, 60);
     let (buf, _w) = paint("Default Round", size);
@@ -107,7 +105,6 @@ fn default_round_deposits_a_solid_stroke() {
 /// broken/grainy coverage - both solid and holey pixels inside its footprint,
 /// unlike the solid Default Round.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn chalk_stroke_is_grainy() {
     let size = Size::new(220, 60);
     let (buf, w) = paint("Chalk", size);
@@ -149,7 +146,6 @@ fn chalk_stroke_is_grainy() {
 /// grainy/broken and a firm press lays a solid, dark line - the opposite ends
 /// must look clearly different.
 #[test]
-#[ignore = "requires vulkan loader and device"]
 fn charcoal_pencil_pressure_goes_grainy_to_solid() {
     let size = Size::new(220, 60);
 
