@@ -52,7 +52,7 @@ impl CanvasInfoBar {
         let root = gtk::Box::builder()
             .orientation(gtk::Orientation::Horizontal)
             .spacing(8)
-            .css_classes(["sidebar"])
+            .css_classes(["oxiedraw-chrome"])
             .build();
         root.set_margin_start(8);
         root.set_margin_end(8);
@@ -255,8 +255,8 @@ fn draw_rotator(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, _w: i32, h: i
 /// concludes the app is broken.
 fn draw_lock_chip(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: i32) {
     let (w, h) = (f64::from(w), f64::from(h));
-    let fg = area.color();
-    let (fr, fg_, fb) = (f64::from(fg.red()), f64::from(fg.green()), f64::from(fg.blue()));
+    let ground = crate::theme::warning_ground(area);
+    let (ar, ag, ab) = crate::theme::warning_accent(area);
 
     // Ground: a warm wash that reads as a caution without shouting.
     let r = h / 2.0;
@@ -264,13 +264,13 @@ fn draw_lock_chip(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: 
     cr.arc(w - r, r, r, -std::f64::consts::FRAC_PI_2, std::f64::consts::FRAC_PI_2);
     cr.arc(r, r, r, std::f64::consts::FRAC_PI_2, 3.0 * std::f64::consts::FRAC_PI_2);
     cr.close_path();
-    cr.set_source_rgba(0.9, 0.68, 0.16, 0.26);
+    cr.set_source_rgba(ground.0, ground.1, ground.2, crate::theme::WARNING_WASH_ALPHA);
     cr.fill().ok();
 
     // Padlock: shackle arc over a rounded body.
     let cx = 12.0;
     let cy = h / 2.0;
-    cr.set_source_rgba(fr, fg_, fb, 0.85);
+    cr.set_source_rgb(ar, ag, ab);
     cr.set_line_width(1.3);
     cr.new_path();
     cr.arc(cx, cy - 1.6, 2.6, std::f64::consts::PI, std::f64::consts::TAU);
@@ -279,7 +279,7 @@ fn draw_lock_chip(area: &gtk::DrawingArea, cr: &gtk::cairo::Context, w: i32, h: 
     cr.fill().ok();
 
     cr.set_font_size(11.0);
-    cr.set_source_rgba(fr, fg_, fb, 0.9);
+    cr.set_source_rgb(ar, ag, ab);
     let text = "Alpha locked";
     let ty = cy + cr.text_extents(text).map_or(4.0, |e| e.height() / 2.0);
     cr.move_to(cx + 9.0, ty);

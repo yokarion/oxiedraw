@@ -214,7 +214,7 @@ pub(crate) fn build(
         .min_content_height(0)
         .child(&panel)
         .build();
-    root.add_css_class("sidebar"); // match the colour-picker / layers panels
+    root.add_css_class("oxiedraw-chrome"); // match the colour-picker / layers panels
     root.set_visible(false);
 
     // Refresh closure: sync all controls from the controller state.

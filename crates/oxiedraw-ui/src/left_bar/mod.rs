@@ -96,7 +96,7 @@ pub(crate) fn build(
         .orientation(gtk::Orientation::Vertical)
         .width_request(WIDTH)
         .build();
-    bar.add_css_class("sidebar");
+    bar.add_css_class("oxiedraw-chrome");
 
     // Shared guard: when true, `toggled` handlers skip `on_change`.
     let programmatic = Rc::new(Cell::new(false));

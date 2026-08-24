@@ -201,7 +201,7 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         .selection_mode(gtk::SelectionMode::Single)
         .width_request(210)
         .build();
-    sidebar.add_css_class("sidebar");
+    sidebar.add_css_class("oxiedraw-chrome");
     let stack = gtk::Stack::builder()
         .hexpand(true)
         .vexpand(true)

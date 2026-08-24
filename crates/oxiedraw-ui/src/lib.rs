@@ -27,6 +27,7 @@ mod settings;
 mod splash;
 mod tabs;
 mod text_edit;
+mod theme;
 mod toaster;
 mod tool_options_bar;
 mod top_bar;

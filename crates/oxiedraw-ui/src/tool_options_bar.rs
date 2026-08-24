@@ -72,7 +72,7 @@ pub(crate) fn build(
         .orientation(gtk::Orientation::Horizontal)
         .height_request(HEIGHT)
         .build();
-    bar.add_css_class("sidebar");
+    bar.add_css_class("oxiedraw-chrome");
 
     let (chip_widget, update_chip) = tool_chip::build(tools.active.get());
     bar.append(&chip_widget);

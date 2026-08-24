@@ -36,7 +36,7 @@ pub(crate) fn build(
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    panel.add_css_class("sidebar");
+    panel.add_css_class("oxiedraw-chrome");
 
     // Guard set while `refresh` writes widget values, so value-changed handlers
     // don't loop a notify back through the state.

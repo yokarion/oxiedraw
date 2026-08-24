@@ -187,7 +187,7 @@ fn build_left_pane(
     let outer = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    outer.add_css_class("sidebar");
+    outer.add_css_class("oxiedraw-chrome");
 
     // Sidebar header - full-height adw::HeaderBar so the sidebar
     // column extends to the top of the window frame.

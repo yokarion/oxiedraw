@@ -12,7 +12,7 @@ pub(crate) fn build(crop: &CropState) -> gtk::Box {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .build();
-    panel.add_css_class("sidebar");
+    panel.add_css_class("oxiedraw-chrome");
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

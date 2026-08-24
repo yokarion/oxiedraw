@@ -65,8 +65,7 @@ const SHADOW_SPREAD: f64 = 9.0;
 const SHADOW_OFFSET_Y: f64 = 2.0;
 const SHADOW_STEP_ALPHA: f64 = 0.05;
 
-// How long a dropped block takes to travel from where the pointer let go of it
-// to the slot it landed in.
+// Travel time from where the pointer released a block to the slot it landed in.
 const DROP_SETTLE_SECS: f64 = 0.16;
 
 // The clip rod sits near the left of its own 10px gutter column, so the hook
@@ -223,25 +222,20 @@ pub(super) struct Drag {
     last_frame_time_us: i64,
 }
 
-/// The drop landing: the reorder is already committed, and this eases the rows
-/// from where they were drawn when the pointer came up into where they now
-/// belong, so nothing teleports on release.
-///
-/// Offsets are stored against the *post*-drop layout and scaled by the
-/// remaining fraction of the animation, which makes the resting state - and so
-/// the state after any interruption - simply "no offset at all".
+/// Eases the rows from where the drag had them into where the committed drop
+/// put them. Offsets are held against the *post*-drop layout and scaled by
+/// what is left of the animation, so the resting state is no offset at all.
 #[derive(Clone, Debug)]
 pub(super) struct DropSettle {
-    // The dropped block's position in the post-drop list, plus the id it should
-    // be at: any edit that moves it invalidates the whole animation.
+    // Position of the dropped block, plus the id expected there: any edit that
+    // moves it invalidates the animation.
     from_row: usize,
     span: usize,
     id: String,
-    // Release position of the block, relative to the slot it landed in.
+    // Release position and indent of the block, relative to where it landed.
     offset_y: f64,
-    // Release indent of the block, relative to its landed depth, in depth units.
     depth_offset: f64,
-    // Same, per row, for everything that was still sliding out of the way.
+    // Same, per row, for everything still sliding out of the way.
     row_y: Vec<f64>,
     // 0 at release, 1 once landed.
     progress: f64,
@@ -249,17 +243,15 @@ pub(super) struct DropSettle {
 }
 
 impl DropSettle {
-    /// Fraction of the release offsets still to be travelled.
+    /// Fraction of the release offsets still to travel.
     fn remaining(&self) -> f64 {
         let t = self.progress.clamp(0.0, 1.0);
-        // Ease-out cubic: leaves the pointer at full speed and decelerates in.
+        // Ease-out cubic: leaves the pointer at speed, decelerates into place.
         (1.0 - t).powi(3)
     }
 
-    /// Whether this still describes the list it was built for. A drop lands
-    /// during a live redraw loop, so an undo or a layer edit can land on top of
-    /// it; those re-lay-out the rows and the stored offsets stop meaning
-    /// anything.
+    /// Whether this still describes the list it was built for. An undo or a
+    /// layer edit can land mid-animation and re-lay-out the rows underneath it.
     fn matches(&self, rows: &[VisibleRow]) -> bool {
         self.span > 0
             && self.row_y.len() == rows.len()
@@ -268,10 +260,8 @@ impl DropSettle {
     }
 }
 
-/// A block lifted above the list: the rows the pointer is holding, or the ones
-/// it just dropped and that are still settling. Both draw the same way - offset
-/// from their slot, indented off their real depth, and casting a shadow - so
-/// both go through this.
+/// A block lifted above the list: the rows the pointer holds, or the ones it
+/// just dropped and that are still settling. Both draw the same way.
 struct FloatBlock {
     from: usize,
     span: usize,
@@ -279,10 +269,8 @@ struct FloatBlock {
     top: f64,
     // Indent offset from the row's real depth, in depth units.
     depth_offset: f64,
-    // How far off the list the block is held: 1 while the pointer has it, easing
-    // to 0 as a dropped block lands. Drives everything that says "this is not
-    // part of the list right now" - the shadow, and the card a row carries
-    // while it has no container of its own.
+    // 1 while the pointer holds the block, easing to 0 as it lands. Drives the
+    // shadow and the card a row carries while it has no container of its own.
     lift: f64,
 }
 
@@ -292,10 +280,10 @@ pub(super) struct Ui {
     pub(super) state: LayerState,
     pub(super) tree: Rc<RefCell<Vec<LayerNode>>>,
     pub(super) drag: Rc<RefCell<Option<Drag>>>,
-    // Set for the moment between a drop and the rows reaching their new slots.
+    // Set between a drop and the rows reaching their new slots.
     pub(super) drop_settle: Rc<RefCell<Option<DropSettle>>>,
-    // Whether a tick callback is already driving `drop_settle`, so back-to-back
-    // drops replace the animation instead of stacking a second one on it.
+    // A tick callback is already driving `drop_settle`; back-to-back drops
+    // replace the state rather than stacking a second callback on it.
     pub(super) settle_ticking: Rc<Cell<bool>>,
     pub(super) thumbnails: Rc<RefCell<Vec<Option<cairo::ImageSurface>>>>,
     pub(super) multi_selected: Rc<RefCell<HashSet<String>>>,
@@ -625,8 +613,7 @@ fn tree_depth(row: &VisibleRow) -> usize {
     row.depth + row.adjust_indent
 }
 
-/// Layers and folders share one id space, so a row is identified the same way
-/// whichever it is.
+/// Layers and folders share one id space.
 fn row_id(row: &VisibleRow) -> &str {
     match &row.kind {
         RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.as_str(),
@@ -1586,7 +1573,7 @@ pub(crate) fn build(
         .vexpand(true)
         .hexpand(true)
         .build();
-    panel.add_css_class("sidebar");
+    panel.add_css_class("oxiedraw-chrome");
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1841,13 +1828,16 @@ fn build_layers_page(
     reinstall_actions();
     start_thumbnail_refresh(&ui, Rc::clone(canvas), area.clone());
 
-    page.append(&build_layers_header(&ui, &area, canvas, redraw, toaster, history));
+    let (header, lock_btn) =
+        build_layers_header(&ui, &area, canvas, redraw, toaster, history);
+    page.append(&header);
     page.append(&build_blend_controls(
         &ui,
         canvas,
         redraw,
         history,
         alpha_lock_observer,
+        &lock_btn,
     ));
 
     // List body: the drawing area plus our own vertical scrollbar. We manage the
@@ -1993,6 +1983,8 @@ fn tooltip_with_accel(label: &str, action_id: &str) -> String {
     }
 }
 
+/// The strip above the list: create buttons left, alpha lock right. The toggle
+/// comes back with the bar because the blend controls drive its state.
 fn build_layers_header(
     ui: &Ui,
     area: &gtk::DrawingArea,
@@ -2000,25 +1992,11 @@ fn build_layers_header(
     redraw: &RedrawHandle,
     toaster: &Toaster,
     history: &Rc<RefCell<HistoryStack>>,
-) -> gtk::Box {
+) -> (gtk::Box, gtk::ToggleButton) {
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(TAB_SPACING)
         .build();
-
-    let spacer = gtk::Label::builder()
-        .hexpand(true)
-        .halign(gtk::Align::Start)
-        .build();
-    header.append(&spacer);
-
-    let group_btn = gtk::Button::builder()
-        .icon_name("folder-new-symbolic")
-        .tooltip_text(tooltip_with_accel("Group selected layers", "layer-group"))
-        .css_classes(["flat", "circular"])
-        .action_name("app.layer-group")
-        .build();
-    header.append(&group_btn);
 
     let add_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
@@ -2059,7 +2037,33 @@ fn build_layers_header(
         .build();
     header.append(&add_adjustment_btn);
 
-    header
+    let group_btn = gtk::Button::builder()
+        .icon_name("folder-new-symbolic")
+        .tooltip_text(tooltip_with_accel("Group selected layers", "layer-group"))
+        .css_classes(["flat", "circular"])
+        .action_name("app.layer-group")
+        .build();
+    header.append(&group_btn);
+
+    let spacer = gtk::Label::builder()
+        .hexpand(true)
+        .halign(gtk::Align::Start)
+        .build();
+    header.append(&spacer);
+
+    // Fixed 34x34 so the strip never reflows, and rounded rather than circular
+    // so the part-locked bar under the glyph has an edge to sit on.
+    let lock_btn = gtk::ToggleButton::builder()
+        .icon_name("oxiedraw-alpha-lock-symbolic")
+        .tooltip_text("Lock alpha - paint only where this layer already has pixels")
+        .css_classes(["flat", "alpha-lock"])
+        .width_request(34)
+        .height_request(34)
+        .build();
+    load_lock_toggle_css();
+    header.append(&lock_btn);
+
+    (header, lock_btn)
 }
 
 // Button sensitivity is driven from the action's enabled flag.
@@ -2100,6 +2104,8 @@ fn build_blend_controls(
     redraw: &RedrawHandle,
     history: &Rc<RefCell<HistoryStack>>,
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
+    // Built by the header; reloads off the selection like the other controls.
+    lock_btn: &gtk::ToggleButton,
 ) -> gtk::Box {
     let controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -2110,26 +2116,6 @@ fn build_blend_controls(
     let mode_dropdown = gtk::DropDown::from_strings(&labels);
     mode_dropdown.set_hexpand(true);
     mode_dropdown.set_tooltip_text(Some("Blend mode of the selected layers"));
-
-    // Alpha lock lives with the other per-layer properties. It is the feature's
-    // discoverable home - the row badge is only a readout - and it keeps its
-    // 34x34 footprint in every state so the strip never reflows.
-    let lock_btn = gtk::ToggleButton::builder()
-        .icon_name("oxiedraw-alpha-lock-symbolic")
-        .tooltip_text("Lock alpha - paint only where this layer already has pixels")
-        .css_classes(["flat"])
-        .width_request(34)
-        .height_request(34)
-        .build();
-
-    load_lock_toggle_css();
-
-    let mode_row = gtk::Box::builder()
-        .orientation(gtk::Orientation::Horizontal)
-        .spacing(TAB_SPACING)
-        .build();
-    mode_row.append(&mode_dropdown);
-    mode_row.append(&lock_btn);
 
     let opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
     opacity.set_hexpand(true);
@@ -2151,7 +2137,7 @@ fn build_blend_controls(
     opacity_row.append(&opacity);
     opacity_row.append(&opacity_label);
 
-    controls.append(&mode_row);
+    controls.append(&mode_dropdown);
     controls.append(&opacity_row);
 
     // True while the sync callback is writing the widgets, so their change
@@ -2566,9 +2552,8 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         // No hover highlight mid-drag (rows are sliding around).
         let hover = if drag.is_none() { *ui.hover.borrow() } else { None };
 
-        // The block held above the list. A live drag owns it; once the pointer
-        // is up the drop animation takes over and flies it into its new slot,
-        // so the same rows keep the same treatment across the release.
+        // The block held above the list: owned by a live drag, then handed to
+        // the drop animation so nothing changes at the release.
         let float = drag
             .as_ref()
             .filter(|d| d.zone == HitZone::Handle && d.from_row < count)
@@ -2600,8 +2585,7 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 })
             });
 
-        // Y nudge from a row's natural slot: rows make room for the block while
-        // it is dragged, then close the last of that gap as it lands.
+        // Y nudge from a row's natural slot, making room for the held block.
         let row_offset = |r: usize| -> f64 {
             if let Some(d) = drag.as_ref().filter(|d| d.zone == HitZone::Handle) {
                 return d.row_y_anim.get(r).copied().unwrap_or(0.0);
@@ -2676,19 +2660,16 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             let (from, span) = (f.from, f.span);
             let anim = f.depth_offset;
 
-            // The floating block is laid out on its own so its internal
-            // container padding survives the trip, then shifted so its first
-            // row lands where the block is currently drawn.
+            // Laid out on its own so its internal container padding survives
+            // the trip, then shifted to where the block is currently drawn.
             let block: Vec<VisibleRow> = rows[from..(from + span).min(count)].to_vec();
             let block_layout = RowLayout::new(&block);
             let shift = f.top - block_layout.top(0);
-            // Nesting *within* the block starts here: the block's own root
-            // level, which is the depth its first row sits at.
+            // Nesting within the block is measured from its own root level.
             let block_base = tree_depth(&block[0]);
 
-            // Lift the block off the list. A folder is shadowed by its
-            // container's outline, a lone layer by its own row, so the shadow
-            // always traces what the user is actually holding.
+            // The shadow traces what is actually held: a folder's container
+            // outline, or a lone layer's own row.
             {
                 let level = (count_f64(tree_depth(&block[0])) + anim).max(0.0);
                 let (sx, sy, sw, sh, radius) = if opens_box(&block, 0) {
@@ -2739,13 +2720,10 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                     RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
                     RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
                 };
-                // Indent still tracks the row's real depth (easing toward the
-                // drop target), and the surface it sits on is still its real
-                // level - but whether it paints its own fill is decided
-                // *within the block*, measured from the block's own root. A
-                // lone dragged layer has no container travelling with it,
-                // however deeply nested it used to be, so it has to paint its
-                // own, and give it back as it lands.
+                // Whether the row paints its own fill is decided within the
+                // block: a lone dragged layer has no container travelling with
+                // it however nested it was, so it carries a card and gives it
+                // back as it lands.
                 let nest = box_depth(&rows, row_idx);
                 let depth_f = (count_f64(nest) + anim).max(0.0);
                 let lifted_bg = if box_depth(&block, i) == block_base { 1.0 } else { 0.0 };
@@ -2755,8 +2733,8 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 let is_text = row_is_text(&ui, row);
                 let is_adjustment = row_is_adjustment(&ui, row);
                 let mask_active = is_adjustment && row_mask_active(&ui, row);
-                // A floating row has no neighbours to connect to, so it keeps
-                // its clip badge but drops the rod and terminus.
+                // No neighbours to connect to: keep the clip badge, drop the
+                // rod and terminus.
                 let mut clip = clip_info(&rows, row_idx);
                 clip.clipped_above = false;
                 clip.clipped_below = false;
@@ -2842,18 +2820,16 @@ fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     }
 }
 
-/// Where the list was actually drawn at the instant the pointer came up, keyed
-/// by row id so it survives the reorder that follows.
+/// Where the list was drawn when the pointer came up. Keyed by row id so it
+/// survives the reorder that follows.
 struct ReleaseVisual {
     row_tops: HashMap<String, f64>,
     block_top: f64,
     block_depth: f64,
 }
 
-/// Sample [`ReleaseVisual`] from a drag about to end. Mirrors what the draw
-/// function was putting on screen for that same frame - the eased per-row
-/// nudges, and the block hanging off the pointer - so the settle animation
-/// starts from exactly where the user last saw things.
+/// Mirrors what the draw function put on screen for the drag's last frame, so
+/// the settle starts where the user last saw things.
 fn release_visual(rows: &[VisibleRow], drag: &Drag, span: usize) -> ReleaseVisual {
     let layout = RowLayout::new(rows);
     let count = rows.len();
@@ -2878,14 +2854,10 @@ fn release_visual(rows: &[VisibleRow], drag: &Drag, span: usize) -> ReleaseVisua
     }
 }
 
-/// The gap between where the list was drawn at release and where the drop put
-/// it, expressed as offsets to unwind. `rows` is the *final* list, so this runs
-/// after the reorder is committed. `None` when nothing moved far enough to be
-/// worth animating - a plain click on the handle, or a drag that ended on its
-/// own slot.
-///
-/// Rows the drag never touched get an offset too: their make-room easing was
-/// interrupted wherever the pointer happened to come up.
+/// The gap between the release and the committed drop, as offsets to unwind.
+/// `rows` is the final list, so this runs after the reorder. Rows the drag
+/// never touched get one too - their make-room easing was interrupted. `None`
+/// when nothing moved far enough to animate.
 fn settle_from_release(
     rows: &[VisibleRow],
     before: &ReleaseVisual,
@@ -2931,8 +2903,7 @@ fn settle_from_release(
     })
 }
 
-/// Run [`settle_from_release`] as an animation, so the dropped block flies into
-/// its slot rather than appearing there.
+/// Run [`settle_from_release`] as an animation.
 fn start_drop_settle(
     ui: &Ui,
     area: &gtk::DrawingArea,
@@ -2950,8 +2921,8 @@ fn start_drop_settle(
     };
     *ui.drop_settle.borrow_mut() = Some(settle);
 
-    // One tick callback drives however many drops happen: a second drop while
-    // the first is still landing replaces the state under it.
+    // One callback drives however many drops happen: a second drop while the
+    // first is landing replaces the state under it.
     if ui.settle_ticking.replace(true) {
         return;
     }
@@ -2997,6 +2968,10 @@ struct Palette {
     accent_bg: Rgb,
     accent_fg: Rgb,
     fg: Rgb,
+    /// Alpha lock's warning yellow, and what goes on top of it. Both fixed
+    /// rather than following the row, which would tint them on the active one.
+    lock_accent: Rgb,
+    lock_glyph: Rgb,
 }
 
 impl Palette {
@@ -3014,6 +2989,8 @@ impl Palette {
             accent_bg: lookup(widget, "accent_bg_color").unwrap_or(FALLBACK_ACCENT_BG),
             accent_fg: lookup(widget, "accent_fg_color").unwrap_or(FALLBACK_ACCENT_FG),
             fg,
+            lock_accent: crate::theme::warning_accent(widget),
+            lock_glyph: crate::theme::warning_fg(widget),
         }
     }
 
@@ -3030,10 +3007,9 @@ impl Palette {
         lerp_rgb(self.row_bg, self.fg, t)
     }
 
-    /// What is already painted behind a row at nesting level `nest`: the
-    /// enclosing container's fill, or the panel itself at the root. A row that
-    /// paints no card of its own is showing exactly this, which is what lets a
-    /// dropped row fade its card out into place instead of dropping it.
+    /// What is already painted behind a row at level `nest` - the enclosing
+    /// container's fill, or the panel at the root. Lets a landing row fade its
+    /// card out rather than dropping it in one frame.
     fn backdrop(&self, nest: usize) -> Rgb {
         nest.checked_sub(1)
             .map_or(self.window_bg, |level| self.surface(level))
@@ -3125,10 +3101,9 @@ fn draw_row(
     clip: ClipInfo,
     // Nesting level the row sits at, which picks the surface it is drawn over.
     nest: usize,
-    // How much of its own card the row paints. Normally all or nothing - a row
-    // inside a container sits on that container's surface and paints none - but
-    // a row torn out of one by a drag has no container travelling with it and
-    // carries its own, then fades it back out as it lands.
+    // How much of its own card the row paints. All or nothing except while a
+    // dragged row, which has no container travelling with it, fades its own
+    // card back out as it lands.
     own_bg: f64,
 ) {
     // `depth_f` is the animated nesting level during a drag; it tracks `nest`
@@ -3154,10 +3129,8 @@ fn draw_row(
     // A row inside a container already sits on that container's surface, so it
     // paints no fill of its own - stacking a second card on the first only
     // muddies the nesting. Selection still paints, since that is the row
-    // standing out from its surroundings rather than describing structure.
-    //
-    // A partial card is mixed against what is already behind the row, so at
-    // zero it is indistinguishable from painting nothing at all.
+    // standing out from its surroundings rather than describing structure. A
+    // partial card mixes against the backdrop, so zero paints nothing.
     let surface = palette.surface(nest);
     let bg = if is_active {
         Some(palette.accent_bg)
@@ -3210,7 +3183,15 @@ fn draw_row(
                 // The badge knocks its padlock out in whatever the row sits
                 // on, which is its own fill when it has one and the container's
                 // surface when it does not.
-                draw_alpha_lock_badge(ctx, sx, sy, icon_color, bg.unwrap_or(surface), 1.0);
+                draw_alpha_lock_badge(
+                    ctx,
+                    sx,
+                    sy,
+                    palette.lock_accent,
+                    bg.unwrap_or(surface),
+                    palette.lock_glyph,
+                    1.0,
+                );
             }
             if dim {
                 ctx.pop_group_to_source().ok();
@@ -3493,15 +3474,16 @@ fn draw_clip_terminus(ctx: &cairo::Context, nest_left: f64, top: f64, color: Rgb
 }
 
 /// The alpha-lock badge, knocked out of the thumbnail's bottom-right corner.
-/// The ring is painted in the row's own background rather than a fixed colour,
-/// so the badge separates from any thumbnail behind it - checkerboard included -
-/// in both themes.
+/// The halo takes the row's background so the badge separates from whatever
+/// thumbnail is behind it; the padlock takes `glyph`, since cutting it in the
+/// row colour turned it accent-coloured on the active row.
 fn draw_alpha_lock_badge(
     ctx: &cairo::Context,
     sx: f64,
     sy: f64,
     fg: Rgb,
     bg: Rgb,
+    glyph: Rgb,
     alpha: f64,
 ) {
     // Overhangs the swatch by 1px on each side so it never sits on the edge.
@@ -3517,8 +3499,8 @@ fn draw_alpha_lock_badge(
     ctx.arc(cx, cy, LOCK_DISC_D / 2.0, 0.0, TAU);
     ctx.fill().ok();
 
-    // Padlock knocked back out in the row background: shackle arc over a body.
-    ctx.set_source_rgb(bg.0, bg.1, bg.2);
+    // Padlock cut back out of the disc: shackle arc over a body.
+    ctx.set_source_rgba(glyph.0, glyph.1, glyph.2, 0.8 * alpha);
     ctx.set_line_width(1.3);
     ctx.new_path();
     ctx.arc(cx, cy - 1.1, 2.1, std::f64::consts::PI, TAU);
@@ -3822,16 +3804,38 @@ fn hit_zone(
     HitZone::Body
 }
 
-// A part-locked selection reads as neither on nor off: a faint accent wash with
-// a bar under the glyph, distinct from the solid accent of a fully locked one.
-// Clicking it locks the whole selection.
+// Warning yellow rather than the accent, which the active row already uses.
+// A lit toggle repeats the canvas chip exactly; 0.26 tracks
+// `theme::WARNING_WASH_ALPHA`, so change both together. A part-locked
+// selection gets a fainter wash plus a bar under the glyph.
+//
+// Hover is spelled out because these rules sit at application priority and
+// would otherwise mask the theme's, leaving a lit button dead under the
+// pointer. The node is `button`, not `togglebutton` - GTK4 gives
+// GtkToggleButton a `button` node with a `.toggle` class.
 fn load_lock_toggle_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
-        "togglebutton.mixed {
-            background: alpha(@accent_bg_color, 0.22);
-            color: @accent_color;
-            box-shadow: inset 0 -2px 0 0 @accent_color;
+        "button.alpha-lock:checked {
+            background: alpha(@warning_bg_color, 0.26);
+            color: @warning_color;
+        }
+
+        button.alpha-lock:checked:hover {
+            background: alpha(@warning_bg_color, 0.38);
+            color: @warning_color;
+        }
+
+        button.alpha-lock.mixed {
+            background: alpha(@warning_bg_color, 0.12);
+            color: @warning_color;
+            box-shadow: inset 0 -2px 0 0 @warning_color;
+        }
+
+        button.alpha-lock.mixed:hover {
+            background: alpha(@warning_bg_color, 0.22);
+            color: @warning_color;
+            box-shadow: inset 0 -2px 0 0 @warning_color;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
@@ -3969,8 +3973,8 @@ fn install_list_input(
             if ui.drag.borrow().is_some() {
                 return;
             }
-            // Any press lands a still-settling drop at once: the new gesture
-            // has to act on where the rows really are.
+            // Land any settling drop at once: the new gesture has to act on
+            // where the rows really are.
             ui.drop_settle.borrow_mut().take();
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
@@ -4271,8 +4275,7 @@ fn install_list_input(
                         }
                 }
                 HitZone::Handle => {
-                    // Where the list was drawn on the last frame of the drag.
-                    // Sampled before the reorder, since that is what the drop
+                    // Sampled before the reorder: this is where the settle
                     // animation has to start from.
                     let span = drag_span(&rows, d.from_row);
                     let released = release_visual(&rows, &d, span);
@@ -4354,8 +4357,6 @@ fn install_list_input(
                             redraw.request();
                         }
                     }
-                    // Fly the block from the pointer into the slot it landed
-                    // in, instead of having it appear there.
                     if let Some(id) = held_id {
                         start_drop_settle(&ui, &area_w, &released, &id);
                     }
@@ -5180,8 +5181,8 @@ mod tests {
         Drag {
             from_row,
             current_row: to,
-            // The draw function reads `pointer_y - grab_offset_y` as the block's
-            // top edge, so this is one degree of freedom, not two.
+            // The draw function reads `pointer_y - grab_offset_y` as the top
+            // edge, so this is one degree of freedom, not two.
             pointer_y: block_top,
             grab_offset_y: 0.0,
             zone: HitZone::Handle,
@@ -5191,9 +5192,8 @@ mod tests {
         }
     }
 
-    // The point of the whole animation: at the instant the pointer comes up,
-    // every row is drawn exactly where the drag had it. Anything else is the
-    // snap the animation exists to remove.
+    // At release every row must be drawn exactly where the drag had it.
+    // Anything else is the snap this animation exists to remove.
     #[test]
     fn the_drop_settle_starts_from_where_the_drag_left_off() {
         let rows = vec![
@@ -5229,16 +5229,14 @@ mod tests {
             assert!((drawn - was).abs() < 1e-9, "row {r} jumps {}px", drawn - was);
         }
 
-        // ...and once it has run, every offset is spent, so the rows are simply
-        // where the layout says.
+        // Once it has run, every offset is spent.
         let mut landed = settle;
         landed.progress = 1.0;
         assert!(landed.remaining().abs() < f64::EPSILON);
     }
 
-    // A drag that reparents is still easing its indent when the pointer comes
-    // up; the block has to carry that remainder into its landing rather than
-    // popping a level sideways.
+    // A reparenting drag is still easing its indent at release; the remainder
+    // has to be carried into the landing rather than popping a level sideways.
     #[test]
     fn the_drop_settle_carries_an_unfinished_reparent_indent() {
         let rows = vec![
@@ -5283,6 +5281,8 @@ mod tests {
             accent_bg: (0.21, 0.52, 0.89),
             accent_fg: (1.0, 1.0, 1.0),
             fg: (0.90, 0.90, 0.92),
+            lock_accent: (1.0, 0.76, 0.32),
+            lock_glyph: (0.0, 0.0, 0.0),
         }
     }
 
@@ -5301,9 +5301,9 @@ mod tests {
             .find(|&j| opens_box(rows, j) && j + contained_rows(rows, j) >= i)
     }
 
-    // A landing row gives its card back by mixing it into what is behind it, so
-    // the colour it ends on has to be the colour that is already there. Get the
-    // level wrong by one and every drop into a folder finishes on a flash.
+    // A landing row mixes its card into what is behind it, so it has to end on
+    // the colour already there. One level out and every drop into a folder
+    // finishes on a flash.
     #[test]
     fn a_lifted_card_fades_into_whatever_is_actually_behind_the_row() {
         // Group
@@ -5330,9 +5330,8 @@ mod tests {
         }
     }
 
-    // The animation is described against the post-drop list, so any edit that
-    // relays out the rows underneath it has to void it rather than offset the
-    // wrong rows by the old numbers.
+    // Offsets are described against the post-drop list, so an edit that
+    // re-lays-out the rows has to void them, not apply them to the wrong ones.
     #[test]
     fn a_stale_drop_settle_is_ignored() {
         let rows = vec![

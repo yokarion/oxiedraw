@@ -85,14 +85,14 @@ impl PickerState {
 pub(crate) fn build(colors: ColorState) -> gtk::Box {
     let state = PickerState::new(colors);
 
-    // Outer panel fills the Paned slot edge-to-edge so the .sidebar
-    // background has no gaps; inner box owns the padding.
+    // Outer panel fills the Paned slot edge-to-edge so the chrome background
+    // has no gaps; inner box owns the padding.
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .vexpand(true)
         .hexpand(true)
         .build();
-    panel.add_css_class("sidebar");
+    panel.add_css_class("oxiedraw-chrome");
 
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)

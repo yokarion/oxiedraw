@@ -472,16 +472,39 @@ fn install_key_handler(
 
 /// Put every chrome panel on the app's real window colour.
 ///
-/// libadwaita's `.sidebar` exists to tint a sidebar away from the window, which
-/// left the panels a different shade from the background their content sits on.
-/// The layers list draws rows in `card_bg_color` on top of this, so the two
-/// tones have to be the window/card pair to read as surfaces stacked on a
-/// background rather than two arbitrary greys.
+/// The panels used to carry libadwaita's `.sidebar`, which leaves the
+/// background to the theme - so whatever tint a theme or a user's `gtk.css`
+/// gave sidebars landed on them, out of step with the window colour the layers
+/// list paints on. `.oxiedraw-chrome` is the same styling with the background
+/// pinned and no sidebar rule to catch it. Application priority, so a user
+/// restyling `.oxiedraw-chrome` still wins.
 fn load_chrome_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
-        ".sidebar {
+        ".oxiedraw-chrome {
             background-color: @window_bg_color;
+        }
+
+        /* A list inside a panel sits on the panel, not on its own view colour. */
+        .oxiedraw-chrome list,
+        .oxiedraw-chrome listview.view {
+            background-color: transparent;
+            color: inherit;
+        }
+
+        /* Leading-edge hairline; a panel in a paned has the handle instead. */
+        .oxiedraw-chrome:dir(ltr) {
+            border-right: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+            border-left-style: none;
+        }
+
+        .oxiedraw-chrome:dir(rtl) {
+            border-left: 1px solid color-mix(in srgb, currentColor 15%, transparent);
+            border-right-style: none;
+        }
+
+        paned .oxiedraw-chrome {
+            border-style: none;
         }",
     );
     if let Some(display) = gtk::gdk::Display::default() {
