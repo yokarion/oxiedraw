@@ -8,6 +8,7 @@ mod layers;
 mod text_properties;
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use oxiedraw_core::canvas::Canvas;
@@ -15,7 +16,7 @@ use oxiedraw_core::color::ColorState;
 use oxiedraw_core::components::ComponentLibrary;
 use oxiedraw_core::document::LayerState;
 use oxiedraw_core::guides::GuideState;
-use oxiedraw_core::history::HistoryStack;
+use oxiedraw_core::history::{HistoryStack, LayerExtension};
 use oxiedraw_core::text::fonts::TextEngine;
 use oxiedraw_core::tools::{CropState, FillTool, GradientState, Tool, ToolState};
 use relm4::gtk;
@@ -52,6 +53,7 @@ pub(crate) fn build(
     select_layer_content: &Rc<dyn Fn(usize)>,
     select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     components: &Rc<RefCell<ComponentLibrary>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
@@ -124,6 +126,7 @@ pub(crate) fn build(
         select_layer_content,
         select_folder_content,
         history,
+        layer_extensions,
         components,
         on_edit_component,
         component_exit,

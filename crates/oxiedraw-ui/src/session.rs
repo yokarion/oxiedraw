@@ -1036,6 +1036,7 @@ impl DocumentSession {
             &select_layer_content,
             &select_folder_content,
             &history,
+            &layer_extensions,
             &components,
             &on_edit_component,
             &component_exit,

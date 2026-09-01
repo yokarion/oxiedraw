@@ -2,12 +2,13 @@
 //! clipboard copy / paste implementations.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
 
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::history::{
-    FoldedLayer, HistoryAction, HistoryStack, LayerPatch, capture_layer,
+    FoldedLayer, HistoryAction, HistoryStack, LayerExtension, LayerPatch, capture_layer,
 };
 use oxiedraw_core::renderer::RendererError;
 use relm4::gtk;
@@ -65,6 +66,7 @@ pub(super) fn install_layer_actions(
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
     toaster: &Toaster,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
 ) {
     let Some(gio_app) = gio::Application::default() else {
@@ -786,9 +788,19 @@ pub(super) fn install_layer_actions(
         let layer_clipboard = Rc::clone(layer_clipboard);
         let toaster = toaster.clone();
         let history = Rc::clone(history);
+        let layer_extensions = Rc::clone(layer_extensions);
         let action = gio::SimpleAction::new("paste", None);
         action.connect_activate(move |_, _| {
-            layer_paste(&area, &ui, &canvas, &redraw, &layer_clipboard, &toaster, &history);
+            layer_paste(
+                &area,
+                &ui,
+                &canvas,
+                &redraw,
+                &layer_clipboard,
+                &toaster,
+                &history,
+                &layer_extensions,
+            );
         });
         app.add_action(&action);
     }
@@ -878,6 +890,9 @@ pub(super) fn layer_copy(
 ///   on-canvas toast appears. The idle poller sets the done flag and dismisses
 ///   the toast when the result arrives.
 /// - Shows "External image pasted!" on success or an error description on failure.
+/// - An image larger than the canvas keeps its off-canvas parts in
+///   `layer_extensions`, so a later Transform can scale them back into view.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn layer_paste(
     area: &gtk::DrawingArea,
     ui: &Ui,
@@ -886,6 +901,7 @@ pub(super) fn layer_paste(
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
     toaster: &Toaster,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
 ) {
     let canvas_size = canvas.borrow().size();
 
@@ -936,6 +952,7 @@ pub(super) fn layer_paste(
     let canvas = Rc::clone(canvas);
     let redraw = redraw.clone();
     let history = Rc::clone(history);
+    let layer_extensions = Rc::clone(layer_extensions);
 
     display
         .clipboard()
@@ -1001,7 +1018,15 @@ pub(super) fn layer_paste(
                 match result {
                     Ok((pixels, src_w, src_h)) => {
                         paste_as_new_layer(
-                            &area, &ui, &canvas, &redraw, &toaster, &history, &pixels, src_w,
+                            &area,
+                            &ui,
+                            &canvas,
+                            &redraw,
+                            &toaster,
+                            &history,
+                            &layer_extensions,
+                            &pixels,
+                            src_w,
                             src_h,
                         );
                     }
@@ -1014,7 +1039,9 @@ pub(super) fn layer_paste(
 }
 
 // Add the decoded clipboard image as a brand-new layer, centred on the canvas
-// at its original size and clipped to the canvas bounds.
+// at its original size. Anything past the canvas edge is kept as an off-canvas
+// extension so it survives until a Transform brings it back into view.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
 fn paste_as_new_layer(
     area: &gtk::DrawingArea,
     ui: &Ui,
@@ -1022,17 +1049,30 @@ fn paste_as_new_layer(
     redraw: &RedrawHandle,
     toaster: &Toaster,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     src: &[u8],
     src_w: u32,
     src_h: u32,
 ) {
     let size = canvas.borrow().size();
+    let off_x = (size.width as i32 - src_w as i32) / 2;
+    let off_y = (size.height as i32 - src_h as i32) / 2;
     let pixels = composite_centered(src, src_w, src_h, size.width, size.height);
     let next_n = canvas.borrow().layers().len() + 1;
     let name = format!("Layer {next_n}");
     let result = canvas.borrow_mut().add_layer_with_pixels(name, &pixels);
     match result {
         Ok(new_idx) => {
+            stash_paste_overflow(
+                canvas,
+                layer_extensions,
+                new_idx,
+                src,
+                src_w,
+                src_h,
+                off_x,
+                off_y,
+            );
             if let Some((id, name, visible, kind, blend, opacity, px)) =
                 capture_layer(&mut canvas.borrow_mut(), new_idx)
             {
@@ -1056,6 +1096,49 @@ fn paste_as_new_layer(
         Err(RendererError::LayerLimit) => toaster.layer_limit_reached(),
         Err(e) => toaster.error(&format!("Failed to paste layer: {e}")),
     }
+}
+
+// Whether a `src_w` x `src_h` image placed at canvas offset `(off_x, off_y)`
+// reaches past any canvas edge.
+#[allow(clippy::cast_possible_wrap)]
+fn overflows_canvas(src_w: u32, src_h: u32, off_x: i32, off_y: i32, cw: u32, ch: u32) -> bool {
+    off_x < 0
+        || off_y < 0
+        || off_x.saturating_add(src_w as i32) > cw as i32
+        || off_y.saturating_add(src_h as i32) > ch as i32
+}
+
+// Keep the full pasted image as the layer's off-canvas extension when it does
+// not fit. Without this the cropped-away pixels are gone for good, so scaling
+// the layer down with the Transform tool can never bring them back.
+#[allow(clippy::too_many_arguments)]
+fn stash_paste_overflow(
+    canvas: &Rc<RefCell<Canvas>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
+    idx: usize,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    off_x: i32,
+    off_y: i32,
+) {
+    let size = canvas.borrow().size();
+    if !overflows_canvas(src_w, src_h, off_x, off_y, size.width, size.height) {
+        return;
+    }
+    let Some(layer_id) = canvas.borrow().layers().snapshot().get(idx).map(|l| l.id.clone()) else {
+        return;
+    };
+    layer_extensions.borrow_mut().insert(
+        layer_id,
+        LayerExtension {
+            offset_x: off_x,
+            offset_y: off_y,
+            width: src_w,
+            height: src_h,
+            pixels: Rc::new(src.to_vec()),
+        },
+    );
 }
 
 // Blit `src` (premultiplied BGRA8, `src_w` x `src_h`) centred into a fresh
@@ -1247,5 +1330,47 @@ pub(super) fn install_context_menu(
         area.connect_destroy(move |_| {
             popover.unparent();
         });
+    }
+}
+
+// --- Tests ---
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Opaque white `w` x `h` premultiplied BGRA8.
+    fn opaque(w: u32, h: u32) -> Vec<u8> {
+        vec![255u8; (w * h * 4) as usize]
+    }
+
+    #[test]
+    fn overflow_detected_only_when_the_image_leaves_the_canvas() {
+        assert!(!overflows_canvas(4, 4, 0, 0, 4, 4), "exact fit");
+        assert!(!overflows_canvas(2, 2, 1, 1, 4, 4), "smaller, inside");
+        assert!(overflows_canvas(8, 8, -2, -2, 4, 4), "larger on every side");
+        assert!(overflows_canvas(4, 4, 1, 0, 4, 4), "pushed past the right edge");
+        assert!(overflows_canvas(4, 4, 0, -1, 4, 4), "pushed past the top edge");
+    }
+
+    // The pasted layer only ever holds the canvas-sized crop, which is exactly
+    // why the full image has to be stashed as an extension.
+    #[test]
+    fn composite_centered_drops_the_off_canvas_pixels() {
+        let src = opaque(4, 4);
+        let out = composite_centered(&src, 4, 4, 2, 2);
+        assert_eq!(out.len(), 2 * 2 * 4);
+        assert!(out.iter().all(|&b| b == 255), "the centre 2x2 survives");
+    }
+
+    // A centred oversized paste puts the image's top-left at a negative offset;
+    // the extension frame has to cover the canvas plus the cropped border.
+    #[test]
+    fn centred_offset_covers_the_whole_source() {
+        let (src_w, src_h) = (10i32, 6i32);
+        let (cw, ch) = (4i32, 4i32);
+        let off_x = (cw - src_w) / 2;
+        let off_y = (ch - src_h) / 2;
+        assert_eq!((off_x, off_y), (-3, -1));
+        assert!(off_x + src_w >= cw && off_y + src_h >= ch, "spans the canvas");
     }
 }

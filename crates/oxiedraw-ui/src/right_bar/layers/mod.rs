@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::document::{BlendMode, LayerGroup, LayerKind, LayerState, LayerTreeNode};
 use oxiedraw_core::enum_meta::EnumMeta;
-use oxiedraw_core::history::{HistoryAction, HistoryStack};
+use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerExtension};
 use relm4::gtk;
 use relm4::gtk::cairo;
 use relm4::gtk::gdk;
@@ -1549,6 +1549,7 @@ pub(crate) fn build(
     select_layer_content: &Rc<dyn Fn(usize)>,
     select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     components: &Rc<RefCell<oxiedraw_core::components::ComponentLibrary>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
@@ -1606,6 +1607,7 @@ pub(crate) fn build(
             select_layer_content,
             select_folder_content,
             history,
+            layer_extensions,
             on_edit_component,
             prepare_delete,
             prepare_reorder,
@@ -1753,6 +1755,7 @@ fn build_layers_page(
     select_layer_content: &Rc<dyn Fn(usize)>,
     select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
+    layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
@@ -1811,6 +1814,7 @@ fn build_layers_page(
         let layer_clipboard = Rc::clone(layer_clipboard);
         let toaster = toaster.clone();
         let history = Rc::clone(history);
+        let layer_extensions = Rc::clone(layer_extensions);
         let prepare_delete = Rc::clone(prepare_delete);
         Rc::new(move || {
             actions::install_layer_actions(
@@ -1821,6 +1825,7 @@ fn build_layers_page(
                 &layer_clipboard,
                 &toaster,
                 &history,
+                &layer_extensions,
                 &prepare_delete,
             );
         })
