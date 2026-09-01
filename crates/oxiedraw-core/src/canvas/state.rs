@@ -1140,6 +1140,9 @@ impl Canvas {
                     self.renderer.render_gradient_preview(&visibilities)?;
                 }
                 self.renderer.present_to_display(PresentSource::Preview)?;
+            } else if self.renderer.pattern_overlay_active() {
+                self.render_armed_pattern_preview()?;
+                self.renderer.present_to_display(PresentSource::Preview)?;
             } else if self.renderer.liquify_active() {
                 let visibilities = self.visibilities();
                 // Same reasoning as the transform preview: the flat path skips
@@ -1828,6 +1831,79 @@ impl Canvas {
     /// Cancel an in-flight gradient overlay without committing.
     pub fn cancel_gradient_overlay(&mut self) {
         self.renderer.clear_gradient_overlay();
+        self.renderer.set_alpha_lock(false);
+        self.bump_version();
+    }
+
+    // ----------------------------------------------------------------
+    // Pattern tool GPU overlay
+    // ----------------------------------------------------------------
+
+    /// Arm the pattern overlay over `layer_idx` and hand it the generated
+    /// pattern: a `w x h` premultiplied BGRA block landing at `(x, y)` in canvas
+    /// pixels. Re-armed on every regeneration, so the preview follows whichever
+    /// layer is active and picks up its alpha lock.
+    pub fn set_pattern_overlay(
+        &mut self,
+        layer_idx: usize,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        pixels: &[u8],
+    ) -> Result<(), RendererError> {
+        self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
+        self.renderer.begin_pattern_overlay(layer_idx)?;
+        self.renderer.upload_pattern_overlay(x, y, w, h, pixels)?;
+        self.bump_version();
+        Ok(())
+    }
+
+    /// Whether a pattern overlay is currently on screen.
+    #[must_use]
+    pub const fn pattern_overlay_active(&self) -> bool {
+        self.renderer.pattern_overlay_active()
+    }
+
+    /// Render the armed pattern preview into the preview image. Routed on the
+    /// same test the gradient uses: the flat path knows nothing of adjustment
+    /// slots, folder scope or clipping masks, so the live pattern would show
+    /// unadjusted and unclipped right up to the moment it is applied.
+    fn render_armed_pattern_preview(&mut self) -> Result<(), RendererError> {
+        let target = self.renderer.pattern_overlay_target();
+        if self.any_clipped() || self.effective_adjustment_excluding(target) {
+            let snapshot = self.layers.snapshot();
+            let steps = self.preview_steps(&snapshot);
+            self.renderer.render_pattern_preview_scoped(&steps)
+        } else {
+            let visibilities = self.visibilities();
+            self.renderer.render_pattern_preview(&visibilities)
+        }
+    }
+
+    /// Render the armed pattern preview and read it back as BGRA8. Intended for
+    /// tests; the live path presents straight to the display.
+    pub fn read_pattern_preview(&mut self) -> Result<Vec<u8>, RendererError> {
+        self.render_armed_pattern_preview()?;
+        self.renderer.read_preview()
+    }
+
+    /// Apply the previewed pattern to `layer_idx` through the same pass the
+    /// preview used, clear the overlay, and recomposite.
+    pub fn commit_pattern(&mut self, layer_idx: usize) -> Result<(), RendererError> {
+        self.renderer
+            .set_alpha_lock(self.layers.alpha_lock_active(layer_idx));
+        let result = self.renderer.commit_pattern(layer_idx);
+        self.renderer.set_alpha_lock(false);
+        result?;
+        self.normalize_adjustment_slot(layer_idx)?;
+        self.recomposite_canvas()
+    }
+
+    /// Take the pattern overlay off screen without applying it.
+    pub fn cancel_pattern_overlay(&mut self) {
+        self.renderer.clear_pattern_overlay();
         self.renderer.set_alpha_lock(false);
         self.bump_version();
     }

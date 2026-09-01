@@ -1,15 +1,19 @@
 //! The Pattern tool's live curve: draw it, drag its points, see the pattern
-//! grow along it, and bake it into the layer on the way out.
+//! grow along it, and bake it into the layer on Apply or on the way out.
 //!
-//! Nothing is committed while the tool is active: the curve and its handles are
-//! an overlay and the pattern under them is a preview, regenerated whenever the
-//! curve changes. Leaving the tool applies the pattern and clears both.
+//! Nothing is committed while the tool is active. The curve and its handles are
+//! a cairo overlay; the pattern under them is handed to the canvas as a GPU
+//! overlay spliced in at the target layer's z-order, so the live pattern goes
+//! through that layer's adjustments, blend mode, opacity, clipping mask and
+//! enclosing folders exactly as the applied pixels will. Apply runs the same
+//! pass straight into the layer, which is what keeps preview and result
+//! identical.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::color::ColorState;
+use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch};
 use oxiedraw_core::patterns::PatternState;
 use oxiedraw_patterns::{Bindings, CoverageTile, PatternRequest, RasterOptions, Side, SpineNode};
@@ -144,13 +148,14 @@ fn furthest_from_chord(points: &[Point], from: Point, to: Point) -> Option<(usiz
     best
 }
 
-/// What the layer will let through, as a per-pixel multiplier over the whole
-/// canvas - the selection mask, times the layer's own alpha where alpha lock is
-/// on. `None` means nothing is holding the pattern back.
+/// What a selection lets through, as a per-pixel multiplier over the whole
+/// canvas. `None` means nothing is holding the pattern back. Alpha lock is not
+/// folded in: the GPU blend imposes that on the preview and on the applied
+/// pixels alike, so it needs no readback.
 ///
-/// Both halves are GPU readbacks, too expensive per motion event, so this is
-/// read once when a curve begins. Nothing can change either one in between:
-/// picking a selection or toggling alpha lock leaves the tool, which bakes.
+/// A GPU readback, too expensive per motion event, so this is read once when a
+/// curve begins. Nothing can change it in between: picking a selection leaves
+/// the tool, which bakes.
 type PreviewClip = Option<Vec<u8>>;
 
 struct Live {
@@ -176,7 +181,7 @@ struct Live {
     preview: Option<CoverageTile>,
     /// Present only while a fresh line is being drawn.
     builder: Option<CurveBuilder>,
-    /// What the layer will let through, read once when this curve began.
+    /// What a selection lets through, read once when this curve began.
     clip: PreviewClip,
 }
 
@@ -645,30 +650,14 @@ impl PatternEdit {
         }
     }
 
-    /// Read what the active layer will let a bake through: the selection mask,
-    /// narrowed by the layer's own alpha when alpha lock is on. Two GPU
-    /// readbacks, so it runs once per curve - see [`PreviewClip`].
+    /// Read the selection mask a bake would be clipped by. One GPU readback, so
+    /// it runs once per curve - see [`PreviewClip`].
     fn read_clip(&self) -> PreviewClip {
         let mut canvas = self.canvas.borrow_mut();
-        let idx = canvas.layers().active()?;
-        let mask = canvas
-            .selection_active()
-            .then(|| canvas.read_selection_mask().ok())
-            .flatten();
-        if !canvas.layer_alpha_locked(idx) {
-            return mask;
+        if !canvas.selection_active() {
+            return None;
         }
-        // BGRA8, so alpha is every 4th byte.
-        let Ok(pixels) = canvas.read_layer(idx) else {
-            return mask;
-        };
-        let mut clip: Vec<u8> = pixels.iter().skip(3).step_by(4).copied().collect();
-        if let Some(mask) = mask {
-            for (out, m) in clip.iter_mut().zip(&mask) {
-                *out = ((u32::from(*out) * u32::from(*m) + 127) / 255) as u8;
-            }
-        }
-        Some(clip)
+        canvas.read_selection_mask().ok()
     }
 
     /// A knob in the tool's panel moved: re-grow the curve under the new
@@ -736,53 +725,87 @@ impl PatternEdit {
     }
 
     fn refresh_overlay(&self) {
-        let live = self.live.borrow();
-        let Some(live) = live.as_ref() else {
+        // Built while the curve is borrowed, then handed on once it is not:
+        // pushing the pattern reaches the canvas, and the curve stays out of
+        // that call's way.
+        let drawn = {
+            let live = self.live.borrow();
+            live.as_ref().map(|live| {
+                let nodes: Vec<Point> = live.nodes.iter().map(|n| n.pos).collect();
+                // The sampled curve, not the polyline through the nodes: the
+                // pattern follows the smooth one, and segments sit visibly off
+                // it on a bend.
+                let curve = if live.curve.is_empty() {
+                    nodes.clone()
+                } else {
+                    live.curve.clone()
+                };
+                let size = self.canvas_size.get();
+                let pixels = live.preview.as_ref().and_then(|tile| {
+                    tint(tile, self.colors.current(), live.clip.as_deref(), size)
+                });
+                // The field is framed for the left side, so growing on the right
+                // is the same marks turned round.
+                let flipped = self.pattern.side_for(&self.pattern.params()) == Side::Right;
+                let marks: Vec<SideMark> = live
+                    .marks
+                    .iter()
+                    .map(|mark| SideMark {
+                        at: mark.at,
+                        normal: if flipped {
+                            Point::new(-mark.normal.x, -mark.normal.y)
+                        } else {
+                            mark.normal
+                        },
+                    })
+                    .collect();
+                (curve, nodes, marks, pixels)
+            })
+        };
+        let Some((curve, nodes, marks, pixels)) = drawn else {
+            self.push_pattern(None);
             self.paintable
-                .set_pattern_overlay(None, Vec::new(), Vec::new(), Vec::new(), None);
+                .set_pattern_overlay(None, Vec::new(), Vec::new(), Vec::new());
             self.redraw.request();
             return;
         };
-        let nodes: Vec<Point> = live.nodes.iter().map(|n| n.pos).collect();
-        // The sampled curve, not the polyline through the nodes: the pattern
-        // follows the smooth one, and segments sit visibly off it on a bend.
-        let curve = if live.curve.is_empty() {
-            nodes.clone()
-        } else {
-            live.curve.clone()
-        };
-        let canvas_width = self.canvas_size.get().width;
-        let surface = live.preview.as_ref().and_then(|tile| {
-            tint(
-                tile,
-                self.colors.current(),
-                live.clip.as_deref(),
-                canvas_width,
-            )
-        });
-        // The field is framed for the left side, so growing on the right is the
-        // same marks turned round.
-        let flipped = self.pattern.side_for(&self.pattern.params()) == Side::Right;
-        let marks: Vec<SideMark> = live
-            .marks
-            .iter()
-            .map(|mark| SideMark {
-                at: mark.at,
-                normal: if flipped {
-                    Point::new(-mark.normal.x, -mark.normal.y)
-                } else {
-                    mark.normal
-                },
-            })
-            .collect();
+        self.push_pattern(pixels.as_ref());
         self.paintable
-            .set_pattern_overlay(Some(()), curve, nodes, marks, surface);
+            .set_pattern_overlay(Some(()), curve, nodes, marks);
         self.redraw.request();
     }
 
+    /// Hand the tinted pattern to the canvas, which composites it at the active
+    /// layer's z-order, or take it off screen when there is nothing to show.
+    /// Re-armed on every refresh so it follows the active layer and its alpha
+    /// lock rather than pinning whichever was current when the curve began.
+    fn push_pattern(&self, pixels: Option<&PatternPixels>) {
+        let mut canvas = self.canvas.borrow_mut();
+        let target = pixels.zip(canvas.layers().active());
+        let Some((pixels, idx)) = target else {
+            if canvas.pattern_overlay_active() {
+                canvas.cancel_pattern_overlay();
+            }
+            return;
+        };
+        if let Err(e) = canvas.set_pattern_overlay(
+            idx,
+            pixels.x,
+            pixels.y,
+            pixels.width,
+            pixels.height,
+            &pixels.bgra,
+        ) {
+            tracing::error!(error = %e, "pattern: overlay upload failed");
+            canvas.cancel_pattern_overlay();
+        }
+    }
+
     /// Bake the pattern into the active layer and drop the curve, returning
-    /// whether it baked one. Called on leaving the tool, on starting a new line,
-    /// and before anything else touches the layer stack; a no-op with no curve.
+    /// whether it baked one. What the bar's Apply button and Enter do; also
+    /// called on leaving the tool, on starting a new line, and before anything
+    /// else touches the layer stack. A no-op with no curve, and the tool is left
+    /// ready for the next line either way.
     ///
     /// The curve stays on screen until the bake has definitely happened, since
     /// every step below can fail and a curve dropped on a failure is gone with
@@ -799,9 +822,20 @@ impl PatternEdit {
         if !has_preview {
             return false;
         }
+        // Re-arm against whatever layer is active now. Picking a different layer
+        // in the panel does not run through this tool, so the overlay could
+        // still be aimed at the one the curve was drawn over - and the bake
+        // below goes to the active one.
+        self.refresh_overlay();
 
         let target = {
             let mut canvas = self.canvas.borrow_mut();
+            // The overlay holds the very pixels the preview showed. Without one
+            // armed there is nothing to apply, and applying anyway would put the
+            // previous curve's pattern down a second time.
+            if !canvas.pattern_overlay_active() {
+                return false;
+            }
             let Some(idx) = canvas.layers().active() else {
                 return false;
             };
@@ -812,41 +846,20 @@ impl PatternEdit {
                 .map(|l| l.id.clone())
                 .unwrap_or_default();
             let size = canvas.size();
-            let mask = if canvas.selection_active() {
-                canvas.read_selection_mask().ok()
-            } else {
-                None
-            };
             match canvas.read_layer(idx) {
-                Ok(before) => Some((idx, layer_id, before, size, mask)),
+                Ok(before) => Some((idx, layer_id, before, size)),
                 Err(e) => {
                     tracing::error!(error = %e, "pattern: read_layer failed");
                     None
                 }
             }
         };
-        let Some((idx, layer_id, before, size, mask)) = target else {
+        let Some((idx, layer_id, before, size)) = target else {
             return false;
         };
 
-        let mut pixels = before.clone();
-        {
-            let live = self.live.borrow();
-            let Some(tile) = live.as_ref().and_then(|l| l.preview.as_ref()) else {
-                return false;
-            };
-            oxiedraw_core::patterns::paint_coverage(
-                &mut pixels,
-                size.width,
-                size.height,
-                tile,
-                self.colors.current(),
-                1.0,
-                mask.as_deref(),
-            );
-        }
-
-        if let Err(e) = self.canvas.borrow_mut().commit_fill(idx, &pixels) {
+        // The same pass the preview ran, into the layer this time.
+        if let Err(e) = self.canvas.borrow_mut().commit_pattern(idx) {
             tracing::error!(error = %e, "pattern: commit failed");
             return false;
         }
@@ -907,6 +920,19 @@ impl PatternEdit {
         }
         self.curve_history.borrow_mut().clear();
         self.refresh_overlay();
+    }
+
+    /// Throw the curve away without applying it: the pattern comes off the
+    /// canvas and the layer is left untouched. What the bar's Cancel button and
+    /// Escape do. Returns whether there was a curve to discard.
+    pub(crate) fn cancel(&self) -> bool {
+        let had_curve = self.take_live().is_some();
+        self.curve_history.borrow_mut().clear();
+        self.refresh_overlay();
+        if had_curve {
+            tracing::info!(target: "oxiedraw::tool", "pattern: curve discarded");
+        }
+        had_curve
     }
 
     /// Put the most recently baked curve back on screen, editable, with its own
@@ -1086,73 +1112,69 @@ fn nearest_on_polyline(points: &[Point], at: Point) -> Option<(usize, Point, f32
     best
 }
 
-/// `0` off the canvas, where a bake writes nothing either.
-fn clip_at(clip: &[u8], x: i32, y: i32, canvas_width: u32) -> u8 {
-    if x < 0 || y < 0 || x >= canvas_width as i32 {
-        return 0;
-    }
-    let at = y as usize * canvas_width as usize + x as usize;
-    clip.get(at).copied().unwrap_or(0)
-}
-
-/// Turn a coverage tile into a cairo surface in the active colour, ready to blit
-/// as the preview. `clip` is the same per-pixel limit the bake applies (see
-/// [`PreviewClip`]), or the preview shows fur that vanishes when it is applied.
+/// Turn a coverage tile into a premultiplied BGRA block in the active colour,
+/// clipped to the canvas, ready to upload as the overlay. `clip` is the same
+/// per-pixel limit the bake applies (see [`PreviewClip`]), or the preview shows
+/// fur that vanishes when it is applied.
+///
+/// Layer images are premultiplied sRGB BGRA, so these bytes go in the same way
+/// a layer's own pixels do and the GPU handles the linear conversion.
 fn tint(
     tile: &CoverageTile,
-    color: oxiedraw_core::color::Color,
+    color: Color,
     clip: Option<&[u8]>,
-    canvas_width: u32,
-) -> Option<PatternSurface> {
-    use gtk::cairo::{Format, ImageSurface};
-    use relm4::gtk;
-
-    if tile.width == 0 || tile.height == 0 {
+    canvas: Size,
+) -> Option<PatternPixels> {
+    let (canvas_w, canvas_h) = (canvas.width as i32, canvas.height as i32);
+    let x0 = tile.x.max(0);
+    let y0 = tile.y.max(0);
+    let x1 = (tile.x + tile.width as i32).min(canvas_w);
+    let y1 = (tile.y + tile.height as i32).min(canvas_h);
+    if x1 <= x0 || y1 <= y0 {
         return None;
     }
-    let (w, h) = (tile.width as i32, tile.height as i32);
-    let mut surface = ImageSurface::create(Format::ARgb32, w, h).ok()?;
-    let stride = surface.stride() as usize;
-    {
-        let mut data = surface.data().ok()?;
-        let (r, g, b) = (
-            u32::from(color.r),
-            u32::from(color.g),
-            u32::from(color.b),
-        );
-        for y in 0..h {
-            for x in 0..w {
-                let (cx, cy) = (tile.x + x, tile.y + y);
-                let mut a = u32::from(tile.coverage_at(cx, cy));
-                if let Some(clip) = clip {
-                    let allowed = clip_at(clip, cx, cy, canvas_width);
-                    a = (a * u32::from(allowed) + 127) / 255;
-                }
-                if a == 0 {
-                    continue;
-                }
-                let i = y as usize * stride + x as usize * 4;
-                // Cairo's ARGB32 is native-endian premultiplied BGRA in memory.
-                data[i] = ((b * a + 127) / 255) as u8;
-                data[i + 1] = ((g * a + 127) / 255) as u8;
-                data[i + 2] = ((r * a + 127) / 255) as u8;
-                data[i + 3] = a as u8;
+    let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
+    let mut bgra = vec![0_u8; (width as usize) * (height as usize) * 4];
+    let (r, g, b) = (
+        u32::from(color.r),
+        u32::from(color.g),
+        u32::from(color.b),
+    );
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let mut a = u32::from(tile.coverage_at(x, y));
+            if let Some(clip) = clip {
+                let at = y as usize * canvas.width as usize + x as usize;
+                let allowed = clip.get(at).copied().unwrap_or(0);
+                a = (a * u32::from(allowed) + 127) / 255;
             }
+            if a == 0 {
+                continue;
+            }
+            let i = ((y - y0) as usize * width as usize + (x - x0) as usize) * 4;
+            bgra[i] = ((b * a + 127) / 255) as u8;
+            bgra[i + 1] = ((g * a + 127) / 255) as u8;
+            bgra[i + 2] = ((r * a + 127) / 255) as u8;
+            bgra[i + 3] = a as u8;
         }
     }
-    Some(PatternSurface {
-        surface,
-        x: tile.x,
-        y: tile.y,
+    Some(PatternPixels {
+        x: x0,
+        y: y0,
+        width,
+        height,
+        bgra,
     })
 }
 
-/// A premultiplied surface and where it sits in canvas pixels.
-#[derive(Clone)]
-pub(crate) struct PatternSurface {
-    pub surface: relm4::gtk::cairo::ImageSurface,
-    pub x: i32,
-    pub y: i32,
+/// A premultiplied BGRA block and where it sits in canvas pixels. Always inside
+/// the canvas - the upload takes it as a plain sub-rectangle.
+struct PatternPixels {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    bgra: Vec<u8>,
 }
 
 #[cfg(test)]
@@ -1487,5 +1509,64 @@ mod tests {
         history.push(CurveStep { label: "Draw line", nodes: Vec::new() });
         let step = history.undo(curve(&[0.0, 10.0, 20.0])).expect("a step back");
         assert!(step.nodes.is_empty());
+    }
+
+    /// A tile at `(x, y)` with uniform coverage.
+    fn tile(x: i32, y: i32, width: u32, height: u32, coverage: u8) -> CoverageTile {
+        CoverageTile {
+            x,
+            y,
+            width,
+            height,
+            data: vec![coverage; (width * height) as usize],
+        }
+    }
+
+    // The upload takes the block as a plain sub-rectangle, so a tile hanging off
+    // the edge has to come back trimmed, not with negative coordinates.
+    #[test]
+    fn a_tile_off_the_edge_is_trimmed_to_the_canvas() {
+        let canvas = Size::new(20, 20);
+        let out = tint(&tile(-4, -6, 10, 10, 255), Color::new(255, 0, 0), None, canvas)
+            .expect("a block");
+        assert_eq!((out.x, out.y), (0, 0));
+        assert_eq!((out.width, out.height), (6, 4));
+        assert_eq!(out.bgra.len(), 6 * 4 * 4);
+
+        // Entirely off the canvas: nothing to upload at all.
+        assert!(tint(&tile(40, 40, 4, 4, 255), Color::new(255, 0, 0), None, canvas).is_none());
+    }
+
+    #[test]
+    fn coverage_becomes_premultiplied_paint_in_the_active_colour() {
+        let canvas = Size::new(8, 8);
+        let out = tint(&tile(0, 0, 4, 4, 128), Color::new(255, 0, 0), None, canvas)
+            .expect("a block");
+        // Premultiplied BGRA: red at half coverage, blue and green empty.
+        assert_eq!(&out.bgra[0..4], &[0, 0, 128, 128]);
+    }
+
+    // The selection is applied here rather than on the GPU, so the preview and
+    // the applied pixels are clipped by the same buffer.
+    #[test]
+    fn a_selection_holds_the_pattern_back() {
+        let canvas = Size::new(8, 8);
+        // Let only the left half through.
+        let mut mask = vec![0_u8; 64];
+        for y in 0..8 {
+            for x in 0..4 {
+                mask[y * 8 + x] = 255;
+            }
+        }
+        let out = tint(
+            &tile(0, 0, 8, 8, 255),
+            Color::new(255, 0, 0),
+            Some(&mask),
+            canvas,
+        )
+        .expect("a block");
+        let alpha_at = |x: usize, y: usize| out.bgra[(y * 8 + x) * 4 + 3];
+        assert_eq!(alpha_at(1, 3), 255, "the mask ate paint it should have let by");
+        assert_eq!(alpha_at(6, 3), 0, "the mask did not hold the pattern back");
     }
 }

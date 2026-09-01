@@ -54,6 +54,10 @@ name = "liquify_gpu"
 required-features = ["gpu-tests"]
 
 [[test]]
+name = "pattern_overlay_gpu"
+required-features = ["gpu-tests"]
+
+[[test]]
 name = "present_gpu"
 required-features = ["gpu-tests"]
 

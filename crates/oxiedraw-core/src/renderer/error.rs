@@ -30,4 +30,6 @@ pub enum RendererError {
     PatternAtlasFull,
     #[error("fill overlay mask is smaller than the canvas")]
     FillMaskTooSmall,
+    #[error("no pattern overlay is armed")]
+    PatternOverlayMissing,
 }

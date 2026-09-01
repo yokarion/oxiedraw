@@ -42,6 +42,7 @@ const STACK_GRADIENT: &str = "gradient";
 const STACK_TEXT: &str = "text";
 const STACK_GUIDE: &str = "guide";
 const STACK_LIQUIFY: &str = "liquify";
+const STACK_PATTERN: &str = "pattern";
 const STACK_NONE: &str = "none";
 
 const TOLERANCE_SLIDER_WIDTH: i32 = 320;
@@ -64,6 +65,8 @@ pub(crate) fn build(
     shape: &ShapeState,
     gradient: &GradientState,
     liquify: &LiquifyState,
+    on_pattern_apply: Rc<dyn Fn()>,
+    on_pattern_cancel: Rc<dyn Fn()>,
     text_edit: &Rc<std::cell::RefCell<Option<crate::text_edit::TextEdit>>>,
     default_brush_name: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     toaster: crate::toaster::Toaster,
@@ -110,6 +113,10 @@ pub(crate) fn build(
     stack.add_named(&build_shape_page(shape), Some(STACK_SHAPE));
     stack.add_named(&build_gradient_page(gradient), Some(STACK_GRADIENT));
     stack.add_named(&build_liquify_page(liquify), Some(STACK_LIQUIFY));
+    stack.add_named(
+        &build_pattern_page(on_pattern_apply, on_pattern_cancel),
+        Some(STACK_PATTERN),
+    );
     stack.add_named(&build_text_page(text_edit), Some(STACK_TEXT));
     stack.add_named(&build_guide_page(), Some(STACK_GUIDE));
     stack.add_named(
@@ -162,7 +169,8 @@ const fn stack_name_for(tool: Tool) -> &'static str {
         Tool::Liquify => STACK_LIQUIFY,
         Tool::DrawingGuide => STACK_GUIDE,
         Tool::Selection(_) => STACK_SELECTION,
-        Tool::Cursor | Tool::ColorPicker | Tool::Pattern => STACK_NONE,
+        Tool::Pattern => STACK_PATTERN,
+        Tool::Cursor | Tool::ColorPicker => STACK_NONE,
     }
 }
 
@@ -962,6 +970,51 @@ fn build_transform_page(
 
     let apply_btn = gtk::Button::builder()
         .label("Apply")
+        .valign(gtk::Align::Center)
+        .build();
+    apply_btn.add_css_class("suggested-action");
+    apply_btn.connect_clicked(move |_| {
+        on_apply();
+    });
+    row.append(&apply_btn);
+
+    row
+}
+
+// ---------------------------------------------------------------------------
+// Pattern page
+// ---------------------------------------------------------------------------
+
+/// Cancel / Apply for the Pattern tool, styled like the Transform bar's pair.
+/// The pattern's own knobs live in the right-hand panel, so there is nothing
+/// else on this row. Apply bakes the curve and leaves the tool ready for the
+/// next line; Cancel drops it without touching the layer.
+fn build_pattern_page(on_apply: Rc<dyn Fn()>, on_cancel: Rc<dyn Fn()>) -> gtk::Box {
+    let row = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .margin_start(6)
+        .margin_end(8)
+        .valign(gtk::Align::Center)
+        .build();
+
+    let spacer = gtk::Box::builder().hexpand(true).build();
+    row.append(&spacer);
+
+    let cancel_btn = gtk::Button::builder()
+        .label("Cancel")
+        .tooltip_text("Discard the pattern line (Esc)")
+        .valign(gtk::Align::Center)
+        .build();
+    cancel_btn.add_css_class("flat");
+    cancel_btn.connect_clicked(move |_| {
+        on_cancel();
+    });
+    row.append(&cancel_btn);
+
+    let apply_btn = gtk::Button::builder()
+        .label("Apply")
+        .tooltip_text("Draw the pattern into the layer (Enter)")
         .valign(gtk::Align::Center)
         .build();
     apply_btn.add_css_class("suggested-action");

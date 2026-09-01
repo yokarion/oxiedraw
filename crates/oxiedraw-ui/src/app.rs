@@ -453,6 +453,19 @@ fn install_key_handler(
                 _ => glib::Propagation::Proceed,
             };
         }
+        if active == Tool::Pattern && !typing {
+            return match keyval {
+                gdk::Key::Return | gdk::Key::KP_Enter => {
+                    (session.pattern_apply)();
+                    glib::Propagation::Stop
+                }
+                gdk::Key::Escape => {
+                    (session.pattern_cancel)();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            };
+        }
         if keyval == gdk::Key::Escape {
             // Cancel whatever the active tool has in progress.
             if active == Tool::Crop {

@@ -355,23 +355,23 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
-    /// The Pattern tool's live curve, its draggable points, and a preview of the
-    /// pattern grown along it, all in canvas coordinates. `active = None` clears
-    /// the overlay, which is what leaving the tool does once it has baked.
+    /// The Pattern tool's live curve and its draggable points, in canvas
+    /// coordinates. `active = None` clears the overlay, which is what leaving
+    /// the tool does once it has baked. The pattern itself is not drawn here -
+    /// it goes through the canvas composite so it picks up the layer's
+    /// adjustments, blend mode and clipping (see [`crate::pattern_edit`]).
     pub(crate) fn set_pattern_overlay(
         &self,
         active: Option<()>,
         curve: Vec<Point>,
         nodes: Vec<Point>,
         marks: Vec<crate::pattern_edit::SideMark>,
-        preview: Option<crate::pattern_edit::PatternSurface>,
     ) {
         let imp = self.imp();
         imp.pattern_active.set(active.is_some());
         *imp.pattern_curve.borrow_mut() = curve;
         *imp.pattern_nodes.borrow_mut() = nodes;
         *imp.pattern_marks.borrow_mut() = marks;
-        *imp.pattern_preview.borrow_mut() = preview;
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
@@ -801,16 +801,15 @@ fn render_guide_texture(
 const MARK_LEN_PX: f64 = 35.0;
 const MARK_MIN_GAP_PX: f64 = 55.0;
 
-/// The Pattern tool's overlay: the pattern as it currently stands, the guide
-/// curve in the accent colour, and a draggable point at every node. The preview
-/// is the real rasteriser's output, so what is on screen is what gets baked in.
-#[allow(clippy::too_many_arguments)]
+/// The Pattern tool's overlay: the guide curve in the accent colour and a
+/// draggable point at every node. The pattern itself is composited into the
+/// canvas image, not drawn here, so it is already under the layer's effects by
+/// the time this runs.
 fn draw_pattern_overlay_cairo(
     cr: &gtk::cairo::Context,
     curve: &[Point],
     nodes: &[Point],
     marks: &[crate::pattern_edit::SideMark],
-    preview: Option<&crate::pattern_edit::PatternSurface>,
     accent: (f32, f32, f32),
     pan_x: f32,
     pan_y: f32,
@@ -822,16 +821,6 @@ fn draw_pattern_overlay_cairo(
             f64::from(pan_y + p.y * zoom),
         )
     };
-
-    if let Some(preview) = preview {
-        cr.save().ok();
-        cr.translate(f64::from(pan_x), f64::from(pan_y));
-        cr.scale(f64::from(zoom), f64::from(zoom));
-        cr.set_source_surface(&preview.surface, f64::from(preview.x), f64::from(preview.y))
-            .ok();
-        cr.paint().ok();
-        cr.restore().ok();
-    }
 
     if curve.len() < 2 {
         return;
@@ -2102,12 +2091,12 @@ mod imp {
         pub(super) text_selection: RefCell<Vec<(f32, f32, f32, f32)>>,
         /// Resize-handle centres in canvas coordinates.
         pub(super) text_handles: RefCell<Vec<(f32, f32)>>,
-        /// Pattern tool: the live guide curve, its handles and the preview.
+        /// Pattern tool: the live guide curve and its handles. The pattern
+        /// itself is composited into the canvas image, not drawn here.
         pub(super) pattern_active: Cell<bool>,
         pub(super) pattern_curve: RefCell<Vec<Point>>,
         pub(super) pattern_nodes: RefCell<Vec<Point>>,
         pub(super) pattern_marks: RefCell<Vec<crate::pattern_edit::SideMark>>,
-        pub(super) pattern_preview: RefCell<Option<crate::pattern_edit::PatternSurface>>,
         /// Rubber-band box drawn while dragging out a new text box (canvas coords).
         pub(super) text_pending_box: Cell<Option<TransformRect>>,
         /// Anamorphic display scale `(sx, sy)` of the text box being edited.
@@ -2199,7 +2188,6 @@ mod imp {
                 pattern_curve: RefCell::new(Vec::new()),
                 pattern_nodes: RefCell::new(Vec::new()),
                 pattern_marks: RefCell::new(Vec::new()),
-                pattern_preview: RefCell::new(None),
                 text_pending_box: Cell::new(None),
                 text_scale: Cell::new((1.0, 1.0)),
                 guide: RefCell::new(None),
@@ -2741,7 +2729,7 @@ mod imp {
                 );
             }
 
-            // 6a-2. Pattern tool: live preview + guide curve + grab points.
+            // 6a-2. Pattern tool: guide curve + grab points.
             if self.pattern_active.get() {
                 let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
                 let cr = gtk_snap.append_cairo(&widget_rect);
@@ -2751,7 +2739,6 @@ mod imp {
                     &self.pattern_curve.borrow(),
                     &self.pattern_nodes.borrow(),
                     &self.pattern_marks.borrow(),
-                    self.pattern_preview.borrow().as_ref(),
                     self.guide_accent.get(),
                     pan_x,
                     pan_y,

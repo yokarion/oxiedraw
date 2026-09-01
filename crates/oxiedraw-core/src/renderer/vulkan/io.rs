@@ -229,6 +229,45 @@ impl VulkanRenderer {
         if idx >= self.layer_stack.slots.len() {
             return Err(RendererError::LayerIndexOutOfRange);
         }
+        let image = self.layer_stack.slots[idx].image.handle;
+        self.write_image_region(image, x, y, w, h, pixels)?;
+        self.layer_stack.touch(idx);
+        Ok(())
+    }
+
+    /// As [`Self::write_layer_region`] but into any canvas-format image. The
+    /// rect is clamped to the canvas, so a region that hangs off the edge
+    /// uploads only the part that lands on it.
+    pub(super) fn write_image_region(
+        &mut self,
+        image: vk::Image,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        pixels: &[u8],
+    ) -> Result<(), RendererError> {
+        let Some((x, y, w, h)) = self.stage_image_region(x, y, w, h, pixels)? else {
+            return Ok(());
+        };
+        self.record_and_submit(|this| {
+            this.cmd_copy_staging_region_to_image(image, x, y, w, h);
+            Ok(())
+        })
+    }
+
+    /// Copy the part of `pixels` that lands on the canvas into staging, and
+    /// return the clamped destination rect (`None` when none of it does). Split
+    /// out so a caller can fold the upload into a submit of its own instead of
+    /// paying for a second one.
+    pub(super) fn stage_image_region(
+        &mut self,
+        x: i32,
+        y: i32,
+        w: u32,
+        h: u32,
+        pixels: &[u8],
+    ) -> Result<Option<(i32, i32, u32, u32)>, RendererError> {
         let cw = self.canvas.extent.width as i32;
         let ch = self.canvas.extent.height as i32;
         // Clamp the destination rect to the canvas; derive the matching source
@@ -240,79 +279,72 @@ impl VulkanRenderer {
         let copy_w = (x1 - x0) as u32;
         let copy_h = (y1 - y0) as u32;
         if copy_w == 0 || copy_h == 0 {
-            return Ok(());
+            return Ok(None);
         }
-        {
-            let staging = self
-                .staging
-                .mapped_mut()
-                .ok_or(RendererError::StagingNotMapped)?;
-            let bpp = CANVAS_BYTES_PER_PIXEL as usize;
-            let src_stride = (w as usize) * bpp;
-            let dst_stride = (copy_w as usize) * bpp;
-            let col_off = ((x0 - x) as usize) * bpp;
-            let row_off = (y0 - y) as usize;
-            // Region always fits the canvas-sized staging buffer.
-            for row in 0..copy_h as usize {
-                let src = (row_off + row) * src_stride + col_off;
-                let dst = row * dst_stride;
-                staging[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
-            }
+        let staging = self
+            .staging
+            .mapped_mut()
+            .ok_or(RendererError::StagingNotMapped)?;
+        let bpp = CANVAS_BYTES_PER_PIXEL as usize;
+        let src_stride = (w as usize) * bpp;
+        let dst_stride = (copy_w as usize) * bpp;
+        let col_off = ((x0 - x) as usize) * bpp;
+        let row_off = (y0 - y) as usize;
+        // Region always fits the canvas-sized staging buffer.
+        for row in 0..copy_h as usize {
+            let src = (row_off + row) * src_stride + col_off;
+            let dst = row * dst_stride;
+            staging[dst..dst + dst_stride].copy_from_slice(&pixels[src..src + dst_stride]);
         }
-        let image = self.layer_stack.slots[idx].image.handle;
-        self.write_staging_region_to_image(image, x0, y0, copy_w, copy_h)?;
-        self.layer_stack.touch(idx);
-        Ok(())
+        Ok(Some((x0, y0, copy_w, copy_h)))
     }
 
-    /// Copy the first `w*h` tightly-packed pixels of staging into `image` at
-    /// `(x, y)`. Counterpart of [`write_staging_to_image`] for a sub-rect.
-    fn write_staging_region_to_image(
-        &mut self,
+    /// Record (no submit) a copy of the first `w*h` tightly-packed pixels of
+    /// staging into `image` at `(x, y)`. Counterpart of
+    /// [`Self::write_staging_to_image`] for a sub-rect.
+    pub(super) fn cmd_copy_staging_region_to_image(
+        &self,
         image: vk::Image,
         x: i32,
         y: i32,
         w: u32,
         h: u32,
-    ) -> Result<(), RendererError> {
-        self.record_and_submit(|this| {
-            this.barrier(
-                image,
-                vk::ImageLayout::GENERAL,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            );
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .buffer_row_length(0)
-                .buffer_image_height(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_offset(vk::Offset3D { x, y, z: 0 })
-                .image_extent(vk::Extent3D {
-                    width: w,
-                    height: h,
-                    depth: 1,
-                });
-            unsafe {
-                this.device.cmd_copy_buffer_to_image(
-                    this.command_buffer,
-                    this.staging.handle,
-                    image,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    &[region],
-                );
-            }
-            this.barrier(
+    ) {
+        self.barrier(
+            image,
+            vk::ImageLayout::GENERAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D { x, y, z: 0 })
+            .image_extent(vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                self.command_buffer,
+                self.staging.handle,
                 image,
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::GENERAL,
+                &[region],
             );
-            Ok(())
-        })
+        }
+        self.barrier(
+            image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::GENERAL,
+        );
     }
 
     pub(super) fn write_staging_to_image(

@@ -129,6 +129,7 @@ mod liquify;
 mod mask;
 mod pass;
 mod pattern_atlas;
+mod pattern_overlay;
 mod present_convert;
 mod resources;
 mod selection;

@@ -18,6 +18,7 @@ mod io;
 mod layer_ops;
 mod liquify_ops;
 mod pattern_ops;
+mod pattern_overlay_ops;
 mod present;
 mod preview;
 mod selection_ops;
@@ -59,6 +60,7 @@ use super::layers::{ClipMaskPipeline, LayerBlendPipeline, LayerCompositePipeline
 use transform_preview::TransformPreview;
 use super::mask::{DabPipelineSet, MaskPipelineSet};
 use super::pattern_atlas::PatternAtlas;
+use super::pattern_overlay::PatternOverlay;
 use super::resources::{Buffer, Image};
 use super::selection::SelectionResources;
 use super::gradient_overlay::GradientOverlayResources;
@@ -329,6 +331,16 @@ pub struct VulkanRenderer {
     /// and extra (kind/sel_active/_/_).
     pub(super) gradient_endpoints: [f32; 4],
     pub(super) gradient_extra: [f32; 4],
+
+    /// The Pattern tool's overlay image and its composite set. Allocated on
+    /// first use - most documents never open the tool. Not the brush's
+    /// `pattern_atlas`: this is the generated pattern the tool previews and
+    /// applies.
+    pub(super) pattern_overlay: Option<PatternOverlay>,
+    /// True while the Pattern tool has a curve on screen. Gates the preview
+    /// path so the pattern composites at `pattern_overlay_layer_idx`'s z-order.
+    pub(super) pattern_overlay_active: bool,
+    pub(super) pattern_overlay_layer_idx: usize,
 
     pub(super) filter_resources: ManuallyDrop<FilterResources>,
     /// True while a filter popup is open. Gates the preview path so the
@@ -696,6 +708,9 @@ impl VulkanRenderer {
             gradient_layer_idx: 0,
             gradient_endpoints: [0.0; 4],
             gradient_extra: [0.0; 4],
+            pattern_overlay: None,
+            pattern_overlay_active: false,
+            pattern_overlay_layer_idx: 0,
             filter_resources: ManuallyDrop::new(filter_resources),
             filter_active: false,
             filter_spec: crate::filters::FilterSpec::Invert,
@@ -1394,6 +1409,9 @@ impl Drop for VulkanRenderer {
             if let Some((layout, pipeline)) = self.smudge_pipeline.take() {
                 self.device.destroy_pipeline(pipeline, None);
                 self.device.destroy_pipeline_layout(layout, None);
+            }
+            if let Some(overlay) = self.pattern_overlay.take() {
+                overlay.destroy(&self.device, &mut self.allocator);
             }
             if let Some((mut image, pool, _)) = self.smudge_before.take() {
                 self.device.destroy_descriptor_pool(pool, None);

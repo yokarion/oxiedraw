@@ -203,6 +203,10 @@ pub(crate) struct DocumentSession {
     pub(crate) set_active_tool: SetActiveToolSlot,
     pub(crate) transform_apply: Rc<dyn Fn()>,
     pub(crate) transform_cancel: Rc<dyn Fn()>,
+    /// Bake the live pattern curve into the layer, staying in the tool.
+    pub(crate) pattern_apply: Rc<dyn Fn()>,
+    /// Drop the live pattern curve without touching the layer.
+    pub(crate) pattern_cancel: Rc<dyn Fn()>,
     /// Revert to the pre-tool pixels (as an undoable edit) and close the session.
     pub(crate) liquify_cancel: Rc<dyn Fn()>,
     /// Revert to the pre-tool pixels, staying in the tool.
@@ -820,6 +824,9 @@ impl DocumentSession {
         // Likewise, so the layer-delete and reorder paths (built below, before
         // the controller) can bake a live curve before the stack moves under it.
         let pattern_flush: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        // And so the tool bar's Cancel (built with the bar, before the
+        // controller) can throw the live curve away.
+        let pattern_discard: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let liquify = LiquifyState::new();
         let guide = GuideState::new();
         let doc_props = document.properties.clone();
@@ -884,6 +891,16 @@ impl DocumentSession {
                 redraw.request();
             })
         };
+        // Apply is the same bake the flush path does; Cancel throws the curve
+        // away. Both dispatch late - the controller is built further down.
+        let pattern_apply: Rc<dyn Fn()> = {
+            let pattern_flush = Rc::clone(&pattern_flush);
+            Rc::new(move || call_slot(&pattern_flush))
+        };
+        let pattern_cancel: Rc<dyn Fn()> = {
+            let pattern_discard = Rc::clone(&pattern_discard);
+            Rc::new(move || call_slot(&pattern_discard))
+        };
         let (tool_options_widget, set_tool_options) = crate::tool_options_bar::build(
             &global.tools,
             &global.brush_engine,
@@ -898,6 +915,8 @@ impl DocumentSession {
             &shape,
             &gradient,
             &liquify,
+            Rc::clone(&pattern_apply),
+            Rc::clone(&pattern_cancel),
             &text_edit_slot,
             global.default_brush_name.clone(),
             global.toaster.clone(),
@@ -1154,6 +1173,12 @@ impl DocumentSession {
                 pattern_edit.commit();
             })
         });
+        *pattern_discard.borrow_mut() = Some({
+            let pattern_edit = pattern_edit.clone();
+            Rc::new(move || {
+                pattern_edit.cancel();
+            })
+        });
 
         canvas::wire(
             &picture,
@@ -1334,6 +1359,8 @@ impl DocumentSession {
             set_active_tool: Rc::clone(set_active_tool_late),
             transform_apply,
             transform_cancel,
+            pattern_apply,
+            pattern_cancel,
             liquify_cancel,
             liquify_restore,
             liquify_flush,
