@@ -177,6 +177,8 @@ pub(super) struct PrimaryDragHandler {
     gradient_cur_endpoints: Rc<Cell<Option<[f32; 4]>>>,
     /// Layer pixels + id captured at gradient_begin for the history patch.
     gradient_pending: Rc<RefCell<Option<GradientPending>>>,
+    // -- pattern ----------------------------------------------------------
+    pattern_edit: crate::pattern_edit::PatternEdit,
     // -- liquify ----------------------------------------------------------
     liquify: LiquifyState,
     /// Opens (or reuses) a liquify session on the active layer, returning false
@@ -373,6 +375,7 @@ impl PrimaryDragHandler {
             Tool::Text => self.text_begin(x, y),
             Tool::Liquify => self.liquify_begin(gesture, x, y),
             Tool::DrawingGuide => self.guide_begin(x, y),
+            Tool::Pattern => self.pattern_begin(x, y),
             Tool::Cursor => {
                 (self.cursor_activates_transform)();
                 gesture.set_state(gtk::EventSequenceState::Denied);
@@ -393,6 +396,7 @@ impl PrimaryDragHandler {
             Tool::Text => self.text_update(gesture, dx, dy),
             Tool::Liquify => self.liquify_update(gesture, dx, dy),
             Tool::DrawingGuide => self.guide_update(gesture),
+            Tool::Pattern => self.pattern_update(gesture, dx, dy),
             _ => {}
         }
     }
@@ -424,6 +428,7 @@ impl PrimaryDragHandler {
             Tool::Text => self.text_end(),
             Tool::Liquify => self.liquify_end(),
             Tool::DrawingGuide => self.guide_end(),
+            Tool::Pattern => self.pattern_end(),
             _ => {}
         }
     }
@@ -2207,6 +2212,34 @@ impl PrimaryDragHandler {
         present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
     }
 
+    // -----------------------------------------------------------------
+    // Pattern tool
+    // -----------------------------------------------------------------
+    //
+    // Nothing is baked here; see `crate::pattern_edit`.
+
+    fn pattern_begin(&self, x: f64, y: f64) {
+        self.pattern_edit
+            .pointer_press(widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation));
+    }
+
+    fn pattern_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
+        let Some((sx, sy)) = gesture.start_point() else {
+            return;
+        };
+        self.pattern_edit.pointer_motion(widget_to_canvas(
+            sx + dx,
+            sy + dy,
+            &self.pan,
+            &self.zoom,
+            &self.rotation,
+        ));
+    }
+
+    fn pattern_end(&self) {
+        self.pattern_edit.pointer_release();
+    }
+
     /// Selection-tool click with no drag: clear any existing selection.
     /// Photoshop parity - a single click in the marquee/lasso tool means
     /// "I'm not picking anything, drop the current selection".
@@ -3066,6 +3099,7 @@ pub(super) fn install_primary_drag(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    pattern_edit: &crate::pattern_edit::PatternEdit,
     liquify: &LiquifyState,
     liquify_ensure: Rc<dyn Fn() -> bool>,
     liquify_bake_stroke: Rc<dyn Fn() -> bool>,
@@ -3120,6 +3154,7 @@ pub(super) fn install_primary_drag(
         gradient_drag_start: Rc::new(Cell::new(Point::ZERO)),
         gradient_cur_endpoints: Rc::new(Cell::new(None)),
         gradient_pending: Rc::new(RefCell::new(None)),
+        pattern_edit: pattern_edit.clone(),
         liquify: liquify.clone(),
         liquify_ensure,
         liquify_bake_stroke,

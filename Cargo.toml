@@ -3,6 +3,7 @@ resolver = "3"
 members = [
   "crates/oxiedraw-ui",
   "crates/oxiedraw-core",
+  "crates/oxiedraw-patterns",
   "crates/oxiedraw-utils",
 ]
 
@@ -15,6 +16,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 oxiedraw-ui = { path = "crates/oxiedraw-ui" }
 oxiedraw-core = { path = "crates/oxiedraw-core" }
+oxiedraw-patterns = { path = "crates/oxiedraw-patterns" }
 oxiedraw-utils = { path = "crates/oxiedraw-utils" }
 
 relm4 = { version = "0.11", features = ["libadwaita"] }

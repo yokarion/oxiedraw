@@ -162,7 +162,7 @@ const fn stack_name_for(tool: Tool) -> &'static str {
         Tool::Liquify => STACK_LIQUIFY,
         Tool::DrawingGuide => STACK_GUIDE,
         Tool::Selection(_) => STACK_SELECTION,
-        Tool::Cursor | Tool::ColorPicker => STACK_NONE,
+        Tool::Cursor | Tool::ColorPicker | Tool::Pattern => STACK_NONE,
     }
 }
 

@@ -26,6 +26,8 @@ mod session;
 mod settings;
 mod splash;
 mod tabs;
+mod pattern_cursor;
+mod pattern_edit;
 mod text_edit;
 mod theme;
 mod toaster;

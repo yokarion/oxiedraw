@@ -134,6 +134,9 @@ fn write_project(
     // writer - so autosave and the untitled-document recovery copy can't fire
     // between motion events and persist an image missing the live stroke.
     (session.liquify_flush)();
+    // Same for a live pattern curve: it is an overlay until the tool is left, so
+    // without this the saved file has none of the pattern on screen.
+    session.pattern_edit.commit();
 
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.

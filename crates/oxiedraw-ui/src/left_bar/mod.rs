@@ -30,7 +30,7 @@ static SHAPE_SUBTOOLS: [Tool; 4] = [
     Tool::Shapes(ShapeTool::Triangle),
 ];
 
-static GROUPS: [ToolGroupSpec; 10] = [
+static GROUPS: [ToolGroupSpec; 11] = [
     ToolGroupSpec {
         name: "Cursor",
         subtools: &[Tool::Cursor],
@@ -80,6 +80,11 @@ static GROUPS: [ToolGroupSpec; 10] = [
         name: "Liquify",
         subtools: &[Tool::Liquify],
         action_id: Some("select-liquify"),
+    },
+    ToolGroupSpec {
+        name: "Pattern",
+        subtools: &[Tool::Pattern],
+        action_id: Some("select-pattern"),
     },
 ];
 

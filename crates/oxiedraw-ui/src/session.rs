@@ -44,6 +44,14 @@ use crate::canvas::{self, Viewport};
 /// back to the Cursor tool without a forward reference.
 pub(crate) type SetActiveToolSlot = Rc<RefCell<Option<Rc<dyn Fn(Tool)>>>>;
 
+/// Call a late-bound callback slot if it has been wired up yet.
+fn call_slot(slot: &Rc<RefCell<Option<Rc<dyn Fn()>>>>) {
+    let callback = slot.borrow().clone();
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
 pub(crate) use oxiedraw_core::history::LayerExtension;
 
 /// State shared across every open document tab.
@@ -161,6 +169,9 @@ pub(crate) struct DocumentSession {
     pub(crate) fill: FillState,
     pub(crate) shape: ShapeState,
     pub(crate) gradient: GradientState,
+    /// Per-document Pattern-tool state: chosen generator, its knob values and
+    /// the seed. Not the curve - that is the tool's, and lives in the UI.
+    pub(crate) pattern: oxiedraw_core::patterns::PatternState,
     pub(crate) liquify: LiquifyState,
     /// Per-document drawing guide (symmetry / grid / perspective). Edited by the
     /// Drawing Guide tool; its symmetry keeps affecting strokes once assisted.
@@ -182,8 +193,14 @@ pub(crate) struct DocumentSession {
     /// switches and ESC can commit the in-flight edit.
     pub(crate) text_edit: crate::text_edit::TextEdit,
 
+    /// Editable while the tool is active; leaving it bakes into the layer.
+    pub(crate) pattern_edit: crate::pattern_edit::PatternEdit,
+
     // Per-document callbacks.
     pub(crate) apply_tool: Rc<dyn Fn(Tool)>,
+    /// The window-level tool setter. Needed here so an undo that hands a
+    /// pattern curve back can put the user in the tool that owns it.
+    pub(crate) set_active_tool: SetActiveToolSlot,
     pub(crate) transform_apply: Rc<dyn Fn()>,
     pub(crate) transform_cancel: Rc<dyn Fn()>,
     /// Revert to the pre-tool pixels (as an undoable edit) and close the session.
@@ -796,6 +813,13 @@ impl DocumentSession {
         let fill = FillState::new();
         let shape = ShapeState::new();
         let gradient = GradientState::new();
+        let pattern = oxiedraw_core::patterns::PatternState::new();
+        // Filled in once the Pattern controller exists, so the right-bar panel
+        // can re-grow the live curve when a knob moves.
+        let pattern_regenerate: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
+        // Likewise, so the layer-delete and reorder paths (built below, before
+        // the controller) can bake a live curve before the stack moves under it.
+        let pattern_flush: Rc<RefCell<Option<Rc<dyn Fn()>>>> = Rc::new(RefCell::new(None));
         let liquify = LiquifyState::new();
         let guide = GuideState::new();
         let doc_props = document.properties.clone();
@@ -916,10 +940,14 @@ impl DocumentSession {
             let transform = transform.clone();
             let transform_cancel = Rc::clone(&transform_cancel);
             let liquify_flush = Rc::clone(&liquify_flush);
+            let pattern_flush = Rc::clone(&pattern_flush);
             Rc::new(move || {
                 // A liquify session pins its target's index; a delete would shift
                 // the stack under it, so bake the warp before the stack moves.
                 liquify_flush();
+                // A curve bakes into whatever layer is active when the tool is
+                // left, which after a delete is not the one it previewed over.
+                call_slot(&pattern_flush);
                 prepare_transform_for_delete(&transform, || transform_cancel())
             })
         };
@@ -934,9 +962,11 @@ impl DocumentSession {
             let transform = transform.clone();
             let transform_apply = Rc::clone(&transform_apply);
             let liquify_flush = Rc::clone(&liquify_flush);
+            let pattern_flush = Rc::clone(&pattern_flush);
             Rc::new(move || {
                 // Same index hazard as the delete path above.
                 liquify_flush();
+                call_slot(&pattern_flush);
                 let in_progress = transform.has_targets() || transform.rect.get().is_some();
                 if in_progress {
                     transform_apply();
@@ -979,6 +1009,8 @@ impl DocumentSession {
             &crop,
             &global.tools,
             &gradient,
+            &pattern,
+            &pattern_regenerate,
             &guide,
             &global.clipboard,
             &global.toaster,
@@ -1102,6 +1134,27 @@ impl DocumentSession {
             text_edit.connect_changed(Box::new(move || refresh()));
         }
 
+        let pattern_edit = crate::pattern_edit::PatternEdit::new(
+            &viewport.canvas(),
+            &pattern,
+            &global.colors,
+            &history,
+            viewport.paintable(),
+            &viewport.redraw_handle(),
+            &viewport.canvas_size_handle(),
+            &viewport.zoom_handle(),
+        );
+        *pattern_regenerate.borrow_mut() = Some({
+            let pattern_edit = pattern_edit.clone();
+            Rc::new(move || pattern_edit.settings_changed())
+        });
+        *pattern_flush.borrow_mut() = Some({
+            let pattern_edit = pattern_edit.clone();
+            Rc::new(move || {
+                pattern_edit.commit();
+            })
+        });
+
         canvas::wire(
             &picture,
             &viewport,
@@ -1114,6 +1167,7 @@ impl DocumentSession {
             &fill,
             &shape,
             &gradient,
+            &pattern_edit,
             &liquify,
             Rc::clone(&liquify_ensure),
             Rc::clone(&liquify_bake_stroke),
@@ -1264,6 +1318,7 @@ impl DocumentSession {
             fill,
             shape,
             gradient,
+            pattern,
             liquify,
             guide,
             viewport,
@@ -1274,7 +1329,9 @@ impl DocumentSession {
             edit_mode,
             exit_component_edit,
             text_edit,
+            pattern_edit,
             apply_tool,
+            set_active_tool: Rc::clone(set_active_tool_late),
             transform_apply,
             transform_cancel,
             liquify_cancel,
@@ -1384,7 +1441,31 @@ impl DocumentSession {
 
     // -- App-level action handlers (dispatched to the active document) ---
 
+    fn editing_pattern(&self) -> bool {
+        self.global.tools.active.get() == Tool::Pattern
+    }
+
+    /// No-op if it is already active, or if the late-bound setter is unwired.
+    fn select_tool(&self, tool: Tool) {
+        if self.global.tools.active.get() == tool {
+            return;
+        }
+        if let Some(setter) = self.set_active_tool.borrow().as_ref() {
+            setter(tool);
+        }
+    }
+
     pub(crate) fn undo(&self) {
+        // The curve has not reached the document, so it gets first refusal
+        // while the tool is up and falls through here once its edits run out.
+        // Gated on the tool, or a curve left behind by a failed bake would eat
+        // the undos meant for whatever you moved on to.
+        if self.editing_pattern()
+            && let Some(label) = self.pattern_edit.undo()
+        {
+            self.global.toaster.info(&format!("Undo: {label}"));
+            return;
+        }
         // Land any in-flight shape-correction stroke as a real history entry
         // first, so this undo pops a consistent canvas state instead of
         // reverting an older action behind an unrecorded corrected shape.
@@ -1396,6 +1477,9 @@ impl DocumentSession {
         // Extension state each transformed layer returns to (captured before the
         // entry moves to the redo stack).
         let ext_reconcile = self.history.borrow().undo_ext_reconcile();
+        // Taking a bake off the layer hands its curve back, so undo carries on
+        // into how that curve was made rather than stopping at nothing.
+        let restores_curve = self.history.borrow().undo_takes_back_a_pattern();
         let label = {
             let mut h = self.history.borrow_mut();
             let mut c = canvas.borrow_mut();
@@ -1410,6 +1494,7 @@ impl DocumentSession {
         };
         if let Some(l) = label {
             reconcile_extensions(&self.layer_extensions, ext_reconcile);
+            let handed_back = restores_curve && self.pattern_edit.restore_last_applied();
             self.viewport.resync_canvas_size();
             (self.refresh_layers)();
             (self.refresh_components)();
@@ -1419,16 +1504,29 @@ impl DocumentSession {
                 &self.viewport.canvas_size_handle(),
             );
             self.viewport.redraw_handle().request();
+            // Handles you cannot drag are only a picture.
+            if handed_back {
+                self.select_tool(Tool::Pattern);
+            }
             self.global.toaster.info(&format!("Undo: {l}"));
             self.refresh_tab_title();
         }
     }
 
     pub(crate) fn redo(&self) {
+        if self.editing_pattern()
+            && let Some(label) = self.pattern_edit.redo()
+        {
+            self.global.toaster.info(&format!("Redo: {label}"));
+            return;
+        }
         self.viewport.flush_pending_correction();
         (self.liquify_flush)();
         let canvas = self.viewport.canvas();
         let ext_reconcile = self.history.borrow().redo_ext_reconcile();
+        // Putting a bake back on the layer takes the curve off screen again -
+        // otherwise the same pattern would be on the canvas twice.
+        let takes_curve = self.history.borrow().redo_puts_back_a_pattern();
         let label = {
             let mut h = self.history.borrow_mut();
             let mut c = canvas.borrow_mut();
@@ -1443,6 +1541,7 @@ impl DocumentSession {
         };
         if let Some(l) = label {
             reconcile_extensions(&self.layer_extensions, ext_reconcile);
+            let handed_back = takes_curve && self.pattern_edit.stash_live();
             self.viewport.resync_canvas_size();
             (self.refresh_layers)();
             (self.refresh_components)();
@@ -1452,6 +1551,9 @@ impl DocumentSession {
                 &self.viewport.canvas_size_handle(),
             );
             self.viewport.redraw_handle().request();
+            if handed_back {
+                self.select_tool(Tool::Pattern);
+            }
             self.global.toaster.info(&format!("Redo: {l}"));
             self.refresh_tab_title();
         }

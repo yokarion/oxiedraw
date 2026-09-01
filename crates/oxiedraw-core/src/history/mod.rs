@@ -98,6 +98,43 @@ mod tests {
         assert!(!stack.can_redo());
     }
 
+    /// The Pattern tool hands its curve across the history on these two peeks,
+    /// so they have to name the entry that is actually next and stay quiet for
+    /// anything else.
+    #[test]
+    fn pattern_peeks_name_only_the_entry_that_is_next() {
+        let patch = LayerPatch::from_full_diff(&[0u8; 64], &[1u8; 64], 4, 4).unwrap();
+        let mut stack = HistoryStack::new(HistoryConfig::default());
+        assert!(!stack.undo_takes_back_a_pattern(), "empty stack claimed one");
+
+        stack.record(HistoryAction::LayerReorder { from: 0, to: 1 });
+        assert!(!stack.undo_takes_back_a_pattern());
+
+        stack.record(HistoryAction::Pattern {
+            layer_id: "a".into(),
+            patch: patch.clone(),
+        });
+        assert!(stack.undo_takes_back_a_pattern(), "missed the top entry");
+
+        // Only the top one counts: a later unrelated edit hides it again.
+        stack.record(HistoryAction::LayerReorder { from: 1, to: 2 });
+        assert!(!stack.undo_takes_back_a_pattern());
+
+        // And the redo side reads its own stack, not the undo one.
+        let entry = stack.entries().back().cloned().unwrap();
+        let stack = HistoryStack::from_parts(8, VecDeque::default(), vec![entry]);
+        assert!(!stack.redo_puts_back_a_pattern());
+        let pattern = HistoryEntry {
+            action: HistoryAction::Pattern {
+                layer_id: "a".into(),
+                patch,
+            },
+        };
+        let stack = HistoryStack::from_parts(8, VecDeque::default(), vec![pattern]);
+        assert!(stack.redo_puts_back_a_pattern());
+        assert!(!stack.undo_takes_back_a_pattern());
+    }
+
     /// LayerPatch::from_full_diff returns None when buffers are identical.
     #[test]
     fn patch_no_diff_is_none() {

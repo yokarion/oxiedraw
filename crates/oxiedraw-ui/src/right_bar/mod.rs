@@ -3,6 +3,7 @@ mod components;
 mod crop_properties;
 mod gradient_properties;
 mod guide_properties;
+mod pattern_properties;
 mod layers;
 mod text_properties;
 
@@ -26,6 +27,7 @@ const WIDTH: i32 = 300;
 const STACK_NORMAL: &str = "normal";
 const STACK_CROP: &str = "crop";
 const STACK_GUIDE: &str = "guide";
+const STACK_PATTERN: &str = "pattern";
 
 /// Build the right sidebar.
 ///
@@ -40,6 +42,10 @@ pub(crate) fn build(
     crop: &CropState,
     tools: &ToolState,
     gradient: &GradientState,
+    pattern: &oxiedraw_core::patterns::PatternState,
+    // Filled once the Pattern controller exists (it is built after this), so
+    // the panel can re-grow the live curve when a knob moves.
+    pattern_regenerate: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     guide: &GuideState,
     layer_clipboard: &Rc<RefCell<Option<crate::clipboard::LayerClipboard>>>,
     toaster: &crate::toaster::Toaster,
@@ -79,6 +85,15 @@ pub(crate) fn build(
     // Colour picker with the gradient panel revealed on top of it while the
     // Gradient tool is active.
     let guide_panel = guide_properties::build(guide, canvas, &colors);
+    let pattern_panel = pattern_properties::build(pattern, {
+        let slot = Rc::clone(pattern_regenerate);
+        Rc::new(move || {
+            let cb = slot.borrow().clone();
+            if let Some(cb) = cb {
+                cb();
+            }
+        })
+    });
     let (gradient_panel, set_gradient_active) = gradient_properties::build(gradient, &colors);
     let picker_column = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -154,10 +169,12 @@ pub(crate) fn build(
     stack.add_named(&normal_root, Some(STACK_NORMAL));
     stack.add_named(&crop_panel, Some(STACK_CROP));
     stack.add_named(&guide_panel, Some(STACK_GUIDE));
+    stack.add_named(&pattern_panel, Some(STACK_PATTERN));
 
     let page_for_tool = |t: Tool| match t {
         Tool::Crop => STACK_CROP,
         Tool::DrawingGuide => STACK_GUIDE,
+        Tool::Pattern => STACK_PATTERN,
         _ => STACK_NORMAL,
     };
     stack.set_visible_child_name(page_for_tool(tools.active.get()));

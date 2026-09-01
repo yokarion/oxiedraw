@@ -969,6 +969,8 @@ pub enum Tool {
     Crop,
     Liquify,
     DrawingGuide,
+    /// Draw a line, get a generated pattern grown along it (fur and friends).
+    Pattern,
 }
 
 impl Tool {
@@ -985,6 +987,7 @@ impl Tool {
             Self::Crop => "Crop",
             Self::Liquify => "Liquify",
             Self::DrawingGuide => "Drawing Guide",
+            Self::Pattern => "Pattern",
         }
     }
 
@@ -1001,6 +1004,7 @@ impl Tool {
             Self::Crop => "oxiedraw-crop-symbolic",
             Self::Liquify => "oxiedraw-liquify-symbolic",
             Self::DrawingGuide => "oxiedraw-guide-symbolic",
+            Self::Pattern => "oxiedraw-pattern-symbolic",
         }
     }
 }

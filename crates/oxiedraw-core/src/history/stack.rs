@@ -132,6 +132,13 @@ impl HistoryStack {
         self.redo.clear();
     }
 
+    /// For edits that never reach the document: reshaping the Pattern tool's
+    /// curve records nothing here, but a redo left walkable would step forward
+    /// into pixels that no longer follow from what is on screen.
+    pub fn drop_redo(&mut self) {
+        self.redo.clear();
+    }
+
     /// Off-canvas extension state each transformed layer should hold after the
     /// next `undo` (empty if none). Lets the UI reconcile its extension map in
     /// lock-step with the undo so redo can restore it too.
@@ -148,6 +155,25 @@ impl HistoryStack {
         self.redo
             .last()
             .map_or_else(Vec::new, |e| e.action.transform_ext_reconcile(Direction::Forward))
+    }
+
+    /// Whether the next `undo` would take back a baked pattern, and likewise
+    /// for the next `redo`. Only the baked pixels are recorded here, so the
+    /// tool has to be told in order to hand its curve back.
+    #[must_use]
+    pub fn undo_takes_back_a_pattern(&self) -> bool {
+        matches!(
+            self.undo.back().map(|e| &e.action),
+            Some(HistoryAction::Pattern { .. })
+        )
+    }
+
+    #[must_use]
+    pub fn redo_puts_back_a_pattern(&self) -> bool {
+        matches!(
+            self.redo.last().map(|e| &e.action),
+            Some(HistoryAction::Pattern { .. })
+        )
     }
 
     // Test-only helpers for exercising the undo/redo wiring directly.
@@ -189,6 +215,7 @@ fn apply_direction(
         | HistoryAction::Fill { layer_id, patch }
         | HistoryAction::Shape { layer_id, patch }
         | HistoryAction::Gradient { layer_id, patch }
+        | HistoryAction::Pattern { layer_id, patch }
         | HistoryAction::Clear { layer_id, patch }
         | HistoryAction::Transform { layer_id, patch, .. }
         | HistoryAction::Filter { layer_id, patch }

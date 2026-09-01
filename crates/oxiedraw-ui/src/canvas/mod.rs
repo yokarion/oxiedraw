@@ -40,6 +40,7 @@ use crate::canvas_paintable::{CanvasPaintable, ColorPickerOverlay, GradientCurso
 
 pub(super) const BUTTON_PRIMARY: u32 = 1;
 const BUTTON_MIDDLE: u32 = 2;
+const BUTTON_SECONDARY: u32 = 3;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 32.0;
 const ZOOM_STEP: f64 = 1.1;
@@ -718,6 +719,7 @@ pub(crate) fn wire(
     fill: &FillState,
     shape: &ShapeState,
     gradient: &GradientState,
+    pattern_edit: &crate::pattern_edit::PatternEdit,
     liquify: &LiquifyState,
     liquify_ensure: Rc<dyn Fn() -> bool>,
     liquify_bake_stroke: Rc<dyn Fn() -> bool>,
@@ -747,8 +749,9 @@ pub(crate) fn wire(
 
     install_motion(
         picture, viewport, brush_engine, colors, tools, crop, transform, selection, gradient,
-        liquify, text_edit,
+        liquify, text_edit, pattern_edit,
     );
+    install_pattern_secondary(picture, viewport, tools, pattern_edit);
     install_pan(picture, viewport);
     install_scroll(picture, viewport);
     install_pinch_zoom(picture, viewport);
@@ -764,6 +767,7 @@ pub(crate) fn wire(
         fill,
         shape,
         gradient,
+        pattern_edit,
         liquify,
         liquify_ensure,
         liquify_bake_stroke,
@@ -804,6 +808,7 @@ fn install_motion(
     gradient: &GradientState,
     liquify: &LiquifyState,
     text_edit: &crate::text_edit::TextEdit,
+    pattern_edit: &crate::pattern_edit::PatternEdit,
 ) {
     let motion = gtk::EventControllerMotion::new();
     let cursor_pos = Rc::clone(&viewport.cursor);
@@ -823,6 +828,7 @@ fn install_motion(
     let colors = colors.clone();
     let area_c = area.clone();
     let text_edit = text_edit.clone();
+    let pattern_edit = pattern_edit.clone();
     let fill_drag = viewport.fill_drag_handle();
 
     // Per-pointer history used to feed dynamics for the cursor preview:
@@ -972,6 +978,18 @@ fn install_motion(
                 let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
                 let name = text_edit.cursor_for(canvas_pos).unwrap_or("text");
                 area_c.set_cursor_from_name(Some(name));
+                paintable.set_brush_cursor(None, Point::ZERO);
+                paintable.set_color_picker(None);
+            }
+            Tool::Pattern => {
+                // A cross to draw with, a move cursor over a draggable node,
+                // and a plus over the curve where a click would add one.
+                let canvas_pos = widget_to_canvas(x, y, &pan, &zoom, &rotation);
+                let drawing = pattern_edit.is_drawing();
+                let hover = pattern_edit.hit_test(canvas_pos);
+                area_c.set_cursor(
+                    crate::pattern_cursor::for_hover(hover, drawing).as_ref(),
+                );
                 paintable.set_brush_cursor(None, Point::ZERO);
                 paintable.set_color_picker(None);
             }
@@ -1137,6 +1155,34 @@ fn drag_modifier_mask(id: &str) -> Option<gdk::ModifierType> {
 /// turns it into a Krita-style continuous zoom centred on the drag origin;
 /// holding the configured rotate modifier rotates the canvas about the viewport
 /// centre (add the snap modifier for 45 deg steps).
+/// Right-click on a node of the Pattern tool's curve removes it.
+///
+/// Its own controller rather than a branch of the primary drag: that one is
+/// bound to the left button, and a delete is a click, not a drag.
+fn install_pattern_secondary(
+    area: &gtk::Picture,
+    viewport: &Viewport,
+    tools: &ToolState,
+    pattern_edit: &crate::pattern_edit::PatternEdit,
+) {
+    let click = gtk::GestureClick::new();
+    click.set_button(BUTTON_SECONDARY);
+
+    let pan = Rc::clone(&viewport.pan);
+    let zoom = Rc::clone(&viewport.zoom);
+    let rotation = Rc::clone(&viewport.rotation);
+    let tools = tools.clone();
+    let pattern_edit = pattern_edit.clone();
+    click.connect_pressed(move |gesture, _, x, y| {
+        if tools.active.get() != Tool::Pattern {
+            return;
+        }
+        pattern_edit.delete_node(widget_to_canvas(x, y, &pan, &zoom, &rotation));
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+    });
+    area.add_controller(click);
+}
+
 fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
     let drag = gtk::GestureDrag::new();
     drag.set_button(BUTTON_MIDDLE);

@@ -64,6 +64,12 @@ impl TabManager {
         // Leaving a text edit (or any tool switch) commits the in-flight box.
         if let Some(s) = self.active.borrow().as_ref() {
             s.text_edit.commit();
+            // Keyed on the tool being switched to, not on which one is being
+            // left: `previous` is only as trustworthy as every caller, and a
+            // curve left live paints its handles over whatever comes next.
+            if t != Tool::Pattern {
+                s.pattern_edit.leave();
+            }
         }
         self.global.tools.active.set(t);
         (self.set_left_bar)(t);
@@ -195,6 +201,9 @@ impl TabManager {
             && !Rc::ptr_eq(previous, session)
         {
             (previous.liquify_flush)();
+            // The tool is shared, so a curve left on a background tab would
+            // bake its pixels onto whatever document is in front.
+            previous.pattern_edit.leave();
         }
         // Only a real change of document is a tab switch; `activate` also runs
         // again for the tab that is already in front (add_session, re-selects).
@@ -260,6 +269,9 @@ impl TabManager {
         let Some(session) = self.session_for_page(page) else {
             return glib::Propagation::Proceed;
         };
+        // Before the dirty check, or a document whose only unsaved work is the
+        // curve on screen reads as clean and closes without asking.
+        session.pattern_edit.leave();
         if !session.is_dirty() {
             return glib::Propagation::Proceed;
         }
@@ -587,6 +599,7 @@ impl TabManager {
             ("select-text", Tool::Text),
             ("select-crop", Tool::Crop),
             ("select-liquify", Tool::Liquify),
+            ("select-pattern", Tool::Pattern),
         ];
         for &(id, tool) in tool_actions {
             let manager = Rc::clone(self);

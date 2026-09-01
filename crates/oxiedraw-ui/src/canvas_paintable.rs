@@ -355,6 +355,26 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
+    /// The Pattern tool's live curve, its draggable points, and a preview of the
+    /// pattern grown along it, all in canvas coordinates. `active = None` clears
+    /// the overlay, which is what leaving the tool does once it has baked.
+    pub(crate) fn set_pattern_overlay(
+        &self,
+        active: Option<()>,
+        curve: Vec<Point>,
+        nodes: Vec<Point>,
+        marks: Vec<crate::pattern_edit::SideMark>,
+        preview: Option<crate::pattern_edit::PatternSurface>,
+    ) {
+        let imp = self.imp();
+        imp.pattern_active.set(active.is_some());
+        *imp.pattern_curve.borrow_mut() = curve;
+        *imp.pattern_nodes.borrow_mut() = nodes;
+        *imp.pattern_marks.borrow_mut() = marks;
+        *imp.pattern_preview.borrow_mut() = preview;
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
     /// Rubber-band outline shown while dragging out a new text box. Canvas
     /// coordinates; `None` clears it.
     pub(crate) fn set_text_pending_box(&self, box_rect: Option<TransformRect>) {
@@ -773,6 +793,102 @@ fn render_guide_texture(
         margin,
         texture,
     })
+}
+
+/// Screen length of a side-marker tick, and the closest two may sit before the
+/// run is thinned. Both in widget pixels, so the marks stay legible at any zoom
+/// instead of piling up as you zoom out.
+const MARK_LEN_PX: f64 = 35.0;
+const MARK_MIN_GAP_PX: f64 = 55.0;
+
+/// The Pattern tool's overlay: the pattern as it currently stands, the guide
+/// curve in the accent colour, and a draggable point at every node. The preview
+/// is the real rasteriser's output, so what is on screen is what gets baked in.
+#[allow(clippy::too_many_arguments)]
+fn draw_pattern_overlay_cairo(
+    cr: &gtk::cairo::Context,
+    curve: &[Point],
+    nodes: &[Point],
+    marks: &[crate::pattern_edit::SideMark],
+    preview: Option<&crate::pattern_edit::PatternSurface>,
+    accent: (f32, f32, f32),
+    pan_x: f32,
+    pan_y: f32,
+    zoom: f32,
+) {
+    let to_widget = |p: Point| {
+        (
+            f64::from(pan_x + p.x * zoom),
+            f64::from(pan_y + p.y * zoom),
+        )
+    };
+
+    if let Some(preview) = preview {
+        cr.save().ok();
+        cr.translate(f64::from(pan_x), f64::from(pan_y));
+        cr.scale(f64::from(zoom), f64::from(zoom));
+        cr.set_source_surface(&preview.surface, f64::from(preview.x), f64::from(preview.y))
+            .ok();
+        cr.paint().ok();
+        cr.restore().ok();
+    }
+
+    if curve.len() < 2 {
+        return;
+    }
+    let (ar, ag, ab) = (f64::from(accent.0), f64::from(accent.1), f64::from(accent.2));
+
+    // Sampled from the same spine the pattern grows along. Fixed screen width
+    // so it stays findable at any zoom, stroked twice for a dark backing.
+    cr.set_line_cap(gtk::cairo::LineCap::Round);
+    cr.set_line_join(gtk::cairo::LineJoin::Round);
+    cr.set_dash(&[], 0.0);
+    for (width, (r, g, b, a)) in [(3.0, (0.0, 0.0, 0.0, 0.35)), (1.5, (ar, ag, ab, 0.95))] {
+        let (first, rest) = curve.split_first().expect("checked len >= 2");
+        let (x, y) = to_widget(*first);
+        cr.move_to(x, y);
+        for point in rest {
+            let (x, y) = to_widget(*point);
+            cr.line_to(x, y);
+        }
+        cr.set_line_width(width);
+        cr.set_source_rgba(r, g, b, a);
+        cr.stroke().ok();
+    }
+
+    // Short ticks into the side the body is on. Without them nothing on screen
+    // says which way Flip side has the fur pointing until it is grown.
+    let mut previous: Option<(f64, f64)> = None;
+    cr.set_line_width(1.0);
+    cr.set_source_rgba(ar, ag, ab, 0.55);
+    for mark in marks {
+        let (x, y) = to_widget(mark.at);
+        // Thin the run rather than the spacing, so zooming out drops whole
+        // ticks instead of shrinking them into a smear along the line.
+        if let Some((px, py)) = previous
+            && (x - px).hypot(y - py) < MARK_MIN_GAP_PX
+        {
+            continue;
+        }
+        previous = Some((x, y));
+        cr.move_to(x, y);
+        cr.line_to(
+            x + f64::from(mark.normal.x) * MARK_LEN_PX,
+            y + f64::from(mark.normal.y) * MARK_LEN_PX,
+        );
+    }
+    cr.stroke().ok();
+
+    // A grab point per node, fixed screen size for the same reason.
+    for node in nodes {
+        let (x, y) = to_widget(*node);
+        cr.arc(x, y, 4.0, 0.0, std::f64::consts::TAU);
+        cr.set_source_rgba(1.0, 1.0, 1.0, 0.95);
+        cr.fill_preserve().ok();
+        cr.set_line_width(1.5);
+        cr.set_source_rgba(ar, ag, ab, 1.0);
+        cr.stroke().ok();
+    }
 }
 
 /// Draw the active guide: symmetry / grid / perspective lines, plus the two
@@ -1910,7 +2026,8 @@ mod imp {
         GradientCursorOverlay, GuideCacheEntry, GuideCacheKey, PendingMarquee, Point, RefCell,
         TransformRect,
         append_brush_cursor, apply_view_rotation, draw_color_picker_cairo,
-        draw_crop_overlay_cairo, draw_gradient_cursor_cairo, draw_pixel_grid_cairo,
+        draw_crop_overlay_cairo, draw_gradient_cursor_cairo, draw_pattern_overlay_cairo,
+        draw_pixel_grid_cairo,
         draw_selection_overlay_cairo, draw_text_edit_overlay_cairo, draw_transform_overlay_cairo,
         frame_profile, gdk, glib, graphene, gsk, gtk, render_guide_texture,
         snapshot_view_rotation,
@@ -1985,6 +2102,12 @@ mod imp {
         pub(super) text_selection: RefCell<Vec<(f32, f32, f32, f32)>>,
         /// Resize-handle centres in canvas coordinates.
         pub(super) text_handles: RefCell<Vec<(f32, f32)>>,
+        /// Pattern tool: the live guide curve, its handles and the preview.
+        pub(super) pattern_active: Cell<bool>,
+        pub(super) pattern_curve: RefCell<Vec<Point>>,
+        pub(super) pattern_nodes: RefCell<Vec<Point>>,
+        pub(super) pattern_marks: RefCell<Vec<crate::pattern_edit::SideMark>>,
+        pub(super) pattern_preview: RefCell<Option<crate::pattern_edit::PatternSurface>>,
         /// Rubber-band box drawn while dragging out a new text box (canvas coords).
         pub(super) text_pending_box: Cell<Option<TransformRect>>,
         /// Anamorphic display scale `(sx, sy)` of the text box being edited.
@@ -2072,6 +2195,11 @@ mod imp {
                 text_caret_visible: Cell::new(true),
                 text_selection: RefCell::new(Vec::new()),
                 text_handles: RefCell::new(Vec::new()),
+                pattern_active: Cell::new(false),
+                pattern_curve: RefCell::new(Vec::new()),
+                pattern_nodes: RefCell::new(Vec::new()),
+                pattern_marks: RefCell::new(Vec::new()),
+                pattern_preview: RefCell::new(None),
                 text_pending_box: Cell::new(None),
                 text_scale: Cell::new((1.0, 1.0)),
                 guide: RefCell::new(None),
@@ -2607,6 +2735,24 @@ mod imp {
                     &self.text_selection.borrow(),
                     &self.text_handles.borrow(),
                     self.text_scale.get(),
+                    pan_x,
+                    pan_y,
+                    zoom,
+                );
+            }
+
+            // 6a-2. Pattern tool: live preview + guide curve + grab points.
+            if self.pattern_active.get() {
+                let gtk_snap = unsafe { snapshot.unsafe_cast_ref::<gtk::Snapshot>() };
+                let cr = gtk_snap.append_cairo(&widget_rect);
+                apply_view_rotation(&cr, pan_x, pan_y, rotation);
+                draw_pattern_overlay_cairo(
+                    &cr,
+                    &self.pattern_curve.borrow(),
+                    &self.pattern_nodes.borrow(),
+                    &self.pattern_marks.borrow(),
+                    self.pattern_preview.borrow().as_ref(),
+                    self.guide_accent.get(),
                     pan_x,
                     pan_y,
                     zoom,

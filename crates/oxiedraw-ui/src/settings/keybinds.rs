@@ -248,6 +248,11 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
                 default_accel: Some("t"),
             },
             ActionInfo {
+                id: "select-pattern",
+                label: "Pattern",
+                default_accel: Some("<Shift>p"),
+            },
+            ActionInfo {
                 id: "select-crop",
                 label: "Crop",
                 default_accel: Some("<Shift>c"),

@@ -65,6 +65,12 @@ pub enum HistoryAction {
         layer_id: String,
         patch: LayerPatch,
     },
+    /// Pattern-tool commit on a single layer: one generated pattern baked into
+    /// the pixels. Patch carries the before+after BGRA8 of the changed region.
+    Pattern {
+        layer_id: String,
+        patch: LayerPatch,
+    },
     /// Clear-layer or selection-clear pixel write.
     Clear {
         layer_id: String,
@@ -378,6 +384,7 @@ impl HistoryAction {
             Self::Fill { .. } => "Bucket fill",
             Self::Shape { .. } => "Shape",
             Self::Gradient { .. } => "Gradient",
+            Self::Pattern { .. } => "Pattern",
             Self::Clear { .. } => "Clear layer",
             Self::Transform { .. } => "Transform",
             Self::TextEdit { .. } => "Edit text",

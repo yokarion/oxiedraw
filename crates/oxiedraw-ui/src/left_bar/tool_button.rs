@@ -54,7 +54,6 @@ pub(super) fn build(
     }
 
     {
-        let tools_c = tools.clone();
         let on_change_c = Rc::clone(on_change);
         let active_sub_c = Rc::clone(&active_subtool);
         let prog_c = Rc::clone(&programmatic);
@@ -72,9 +71,10 @@ pub(super) fn build(
                 return;
             }
             if b.is_active() {
-                let tool = active_sub_c.get();
-                tools_c.active.set(tool);
-                on_change_c(tool);
+                // Don't set the active tool here - `on_change` does it, and
+                // doing it first hides the tool being left from everything
+                // that needs to wind it down.
+                on_change_c(active_sub_c.get());
             }
         });
     }
@@ -89,7 +89,7 @@ pub(super) fn build(
         });
         overlay.add_overlay(&indicator);
 
-        let popover = build_popover(subtools, tools, &active_subtool, &btn, on_change);
+        let popover = build_popover(subtools, &active_subtool, &btn, on_change);
         popover.set_parent(&btn);
 
         let popover_for_click = popover.clone();
@@ -146,7 +146,6 @@ fn draw_indicator(cr: &cairo::Context, w: i32, h: i32) {
 
 fn build_popover(
     subtools: &'static [Tool],
-    tools: &ToolState,
     active_subtool: &Rc<Cell<Tool>>,
     group_btn: &gtk::ToggleButton,
     on_change: &Rc<dyn Fn(Tool)>,
@@ -175,7 +174,6 @@ fn build_popover(
         sub_btn.set_child(Some(&row));
         sub_btn.add_css_class("flat");
 
-        let tools_c = tools.clone();
         let active_sub_c = Rc::clone(active_subtool);
         let group_btn_c = group_btn.clone();
         let on_change_c = Rc::clone(on_change);
@@ -183,7 +181,6 @@ fn build_popover(
 
         sub_btn.connect_clicked(move |_| {
             active_sub_c.set(subtool);
-            tools_c.active.set(subtool);
             group_btn_c.set_icon_name(subtool.icon_name());
             group_btn_c.set_tooltip_text(Some(subtool.display_name()));
             if group_btn_c.is_active() {
