@@ -9,9 +9,10 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use oxiedraw_patterns::{CoverageTile, Params, Side, StrokeStyle};
+use oxiedraw_patterns::{CanvasElement, CoverageTile, Params, Side, StrokeStyle};
 
 use crate::color::Color;
+use crate::guides::Symmetry;
 
 /// How the pattern is inked. Mirrors [`StrokeStyle`] but is `Copy` and carries
 /// its own pen width, so the UI can flip between the two without losing it.
@@ -138,6 +139,43 @@ impl Default for PatternState {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Reproduce generated geometry across a symmetry guide: the drawn elements
+/// plus one transformed copy per symmetry element. Canvas space, so it runs on
+/// what [`oxiedraw_patterns::PatternGeometry::to_canvas`] hands back and the
+/// whole lot rasterises in one pass.
+///
+/// The brush mirrors at the dab level; a pattern has no dabs, so its geometry is
+/// mirrored instead. That keeps the copies exact - same generator output, moved -
+/// rather than re-growing along a mirrored curve and hoping the random numbers
+/// land the same way.
+#[must_use]
+pub fn symmetry_copies(elements: &[CanvasElement], symmetry: &Symmetry) -> Vec<CanvasElement> {
+    if elements.is_empty() || symmetry.elements.is_empty() {
+        return elements.to_vec();
+    }
+    let origin = symmetry.origin;
+    let mut out = Vec::with_capacity(elements.len() * (symmetry.elements.len() + 1));
+    out.extend_from_slice(elements);
+    for element in &symmetry.elements {
+        let matrix = element.linear();
+        let flips = element.flips();
+        for source in elements {
+            let mut copy = source.clone();
+            for vertex in &mut copy.verts {
+                vertex.pos = crate::guides::map_about(matrix, origin, vertex.pos);
+            }
+            // A reflection reverses a contour's winding, and the fill rule is
+            // non-zero: a mirrored copy overlapping the original would cancel it
+            // to a hole where they meet.
+            if flips && copy.fill {
+                copy.verts.reverse();
+            }
+            out.push(copy);
+        }
+    }
+    out
 }
 
 /// Composite a generated coverage tile onto layer pixels in one flat colour, on
@@ -272,6 +310,129 @@ mod tests {
             &RasterOptions { canvas: Some((w, h)), edge: 1.0 },
         )
         .expect("fur generated")
+    }
+
+    /// A fur run along the left third of the canvas, as canvas-space geometry
+    /// ready to be reproduced and rasterised.
+    fn fur_elements(w: u32, h: u32) -> Vec<CanvasElement> {
+        use oxiedraw_patterns::{Bindings, PatternRequest, SpineNode};
+        let state = PatternState::new();
+        let params = state.params();
+        let bindings = Bindings::default();
+        let nodes = vec![
+            SpineNode::new(oxiedraw_utils::geometry::Point::new(20.0, h as f32 * 0.5), 1.0),
+            SpineNode::new(
+                oxiedraw_utils::geometry::Point::new(w as f32 / 3.0, h as f32 * 0.5),
+                1.0,
+            ),
+        ];
+        oxiedraw_patterns::generate(&PatternRequest {
+            pattern: state.pattern(),
+            params: &params,
+            bindings: &bindings,
+            nodes: &nodes,
+            seed: 7,
+            side: state.side_for(&params),
+            style: state.style.borrow().to_stroke_style(),
+            rest_length: None,
+        })
+        .expect("fur generated")
+        .to_canvas()
+    }
+
+    fn vertical_axis(width: u32, height: u32) -> Symmetry {
+        let cfg = crate::guides::GuideConfig::centered(width, height);
+        Symmetry::from_config(&cfg).expect("a centred guide reproduces strokes")
+    }
+
+    // What the tool draws has to come out on the far side of the guide too, in
+    // the same one raster pass - the whole point of the bug this fixes.
+    #[test]
+    fn a_symmetry_guide_reproduces_the_pattern_across_the_axis() {
+        use oxiedraw_patterns::{RasterOptions, rasterize};
+        let (w, h) = (300_u32, 160_u32);
+        let elements = fur_elements(w, h);
+        let options = RasterOptions { canvas: Some((w, h)), edge: 1.0 };
+        let plain = rasterize(&elements, &options).expect("fur");
+        let mirrored = rasterize(&symmetry_copies(&elements, &vertical_axis(w, h)), &options)
+            .expect("fur and its copy");
+
+        let right_half = |tile: &CoverageTile| {
+            (0..h as i32)
+                .flat_map(|y| (w as i32 / 2..w as i32).map(move |x| (x, y)))
+                .filter(|(x, y)| tile.coverage_at(*x, *y) > 0)
+                .count()
+        };
+        assert_eq!(right_half(&plain), 0, "the drawn fur was not on the left");
+        assert!(right_half(&mirrored) > 0, "nothing was reproduced");
+
+        // Reflected about x = w/2, so column x maps onto column w-1-x exactly.
+        let mut compared = 0;
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let here = mirrored.coverage_at(x, y);
+                let across = mirrored.coverage_at(w as i32 - 1 - x, y);
+                assert!(
+                    here.abs_diff(across) <= 2,
+                    "coverage {here} at ({x}, {y}) came back as {across} across the axis"
+                );
+                compared += usize::from(here > 0);
+            }
+        }
+        assert!(compared > 100, "only {compared} pixels of fur to compare");
+    }
+
+    #[test]
+    fn every_symmetry_element_gets_a_copy() {
+        let (w, h) = (300_u32, 160_u32);
+        let elements = fur_elements(w, h);
+        let mut symmetry = vertical_axis(w, h);
+        symmetry.elements =
+            crate::guides::symmetry_elements(crate::guides::SymmetryMode::Radial, false, 0.0);
+        assert_eq!(symmetry.elements.len(), 7);
+        assert_eq!(
+            symmetry_copies(&elements, &symmetry).len(),
+            elements.len() * 8,
+            "the drawn geometry plus one copy per element"
+        );
+
+        // No elements means nothing to reproduce, not an empty result.
+        symmetry.elements.clear();
+        assert_eq!(symmetry_copies(&elements, &symmetry).len(), elements.len());
+    }
+
+    // The fill rule is non-zero, so a mirrored contour laid over the original
+    // would punch a hole through it instead of reading as one shape.
+    #[test]
+    fn a_mirrored_fill_keeps_its_winding() {
+        use oxiedraw_patterns::{CanvasVertex, RasterOptions, rasterize};
+        use oxiedraw_utils::geometry::Point;
+
+        let square = |points: [(f32, f32); 4]| CanvasElement {
+            verts: points
+                .iter()
+                .map(|(x, y)| CanvasVertex {
+                    pos: Point::new(*x, *y),
+                    half_width: 0.0,
+                })
+                .collect(),
+            alpha: 1.0,
+            depth: 0,
+            fill: true,
+            reverse: false,
+        };
+        // Straddles the axis, so its copy lands back on top of it.
+        let elements = vec![square([(40.0, 40.0), (60.0, 40.0), (60.0, 60.0), (40.0, 60.0)])];
+        let symmetry = vertical_axis(100, 100);
+        let copies = symmetry_copies(&elements, &symmetry);
+        assert_eq!(copies.len(), 2);
+
+        let tile = rasterize(
+            &copies,
+            &RasterOptions { canvas: Some((100, 100)), edge: 0.0 },
+        )
+        .expect("a filled square");
+        assert_eq!(tile.coverage_at(50, 50), 255, "the overlap cancelled itself");
     }
 
     #[test]

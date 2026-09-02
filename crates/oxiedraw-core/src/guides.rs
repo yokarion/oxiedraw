@@ -111,6 +111,12 @@ impl SymElement {
         }
     }
 
+    /// Whether this element flips handedness. Reflections do, rotations do not.
+    #[must_use]
+    pub const fn flips(self) -> bool {
+        matches!(self, Self::Reflect { .. })
+    }
+
     /// The translation-free (linear) part of this element as a row-major 2x2
     /// matrix `[m00, m01, m10, m11]`.
     ///
@@ -134,6 +140,19 @@ impl SymElement {
     }
 }
 
+/// Map a point about `origin` by a row-major 2x2 `matrix` (see
+/// [`SymElement::linear`]). Split out so geometry with many points builds the
+/// matrix once instead of per point, the way [`SymElement::apply`] does.
+#[must_use]
+pub fn map_about(matrix: [f32; 4], origin: Point, p: Point) -> Point {
+    let [m00, m01, m10, m11] = matrix;
+    let (dx, dy) = (p.x - origin.x, p.y - origin.y);
+    Point::new(
+        origin.x + m00 * dx + m01 * dy,
+        origin.y + m10 * dx + m11 * dy,
+    )
+}
+
 /// Resolved symmetry transform set for a live stroke, handed to the renderer
 /// stamp path so each painted dab is reproduced across every copy.
 #[derive(Debug, Clone)]
@@ -154,6 +173,23 @@ impl Symmetry {
             return None;
         }
         Some(Self { origin: cfg.origin, elements })
+    }
+
+    /// Every copy of a canvas-space polyline, one per element. For geometry with
+    /// no orientation of its own - the Pattern tool's curve, which is reproduced
+    /// as a whole rather than dab by dab.
+    #[must_use]
+    pub fn copy_points(&self, points: &[Point]) -> Vec<Vec<Point>> {
+        self.elements
+            .iter()
+            .map(|element| {
+                let matrix = element.linear();
+                points
+                    .iter()
+                    .map(|p| map_about(matrix, self.origin, *p))
+                    .collect()
+            })
+            .collect()
     }
 }
 
@@ -604,6 +640,36 @@ mod tests {
         assert!(cfg.reproduces_strokes());
         let sym = Symmetry::from_config(&cfg).expect("assisted symmetry");
         assert_eq!(sym.elements.len(), 1); // single axis mirror = one copy
+    }
+
+    // The overlay draws the copies with `copy_points` while the pattern itself
+    // is mirrored through the same matrix, so the two must not drift apart.
+    #[test]
+    fn copied_points_agree_with_applying_each_element() {
+        let line = [Point::new(30.0, 20.0), Point::new(140.0, 75.0), Point::ZERO];
+        for rotational in [false, true] {
+            let symmetry = Symmetry {
+                origin: Point::new(100.0, 50.0),
+                elements: symmetry_elements(SymmetryMode::Radial, rotational, 0.4),
+            };
+            let copies = symmetry.copy_points(&line);
+            assert_eq!(copies.len(), symmetry.elements.len());
+            for (element, copy) in symmetry.elements.iter().zip(&copies) {
+                assert_eq!(copy.len(), line.len());
+                for (source, mapped) in line.iter().zip(copy) {
+                    approx(*mapped, element.apply(symmetry.origin, *source, 0.0).0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn only_reflections_flip_handedness() {
+        assert!(SymElement::Reflect { axis: 0.7 }.flips());
+        assert!(!SymElement::Rotate { angle: 0.7 }.flips());
+        for element in symmetry_elements(SymmetryMode::Radial, true, 0.0) {
+            assert!(!element.flips(), "a rotational copy flipped: {element:?}");
+        }
     }
 
     #[test]

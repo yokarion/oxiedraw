@@ -14,8 +14,9 @@ use std::rc::Rc;
 
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::{Color, ColorState};
+use oxiedraw_core::guides::{GuideState, Symmetry};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch};
-use oxiedraw_core::patterns::PatternState;
+use oxiedraw_core::patterns::{PatternState, symmetry_copies};
 use oxiedraw_patterns::{Bindings, CoverageTile, PatternRequest, RasterOptions, Side, SpineNode};
 use oxiedraw_utils::geometry::{Point, Size};
 
@@ -363,6 +364,9 @@ pub(crate) struct PatternEdit {
     canvas: Rc<RefCell<Canvas>>,
     pattern: PatternState,
     colors: ColorState,
+    /// The drawing guide, read on every regrow: an assisted symmetry guide
+    /// reproduces the pattern the way it reproduces a brush stroke.
+    guide: GuideState,
     history: Rc<RefCell<HistoryStack>>,
     paintable: CanvasPaintable,
     redraw: RedrawHandle,
@@ -376,6 +380,7 @@ impl PatternEdit {
         canvas: &Rc<RefCell<Canvas>>,
         pattern: &PatternState,
         colors: &ColorState,
+        guide: &GuideState,
         history: &Rc<RefCell<HistoryStack>>,
         paintable: &CanvasPaintable,
         redraw: &RedrawHandle,
@@ -386,6 +391,7 @@ impl PatternEdit {
             canvas,
             pattern,
             colors,
+            guide,
             history,
             paintable,
             redraw,
@@ -398,6 +404,12 @@ impl PatternEdit {
             let edit = edit.clone();
             move || edit.recolor()
         }));
+        // The copies follow the guide, so moving or reshaping it has to re-grow
+        // them - the same live sync an assisted brush stroke gets.
+        guide.connect_changed(Box::new({
+            let edit = edit.clone();
+            move || edit.guide_changed()
+        }));
         edit
     }
 
@@ -406,6 +418,7 @@ impl PatternEdit {
         canvas: &Rc<RefCell<Canvas>>,
         pattern: &PatternState,
         colors: &ColorState,
+        guide: &GuideState,
         history: &Rc<RefCell<HistoryStack>>,
         paintable: &CanvasPaintable,
         redraw: &RedrawHandle,
@@ -423,6 +436,7 @@ impl PatternEdit {
             canvas: Rc::clone(canvas),
             pattern: pattern.clone(),
             colors: colors.clone(),
+            guide: guide.clone(),
             history: Rc::clone(history),
             paintable: paintable.clone(),
             redraw: redraw.clone(),
@@ -674,6 +688,25 @@ impl PatternEdit {
         self.regenerate();
     }
 
+    /// The drawing guide moved, changed mode, or had assist toggled. Only the
+    /// copies move, so the geometry stands and this just re-maps it. Like a
+    /// settings change it alters what a bake would lay down, so the redo branch
+    /// on the far side of one goes with it.
+    fn guide_changed(&self) {
+        if self.live.borrow().is_none() {
+            return;
+        }
+        self.drop_redo_branch();
+        self.regenerate();
+    }
+
+    /// The transforms an assisted symmetry guide reproduces the pattern across,
+    /// or `None` when no guide is up, assist is off, or it is a guide that snaps
+    /// rather than reproduces.
+    fn symmetry(&self) -> Option<Symmetry> {
+        self.guide.config.borrow().as_ref().and_then(Symmetry::from_config)
+    }
+
     /// Re-grow the pattern along the current curve and repaint.
     ///
     /// Generated once per curve; a later change of shape re-maps that geometry
@@ -686,6 +719,7 @@ impl PatternEdit {
         let bindings = Bindings::default();
         let style = self.pattern.style.borrow().to_stroke_style();
         let seed = self.pattern.seed.get();
+        let symmetry = self.symmetry();
 
         {
             let mut slot = self.live.borrow_mut();
@@ -711,8 +745,15 @@ impl PatternEdit {
                     });
                 }
                 live.preview = live.geometry.as_ref().and_then(|geometry| {
+                    let elements = geometry.to_canvas();
+                    // One raster over the copies as well, so a copy that lands
+                    // on the original reads as one silhouette rather than two.
+                    let elements = match &symmetry {
+                        Some(symmetry) => symmetry_copies(&elements, symmetry),
+                        None => elements,
+                    };
                     oxiedraw_patterns::rasterize(
-                        &geometry.to_canvas(),
+                        &elements,
                         &RasterOptions {
                             canvas: Some((size.width, size.height)),
                             edge: 1.0,
@@ -765,13 +806,19 @@ impl PatternEdit {
         let Some((curve, nodes, marks, pixels)) = drawn else {
             self.push_pattern(None);
             self.paintable
-                .set_pattern_overlay(None, Vec::new(), Vec::new(), Vec::new());
+                .set_pattern_overlay(None, Vec::new(), Vec::new(), Vec::new(), Vec::new());
             self.redraw.request();
             return;
         };
+        // Where the copies will land. Worth drawing even though the pattern
+        // shows them once it is grown: while the pen is down there is no
+        // pattern yet, only the line.
+        let mirrors = self
+            .symmetry()
+            .map_or_else(Vec::new, |symmetry| symmetry.copy_points(&curve));
         self.push_pattern(pixels.as_ref());
         self.paintable
-            .set_pattern_overlay(Some(()), curve, nodes, marks);
+            .set_pattern_overlay(Some(()), curve, mirrors, nodes, marks);
         self.redraw.request();
     }
 

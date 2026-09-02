@@ -360,16 +360,21 @@ impl CanvasPaintable {
     /// the tool does once it has baked. The pattern itself is not drawn here -
     /// it goes through the canvas composite so it picks up the layer's
     /// adjustments, blend mode and clipping (see [`crate::pattern_edit`]).
+    ///
+    /// `mirrors` are the same curve under an assisted symmetry guide: drawn, but
+    /// with no handles, since the one curve is what is edited.
     pub(crate) fn set_pattern_overlay(
         &self,
         active: Option<()>,
         curve: Vec<Point>,
+        mirrors: Vec<Vec<Point>>,
         nodes: Vec<Point>,
         marks: Vec<crate::pattern_edit::SideMark>,
     ) {
         let imp = self.imp();
         imp.pattern_active.set(active.is_some());
         *imp.pattern_curve.borrow_mut() = curve;
+        *imp.pattern_mirrors.borrow_mut() = mirrors;
         *imp.pattern_nodes.borrow_mut() = nodes;
         *imp.pattern_marks.borrow_mut() = marks;
         gdk::prelude::PaintableExt::invalidate_contents(self);
@@ -805,9 +810,13 @@ const MARK_MIN_GAP_PX: f64 = 55.0;
 /// draggable point at every node. The pattern itself is composited into the
 /// canvas image, not drawn here, so it is already under the layer's effects by
 /// the time this runs.
+///
+/// `mirrors` are the symmetry copies of the curve, drawn thin and without
+/// handles: they follow the one curve rather than being editable themselves.
 fn draw_pattern_overlay_cairo(
     cr: &gtk::cairo::Context,
     curve: &[Point],
+    mirrors: &[Vec<Point>],
     nodes: &[Point],
     marks: &[crate::pattern_edit::SideMark],
     accent: (f32, f32, f32),
@@ -827,11 +836,28 @@ fn draw_pattern_overlay_cairo(
     }
     let (ar, ag, ab) = (f64::from(accent.0), f64::from(accent.1), f64::from(accent.2));
 
-    // Sampled from the same spine the pattern grows along. Fixed screen width
-    // so it stays findable at any zoom, stroked twice for a dark backing.
     cr.set_line_cap(gtk::cairo::LineCap::Round);
     cr.set_line_join(gtk::cairo::LineJoin::Round);
     cr.set_dash(&[], 0.0);
+
+    // Under the real curve, so a copy landing on it does not draw over it.
+    cr.set_line_width(1.0);
+    cr.set_source_rgba(ar, ag, ab, 0.45);
+    for mirror in mirrors {
+        let Some((first, rest)) = mirror.split_first() else {
+            continue;
+        };
+        let (x, y) = to_widget(*first);
+        cr.move_to(x, y);
+        for point in rest {
+            let (x, y) = to_widget(*point);
+            cr.line_to(x, y);
+        }
+    }
+    cr.stroke().ok();
+
+    // Sampled from the same spine the pattern grows along. Fixed screen width
+    // so it stays findable at any zoom, stroked twice for a dark backing.
     for (width, (r, g, b, a)) in [(3.0, (0.0, 0.0, 0.0, 0.35)), (1.5, (ar, ag, ab, 0.95))] {
         let (first, rest) = curve.split_first().expect("checked len >= 2");
         let (x, y) = to_widget(*first);
@@ -2095,6 +2121,8 @@ mod imp {
         /// itself is composited into the canvas image, not drawn here.
         pub(super) pattern_active: Cell<bool>,
         pub(super) pattern_curve: RefCell<Vec<Point>>,
+        /// The curve as an assisted symmetry guide reproduces it.
+        pub(super) pattern_mirrors: RefCell<Vec<Vec<Point>>>,
         pub(super) pattern_nodes: RefCell<Vec<Point>>,
         pub(super) pattern_marks: RefCell<Vec<crate::pattern_edit::SideMark>>,
         /// Rubber-band box drawn while dragging out a new text box (canvas coords).
@@ -2186,6 +2214,7 @@ mod imp {
                 text_handles: RefCell::new(Vec::new()),
                 pattern_active: Cell::new(false),
                 pattern_curve: RefCell::new(Vec::new()),
+                pattern_mirrors: RefCell::new(Vec::new()),
                 pattern_nodes: RefCell::new(Vec::new()),
                 pattern_marks: RefCell::new(Vec::new()),
                 text_pending_box: Cell::new(None),
@@ -2737,6 +2766,7 @@ mod imp {
                 draw_pattern_overlay_cairo(
                     &cr,
                     &self.pattern_curve.borrow(),
+                    &self.pattern_mirrors.borrow(),
                     &self.pattern_nodes.borrow(),
                     &self.pattern_marks.borrow(),
                     self.guide_accent.get(),

@@ -1158,6 +1158,7 @@ impl DocumentSession {
             &viewport.canvas(),
             &pattern,
             &global.colors,
+            &guide,
             &history,
             viewport.paintable(),
             &viewport.redraw_handle(),
