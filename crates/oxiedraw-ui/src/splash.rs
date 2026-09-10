@@ -356,7 +356,7 @@ fn load_banner() -> Option<gdk::Texture> {
 }
 
 /// Install the splash CSS once. Transparent window so the card's rounded
-/// corners show; the progress bar is forced to the libadwaita accent colour.
+/// corners show; the progress bar is forced to the libadwaita accent color.
 fn install_css() {
     use std::sync::OnceLock;
     static DONE: OnceLock<()> = OnceLock::new();

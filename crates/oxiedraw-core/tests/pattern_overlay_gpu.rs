@@ -170,7 +170,7 @@ fn preview_matches_the_applied_pixels_under_a_clipping_mask() {
     );
 }
 
-/// Alpha lock recolours what is already there and adds nothing. The lock rides a
+/// Alpha lock recolors what is already there and adds nothing. The lock rides a
 /// blend-state variant on the same pass the preview uses, so the preview shows
 /// the constraint as well.
 #[test]
@@ -206,7 +206,7 @@ fn an_alpha_locked_layer_keeps_its_alpha() {
     assert_eq!(at(5, 8)[3], 255, "alpha lock ate coverage that was there");
     assert!(
         at(5, 8)[1] > 200,
-        "the pattern should have recoloured the locked pixels, got {:?}",
+        "the pattern should have recolored the locked pixels, got {:?}",
         at(5, 8)
     );
 }

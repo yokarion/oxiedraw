@@ -218,7 +218,7 @@ pub(super) fn build_jpeg_page(
 
     let cs_row = adw::ActionRow::new();
     cs_row.set_title("Chroma Subsampling");
-    cs_row.set_subtitle("4:4:4 preserves full colour; 4:2:0 saves space.");
+    cs_row.set_subtitle("4:4:4 preserves full color; 4:2:0 saves space.");
     let cs_items = gtk::StringList::new(&["4:4:4", "4:2:2", "4:2:0", "4:1:1"]);
     let cs_drop = gtk::DropDown::new(Some(cs_items), gtk::Expression::NONE);
     cs_drop.set_valign(gtk::Align::Center);

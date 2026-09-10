@@ -8,7 +8,7 @@
 //!
 //! Per-document state (layers, history, tool state) is owned by
 //! `oxiedraw_ui::session::DocumentSession`, one per open tab; state shared
-//! across tabs (brushes, colours, fonts) lives in its `GlobalState`. Nothing in
+//! across tabs (brushes, colors, fonts) lives in its `GlobalState`. Nothing in
 //! this crate reaches back into the UI.
 //!
 //! Brush presets are plain data (`brush_engine::preset`), not trait impls; the

@@ -109,7 +109,7 @@ fn append_bytes<W: Write>(
 
 /// Encode premultiplied RGBA pattern bytes back to a plain PNG. We
 /// undo premultiplication so the PNG file stores conventional
-/// straight-alpha colours (what every other tool expects).
+/// straight-alpha colors (what every other tool expects).
 fn encode_premul_rgba_to_png(data: &Rc<PatternData>) -> Result<Vec<u8>, BrushError> {
     let mut straight = Vec::with_capacity(data.rgba.len());
     for chunk in data.rgba.chunks_exact(4) {

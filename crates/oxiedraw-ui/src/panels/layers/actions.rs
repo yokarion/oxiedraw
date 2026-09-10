@@ -1,5 +1,3 @@
-//! Layer actions (keyboard shortcuts + context menu backing) and the
-//! clipboard copy / paste implementations.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -28,8 +26,6 @@ use super::{
     ungroup_node,
 };
 
-/// `(layer id, flat index)` for every selected layer, in canvas order. Both
-/// per-layer toggles apply to the whole selection.
 fn selected_layer_targets(ui: &Ui) -> Vec<(String, usize)> {
     let ids = ui.selected_layer_ids_in_order();
     let snapshot = ui.state.snapshot();
@@ -43,9 +39,6 @@ fn selected_layer_targets(ui: &Ui) -> Vec<(String, usize)> {
         .collect()
 }
 
-/// Record a multi-layer toggle as exactly one undo step. A single change is
-/// recorded on its own so the undo label names the real action rather than a
-/// batch of one.
 fn record_one_step(history: &Rc<RefCell<HistoryStack>>, mut steps: Vec<HistoryAction>) {
     let action = match steps.len() {
         0 => return,
@@ -78,7 +71,6 @@ pub(super) fn install_layer_actions(
         return;
     };
 
-    // --- Duplicate ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -149,7 +141,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Clip to layer below ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -162,8 +153,6 @@ pub(super) fn install_layer_actions(
             if targets.is_empty() {
                 return;
             }
-            // Mixed selection follows the first row: if it is unclipped the
-            // whole selection clips, and vice versa.
             let turn_on = !canvas
                 .borrow()
                 .layers()
@@ -193,7 +182,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Lock alpha ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -238,7 +226,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Delete ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -248,9 +235,8 @@ pub(super) fn install_layer_actions(
         let prepare_delete = Rc::clone(prepare_delete);
         let action = gio::SimpleAction::new("layer-delete", None);
         action.connect_activate(move |_, _| {
-            // Cancel an in-progress transform first so its layer index can't go
-            // stale. A paste-via-transform cancel removes its own layer, so
-            // there's nothing left to delete afterwards.
+            // Or the transform's layer index goes stale. A paste-via-transform
+            // cancel removes its own layer, leaving nothing to delete.
             if !prepare_delete() {
                 sync_height(&area, &ui);
                 area.queue_draw();
@@ -259,7 +245,6 @@ pub(super) fn install_layer_actions(
                 return;
             }
             let Some(idx) = ui.state.active() else { return };
-            // Capture layer state before deletion for history.
             let pre = {
                 let mut c = canvas.borrow_mut();
                 let snap = c.layers().snapshot();
@@ -277,10 +262,6 @@ pub(super) fn install_layer_actions(
                     })
                 })
             };
-            // The panel's folder tree drops the leaf as part of the delete, and
-            // nothing else records that. Without it undo puts the layer back in
-            // the stack but not in its group, and the panel re-adopts it at the
-            // root - taking any clip relationship with it.
             let tree_before = tree_to_core(&ui.tree.borrow());
             let result = canvas.borrow_mut().remove_layer(idx);
             match result {
@@ -315,7 +296,6 @@ pub(super) fn install_layer_actions(
                             clipped,
                             alpha_locked,
                         };
-                        // Reconcile first so `tree_after` reflects the drop.
                         sync_height(&area, &ui);
                         let tree_after = tree_to_core(&ui.tree.borrow());
                         if tree_after == tree_before {
@@ -345,7 +325,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Group ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -374,7 +353,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Merge ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -400,7 +378,6 @@ pub(super) fn install_layer_actions(
             let removed_ids: Vec<String> =
                 sorted[1..].iter().map(|&i| snap[i].id.clone()).collect();
 
-            // Capture pre-merge state for history.
             let (survivor_pre, folded) = {
                 let mut c = canvas.borrow_mut();
                 let survivor_pre = c.read_layer(sorted[0]).unwrap_or_default();
@@ -465,7 +442,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Group: ungroup ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -488,7 +464,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Group: delete (group + all its leaf layers) ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -499,8 +474,7 @@ pub(super) fn install_layer_actions(
         action.connect_activate(move |_, _| {
             let Some(gid) = ui.active_group.borrow().clone() else { return };
             let tree_before = tree_to_core(&ui.tree.borrow());
-            // Resolve flat indices first, then remove highest-first so earlier
-            // removals don't shift indices we still need.
+            // Highest index first, or earlier removals shift the rest.
             let leaves = group_leaf_ids(&ui.tree.borrow(), &gid);
             let snap = canvas.borrow().layers().snapshot();
             let mut indices: Vec<usize> = leaves
@@ -517,8 +491,6 @@ pub(super) fn install_layer_actions(
                     continue;
                 }
                 if let Some((id, name, visible, kind, blend, opacity, pixels)) = captured {
-                    // Removals run highest-index-first, so the pre-removal
-                    // snapshot still indexes each layer correctly.
                     removals.push(HistoryAction::LayerRemove {
                         idx,
                         id,
@@ -537,9 +509,8 @@ pub(super) fn install_layer_actions(
             *ui.active_group.borrow_mut() = None;
             ui.multi_selected.borrow_mut().clear();
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
-            // One undoable unit: the leaf removals plus dropping the empty group
-            // node from the folder tree. The tree edit rides last so undo runs it
-            // first, restoring the folder before the leaves are re-added into it.
+            // The tree edit rides last, so undo runs it first and the folder is
+            // back before the leaves are re-added into it.
             let tree_after = tree_to_core(&ui.tree.borrow());
             let mut actions = removals;
             if tree_before != tree_after {
@@ -562,7 +533,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Group: duplicate (recursive) ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -580,7 +550,6 @@ pub(super) fn install_layer_actions(
             };
             let Some(group_clone) = group_clone else { return };
 
-            // Duplicate each leaf on the canvas and remember the src -> new id pairing.
             let mut id_map: std::collections::HashMap<String, String> =
                 std::collections::HashMap::new();
             let mut new_ids: Vec<String> = Vec::new();
@@ -614,8 +583,6 @@ pub(super) fn install_layer_actions(
                 }
             }
 
-            // Nothing got copied (the canvas was already full), so there is no
-            // copy to put in the tree - just say why.
             if id_map.is_empty() {
                 if hit_limit {
                     toaster.layer_limit_reached();
@@ -634,9 +601,6 @@ pub(super) fn install_layer_actions(
                 masked_leaves: std::collections::HashSet::new(),
             });
 
-            // Insert above the source group so the copy stacks on top. The dup'd
-            // leaves are already on the canvas but not yet in the panel tree, so
-            // this snapshot is the folder tree without the copy group.
             let tree_before = tree_to_core(&ui.tree.borrow());
             let pos = find_group_position(&ui.tree.borrow(), &gid);
             match pos {
@@ -654,9 +618,6 @@ pub(super) fn install_layer_actions(
             sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
 
-            // Record the created layers as one undoable unit. Capture each new
-            // layer at its final index (post-reorder) and order ascending so a
-            // redo re-inserts them into the correct positions.
             {
                 let mut adds: Vec<(usize, HistoryAction)> = Vec::with_capacity(new_ids.len());
                 let mut c = canvas.borrow_mut();
@@ -686,9 +647,6 @@ pub(super) fn install_layer_actions(
                 drop(c);
                 adds.sort_by_key(|(idx, _)| *idx);
                 let mut actions: Vec<HistoryAction> = adds.into_iter().map(|(_, a)| a).collect();
-                // Fold in the folder-tree change (the new copy group) so one undo
-                // removes both the copied layers and their group. Rides last so
-                // undo drops the group node before the layers are removed.
                 let tree_after = tree_to_core(&ui.tree.borrow());
                 if tree_before != tree_after {
                     actions.push(HistoryAction::LayerTreeEdit {
@@ -717,10 +675,8 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Initial sensitivity ---
     refresh_action_sensitivity(ui);
 
-    // --- Copy ---
     {
         let ui = ui.clone();
         let canvas = Rc::clone(canvas);
@@ -732,9 +688,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Cut ---
-    // Copy the active layer (or the selection within it) to the clipboard,
-    // then remove the copied pixels from the source layer.
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -747,7 +700,6 @@ pub(super) fn install_layer_actions(
             let Some(idx) = ui.state.active() else { return };
             let had_selection = canvas.borrow().selection_active();
             layer_copy(&ui, &canvas, &layer_clipboard);
-            // Capture before-state for history.
             let (layer_id, before_pixels) = {
                 let mut c = canvas.borrow_mut();
                 let id = c.layers().snapshot().get(idx)
@@ -764,7 +716,6 @@ pub(super) fn install_layer_actions(
                 tracing::error!(error = %e, "cut failed");
                 return;
             }
-            // Record history for the pixel clear.
             let after_pixels = canvas.borrow_mut().read_layer(idx).unwrap_or_default();
             let cs = canvas.borrow().size();
             if let Some(patch) = LayerPatch::from_full_diff(
@@ -779,7 +730,6 @@ pub(super) fn install_layer_actions(
         app.add_action(&action);
     }
 
-    // --- Paste ---
     {
         let ui = ui.clone();
         let area = area.clone();
@@ -806,9 +756,6 @@ pub(super) fn install_layer_actions(
     }
 }
 
-/// Copy the active layer (or the masked subset, if a selection is
-/// active) to the internal clipboard and write a memory texture to the
-/// system clipboard so other apps can receive it.
 pub(super) fn layer_copy(
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
@@ -849,7 +796,6 @@ pub(super) fn layer_copy(
         canvas_height: h,
     });
 
-    // Also push to the system clipboard as a texture so other apps can paste it.
     if let Some(display) = gdk::Display::default() {
         let stride = (w * 4) as usize;
         let bytes = glib::Bytes::from(&pixels);
@@ -865,33 +811,6 @@ pub(super) fn layer_copy(
     }
 }
 
-/// Paste a layer from either the internal clipboard or the system clipboard.
-///
-/// Internal path (fast, synchronous):
-/// - Triggered when the internal LayerClipboard holds pixels that match the
-///   current canvas dimensions exactly.
-/// - Pixels are copied directly into a new layer via add_layer_with_pixels.
-/// - Shows a "Layer pasted!" toast on success.
-///
-/// External path (slow, asynchronous):
-/// - Triggered when there is no matching internal clipboard entry, meaning
-///   the image comes from another application or a size-mismatched copy.
-/// - Step 1: read_texture_async asks GDK to fetch the system clipboard image.
-///   This returns a gdk::Texture on the main thread.
-/// - Step 2: a background thread calls texture.save_to_png_bytes() to encode
-///   the texture into PNG, then decode_png_bytes() to get raw BGRA pixels.
-///   Large images (e.g. 8K) can take several seconds here.
-/// - Step 3: idle_add_local polls the mpsc channel each frame until the result
-///   arrives, then adds it as a new layer (centred on the canvas) on the main
-///   thread.
-/// - Toast behavior: a 500 ms one-shot timer runs concurrently with step 2. If
-///   the background thread finishes before 500 ms, the done flag is set and the
-///   timer callback skips the toast. If 500 ms elapses first, a persistent
-///   on-canvas toast appears. The idle poller sets the done flag and dismisses
-///   the toast when the result arrives.
-/// - Shows "External image pasted!" on success or an error description on failure.
-/// - An image larger than the canvas keeps its off-canvas parts in
-///   `layer_extensions`, so a later Transform can scale them back into view.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn layer_paste(
     area: &gtk::DrawingArea,
@@ -905,7 +824,6 @@ pub(super) fn layer_paste(
 ) {
     let canvas_size = canvas.borrow().size();
 
-    // Internal clipboard - exact canvas match means we can restore all data directly.
     if let Some(internal) = layer_clipboard.borrow().as_ref()
         && internal.canvas_width == canvas_size.width
         && internal.canvas_height == canvas_size.height
@@ -941,7 +859,6 @@ pub(super) fn layer_paste(
         return;
     }
 
-    // System clipboard - async texture read.
     let Some(display) = gdk::Display::default() else {
         tracing::warn!("paste: no display");
         return;
@@ -969,7 +886,6 @@ pub(super) fn layer_paste(
                 }
             };
 
-            // 500 ms grace period: only show a "Pasting..." toast if it takes long.
             let done = Rc::new(Cell::new(false));
             let pending_toast: Rc<RefCell<Option<PendingToast>>> = Rc::new(RefCell::new(None));
             {
@@ -984,7 +900,6 @@ pub(super) fn layer_paste(
                 });
             }
 
-            // Decode the PNG in a background thread; send back raw pixels + dimensions.
             let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<u8>, u32, u32), String>>();
             std::thread::spawn(move || {
                 let png_bytes = texture.save_to_png_bytes();
@@ -998,7 +913,6 @@ pub(super) fn layer_paste(
                 }
             });
 
-            // Idle poller - fires on the main thread when the result is ready.
             glib::idle_add_local(move || {
                 let result = match rx.try_recv() {
                     Ok(r) => r,
@@ -1038,9 +952,6 @@ pub(super) fn layer_paste(
         });
 }
 
-// Add the decoded clipboard image as a brand-new layer, centred on the canvas
-// at its original size. Anything past the canvas edge is kept as an off-canvas
-// extension so it survives until a Transform brings it back into view.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
 fn paste_as_new_layer(
     area: &gtk::DrawingArea,
@@ -1098,8 +1009,6 @@ fn paste_as_new_layer(
     }
 }
 
-// Whether a `src_w` x `src_h` image placed at canvas offset `(off_x, off_y)`
-// reaches past any canvas edge.
 #[allow(clippy::cast_possible_wrap)]
 fn overflows_canvas(src_w: u32, src_h: u32, off_x: i32, off_y: i32, cw: u32, ch: u32) -> bool {
     off_x < 0
@@ -1108,9 +1017,6 @@ fn overflows_canvas(src_w: u32, src_h: u32, off_x: i32, off_y: i32, cw: u32, ch:
         || off_y.saturating_add(src_h as i32) > ch as i32
 }
 
-// Keep the full pasted image as the layer's off-canvas extension when it does
-// not fit. Without this the cropped-away pixels are gone for good, so scaling
-// the layer down with the Transform tool can never bring them back.
 #[allow(clippy::too_many_arguments)]
 fn stash_paste_overflow(
     canvas: &Rc<RefCell<Canvas>>,
@@ -1141,8 +1047,6 @@ fn stash_paste_overflow(
     );
 }
 
-// Blit `src` (premultiplied BGRA8, `src_w` x `src_h`) centred into a fresh
-// `cw` x `ch` transparent buffer, clipping any part that falls off-canvas.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -1170,7 +1074,6 @@ fn composite_centered(src: &[u8], src_w: u32, src_h: u32, cw: u32, ch: u32) -> V
     buf
 }
 
-// Call after any selection or layer-set change so toolbar buttons follow along.
 pub(super) fn refresh_action_sensitivity(ui: &Ui) {
     let Some(gio_app) = gio::Application::default() else { return };
     let Ok(app) = gio_app.downcast::<gtk::Application>() else { return };
@@ -1199,18 +1102,12 @@ pub(super) fn refresh_action_sensitivity(ui: &Ui) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Right-click context menu
-// ---------------------------------------------------------------------------
 
 pub(super) fn install_context_menu(
     area: &gtk::DrawingArea,
     ui: &Ui,
     layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
 ) {
-    // The clip entry names the action it performs rather than carrying a check
-    // mark, because the result is visible on the canvas either way. Two menus
-    // per layer kind, swapped on the clipped state of the clicked row.
     let build_layer_menu = |clipped: bool, locked: bool| {
         let menu = gio::Menu::new();
         menu.append(
@@ -1232,8 +1129,6 @@ pub(super) fn install_context_menu(
         menu
     };
 
-    // Same as a regular layer, plus the entry that re-opens the effect editor.
-    // An adjustment slot holds an opaque mask, so it has no alpha to lock.
     let build_adjustment_menu = |clipped: bool| {
         let menu = gio::Menu::new();
         menu.append(Some("Edit Adjustment"), Some("app.layer-add-adjustment"));
@@ -1275,11 +1170,9 @@ pub(super) fn install_context_menu(
 
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
-            // Row hit-testing is in content space; the pointer Y is viewport.
             let Some(row_idx) = RowLayout::new(&rows).at(y + ui.vadj.value()) else { return };
             let row = &rows[row_idx];
 
-            // Make the clicked row the sole selection so menu actions target it.
             ui.multi_selected.borrow_mut().clear();
             match &row.kind {
                 RowKind::Layer { flat_idx, clipped, alpha_locked, .. } => {
@@ -1333,12 +1226,10 @@ pub(super) fn install_context_menu(
     }
 }
 
-// --- Tests ---
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Opaque white `w` x `h` premultiplied BGRA8.
     fn opaque(w: u32, h: u32) -> Vec<u8> {
         vec![255u8; (w * h * 4) as usize]
     }
@@ -1352,8 +1243,6 @@ mod tests {
         assert!(overflows_canvas(4, 4, 0, -1, 4, 4), "pushed past the top edge");
     }
 
-    // The pasted layer only ever holds the canvas-sized crop, which is exactly
-    // why the full image has to be stashed as an extension.
     #[test]
     fn composite_centered_drops_the_off_canvas_pixels() {
         let src = opaque(4, 4);
@@ -1362,8 +1251,6 @@ mod tests {
         assert!(out.iter().all(|&b| b == 255), "the centre 2x2 survives");
     }
 
-    // A centred oversized paste puts the image's top-left at a negative offset;
-    // the extension frame has to cover the canvas plus the cropped border.
     #[test]
     fn centred_offset_covers_the_whole_source() {
         let (src_w, src_h) = (10i32, 6i32);

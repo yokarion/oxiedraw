@@ -1,4 +1,3 @@
-//! Canvas defaults page (shape correction toggles).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -8,7 +7,6 @@ use relm4::gtk;
 
 use crate::settings::{AppSettings, PixelViewSettings};
 
-/// Selectable rotation snap steps (degrees).
 const SNAP_STEPS: [f32; 7] = [5.0, 10.0, 15.0, 22.5, 30.0, 45.0, 90.0];
 
 pub(super) fn build_canvas_page(
@@ -22,7 +20,6 @@ pub(super) fn build_canvas_page(
     let drawing_group = adw::PreferencesGroup::new();
     drawing_group.set_title("Drawing");
 
-    // -- Shape correction ExpanderRow ------------------------------------------
     let sc = settings.borrow().shape_correction.clone();
 
     let expander = adw::ExpanderRow::new();
@@ -33,19 +30,16 @@ pub(super) fn build_canvas_page(
     expander.set_show_enable_switch(true);
     expander.set_enable_expansion(sc.enabled);
 
-    // Sub-row: trigger delay
     let delay_row = adw::SpinRow::with_range(0.0, 10_000.0, 100.0);
     delay_row.set_title("Trigger delay");
     delay_row.set_subtitle("How long to hold still before correction fires (ms)");
     delay_row.set_value(f64::from(sc.trigger_delay_ms));
 
-    // Sub-row: animation speed
     let anim_row = adw::SpinRow::with_range(0.0, 10_000.0, 10.0);
     anim_row.set_title("Animation speed");
     anim_row.set_subtitle("Total snap animation duration (ms, 0 = instant)");
     anim_row.set_value(f64::from(sc.animation_speed_ms));
 
-    // Sub-rows: per-shape toggles
     let line_row = adw::SwitchRow::new();
     line_row.set_title("Correct lines");
     line_row.set_subtitle("Straighten near-straight strokes, smooth curved ones");
@@ -66,9 +60,7 @@ pub(super) fn build_canvas_page(
     expander.add_row(&circle_row);
     expander.add_row(&rect_row);
 
-    // -- Wire callbacks --------------------------------------------------------
-
-    // Main toggle: if turning on with all shapes off, enable all shapes.
+    // Turning the main switch on with every shape off enables them all.
     {
         let settings = Rc::clone(&settings);
         let line_row = line_row.clone();
@@ -95,33 +87,31 @@ pub(super) fn build_canvas_page(
                     rect_row.set_active(true);
                 }
             }
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
 
-    // Trigger delay
     {
         let settings = Rc::clone(&settings);
         delay_row.connect_value_notify(move |r| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let v = r.value() as u32;
             settings.borrow_mut().shape_correction.trigger_delay_ms = v;
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
 
-    // Animation speed
     {
         let settings = Rc::clone(&settings);
         anim_row.connect_value_notify(move |r| {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let v = r.value() as u32;
             settings.borrow_mut().shape_correction.animation_speed_ms = v;
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
 
-    // Per-shape toggle helper: if all shapes become disabled, turn off the main switch.
+    // The last shape switched off takes the main switch with it.
     let make_shape_cb =
         |settings: Rc<RefCell<AppSettings>>,
          expander: adw::ExpanderRow,
@@ -138,7 +128,7 @@ pub(super) fn build_canvas_page(
                     settings.borrow_mut().shape_correction.enabled = false;
                     expander.set_enable_expansion(false);
                 }
-                settings.borrow().save();
+                settings.borrow_mut().save_keeping_layout();
             }
         };
 
@@ -161,7 +151,6 @@ pub(super) fn build_canvas_page(
     drawing_group.add(&expander);
     page.add(&drawing_group);
 
-    // -- Pixel view group -----------------------------------------------------
     let pv_group = adw::PreferencesGroup::new();
     pv_group.set_title("Pixel view");
 
@@ -193,14 +182,13 @@ pub(super) fn build_canvas_page(
     pv_expander.add_row(&grid_row);
     pv_expander.add_row(&grid_thr_row);
 
-    // Helper: persist + push current pixel_view to the live paintable.
     let push: Rc<dyn Fn()> = {
         let settings = Rc::clone(&settings);
         let apply = Rc::clone(&apply_pixel_view);
         Rc::new(move || {
-            let s = settings.borrow();
+            let mut s = settings.borrow_mut();
             apply(&s.pixel_view);
-            s.save();
+            s.save_keeping_layout();
         })
     };
 
@@ -244,7 +232,6 @@ pub(super) fn build_canvas_page(
     pv_group.add(&pv_expander);
     page.add(&pv_group);
 
-    // -- Rotation group -------------------------------------------------------
     let rot_group = adw::PreferencesGroup::new();
     rot_group.set_title("Rotation");
 
@@ -257,7 +244,6 @@ pub(super) fn build_canvas_page(
         "Angle increment for the rotator dial and snap-modifier rotation",
     );
     snap_row.set_model(Some(&gtk::StringList::new(&label_refs)));
-    // Select the current value, falling back to 45 deg if it isn't a preset.
     let current = settings.borrow().rotation_snap_deg;
     let selected = SNAP_STEPS
         .iter()
@@ -271,7 +257,7 @@ pub(super) fn build_canvas_page(
         snap_row.connect_selected_notify(move |r| {
             let idx = (r.selected() as usize).min(SNAP_STEPS.len() - 1);
             settings.borrow_mut().rotation_snap_deg = SNAP_STEPS[idx];
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
     rot_group.add(&snap_row);
@@ -280,4 +266,3 @@ pub(super) fn build_canvas_page(
     page
 }
 
-// Appearance page

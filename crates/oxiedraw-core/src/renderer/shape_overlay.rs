@@ -52,7 +52,7 @@ impl ShapeOverlayResources {
             sampler,
         )?;
         let layout = pipeline_layout(device, descriptor_set_layout, SHAPE_PUSH_BYTES)?;
-        // Premultiplied OVER - colour is `coverage * push.color`, alpha is
+        // Premultiplied OVER - color is `coverage * push.color`, alpha is
         // `coverage * push.color.a`, both blend identically.
         let mut pass = FullscreenPass {
             vert_spv: COMPOSITE_VERT_SPV,

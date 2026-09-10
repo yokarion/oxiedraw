@@ -2,8 +2,8 @@
 
 // Gradient rasteriser. Computes a ramp coordinate `t` at each canvas pixel
 // from the drag endpoints (Linear / Radial / Square), samples the baked
-// colour LUT (premultiplied linear RGBA), multiplies by the selection mask
-// if one is active, and outputs premultiplied colour. Fixed-function OVER
+// color LUT (premultiplied linear RGBA), multiplies by the selection mask
+// if one is active, and outputs premultiplied color. Fixed-function OVER
 // blend writes it onto the bound target (preview image or layer image).
 //
 // The whole ramp lives in the 256-texel LUT plus 32 bytes of push data; no

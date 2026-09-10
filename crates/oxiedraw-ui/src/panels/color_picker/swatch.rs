@@ -1,4 +1,3 @@
-//! Primary / secondary slot swatch overlay.
 
 use std::rc::Rc;
 
@@ -42,8 +41,6 @@ pub(super) fn install_swatch_input(
     let state = state.clone();
     let refresh = Rc::clone(refresh);
     click.connect_pressed(move |_, _, x, y| {
-        // Back square is the one offset to the upper-right; the visible part
-        // is anywhere it isn't covered by the front square.
         let on_back = x >= SWATCH_OFFSET
             && y <= SWATCH_OFFSET + SWATCH_INNER
             && (x > SWATCH_INNER || y < SWATCH_OFFSET);

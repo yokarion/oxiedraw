@@ -28,10 +28,10 @@ pub struct Dab {
     /// Squish on the local Y axis. `1.0` = round.
     pub aspect: f32,
     /// Coverage multiplier, `0..=1`. Soft-round uses this to attenuate
-    /// per-dab opacity without changing the stroke colour.
+    /// per-dab opacity without changing the stroke color.
     pub flow: f32,
-    /// Per-dab tint. Carries premultiplied colour for stage-3 hue/sat/val
-    /// jitter; today every dab in a stroke shares the stroke colour.
+    /// Per-dab tint. Carries premultiplied color for stage-3 hue/sat/val
+    /// jitter; today every dab in a stroke shares the stroke color.
     pub color: Color,
     /// `(u0, v0, u1, v1)` into the pattern atlas. Unused by the
     /// global-texture path (which samples in canvas space instead).
@@ -54,16 +54,16 @@ pub struct Dab {
     /// Texture composite mode: `0.0` multiply, `1.0` subtract. See
     /// `TexturingMode`.
     pub texturing_mode: f32,
-    /// Smudge family only: how much of the picked-up colour under the dab
-    /// carries into the smudge colour, `0..=1` (Krita "smudge rate").
+    /// Smudge family only: how much of the picked-up color under the dab
+    /// carries into the smudge color, `0..=1` (Krita "smudge rate").
     pub smudge_rate: f32,
-    /// Smudge family only: how much of the brush paint colour is mixed into
+    /// Smudge family only: how much of the brush paint color is mixed into
     /// the deposited dab, `0..=1` (Krita "color rate").
     pub color_rate: f32,
 }
 
 impl Dab {
-    /// Plain round dab at the given centre/radius with the stroke colour.
+    /// Plain round dab at the given centre/radius with the stroke color.
     /// Use this when no dynamics or pattern fields are active.
     pub const fn round(center: Point, radius: f32, color: Color) -> Self {
         Self {

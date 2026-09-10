@@ -3,7 +3,7 @@
 //! A text layer is a non-raster [`crate::document::LayerKind::Text`] whose
 //! canvas-sized slot is re-rendered from this structured content (mirroring how
 //! component instances render from a master). Styling is fully per-range: every
-//! [`TextRun`] carries its own [`TextStyle`], so font, size, colour and the
+//! [`TextRun`] carries its own [`TextStyle`], so font, size, color and the
 //! bold/italic/underline flags can vary mid-string. Alignment and resize mode
 //! are the only box-level properties.
 
@@ -81,7 +81,7 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
-    /// A default style at [`DEFAULT_FONT_SIZE`] in the given colour and font.
+    /// A default style at [`DEFAULT_FONT_SIZE`] in the given color and font.
     #[must_use]
     pub fn new(font: FontId, color: Color) -> Self {
         Self {

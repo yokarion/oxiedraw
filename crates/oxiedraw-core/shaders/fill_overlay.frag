@@ -7,7 +7,7 @@
 //
 // Which is why there are two pipelines. A fill that went in underneath
 // the layer is hidden by taking its share back out (DST_OUT); one that
-// replaced the region is hidden by painting the seed colour back over it
+// replaced the region is hidden by painting the seed color back over it
 // (OVER). One push float controls the radius, swept by the timer.
 
 layout(location = 0) in vec2 v_uv;
@@ -21,7 +21,7 @@ layout(location = 0) out vec4 out_color;
 layout(set = 0, binding = 0) uniform sampler2D u_fill_mask;
 
 layout(push_constant) uniform Push {
-    // Premultiplied colour to paint back over the un-revealed pixels.
+    // Premultiplied color to paint back over the un-revealed pixels.
     // Ignored by the DST_OUT pipeline, which only uses the alpha.
     vec4 color;
     // 0.0..(254/255). Pixels with distance <= reveal are revealed, and

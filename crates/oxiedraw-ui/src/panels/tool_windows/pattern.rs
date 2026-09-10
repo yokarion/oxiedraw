@@ -1,9 +1,5 @@
-//! The Pattern tool's panel: which generator, and its knobs.
-//!
-//! Built entirely from the generator's schema, so a pattern publishing a
-//! `&'static [ParamDef]` gets a working panel with no code in this file. Only
-//! the knobs a schema marks `exposed` are offered; the rest would bury the
-//! handful worth reaching for.
+// Built from the generator's schema: a pattern publishing a `&'static
+// [ParamDef]` gets a working panel with no code here.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -15,12 +11,8 @@ use relm4::gtk::prelude::*;
 
 use crate::widgets::boxed_list;
 
-/// Width of the value readout beside each slider, so the rows line up.
 const VALUE_WIDTH: i32 = 52;
 
-/// Build the panel. Nothing outside this file refreshes it: each control is
-/// constructed from the stored value and is the only thing that writes it back,
-/// and the two things that change the whole set rebuild from in here.
 pub(crate) fn build(pattern: &PatternState, on_change: Rc<dyn Fn()>) -> gtk::Widget {
     let root = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -31,7 +23,6 @@ pub(crate) fn build(pattern: &PatternState, on_change: Rc<dyn Fn()>) -> gtk::Wid
         .margin_end(12)
         .build();
 
-    // Driven by the registry, so new generators appear here as they land.
     let ids: Vec<&'static str> = oxiedraw_patterns::PATTERNS.iter().map(|p| p.id()).collect();
     let labels: Vec<&str> = oxiedraw_patterns::PATTERNS.iter().map(|p| p.label()).collect();
     let chooser = gtk::DropDown::from_strings(&labels);
@@ -45,8 +36,6 @@ pub(crate) fn build(pattern: &PatternState, on_change: Rc<dyn Fn()>) -> gtk::Wid
     chooser_list.append(&boxed_list::row("Pattern", &chooser, &[]));
     root.append(&chooser_list);
 
-    // Their own box, so switching pattern can replace them wholesale without
-    // disturbing the chooser above.
     let knobs = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -74,8 +63,6 @@ pub(crate) fn build(pattern: &PatternState, on_change: Rc<dyn Fn()>) -> gtk::Wid
     };
     rebuild();
 
-    // Rebuilding is what moves the controls, since they are constructed from
-    // the stored values.
     let reset = gtk::Button::builder()
         .label("Reset to defaults")
         .halign(gtk::Align::End)
@@ -225,7 +212,6 @@ fn slider_row(
     boxed_list::row(def.label, &holder, &[])
 }
 
-/// Both ends of a span on one row, so it reads as one control.
 #[allow(clippy::too_many_arguments)]
 fn range_row(
     def: &'static ParamDef,
@@ -260,14 +246,8 @@ fn range_row(
     boxed_list::row(def.label, &ends, &[])
 }
 
-/// How close to a notable value counts as close, as a fraction of the range.
-/// Small enough that a value deliberately set just off one still lands where it
-/// was put.
 const SNAP_FRACTION: f64 = 0.02;
 
-/// The values a slider settles onto when you come near: for a knob that runs
-/// either side of zero, both ends and the neutral middle. Only those - snapping
-/// the end of a plain 2..400 range would put ordinary values out of reach.
 fn snap(value: f64, min: f64, max: f64) -> f64 {
     if min >= 0.0 || max <= 0.0 {
         return value;
@@ -280,8 +260,6 @@ fn snap(value: f64, min: f64, max: f64) -> f64 {
 }
 
 fn on_scale_changed(scale: &gtk::Scale, min: f64, max: f64, on_value: impl Fn(f64) + 'static) {
-    // Writing the snapped value back re-enters this handler; the guard makes
-    // that pass a no-op. The snapped value is a fixed point, so it cannot loop.
     let adjusting = Rc::new(Cell::new(false));
     scale.connect_value_changed(move |scale| {
         if adjusting.get() {
@@ -303,7 +281,7 @@ fn slider(min: f64, max: f64, step: f64, value: f64) -> (gtk::Scale, gtk::Label,
     scale.set_draw_value(false);
     scale.set_hexpand(true);
     scale.set_value(value);
-    // GtkRange's own gestures drop continuous stylus drags, so a pen can tap a
+    // GtkRange's own gestures drop continuous stylus drags: a pen can tap a
     // slider but not drag it. Every scale in the app needs this.
     crate::widgets::slider::install_pen_drag(&scale);
     let readout = gtk::Label::builder()
@@ -322,8 +300,6 @@ fn slider(min: f64, max: f64, step: f64, value: f64) -> (gtk::Scale, gtk::Label,
     (scale, readout, holder)
 }
 
-/// Decimals to match the step, so a 0.01 knob does not read as "0" and a whole
-/// number does not read as "44.00".
 fn format_value(value: f64, step: f64) -> String {
     if step >= 1.0 {
         format!("{value:.0}")
@@ -369,8 +345,6 @@ fn read_choice(pattern: &PatternState, id: &str) -> u32 {
 mod tests {
     use super::*;
 
-    // Everything else is left where it was put: too wide a pull makes the
-    // values just off a snap point unreachable.
     #[test]
     fn a_bipolar_knob_settles_on_its_ends_and_its_middle() {
         for (raw, want) in [
@@ -379,7 +353,6 @@ mod tests {
             (0.015, 0.0),
             (-0.02, 0.0),
             (0.98, 1.0),
-            // Outside the pull: left exactly where it landed.
             (-0.5, -0.5),
             (0.25, 0.25),
             (0.9, 0.9),
@@ -395,8 +368,6 @@ mod tests {
         assert_eq!(snap(0.004, 0.0, 1.0), 0.004);
     }
 
-    // Snapping has to be idempotent, or writing the snapped value back into the
-    // slider would move it again and the handler would never settle.
     #[test]
     fn a_snapped_value_snaps_to_itself() {
         for target in [-1.0, 0.0, 1.0] {

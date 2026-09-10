@@ -260,7 +260,7 @@ pub(crate) fn decode_preview_png(bytes: &[u8]) -> Option<cairo::ImageSurface> {
 /// Paint a cached preview surface into the current cairo context,
 /// scaled to fill `target_w` x `target_h` and tinted with `rgb`. Uses
 /// the alpha channel as a mask so the result follows the GTK theme
-/// foreground regardless of the stored colour.
+/// foreground regardless of the stored color.
 pub(crate) fn paint_preview_masked(
     cr: &cairo::Context,
     surface: &cairo::ImageSurface,

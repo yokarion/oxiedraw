@@ -8,47 +8,54 @@ pub(crate) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct AppSettings {
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) version: String,
-    /// Per-action keybind overrides. `Some(accel)` replaces the default; `None` unbinds.
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) keybinds: HashMap<String, Option<String>>,
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) appearance: AppearanceSettings,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) shape_correction: ShapeCorrectionSettings,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) export: ExportSettings,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) pixel_view: PixelViewSettings,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) history: HistorySettings,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) save: SaveSettings,
-    /// Snap increment (degrees) for canvas rotation - used by the snap-modifier
-    /// rotate drag and the bottom rotator dial. Default 45.
+    #[serde(default, deserialize_with = "forgiving")]
+    pub(crate) layout: crate::layout::LayoutSettings,
     #[serde(default = "default_rotation_snap_deg")]
     pub(crate) rotation_snap_deg: f32,
-    /// Name of the brush that should be active on startup. Falls back to
-    /// "Ink Pen" -> "Default Round" -> first brush if not found.
     #[serde(default)]
     pub(crate) default_brush_name: Option<String>,
-    /// Show the brush picker as an icon grid instead of the default list.
     #[serde(default)]
     pub(crate) brush_picker_grid_view: bool,
 }
 
-/// Project saving: rolling numbered backups and background autosave.
+// Serde gives up on the whole document at the first bad value, which for one
+// mistyped panel name meant losing every other setting in the file.
+fn forgiving<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    let raw = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(raw).unwrap_or_else(|e| {
+        tracing::warn!(err = %e, "unreadable settings block, using its default");
+        T::default()
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SaveSettings {
-    /// Keep the last N project versions next to the file as `<name>-1 ... -N`
-    /// (`-N` newest), rotated on every manual save.
     #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) backups_enabled: bool,
-    /// How many numbered backups to keep (`-1 ... -N`). Default 3.
     #[serde(default = "default_backup_count")]
     pub(crate) backup_count: usize,
-    /// Autosave the open documents in the background. Default on.
     #[serde(default = "oxiedraw_core::serde_defaults::default_true")]
     pub(crate) autosave_enabled: bool,
-    /// Seconds between autosaves. Default 300 (5 minutes).
     #[serde(default = "default_autosave_interval")]
     pub(crate) autosave_interval_secs: u32,
 }
@@ -75,16 +82,13 @@ impl Default for SaveSettings {
 }
 
 impl SaveSettings {
-    /// Backups to keep on a manual save: 0 when disabled (which skips rotation).
     pub(crate) fn effective_backup_count(&self) -> usize {
         if self.backups_enabled { self.backup_count } else { 0 }
     }
 }
 
-/// Undo/redo behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HistorySettings {
-    /// Maximum number of actions kept on the undo stack. Default 256.
     #[serde(default = "default_history_capacity")]
     pub(crate) capacity: usize,
 }
@@ -191,6 +195,7 @@ impl Default for AppSettings {
             pixel_view: PixelViewSettings::default(),
             history: HistorySettings::default(),
             save: SaveSettings::default(),
+            layout: crate::layout::LayoutSettings::default(),
             rotation_snap_deg: default_rotation_snap_deg(),
             default_brush_name: Some("Ink Pen".to_string()),
             brush_picker_grid_view: false,
@@ -216,8 +221,6 @@ pub(crate) fn config_path() -> PathBuf {
     config_dir().join("settings.json")
 }
 
-/// Per-user data directory (`$XDG_DATA_HOME`/`~/.local/share`, `%LOCALAPPDATA%`
-/// on Windows). Holds bulkier artifacts like autosave recovery copies.
 pub(crate) fn data_dir() -> PathBuf {
     #[cfg(target_os = "windows")]
     let base = std::env::var("LOCALAPPDATA")
@@ -239,15 +242,12 @@ pub(crate) fn data_dir() -> PathBuf {
     base.join("oxiedraw")
 }
 
-/// Where autosave keeps recovery copies of documents with no file yet.
 pub(crate) fn recovery_dir() -> PathBuf {
     data_dir().join("recovery")
 }
 
 impl AppSettings {
     pub(crate) fn load() -> Self {
-        // Uncached disk read + parse, and it is called from pen-down and from
-        // every tooltip build - worth seeing on the perf overlay.
         let _span = oxiedraw_utils::frame_profile::span(oxiedraw_utils::frame_profile::Stage::Timers);
         let path = config_path();
         match std::fs::read_to_string(&path) {
@@ -278,11 +278,39 @@ impl AppSettings {
             Err(e) => tracing::warn!(err = %e, "failed to serialize settings"),
         }
     }
+
+    // For anything holding settings open across edits: the dock rewrites the
+    // layout continuously, so a stale copy would put the old one back.
+    pub(crate) fn save_keeping_layout(&mut self) {
+        self.layout = Self::load().layout;
+        self.save();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_block_does_not_take_the_rest_of_the_settings_with_it() {
+        let json = r#"{
+            "version": "9.9.9",
+            "keybinds": { "app.undo": "<Control>z" },
+            "rotation_snap_deg": 30.0,
+            "layout": { "layouts": [{ "name": "Mine", "root": { "panel": "nonsense" },
+                                      "floating": [] }], "current": "Mine" }
+        }"#;
+        let settings: AppSettings = serde_json::from_str(json).expect("parse");
+
+        assert_eq!(settings.version, "9.9.9");
+        assert_eq!(
+            settings.keybinds.get("app.undo"),
+            Some(&Some("<Control>z".to_string()))
+        );
+        assert!((settings.rotation_snap_deg - 30.0).abs() < f32::EPSILON);
+        assert_eq!(settings.layout.layouts.len(), 1);
+        assert_ne!(settings.layout.current, "Mine");
+    }
 
     #[test]
     fn save_settings_defaults() {
@@ -320,8 +348,6 @@ mod tests {
         assert_eq!(back.autosave_interval_secs, s.autosave_interval_secs);
     }
 
-    // Old settings.json files predate the `save` block; they must load with the
-    // backup/autosave defaults rather than failing to parse.
     #[test]
     fn app_settings_without_save_block_uses_defaults() {
         let legacy = r#"{
@@ -335,7 +361,6 @@ mod tests {
         assert_eq!(parsed.save.autosave_interval_secs, 300);
     }
 
-    // Individually missing save fields fall back to their own defaults.
     #[test]
     fn partial_save_block_fills_missing_fields() {
         let partial = r#"{
@@ -348,6 +373,21 @@ mod tests {
         assert_eq!(parsed.save.autosave_interval_secs, 600, "explicit value kept");
         assert!(parsed.save.backups_enabled, "missing field -> default");
         assert_eq!(parsed.save.backup_count, 3);
+    }
+
+    #[test]
+    fn app_settings_without_layout_block_uses_the_default_layout() {
+        let legacy = r#"{
+            "version": "0.1.9",
+            "keybinds": {},
+            "appearance": { "show_window_decorations": true }
+        }"#;
+        let parsed: AppSettings = serde_json::from_str(legacy).expect("legacy settings parse");
+        assert_eq!(
+            parsed.layout.active().name,
+            crate::layout::presets::DEFAULT_LAYOUT_NAME
+        );
+        assert!(parsed.layout.active().is_panel_visible(crate::layout::PanelId::Layers));
     }
 
     #[test]

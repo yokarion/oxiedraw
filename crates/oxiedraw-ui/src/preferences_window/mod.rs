@@ -1,6 +1,5 @@
-//! Preferences window (`app.preferences`): an `adw::PreferencesWindow` with
-//! General, Canvas, Appearance and Keybinds pages. Changes are written to
-//! `settings.json` immediately; there is no Apply/Cancel cycle.
+//! The preferences window: General, Canvas, Appearance and Keybinds pages.
+//! Changes are written to `settings.json` at once - no Apply/Cancel cycle.
 
 mod appearance;
 mod canvas;
@@ -28,7 +27,6 @@ use self::keybinds::{
 };
 use self::project::build_project_page;
 
-// Entry point
 
 pub(crate) fn show(
     parent: &adw::ApplicationWindow,
@@ -68,7 +66,6 @@ pub(crate) fn show(
         Rc::clone(&modified_count),
     ));
 
-    // Window-level key controller for keybind recording
     {
         let settings = Rc::clone(&settings);
         let recording_id = Rc::clone(&recording_id);
@@ -82,7 +79,6 @@ pub(crate) fn show(
                 return glib::Propagation::Proceed;
             };
 
-            // Escape cancels recording for any row.
             if keyval == gdk::Key::Escape {
                 *recording_id.borrow_mut() = None;
                 refresh_row(
@@ -100,7 +96,6 @@ pub(crate) fn show(
             let new_binding: Option<String> = if keyval == gdk::Key::BackSpace {
                 None
             } else if modifier_only {
-                // These bindings record a bare modifier; ignore any other key.
                 match modifier_only_accel(keyval) {
                     Some(a) => Some(a.to_string()),
                     None => return glib::Propagation::Stop,
@@ -116,7 +111,7 @@ pub(crate) fn show(
                 .borrow_mut()
                 .keybinds
                 .insert(action_id.clone(), new_binding);
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
 
             if let Some(gio_app) = gio::Application::default()
                 && let Ok(app) = gio_app.downcast::<gtk::Application>() {
@@ -142,7 +137,6 @@ pub(crate) fn show(
     win.present();
 }
 
-// General page
 
 pub(crate) fn load_keybind_css() {
     let css = r"

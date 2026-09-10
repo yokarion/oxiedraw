@@ -147,7 +147,7 @@ impl VulkanRenderer {
             self.device.cmd_draw(self.command_buffer, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(self.command_buffer);
         }
-        // The render pass's subpass dependency flushes the colour writes to
+        // The render pass's subpass dependency flushes the color writes to
         // MEMORY_READ and leaves the image in GENERAL for the dma-buf importer;
         // implicit dma-buf sync propagates our GPU fence to the compositor.
     }

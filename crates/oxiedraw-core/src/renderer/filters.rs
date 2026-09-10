@@ -106,7 +106,7 @@ pub(super) struct FilterResources {
     /// Adjustment-layer stroke via jump flooding. `jfa_seed` and `jfa_flood`
     /// render into the `coord_*` ping-pong buffers (16-bit float, RG = offset to
     /// nearest inside pixel, BA = nearest outside) through `jfa_render_pass`;
-    /// `jfa_resolve` reads the converged field and writes the coloured band into
+    /// `jfa_resolve` reads the converged field and writes the colored band into
     /// `Scratch::A` through the canvas render pass. Resolve needs the wider
     /// 48-byte push, so it reuses `stroke_layout`.
     pub stroke_layout: vk::PipelineLayout,

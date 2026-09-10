@@ -1,10 +1,4 @@
-//! The "Editing text" properties panel (right bar).
-//!
-//! Shown above the colour picker while a text box is being edited. Font, size
-//! and face apply to the selection (or the whole box); alignment and the resize
-//! mode are box-level. All controls dispatch through the late-bound text-edit
-//! controller slot, and a returned `refresh` closure syncs them from the
-//! controller's current state.
+// Hidden when no box is being edited, which takes its floating frame with it.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -27,13 +21,11 @@ const FACE_OPTIONS: [(&str, bool, bool); 4] = [
     ("Bold Italic", true, true),
 ];
 
-/// Build the panel. Returns the widget and a `refresh` closure that re-syncs
-/// the controls from the controller (and shows/hides the panel).
 pub(crate) fn build(
     slot: &Slot,
     engine: &Rc<RefCell<TextEngine>>,
     previews: &FontPreviews,
-) -> (gtk::ScrolledWindow, Rc<dyn Fn()>) {
+) -> (gtk::Box, Rc<dyn Fn()>) {
     let syncing = Rc::new(Cell::new(false));
 
     let panel = gtk::Box::builder()
@@ -45,7 +37,6 @@ pub(crate) fn build(
         .margin_end(10)
         .build();
 
-    // Header: accent icon + bold title, matching the crop properties panel.
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(8)
@@ -65,15 +56,11 @@ pub(crate) fn build(
 
     let families: Vec<String> = engine.borrow().available_families();
 
-    // Everything lives in one boxed-list of rows.
     let list = gtk::ListBox::new();
     list.add_css_class("boxed-list");
     list.set_selection_mode(gtk::SelectionMode::None);
     panel.append(&list);
 
-    // Font family (rendered in its own face, via pre-rendered previews) as the
-    // first row: full-width, no title, with row-like margins so the dropdown
-    // doesn't look cramped against the boxed-list edges.
     let font_dropdown = build_font_dropdown(&families, previews);
     font_dropdown.set_hexpand(true);
     let font_row = gtk::ListBoxRow::builder()
@@ -102,7 +89,6 @@ pub(crate) fn build(
         });
     }
 
-    // Font size.
     let size_spin = gtk::SpinButton::with_range(1.0, 500.0, 1.0);
     size_spin.set_digits(0);
     size_spin.set_value(20.0);
@@ -121,7 +107,6 @@ pub(crate) fn build(
         });
     }
 
-    // Font family / face.
     let face_dropdown =
         gtk::DropDown::from_strings(&FACE_OPTIONS.iter().map(|f| f.0).collect::<Vec<_>>());
     list.append(&action_row("Font Family", &face_dropdown));
@@ -139,7 +124,6 @@ pub(crate) fn build(
         });
     }
 
-    // Horizontal alignment.
     let (h_box, h_buttons) = segmented(&[
         ("format-justify-left-symbolic", "Left"),
         ("format-justify-center-symbolic", "Center"),
@@ -161,7 +145,6 @@ pub(crate) fn build(
         });
     }
 
-    // Vertical alignment.
     let (v_box, v_buttons) = segmented(&[
         ("oxiedraw-text-valign-top-symbolic", "Top"),
         ("oxiedraw-text-valign-middle-symbolic", "Middle"),
@@ -183,7 +166,6 @@ pub(crate) fn build(
         });
     }
 
-    // Resizing mode.
     let (r_box, r_buttons) = segmented(&[
         ("oxiedraw-text-autowidth-symbolic", "Auto Width"),
         ("oxiedraw-text-autoheight-symbolic", "Auto Height"),
@@ -205,21 +187,10 @@ pub(crate) fn build(
         });
     }
 
-    // Scrollable root so the panel can be shrunk freely via the surrounding
-    // pane handle (a small minimum height keeps the handle fully draggable).
-    let root = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .propagate_natural_height(true)
-        .min_content_height(0)
-        .child(&panel)
-        .build();
-    root.add_css_class("oxiedraw-chrome"); // match the colour-picker / layers panels
-    root.set_visible(false);
+    panel.set_visible(false);
 
-    // Refresh closure: sync all controls from the controller state.
     let refresh: Rc<dyn Fn()> = {
-        let root = root.clone();
+        let root = panel.clone();
         let slot = Rc::clone(slot);
         let syncing = Rc::clone(&syncing);
         let families = families.clone();
@@ -255,10 +226,9 @@ pub(crate) fn build(
         })
     };
 
-    (root, refresh)
+    (panel, refresh)
 }
 
-/// A boxed-list row: a title on the left and the control as a suffix.
 fn action_row(title: &str, control: &impl IsA<gtk::Widget>) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title(title).build();
     let control = control.as_ref();
@@ -267,8 +237,6 @@ fn action_row(title: &str, control: &impl IsA<gtk::Widget>) -> adw::ActionRow {
     row
 }
 
-/// A linked group of icon toggle buttons (radio behaviour). Returns the
-/// container and the buttons in order.
 fn segmented(items: &[(&str, &str)]) -> (gtk::Box, Vec<gtk::ToggleButton>) {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -292,13 +260,10 @@ fn segmented(items: &[(&str, &str)]) -> (gtk::Box, Vec<gtk::ToggleButton>) {
     (row, buttons)
 }
 
-/// Font-family dropdown: searchable, each item shown as a pre-rendered image of
-/// the family name drawn in its own face (no live font loading while scrolling).
 fn build_font_dropdown(families: &[String], previews: &FontPreviews) -> gtk::DropDown {
     let refs: Vec<&str> = families.iter().map(String::as_str).collect();
     let model = gtk::StringList::new(&refs);
 
-    // Search matches against the family-name string.
     let expr = gtk::PropertyExpression::new(
         gtk::StringObject::static_type(),
         None::<gtk::Expression>,
@@ -306,15 +271,11 @@ fn build_font_dropdown(families: &[String], previews: &FontPreviews) -> gtk::Dro
     );
     let dropdown = gtk::DropDown::new(Some(model), Some(expr));
     dropdown.set_enable_search(true);
-    // The factory MUST be set AFTER enabling search/expression, otherwise
-    // GtkDropDown keeps its default text factory and ignores this one.
+    // MUST come after enabling search, or GtkDropDown keeps its text factory.
     dropdown.set_factory(Some(&preview_factory(previews)));
     dropdown
 }
 
-/// A factory that shows each family as its pre-rendered preview image, falling
-/// back to plain text for previews that haven't been rendered yet (they render
-/// in the background after startup).
 fn preview_factory(previews: &FontPreviews) -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {

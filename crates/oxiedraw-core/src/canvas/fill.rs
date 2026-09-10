@@ -9,7 +9,7 @@
 //!
 //! On top of the plain region the fill runs an *edge climb* (see
 //! [`FillOptions::auto_edge`]): from the region's boundary it walks
-//! outward while each step lands further from the seed colour, which
+//! outward while each step lands further from the seed color, which
 //! is exactly the anti-aliasing ramp of whatever bounds the region,
 //! and stops at the ramp's peak - the line's core. No radius to tune,
 //! because the walk terminates on its own.
@@ -17,10 +17,10 @@
 //! How those edge pixels get painted depends on what was there. Click
 //! on empty canvas and the fill goes in *behind* the existing pixels
 //! ([`FillPaint::Behind`]), so a line's own anti-aliasing survives
-//! untouched and the boundary stays smooth. Click on solid colour and
+//! untouched and the boundary stays smooth. Click on solid color and
 //! the edge pixels are un-mixed instead: they hold a blend of the seed
-//! colour and the line, so swapping the seed's contribution for the
-//! fill colour rebuilds the same blend around the new colour.
+//! color and the line, so swapping the seed's contribution for the
+//! fill color rebuilds the same blend around the new color.
 //!
 //! Working set is `Vec<AtomicU8>` (1 byte/pixel, layout-compatible
 //! with `Vec<u8>` for cheap zero-init) + `Vec<u32>` of matched
@@ -32,7 +32,7 @@
 
 /// Tunables for a bucket fill.
 ///
-/// `tolerance` is the maximum colour difference (0..=255, RMS across
+/// `tolerance` is the maximum color difference (0..=255, RMS across
 /// the BGRA channels) from the seed pixel that still counts as part of
 /// the region.
 ///
@@ -63,16 +63,16 @@ impl Default for FillOptions {
     }
 }
 
-/// How the fill colour is combined with what the layer already holds.
+/// How the fill color is combined with what the layer already holds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FillPaint {
     /// The seed was empty canvas, so the fill slides in *underneath*
     /// the existing pixels. Anti-aliased line art keeps its own edge
     /// blending and the fill boundary inherits it for free.
     Behind,
-    /// The seed had colour, so the fill replaces the region outright.
+    /// The seed had color, so the fill replaces the region outright.
     /// Edge pixels are un-mixed: whatever share of them belonged to the
-    /// seed colour is handed over to the fill colour.
+    /// seed color is handed over to the fill color.
     Over { seed: [u8; 4] },
 }
 
@@ -95,7 +95,7 @@ const EDGE_CLIMB_LIMIT: u8 = 8;
 /// constant - that's how the spread animates with no per-frame layer
 /// upload.
 ///
-/// `coverage[i]` is the share of the pixel the fill colour ends up
+/// `coverage[i]` is the share of the pixel the fill color ends up
 /// owning (0 = untouched, 255 = all of it). The flat interior is 255;
 /// an edge pixel gets whatever the boundary leaves over. It is the same
 /// number the GPU overlay uses to hide the fill during the reveal
@@ -303,7 +303,7 @@ pub fn flood_fill(
     }
 
     // The matched region is the fill's outright: the pixels there are
-    // the seed colour, give or take the tolerance.
+    // the seed color, give or take the tolerance.
     let mut coverage = vec![0_u8; n];
     for &idx in &sorted {
         coverage[idx as usize] = 255;
@@ -359,7 +359,7 @@ pub fn flood_fill(
 
 /// Walk outward from the region across a boundary's anti-aliasing ramp.
 ///
-/// Every step must land *further* from the seed colour than the pixel it
+/// Every step must land *further* from the seed color than the pixel it
 /// came from, so the walk runs up the ramp and stops the moment the
 /// difference stops rising - the crest, which for line art is the middle
 /// of the line. That is what makes the reach automatic: a crisp edge
@@ -443,14 +443,14 @@ struct EdgeCoverage<'a> {
     paint: FillPaint,
 }
 
-/// Work out how much of each climbed pixel the fill colour is entitled
+/// Work out how much of each climbed pixel the fill color is entitled
 /// to.
 ///
 /// Each one is part boundary, part region: `t` is the boundary's share,
 /// read off how far up the ramp the pixel sits, so the fill's share is
 /// `1 - t`. The ramp is measured per walk, keyed by the root `climb_edge`
 /// handed back, because the boundaries around one region need not be the
-/// same colour - scaling a pale outline against a black one elsewhere
+/// same color - scaling a pale outline against a black one elsewhere
 /// would read it as barely a boundary at all and paint most of it over.
 /// What else varies is who is going to cover that pixel.
 /// Anything sitting on top of the fill - the target layer's own line
@@ -460,8 +460,8 @@ struct EdgeCoverage<'a> {
 /// itself, or the boundary below it shows through the gap.
 ///
 /// [`FillPaint::Over`] is the odd one out: the pixel is a mixture of the
-/// seed colour and the boundary, and the paint step swaps the seed's
-/// share for the fill colour, so the share is all it needs.
+/// seed color and the boundary, and the paint step swaps the seed's
+/// share for the fill color, so the share is all it needs.
 fn set_edge_coverage(ctx: EdgeCoverage, band: &[u32], roots: &[u32], coverage: &mut [u8]) {
     let root_of = |i: usize, idx: u32| roots.get(i).copied().unwrap_or(idx);
     let mut crests: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
@@ -692,7 +692,7 @@ fn sort_by_euclidean_and_build_mask(
     (sorted, distance_mask)
 }
 
-/// Colour distance from the seed, 0..=255: the RMS difference across
+/// Color distance from the seed, 0..=255: the RMS difference across
 /// the four BGRA channels, which keeps the same scale as the tolerance
 /// slider (a tolerance of 32 admits a 32-per-channel shift).
 #[inline]
@@ -709,7 +709,7 @@ fn pixel_diff(pixels: &[u8], idx: usize, seed: [u8; 4]) -> u32 {
 
 /// Paint `result` into a premultiplied BGRA8 layer buffer in place.
 ///
-/// Colour maths runs in linear light because the layer images are
+/// Color maths runs in linear light because the layer images are
 /// sRGB-encoded and the GPU preview blends the same way; alpha is
 /// already linear.
 pub fn paint_fill(buffer: &mut [u8], result: &FillResult, color_bgr: [u8; 3]) {
@@ -758,12 +758,12 @@ fn paint_behind(buffer: &mut [u8], off: usize, fill_linear: [f32; 3], weight: u8
     buffer[off + 3] = buffer[off + 3].saturating_add(weight);
 }
 
-/// Replace the seed colour's share of the pixel with the fill colour.
+/// Replace the seed color's share of the pixel with the fill color.
 ///
 /// At full weight that is a plain overwrite. Below it the pixel is a
 /// mix of seed and boundary, so only the seed's part is swapped out -
 /// `dst + (fill - seed) * weight` - which rebuilds the identical blend
-/// around the new colour and leaves the boundary's contribution alone.
+/// around the new color and leaves the boundary's contribution alone.
 fn paint_over(
     buffer: &mut [u8],
     off: usize,
@@ -889,7 +889,7 @@ mod tests {
 
     /// A selection mask confines the fill: the BFS never crosses an
     /// out-of-selection pixel, so only the masked pixels get filled
-    /// even though the whole row is the same colour.
+    /// even though the whole row is the same color.
     #[test]
     fn fill_confined_to_selection_mask() {
         let w = 5u32;
@@ -1121,7 +1121,7 @@ mod tests {
         assert_eq!(buf[2 * 4 + 3], edge, "and lands at exactly that alpha");
     }
 
-    /// Filling a solid colour that meets a line un-mixes the blended
+    /// Filling a solid color that meets a line un-mixes the blended
     /// edge pixels: the seed's share becomes fill, the line's share
     /// stays put, so no hard staircase appears at the boundary.
     #[test]

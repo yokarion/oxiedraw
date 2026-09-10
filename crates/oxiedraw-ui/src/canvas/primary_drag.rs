@@ -83,7 +83,7 @@ const LIQUIFY_MAX_STEPS: usize = 64;
 const GUIDE_SNAP_LOCK_PX: f32 = 8.0;
 
 /// Straight RGB (`0.0..=1.0` per channel) for a [`Color`], for seeding guide
-/// colours from the primary colour.
+/// colors from the primary color.
 fn color_to_rgb(c: Color) -> (f32, f32, f32) {
     (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0)
 }
@@ -776,7 +776,7 @@ impl PrimaryDragHandler {
         let opacity = self.brush_engine.opacity.get();
         let active_brush = self.brush_engine.active_brush();
         let buildup = active_brush.buildup;
-        // Colour-smudge brushes paint straight into the layer during the drag,
+        // Color-smudge brushes paint straight into the layer during the drag,
         // so the layer must be snapshotted before the first dab for undo.
         let smudge = active_brush.family.is_smudge();
         // Shape correction re-draws the stroke through the mask path at pen-up,
@@ -2665,7 +2665,7 @@ fn start_shape_animation(
 
 /// Paint-spill animation for the bucket fill, driven on the GPU.
 ///
-/// One-shot setup: upload the R8 distance mask + premultiplied colour
+/// One-shot setup: upload the R8 distance mask + premultiplied color
 /// to the renderer's fill-overlay image, then arm the overlay path.
 /// Per frame all that runs is a push-constant update (the reveal
 /// radius) + the present pipeline - so a single animation tick is

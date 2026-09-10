@@ -51,7 +51,7 @@ impl GradientSlider {
     }
 
     /// Hide the numeric spin button, leaving just the gradient bar. Used where
-    /// the exact number is meaningless (e.g. a colour picker). The spin stays
+    /// the exact number is meaningless (e.g. a color picker). The spin stays
     /// live under the hood, so bar drags still drive `on_change`.
     pub(crate) fn hide_spin(&self) {
         self.spin.set_visible(false);

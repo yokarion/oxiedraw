@@ -193,7 +193,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(matches!(restored.family, BrushFamily::Smudge));
-        // Real Brush drives colour rate + size by pressure; smudge rate is left
+        // Real Brush drives color rate + size by pressure; smudge rate is left
         // constant (its dynamic was removed to stop the deposit pulsing).
         assert!(restored.dynamics.color_rate.is_some());
         assert!(restored.dynamics.size.is_some());

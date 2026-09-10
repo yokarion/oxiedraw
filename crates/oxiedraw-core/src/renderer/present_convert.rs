@@ -1,4 +1,4 @@
-//! Present-time colour-space conversion.
+//! Present-time color-space conversion.
 //!
 //! Samples the canvas (premultiplied linear) and writes premultiplied-gamma
 //! pixels into the display dmabuf, which is the form GSK composites correctly.
@@ -108,7 +108,7 @@ impl PresentConvertPipeline {
 
 /// Single-attachment pass that discards the previous contents (the whole
 /// buffer is redrawn each present) and leaves the image in GENERAL for the
-/// dma-buf importer. A subpass dependency flushes the colour writes out to
+/// dma-buf importer. A subpass dependency flushes the color writes out to
 /// `MEMORY_READ` so implicit dma-buf sync sees a coherent frame.
 fn create_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderPass, RendererError> {
     let attachments = [vk::AttachmentDescription::default()
@@ -136,7 +136,7 @@ fn create_render_pass(device: &Device, format: vk::Format) -> Result<vk::RenderP
             .dst_stage_mask(vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT)
             .src_access_mask(vk::AccessFlags::MEMORY_READ)
             .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE),
-        // Exit: flush the colour writes to MEMORY_READ for the dma-buf importer.
+        // Exit: flush the color writes to MEMORY_READ for the dma-buf importer.
         vk::SubpassDependency::default()
             .src_subpass(0)
             .dst_subpass(vk::SUBPASS_EXTERNAL)

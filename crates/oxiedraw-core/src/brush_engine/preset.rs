@@ -132,8 +132,8 @@ pub enum BrushFamily {
         tip: Rc<PatternData>,
         grain: Option<Rc<PatternData>>,
     },
-    /// Colour-smudge brush (Krita colorsmudge): each dab picks up the colour
-    /// under it from the layer, blends it with the carried smudge colour, and
+    /// Color-smudge brush (Krita colorsmudge): each dab picks up the color
+    /// under it from the layer, blends it with the carried smudge color, and
     /// deposits it (plus a little paint). Painted by a dedicated GPU path, not
     /// the mask pipelines, so it carries no pattern data - the tip is a round
     /// mask shaped by `hardness`.
@@ -152,7 +152,7 @@ impl BrushFamily {
         }
     }
 
-    /// True for the colour-smudge family, which is painted by the dedicated
+    /// True for the color-smudge family, which is painted by the dedicated
     /// GPU smudge path rather than the stroke-buffer mask pipelines.
     pub const fn is_smudge(&self) -> bool {
         matches!(self, Self::Smudge)
@@ -215,8 +215,8 @@ pub struct BrushPreset {
     pub icon: Option<Vec<u8>>,
     /// Cached stroke preview rendered by the actual engine on a
     /// headless canvas, stored as RGBA PNG bytes. The display path uses
-    /// the alpha channel as a mask and recolours with the theme
-    /// foreground colour, so the cached image is colour-neutral.
+    /// the alpha channel as a mask and recolors with the theme
+    /// foreground color, so the cached image is color-neutral.
     /// `None` for brushes that haven't been rendered yet - UI falls
     /// back to a Cairo approximation until the cache is filled.
     pub preview: Option<Vec<u8>>,
@@ -523,11 +523,11 @@ impl BrushPreset {
         }
     }
 
-    /// Real Brush, a colour-smudge brush modelled on Krita's `i) Wet Paint`
-    /// (colorsmudge engine, dulling mode): each dab picks up the colour under
-    /// it, blends it into the carried smudge colour, and deposits that plus a
+    /// Real Brush, a color-smudge brush modelled on Krita's `i) Wet Paint`
+    /// (colorsmudge engine, dulling mode): each dab picks up the color under
+    /// it, blends it into the carried smudge color, and deposits that plus a
     /// little paint. Soft round tip (fade 0.5), tight spacing; pressure drives
-    /// size, smudge rate, colour rate and pickup radius. Painted by the GPU
+    /// size, smudge rate, color rate and pickup radius. Painted by the GPU
     /// smudge path, so it carries no pattern.
     pub fn real_brush(id: BrushPresetId) -> Self {
         let pressure = |lo: f32, hi: f32| Mapping {
@@ -559,8 +559,8 @@ impl BrushPreset {
             // pressure smears harder and lays down more paint.
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
-                // Colour rate stays small so the brush mostly smears existing
-                // paint and lays down only a little of its own colour (a wet
+                // Color rate stays small so the brush mostly smears existing
+                // paint and lays down only a little of its own color (a wet
                 // brush, not a paintbrush). Smudge rate is left at its 1.0
                 // default (constant) so the deposit strength does NOT pulse
                 // with pressure - that pulsing beaded into dots on dark areas.

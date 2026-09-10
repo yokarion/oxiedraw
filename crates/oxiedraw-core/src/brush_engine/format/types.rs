@@ -49,7 +49,7 @@ pub enum FamilyDoc {
         #[serde(default)]
         grain: Option<String>,
     },
-    /// Colour-smudge brush - no pattern; the round tip is shaped by `hardness`.
+    /// Color-smudge brush - no pattern; the round tip is shaped by `hardness`.
     Smudge,
 }
 
@@ -96,7 +96,7 @@ pub struct BrushPackage {
     pub icon: Option<Vec<u8>>,
     /// Raw PNG bytes of the cached stroke preview, if the archive
     /// includes one. The display path (picker rows, editor large
-    /// preview) treats the alpha channel as a mask and recolours with
+    /// preview) treats the alpha channel as a mask and recolors with
     /// the theme foreground.
     pub preview: Option<Vec<u8>>,
 }

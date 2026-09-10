@@ -1,17 +1,5 @@
-//! Top-bar brush picker.
-//!
-//! Renders as a small icon button showing the active brush's custom
-//! icon (or a generic fallback when the brush is icon-less). Clicking
-//! opens a `gtk::Popover` containing a search entry, a list/grid view
-//! toggle, a cog button that opens the Manage Brushes window
-//! (`app.brush-manager`), and a scrollable list or icon grid of brushes.
-//! Each list row shows the brush's icon, name, and a Cairo-drawn sample
-//! stroke; grid tiles are icon-only with a corner default-brush star.
-//! The chosen view mode is persisted in `AppSettings`.
-//!
-//! Wired into `tool_options_bar` as a replacement for the old
-//! `gtk::DropDown`. Listens on `BrushEngine::connect_brushes_changed`
-//! so autoreload events refresh the list and trigger button live.
+//! The brush picker in the tool options bar: a trigger button and a popover
+//! holding a search entry and either a list of brushes or an icon grid.
 
 mod preview;
 pub(crate) mod shared;
@@ -29,20 +17,14 @@ use crate::settings::AppSettings;
 
 const POPOVER_MAX_HEIGHT: i32 = 800;
 const POPOVER_WIDTH: i32 = 360;
-/// Grid view packs 6 tiles per row, so it needs a wider popover than the
-/// list to keep each icon legibly sized.
 const GRID_POPOVER_WIDTH: i32 = 500;
-/// Outer button extent. GTK's default theme enforces a per-state
-/// `min-height` that overrides `height_request`; the matching value
-/// has to land on the inner `button` node via CSS (see `load_css_once`).
+// The theme's own `min-height` overrides `height_request`, so the matching
+// value has to land on the inner button node in `load_css_once`.
 const TRIGGER_BUTTON_HEIGHT: i32 = 28;
 const TRIGGER_BUTTON_WIDTH: i32 = 28;
 const TRIGGER_ICON_SIZE: i32 = 28;
 pub(super) const FALLBACK_ICON: &str = "oxiedraw-brush-symbolic";
 
-/// Build the brush picker as a trigger button + a popover. Returns the
-/// button widget; the popover is attached to it and lives as long as
-/// the button.
 pub(crate) fn build(
     brush_engine: &BrushEngine,
     default_brush_name: Rc<RefCell<Option<String>>>,
@@ -89,8 +71,6 @@ pub(crate) fn build(
     );
     popover.set_child(Some(&content));
 
-    // Refresh trigger icon whenever the brush list changes (autoreload
-    // or user repopulate).
     let refresh_trigger_for_engine = refresh_trigger.clone();
     brush_engine.connect_brushes_changed(Rc::new(move || {
         refresh_trigger_for_engine();
@@ -119,7 +99,6 @@ fn build_popover_content(
         .margin_end(8)
         .build();
 
-    // ----- Header: search + three-dots -----
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -130,8 +109,6 @@ fn build_popover_content(
         .build();
     header.append(&search);
 
-    // List / grid view toggle. Two linked toggles sharing a group so
-    // exactly one stays active.
     let view_toggle = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .build();
@@ -149,7 +126,6 @@ fn build_popover_content(
     view_toggle.append(&grid_toggle);
     header.append(&view_toggle);
 
-    // Cog: opens the Manage Brushes window directly (no intermediate menu).
     let manage_button = gtk::Button::builder()
         .icon_name("emblem-system-symbolic")
         .has_frame(false)
@@ -163,7 +139,6 @@ fn build_popover_content(
     header.append(&manage_button);
     outer.append(&header);
 
-    // ----- Scrollable brush list / grid (swapped via a Stack) -----
     let scrolled = gtk::ScrolledWindow::builder()
         .hscrollbar_policy(gtk::PolicyType::Never)
         .vscrollbar_policy(gtk::PolicyType::Automatic)
@@ -186,8 +161,7 @@ fn build_popover_content(
         .build();
 
     let stack = gtk::Stack::new();
-    // Size to the visible view, not the tallest one - otherwise the grid
-    // inherits the (much taller) list's height and floats in empty space.
+    // Size to the visible view, or the grid inherits the taller list's height.
     stack.set_vhomogeneous(false);
     stack.set_hhomogeneous(false);
     stack.add_named(&listbox, Some("list"));
@@ -195,7 +169,6 @@ fn build_popover_content(
     scrolled.set_child(Some(&stack));
     outer.append(&scrolled);
 
-    // Restore the persisted view and sync the toggle buttons.
     let grid_active = AppSettings::load().brush_picker_grid_view;
     stack.set_visible_child_name(if grid_active { "grid" } else { "list" });
     popover.set_width_request(if grid_active { GRID_POPOVER_WIDTH } else { POPOVER_WIDTH });
@@ -217,10 +190,6 @@ fn build_popover_content(
         });
     }
 
-    // Row/child storage: parallel maps so we can resolve an activation
-    // back to a preset id and drive selection on `active` changes. The
-    // star map holds both list and grid stars so a default change updates
-    // every visible star at once.
     let row_map: Rc<RefCell<Vec<(BrushPresetId, gtk::ListBoxRow)>>> =
         Rc::new(RefCell::new(Vec::new()));
     let flow_map: Rc<RefCell<Vec<(BrushPresetId, gtk::FlowBoxChild)>>> =
@@ -254,7 +223,6 @@ fn build_popover_content(
     };
     rebuild();
 
-    // Re-filter on search change.
     {
         let rebuild = rebuild.clone();
         search.connect_search_changed(move |_| {
@@ -262,8 +230,6 @@ fn build_popover_content(
         });
     }
 
-    // Rebuild + reselect when the engine's brush list changes
-    // (autoreload / repopulate).
     {
         let rebuild = rebuild.clone();
         brush_engine.connect_brushes_changed(Rc::new(move || {
@@ -271,8 +237,6 @@ fn build_popover_content(
         }));
     }
 
-    // Row activation -> set active brush, refresh the trigger icon,
-    // close the popover.
     {
         let brush_engine = brush_engine.clone();
         let row_map = row_map.clone();
@@ -287,7 +251,6 @@ fn build_popover_content(
         });
     }
 
-    // Grid tile activation -> same behaviour as a list row.
     {
         let brush_engine = brush_engine.clone();
         let flow_map = flow_map.clone();
@@ -355,7 +318,6 @@ fn rebuild_rows(
             }
         });
 
-        // List row.
         let (row, star_btn) =
             shared::build_list_row(preset, is_default, Some(on_set_default.clone()));
         if let Some(btn) = star_btn {
@@ -367,7 +329,6 @@ fn rebuild_rows(
         }
         row_map.borrow_mut().push((preset.id, row));
 
-        // Grid tile.
         let (child, grid_star) = shared::build_grid_item(preset, is_default, on_set_default);
         star_map.borrow_mut().push((preset.id, grid_star));
         flowbox.append(&child);
@@ -384,19 +345,11 @@ fn rebuild_rows(
     }
 }
 
-/// Install once-per-process CSS for the picker trigger button. GTK's
-/// css provider de-duplicates additions by priority + display, so even
-/// if this is called multiple times the styles are only applied once.
 fn load_css_once() {
     use std::sync::OnceLock;
     static LOADED: OnceLock<()> = OnceLock::new();
     LOADED.get_or_init(|| {
         let provider = gtk::CssProvider::new();
-        // GTK's default `button` node enforces its own `min-height`
-        // (~24-30px depending on theme), so a bare `min-height` on
-        // `.brush-picker-trigger` is overridden by the theme. We have
-        // to push the override onto the button node *and* zero the
-        // built-in padding so a 16px icon fits in a 30px box.
         provider.load_from_string(
             ".brush-picker-trigger,
              .brush-picker-trigger > * {

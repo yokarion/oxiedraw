@@ -1,3 +1,6 @@
+//! The settings of whichever tool is active: one stack page per tool, plus the
+//! Apply/Cancel buttons of the tools that commit from here.
+
 use std::cell::Cell;
 use std::rc::Rc;
 
@@ -20,10 +23,8 @@ const ROW_SPACING: i32 = 8;
 const OPACITY_STEP: f64 = 0.01;
 const SIZE_SLIDER_WIDTH: i32 = 260;
 
-/// Brush size segments as `(size_lo, size_hi, step, pos_width)`. Each segment
-/// covers a size range with its own increment and occupies `pos_width` of the
-/// slider trough, so fine sizes get more travel than coarse ones. `pos_width`
-/// values sum to 1.0.
+// `(size_lo, size_hi, step, pos_width)`: each segment takes that fraction of
+// the trough, so fine sizes get more travel. The widths sum to 1.0.
 const SIZE_SEGMENTS: [(f64, f64, f64, f64); 3] = [
     (1.0, 50.0, 1.0, 0.50),
     (50.0, 200.0, 10.0, 0.30),
@@ -47,10 +48,6 @@ const STACK_NONE: &str = "none";
 
 const TOLERANCE_SLIDER_WIDTH: i32 = 320;
 
-/// Tool properties bar shown above the canvas.
-///
-/// Returns the widget and a setter the toolbar uses to push the active tool
-/// into the bar - updates the chip and switches the inner stack.
 pub(crate) fn build(
     tools: &ToolState,
     brush_engine: &BrushEngine,
@@ -80,7 +77,6 @@ pub(crate) fn build(
     let (chip_widget, update_chip) = tool_chip::build(tools.active.get());
     bar.append(&chip_widget);
 
-    // Separator between chip and stack.
     let sep = gtk::Separator::new(gtk::Orientation::Vertical);
     sep.set_margin_top(8);
     sep.set_margin_bottom(8);
@@ -128,8 +124,6 @@ pub(crate) fn build(
 
     let setter: Rc<dyn Fn(Tool)> = Rc::new(move |t: Tool| {
         update_chip(t);
-        // The marquee mode button wears the shape it will draw, so switching
-        // Square / Circle / Lasso in the toolbar has to reach it here.
         if let Tool::Selection(shape) = t {
             marquee_btn.set_icon_name(shape.icon_name());
             marquee_btn.set_tooltip_text(Some(marquee_tooltip(shape)));
@@ -139,9 +133,6 @@ pub(crate) fn build(
     (bar, setter)
 }
 
-/// The marquee shape the mode button should show. Anything that isn't a
-/// selection tool leaves it on the default; the bar's selection page is not
-/// visible then anyway.
 const fn marquee_shape(tool: Tool) -> SelectionTool {
     match tool {
         Tool::Selection(shape) => shape,
@@ -174,14 +165,6 @@ const fn stack_name_for(tool: Tool) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Selection page
-// ---------------------------------------------------------------------------
-
-/// Edit modes, brush size / strength for the painting ones, and the
-/// mask-preview toggle. Marching ants only show where the selection crosses
-/// 50%, which says nothing about a feathered or partially-subtracted mask;
-/// the heatmap paints the actual coverage over the canvas instead.
 fn build_selection_page(
     selection: &SelectionState,
     brush_engine: &BrushEngine,
@@ -196,7 +179,6 @@ fn build_selection_page(
         .valign(gtk::Align::Center)
         .build();
 
-    // Sliders only drive the painting modes, so they follow the mode's state.
     let brush_controls = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(ROW_SPACING)
@@ -230,10 +212,6 @@ fn build_selection_page(
     (row, marquee_btn)
 }
 
-/// The linked mode selector: marquee (None) or one of the mask brushes.
-/// Toggling a mode enables/disables `brush_controls` with it. Returns the
-/// marquee button too - it wears the active marquee shape, so it has to be
-/// updated when the toolbar switches between square, circle and lasso.
 fn build_selection_modes(
     selection: &SelectionState,
     brush_controls: &gtk::Box,
@@ -248,8 +226,6 @@ fn build_selection_modes(
     let mut first: Option<gtk::ToggleButton> = None;
     let mut marquee_btn: Option<gtk::ToggleButton> = None;
     for &mode in <SelectionEdit as oxiedraw_core::enum_meta::EnumMeta>::ALL {
-        // No icon of its own means the marquee mode, which borrows the shape
-        // the toolbar is set to draw.
         let is_marquee = mode.icon_name().is_none();
         let (icon, tooltip) = mode.icon_name().map_or_else(
             || (marquee.icon_name(), marquee_tooltip(marquee)),
@@ -292,7 +268,6 @@ const fn selection_edit_tooltip(mode: SelectionEdit) -> &'static str {
     }
 }
 
-/// How much coverage a full-pressure dab lays down (or takes away, or blurs).
 fn build_strength_slider(selection: &SelectionState) -> gtk::Scale {
     let strength = selection.strength.clone();
     slider::build(
@@ -312,9 +287,6 @@ fn build_strength_slider(selection: &SelectionState) -> gtk::Scale {
     )
 }
 
-/// Flat outline icon when off, filled icon on a system-accent background when
-/// on - the same read as the eraser toggle, plus the duotone icon swap. The
-/// tooltip names what the next click does, not the current state.
 fn apply_mask_preview_style(btn: &gtk::ToggleButton, active: bool) {
     if active {
         btn.set_icon_name("oxiedraw-mask-preview-active-symbolic");
@@ -329,9 +301,6 @@ fn apply_mask_preview_style(btn: &gtk::ToggleButton, active: bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Brush page
-// ---------------------------------------------------------------------------
 
 fn build_brush_page(
     brush_engine: &BrushEngine,
@@ -355,13 +324,6 @@ fn build_brush_page(
     row
 }
 
-/// Eraser-mode toggle. While active, brush strokes remove coverage from the
-/// active layer instead of painting (same brush settings, inverted effect).
-///
-/// Inactive it is a plain flat icon button; active it fills with the system
-/// accent color (`.suggested-action`, which follows the GNOME accent). It binds
-/// to the stateful `app.eraser-toggle` action, so clicking it, the keybinding,
-/// and every tab's copy of the button all stay in sync via GTK.
 fn build_eraser_toggle() -> gtk::ToggleButton {
     let btn = gtk::ToggleButton::builder()
         .icon_name("oxiedraw-eraser-symbolic")
@@ -370,12 +332,10 @@ fn build_eraser_toggle() -> gtk::ToggleButton {
         .action_name("app.eraser-toggle")
         .build();
     apply_eraser_style(&btn, btn.is_active());
-    // The action drives `active`; restyle whenever it changes (click or key).
     btn.connect_active_notify(|b| apply_eraser_style(b, b.is_active()));
     btn
 }
 
-/// Flat normally; full system-accent background while erasing.
 fn apply_eraser_style(btn: &gtk::ToggleButton, active: bool) {
     if active {
         btn.remove_css_class("flat");
@@ -386,14 +346,8 @@ fn apply_eraser_style(btn: &gtk::ToggleButton, active: bool) {
     }
 }
 
-/// Brush size, bound to the shared engine cell. The Brush and Selection pages
-/// each build one of these, so the thumb is re-seeded whenever the page is
-/// shown - otherwise a size set on the other page (or by a keybinding) would
-/// look lost when this one comes back.
 fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
     let size = brush_engine.size.clone();
-    // Re-seeding runs the value-changed handler; without this the snap in
-    // `size_pos_to_value` would quietly round the shared size on every switch.
     let programmatic = Rc::new(Cell::new(false));
     let scale = slider::build_mapped(
         f64::from(brush_engine.size.get()),
@@ -427,9 +381,6 @@ fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
     scale
 }
 
-/// Maps a `[0, 1]` trough position to a size snapped to the piecewise step of
-/// the segment it falls in. `segments` is a table in the [`SIZE_SEGMENTS`]
-/// shape, so tools with different ranges share this mapping.
 fn segmented_pos_to_value(pos: f64, segments: &[(f64, f64, f64, f64)]) -> f64 {
     let mut pos_lo = 0.0;
     for &(size_lo, size_hi, step, pos_width) in segments {
@@ -445,7 +396,6 @@ fn segmented_pos_to_value(pos: f64, segments: &[(f64, f64, f64, f64)]) -> f64 {
     segments[segments.len() - 1].1
 }
 
-/// Places a size on the `[0, 1]` trough per the piecewise layout.
 fn segmented_value_to_pos(size: f64, segments: &[(f64, f64, f64, f64)]) -> f64 {
     let mut pos_lo = 0.0;
     for &(size_lo, size_hi, _step, pos_width) in segments {
@@ -485,12 +435,6 @@ fn build_opacity_slider(brush_engine: &BrushEngine) -> gtk::Scale {
     )
 }
 
-// ---------------------------------------------------------------------------
-// Crop page
-// ---------------------------------------------------------------------------
-
-/// Drawing Guide bottom-bar page: right-aligned Cancel / Done, styled like the
-/// crop tool's Cancel / Apply. Buttons drive the window-level guide actions.
 fn build_guide_page() -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -531,18 +475,15 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
         .valign(gtk::Align::Center)
         .build();
 
-    // Aspect ratio dropdown.
     row.append(&build_ratio_dropdown(crop));
 
     row.append(&dim_sep());
 
-    // W field.
     row.append(&small_label("W"));
     let w_spin = build_dim_spin(1.0, 32_000.0);
     row.append(&w_spin);
     row.append(&small_label("px"));
 
-    // Swap button.
     let swap_btn = gtk::Button::builder()
         .icon_name("object-flip-horizontal-symbolic")
         .tooltip_text("Swap W <-> H")
@@ -565,7 +506,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     }
     row.append(&swap_btn);
 
-    // H field.
     row.append(&small_label("H"));
     let h_spin = build_dim_spin(1.0, 32_000.0);
     row.append(&h_spin);
@@ -573,7 +513,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
 
     row.append(&dim_sep());
 
-    // Clear button.
     let clear_btn = gtk::Button::builder()
         .label("Clear")
         .valign(gtk::Align::Center)
@@ -589,7 +528,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     }
     row.append(&clear_btn);
 
-    // Right-aligned: Cancel + Commit.
     let spacer = gtk::Box::builder().hexpand(true).build();
     row.append(&spacer);
 
@@ -618,14 +556,12 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     });
     row.append(&apply_btn);
 
-    // Sync W/H spinners from crop rect when it changes.
     {
         let crop_c = crop.clone();
         let w_c = w_spin.clone();
         let h_c = h_spin.clone();
         let syncing = Rc::new(Cell::new(false));
 
-        // Wire spin -> crop (only when NOT syncing from rect).
         {
             let crop_cc = crop_c.clone();
             let syncing_c = Rc::clone(&syncing);
@@ -641,7 +577,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
                     crop_cc
                         .rect
                         .set(Some(CropRect::new(n.x, n.y, spin.value() as f32, n.h)));
-                    // Avoid re-entering; do not notify here to prevent loop.
                 }
                 let _ = h_cc;
             });
@@ -664,7 +599,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
             });
         }
 
-        // Wire crop -> spinners via connect_rect_changed.
         crop.connect_rect_changed(Box::new(move || {
             syncing.set(true);
             if let Some(r) = crop_c.rect.get() {
@@ -693,7 +627,6 @@ fn build_ratio_dropdown(crop: &CropState) -> gtk::DropDown {
     dropdown.connect_selected_notify(move |d| {
         let ratio = CropAspectRatio::from_index(d.selected());
         crop_c.aspect_ratio.set(ratio);
-        // Constrain existing rect to the new ratio (keep width, adjust height).
         if let (Some(r), Some(rx)) = (crop_c.rect.get(), ratio.ratio()) {
             let n = r.normalized();
             use oxiedraw_core::tools::CropRect;
@@ -733,16 +666,9 @@ fn dim_sep() -> gtk::Separator {
     sep
 }
 
-// ---------------------------------------------------------------------------
-// Liquify page
-// ---------------------------------------------------------------------------
 
 const LIQUIFY_SLIDER_WIDTH: i32 = 110;
 
-/// Liquify brush size segments, in the [`SIZE_SEGMENTS`] shape. Liquify works
-/// at much larger radii than a brush - a single push often wants to cover a
-/// whole limb or face - so this runs to 5000 px and gives the low end less of
-/// the trough than the brush does.
 const LIQUIFY_SIZE_SEGMENTS: [(f64, f64, f64, f64); 4] = [
     (1.0, 100.0, 1.0, 0.35),
     (100.0, 500.0, 10.0, 0.30),
@@ -750,9 +676,6 @@ const LIQUIFY_SIZE_SEGMENTS: [(f64, f64, f64, f64); 4] = [
     (2000.0, oxiedraw_core::liquify::MAX_SIZE as f64, 100.0, 0.15),
 ];
 
-/// Liquify bar: a linked (segmented) row of mode buttons on the left, the brush
-/// knobs next, then Restore All / Cancel / Apply pushed to the right the way the
-/// Crop tool does it.
 fn build_liquify_page(liquify: &LiquifyState) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -765,8 +688,6 @@ fn build_liquify_page(liquify: &LiquifyState) -> gtk::Box {
     row.append(&build_liquify_modes(liquify));
     row.append(&dim_sep());
 
-    // Plain labels, not the dimmed `small_label` the Crop / Shape bars use:
-    // these sit next to brush-style sliders, so they match the Brush bar.
     row.append(&gtk::Label::new(Some("Size")));
     row.append(&build_liquify_size_slider(liquify));
 
@@ -788,7 +709,6 @@ fn build_liquify_page(liquify: &LiquifyState) -> gtk::Box {
         "How fast Twirl / Pucker / Bloat keep applying when held still",
     ));
 
-    // Right-aligned: Restore All + Cancel + Apply, matching the Crop bar.
     let spacer = gtk::Box::builder().hexpand(true).build();
     row.append(&spacer);
 
@@ -821,8 +741,6 @@ fn build_liquify_page(liquify: &LiquifyState) -> gtk::Box {
     row
 }
 
-/// The linked mode selector. Radio-grouped toggles in a `.linked` box, so the
-/// whole run reads as one segmented control.
 fn build_liquify_modes(liquify: &LiquifyState) -> gtk::Box {
     let modes = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -830,8 +748,6 @@ fn build_liquify_modes(liquify: &LiquifyState) -> gtk::Box {
         .valign(gtk::Align::Center)
         .build();
 
-    // Set while a click is being applied programmatically, so pushing the
-    // current mode back into the buttons can't re-enter the handler.
     let programmatic = Rc::new(Cell::new(false));
     let mut first: Option<gtk::ToggleButton> = None;
     let mut buttons: Vec<(LiquifyMode, gtk::ToggleButton)> = Vec::new();
@@ -862,8 +778,6 @@ fn build_liquify_modes(liquify: &LiquifyState) -> gtk::Box {
         buttons.push((mode, btn));
     }
 
-    // Alt-inverted modes and the keyboard both change the mode behind the bar's
-    // back, so follow the state rather than assuming clicks are the only source.
     {
         let liquify = liquify.clone();
         liquify.clone().connect_changed(Box::new(move || {
@@ -909,7 +823,6 @@ fn build_liquify_size_slider(liquify: &LiquifyState) -> gtk::Scale {
     )
 }
 
-/// A `0..=1` knob rendered as a percentage, bound to one of the liquify cells.
 fn build_liquify_unit_slider(cell: &Rc<Cell<f32>>, tooltip: &str) -> gtk::Scale {
     let cell = Rc::clone(cell);
     let initial = f64::from(cell.get());
@@ -932,9 +845,6 @@ fn build_liquify_unit_slider(cell: &Rc<Cell<f32>>, tooltip: &str) -> gtk::Scale 
     scale
 }
 
-// ---------------------------------------------------------------------------
-// Transform page
-// ---------------------------------------------------------------------------
 
 const TRANSFORM_FILTERS: [TransformFilter; 2] =
     [TransformFilter::Bilinear, TransformFilter::NearestNeighbor];
@@ -981,14 +891,6 @@ fn build_transform_page(
     row
 }
 
-// ---------------------------------------------------------------------------
-// Pattern page
-// ---------------------------------------------------------------------------
-
-/// Cancel / Apply for the Pattern tool, styled like the Transform bar's pair.
-/// The pattern's own knobs live in the right-hand panel, so there is nothing
-/// else on this row. Apply bakes the curve and leaves the tool ready for the
-/// next line; Cancel drops it without touching the layer.
 fn build_pattern_page(on_apply: Rc<dyn Fn()>, on_cancel: Rc<dyn Fn()>) -> gtk::Box {
     let row = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -1026,9 +928,6 @@ fn build_pattern_page(on_apply: Rc<dyn Fn()>, on_cancel: Rc<dyn Fn()>) -> gtk::B
     row
 }
 
-// ---------------------------------------------------------------------------
-// Fill page
-// ---------------------------------------------------------------------------
 
 fn build_fill_page(fill: &FillState) -> gtk::Box {
     let row = gtk::Box::builder()
@@ -1064,8 +963,6 @@ fn build_fill_page(fill: &FillState) -> gtk::Box {
     );
     row.append(&slider);
 
-    // Dragging sideways during a fill adjusts the same threshold; let it
-    // move the slider so the two never show different numbers.
     {
         let scale = slider.clone();
         *fill.tolerance_display.borrow_mut() = Some(Box::new(move |value: u8| {
@@ -1073,8 +970,6 @@ fn build_fill_page(fill: &FillState) -> gtk::Box {
         }));
     }
 
-    // What makes fills meet anti-aliased line art cleanly. No radius or
-    // feather to go with it - the edge pass reads the outline itself.
     let auto_edge = fill.auto_edge.clone();
     let auto_check = gtk::CheckButton::builder()
         .label("Smart Edges")
@@ -1087,8 +982,6 @@ fn build_fill_page(fill: &FillState) -> gtk::Box {
     auto_check.connect_toggled(move |c| auto_edge.set(c.is_active()));
     row.append(&auto_check);
 
-    // Sample the composite of all visible layers instead of just the
-    // active one when deciding which pixels to fill.
     let all_layers = fill.sample_all_layers.clone();
     let check = gtk::CheckButton::builder()
         .label("Use all Layers")
@@ -1120,13 +1013,7 @@ fn build_filter_dropdown(filter: Rc<Cell<TransformFilter>>) -> gtk::DropDown {
     dropdown
 }
 
-// ---------------------------------------------------------------------------
-// Shape page
-// ---------------------------------------------------------------------------
 
-// ---------------------------------------------------------------------------
-// Text page (B / I / U)
-// ---------------------------------------------------------------------------
 
 fn build_text_page(
     text_edit: &Rc<std::cell::RefCell<Option<crate::text_edit::TextEdit>>>,
@@ -1146,8 +1033,6 @@ fn build_text_page(
     row
 }
 
-/// A B/I/U toolbar button: a flat button with a Pango-markup label that
-/// dispatches to the (late-bound) text-edit controller on click.
 fn style_button(
     markup: &str,
     text_edit: &Rc<std::cell::RefCell<Option<crate::text_edit::TextEdit>>>,
@@ -1181,9 +1066,6 @@ fn build_shape_page(shape: &ShapeState) -> gtk::Box {
     row
 }
 
-// ---------------------------------------------------------------------------
-// Gradient page
-// ---------------------------------------------------------------------------
 
 const GRADIENT_TYPES: [GradientType; 3] =
     [GradientType::Linear, GradientType::Radial, GradientType::Square];
@@ -1222,14 +1104,10 @@ fn build_gradient_page(gradient: &GradientState) -> gtk::Box {
 }
 
 #[cfg(test)]
-// Exact comparisons are the point: the segment tables are authored so that
-// specific trough positions land on specific snapped sizes.
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
 
-    /// A segment table's widths have to cover the trough exactly, or part of it
-    /// maps nowhere and the top of the range becomes unreachable.
     fn assert_widths_sum_to_one(segments: &[(f64, f64, f64, f64)]) {
         let total: f64 = segments.iter().map(|s| s.3).sum();
         assert!((total - 1.0).abs() < 1e-9, "segment widths sum to {total}");
@@ -1241,8 +1119,6 @@ mod tests {
         assert_widths_sum_to_one(&LIQUIFY_SIZE_SEGMENTS);
     }
 
-    /// Adjacent segments must share a boundary value, otherwise dragging across
-    /// one jumps.
     #[test]
     fn segment_tables_are_contiguous() {
         for table in [&SIZE_SEGMENTS[..], &LIQUIFY_SIZE_SEGMENTS[..]] {
@@ -1258,25 +1134,20 @@ mod tests {
             segmented_pos_to_value(1.0, &LIQUIFY_SIZE_SEGMENTS),
             f64::from(oxiedraw_core::liquify::MAX_SIZE),
         );
-        // ... and the brush is unchanged by the refactor.
         assert_eq!(segmented_pos_to_value(1.0, &SIZE_SEGMENTS), 1000.0);
     }
 
     #[test]
     fn liquify_size_snaps_to_its_segment_step() {
-        // Inside the first segment (step 1) every value is a whole pixel.
         for i in 0..=35 {
             let v = segmented_pos_to_value(f64::from(i) / 100.0, &LIQUIFY_SIZE_SEGMENTS);
             assert_eq!(v, v.round(), "step-1 segment produced {v}");
         }
-        // The last segment steps in hundreds.
         let v = segmented_pos_to_value(0.93, &LIQUIFY_SIZE_SEGMENTS);
         assert_eq!(v % 100.0, 0.0, "step-100 segment produced {v}");
         assert!((2000.0..=5000.0).contains(&v), "{v} outside the last segment");
     }
 
-    /// Position and value have to be inverses at the segment boundaries, or the
-    /// thumb jumps when the slider is seeded from a stored size.
     #[test]
     fn liquify_position_round_trips_at_boundaries() {
         for &(lo, ..) in &LIQUIFY_SIZE_SEGMENTS {

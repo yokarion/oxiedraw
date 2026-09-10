@@ -4,9 +4,20 @@ use relm4::RelmWidgetExt;
 
 use crate::settings::AppSettings;
 
-/// Build the top bar and return it alongside a callback that shows or hides
-/// the window control buttons (minimise / maximise / close).
-pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
+pub(crate) const CONTROL_HEIGHT: i32 = 30;
+
+const CONTROL_CLASS: &str = "oxiedraw-topbar-control";
+
+// The request only lands because `load_css` takes the padding and minimum out
+// of the button inside; left alone each one overshoots by a different amount.
+pub(crate) fn style_control(widget: &impl IsA<gtk::Widget>) {
+    load_css();
+    let widget = widget.as_ref();
+    widget.add_css_class(CONTROL_CLASS);
+    widget.set_height_request(CONTROL_HEIGHT);
+}
+
+pub(crate) fn build(layout_control: &gtk::Widget) -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     load_css();
     let handle = gtk::WindowHandle::new();
 
@@ -44,16 +55,16 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     let spacer = gtk::Box::builder().hexpand(true).build();
     bar.append(&spacer);
 
+    bar.append(layout_control);
     bar.append(&build_guide_control());
 
-    // Primary (gear) menu button
     let primary_btn = gtk::MenuButton::builder()
         .icon_name("emblem-system-symbolic")
         .menu_model(&build_primary_menu().upcast::<gio::MenuModel>())
         .valign(gtk::Align::Center)
         .build();
     primary_btn.add_css_class("flat");
-    primary_btn.inline_css("padding-top: 0; padding-bottom: 0;");
+    style_control(&primary_btn);
     bar.append(&primary_btn);
 
     let right_controls = gtk::WindowControls::builder()
@@ -66,12 +77,10 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
 
     handle.set_child(Some(&bar));
 
-    // Apply initial visibility from saved settings
     let show = AppSettings::load().appearance.show_window_decorations;
     left_controls.set_visible(show);
     right_controls.set_visible(show);
 
-    // Callback used by the preferences window to update controls in real time
     let lc = left_controls;
     let rc = right_controls;
     let apply = move |visible: bool| {
@@ -82,11 +91,6 @@ pub(crate) fn build() -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     (handle, apply)
 }
 
-/// The symmetry button, next to the gear menu. Switches the drawing guide on
-/// and off via `app.guide-toggle`; switching it on enters the Drawing Guide
-/// tool, which opens the guide settings in the right sidebar and puts the
-/// position / rotation nodes on the canvas. Flat like the gear button beside it
-/// while off, accent while the guide is on.
 fn build_guide_control() -> gtk::ToggleButton {
     let toggle = gtk::ToggleButton::builder()
         .icon_name("oxiedraw-guide-symbolic")
@@ -95,17 +99,13 @@ fn build_guide_control() -> gtk::ToggleButton {
         .valign(gtk::Align::Center)
         .margin_end(6)
         .build();
-    toggle.inline_css("padding-top: 0; padding-bottom: 0;");
+    style_control(&toggle);
 
     apply_guide_style(&toggle, toggle.is_active());
-    // The action drives `active` (button, keybinding, or a state push from the
-    // tab manager); restyle whenever it changes.
     toggle.connect_active_notify(|b| apply_guide_style(b, b.is_active()));
     toggle
 }
 
-/// Flat (bar background) normally, full system accent while the guide is on -
-/// the same two states as the brush bar's eraser toggle.
 fn apply_guide_style(toggle: &gtk::ToggleButton, on: bool) {
     if on {
         toggle.remove_css_class("flat");
@@ -117,21 +117,38 @@ fn apply_guide_style(toggle: &gtk::ToggleButton, on: bool) {
 }
 
 fn load_css() {
-    let provider = gtk::CssProvider::new();
-    provider.load_from_string(
-        ".menubar-item > toggle {
-            min-height: 20px;
-            padding-top: 0;
-            padding-bottom: 0;
-        }",
-    );
-    if let Some(display) = gtk::gdk::Display::default() {
-        gtk::style_context_add_provider_for_display(
-            &display,
-            &provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let provider = gtk::CssProvider::new();
+        provider.load_from_string(
+            ".menubar-item > toggle {
+                min-height: 20px;
+                padding-top: 0;
+                padding-bottom: 0;
+            }
+
+            /* Down to nothing, so the height request on a control is the height
+               it comes out at. Spelled out child by child rather than as a
+               descendant selector, which would reach into the popovers too. */
+            .oxiedraw-topbar-control,
+            .oxiedraw-topbar-control > button,
+            .oxiedraw-topbar-control > dropdown > button,
+            .oxiedraw-topbar-control > menubutton > button,
+            .oxiedraw-topbar-control > entry,
+            .oxiedraw-topbar-control > entry > text {
+                min-height: 0;
+                padding-top: 0;
+                padding-bottom: 0;
+            }",
         );
-    }
+        if let Some(display) = gtk::gdk::Display::default() {
+            gtk::style_context_add_provider_for_display(
+                &display,
+                &provider,
+                gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+            );
+        }
+    });
 }
 
 fn item(label: &str, action: &str, accel: Option<&str>) -> gio::MenuItem {

@@ -30,14 +30,9 @@ pub(crate) fn build(crop: &CropState) -> gtk::Box {
     content.append(&build_section_label("Behavior"));
     content.append(&build_behavior_list(crop));
 
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .build();
-    scroll.set_child(Some(&content));
-
-    panel.append(&scroll);
+    // No scroller of its own: nested in the frame's it reports no natural
+    // height, which collapses the window to a sliver.
+    panel.append(&content);
     panel
 }
 
@@ -64,9 +59,8 @@ fn build_header(crop: &CropState) -> gtk::Box {
         .label("")
         .halign(gtk::Align::End)
         .xalign(1.0)
-        // Fixed width: the dimensions update live during a crop drag, and a
-        // width change here would relayout up to the canvas Picture, cancelling
-        // the in-progress stylus grab. A fixed request keeps the size stable.
+        // Fixed: a width change here relayouts up to the canvas Picture, which
+        // cancels an in-progress stylus grab.
         .width_chars(13)
         .max_width_chars(13)
         .ellipsize(gtk::pango::EllipsizeMode::End)
@@ -99,9 +93,6 @@ fn build_section_label(text: &str) -> gtk::Label {
     lbl
 }
 
-// ---------------------------------------------------------------------------
-// Overlay
-// ---------------------------------------------------------------------------
 
 const OVERLAYS: [CropOverlay; 3] = [
     CropOverlay::Thirds,
@@ -137,8 +128,6 @@ fn build_overlay_row(crop: &CropState) -> gtk::Box {
             });
         }
         btn.set_hexpand(true);
-        // Each frame: if the allocated width changed, update the height request
-        // to match so the button stays square.
         btn.add_tick_callback(|b, _| {
             let w = b.width();
             if w > 0 && b.height_request() != w {
@@ -181,9 +170,6 @@ fn make_overlay_toggle(ov: CropOverlay, active: bool) -> gtk::ToggleButton {
     btn
 }
 
-// ---------------------------------------------------------------------------
-// Behavior
-// ---------------------------------------------------------------------------
 
 fn build_behavior_list(crop: &CropState) -> gtk::ListBox {
     let list = gtk::ListBox::new();
@@ -212,9 +198,6 @@ fn build_behavior_list(crop: &CropState) -> gtk::ListBox {
     list
 }
 
-// ---------------------------------------------------------------------------
-// Overlay icon drawing
-// ---------------------------------------------------------------------------
 
 fn draw_overlay_icon(cr: &gtk::cairo::Context, w: i32, h: i32, ov: CropOverlay) {
     let wf = f64::from(w);

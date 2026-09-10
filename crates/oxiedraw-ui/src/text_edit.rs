@@ -195,7 +195,7 @@ impl TextEdit {
         self.edit(move |ed, eng| ed.set_resize_mode(m, eng));
     }
 
-    /// Register a listener so that changing the colour while editing recolours
+    /// Register a listener so that changing the color while editing recolors
     /// the selection (or the whole box). Call once after construction.
     pub(crate) fn connect_color(&self) {
         let this = self.clone();

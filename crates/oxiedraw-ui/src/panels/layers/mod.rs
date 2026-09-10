@@ -1,8 +1,8 @@
-//! Layers panel. Holds the layer/group tree, the cairo-drawn row list, and
-//! input gestures (click, drag-reorder, double-click rename). The tree is the
-//! authoritative source of display order; canvas z-order is synced from it.
+//! Layers panel: the layer/group tree, its cairo-drawn row list and gestures.
+//! The tree is the source of display order; canvas z-order is synced from it.
 
 mod actions;
+mod components;
 mod thumbnail;
 
 use std::cell::{Cell, RefCell};
@@ -30,13 +30,10 @@ use crate::toaster::Toaster;
 
 use self::thumbnail::start_thumbnail_refresh;
 
-// --- Layout constants ---
 const PANEL_MARGIN: i32 = 8;
 const TAB_SPACING: i32 = 6;
 
 const LIST_PADDING: f64 = 8.0;
-// Gap between the row's right edge and the scrollbar. Kept small so rows run
-// close to the scrollbar; the left/top inset stays at LIST_PADDING.
 const LIST_PADDING_RIGHT: f64 = 0.8;
 const ITEM_HEIGHT: f64 = 44.0;
 const ITEM_GAP: f64 = 4.0;
@@ -48,45 +45,30 @@ const HANDLE_WIDTH: f64 = 18.0;
 const HANDLE_LINE_THICKNESS: f64 = 1.5;
 const HANDLE_LINE_GAP: f64 = 4.0;
 
-// Nesting is drawn as a container: a folder or an adjustment layer is filled in
-// together with everything it covers, so the shade itself says "this holds
-// that" and no connector lines are needed. Each level costs `NEST_PAD` of
-// horizontal room on both sides.
-// The same padding on all four sides. Vertically that means the row pitch is
-// not uniform - opening or closing a container adds space - which is why
-// positions come from `RowLayout` rather than a constant slot height.
 const NEST_PAD: f64 = 6.0;
 const NEST_INSET: f64 = NEST_PAD;
 const NEST_RADIUS: f64 = 10.0;
 
-// Drop shadow under whatever is being dragged, faked by stacking rounded rects.
 const SHADOW_STEPS: usize = 8;
 const SHADOW_SPREAD: f64 = 9.0;
 const SHADOW_OFFSET_Y: f64 = 2.0;
 const SHADOW_STEP_ALPHA: f64 = 0.05;
 
-// Travel time from where the pointer released a block to the slot it landed in.
 const DROP_SETTLE_SECS: f64 = 0.16;
 
-// The clip rod sits near the left of its own 10px gutter column, so the hook
-// that turns into the base row has room to read.
 const CONNECTOR_INSET: f64 = 3.0;
 const CONNECTOR_WIDTH: f64 = 1.5;
 const CONNECTOR_R: f64 = 3.0;
 
-// Clip gutter: a clipped row is indented one step past its siblings and the
-// freed column carries the rod down into the base it clips to.
-const CLIP_GUTTER_W: f64 = 20.0; // hit zone width: the gutter plus its indent step
+const CLIP_GUTTER_W: f64 = 20.0;
 
-// Alpha lock reads as a badge knocked out of the thumbnail's bottom-right
-// corner: the state belongs to the pixels, and the swatch is the pixels.
 const LOCK_RING_D: f64 = 13.0;
 const LOCK_DISC_D: f64 = 10.5;
 
-const EYE_RADIUS: f64 = 9.0;   // half the hit-box width/height
-const EDIT_RADIUS: f64 = 8.0;  // adjustment "edit settings" sliders, sits left of the eye
-const MASK_RADIUS: f64 = 8.0;  // adjustment "show mask" toggle, sits left of the sliders
-const EDIT_EYE_GAP: f64 = 6.0; // gap between adjacent row icons
+const EYE_RADIUS: f64 = 9.0;
+const EDIT_RADIUS: f64 = 8.0;
+const MASK_RADIUS: f64 = 8.0;
+const EDIT_EYE_GAP: f64 = 6.0;
 const CHEVRON_SIZE: f64 = 12.0;
 const FOLDER_W: f64 = 16.0;
 const FOLDER_H: f64 = 13.0;
@@ -94,17 +76,11 @@ const INDENT_STEP: f64 = 10.0;
 
 const SLOT_HEIGHT: f64 = ITEM_HEIGHT + ITEM_GAP;
 
-// --- Auto-scroll while drag-reordering ---
-// Thickness of the hot zone at each viewport edge, and the scroll speed reached
-// at the very edge (px/sec). Speed ramps linearly across the zone.
 const AUTOSCROLL_EDGE: f64 = 56.0;
 const AUTOSCROLL_MAX_SPEED: f64 = 700.0;
 
-// Assumed minimum thumb size (px) when mapping a stylus drag onto the vertical
-// scrollbar, so the thumb keeps tracking the pen even on very long lists.
 const SCROLL_THUMB_MIN: f64 = 24.0;
 
-// --- Color types and fallbacks ---
 type Rgb = (f64, f64, f64);
 
 const FALLBACK_WINDOW_BG: Rgb = (0.92, 0.92, 0.92);
@@ -113,16 +89,11 @@ const FALLBACK_ACCENT_BG: Rgb = (0.21, 0.52, 0.89);
 const FALLBACK_ACCENT_FG: Rgb = (1.0, 1.0, 1.0);
 const FALLBACK_FG: Rgb = (0.18, 0.18, 0.20);
 
-// --- Tree node types ---
 static GROUP_COUNTER: AtomicU64 = AtomicU64::new(1);
 fn new_group_id() -> String {
     format!("g{:016x}", GROUP_COUNTER.fetch_add(1, AOrdering::Relaxed))
 }
 
-// Advance the group-id counter past an id loaded from a project file. The
-// counter is process-global and resets to 1 each launch, so without this a
-// reopened document that adds a new folder would mint an id colliding with an
-// existing group - phantom-linking the two (shared expand/select state).
 fn observe_group_id(id: &str) {
     if let Some(hex) = id.strip_prefix('g')
         && let Ok(n) = u64::from_str_radix(hex, 16)
@@ -150,18 +121,15 @@ pub(super) struct GroupData {
     pub(super) expanded: bool,
     pub(super) visible: bool,
     pub(super) children: Vec<LayerNode>,
-    // Leaves we hid when the user toggled the group's eye off. Re-shown on toggle-on.
     pub(super) masked_leaves: HashSet<String>,
 }
 
-// Tree is stored in display order: index 0 is the topmost row (highest z).
 #[derive(Debug, Clone)]
 pub(super) enum LayerNode {
     Layer(String),
     Group(GroupData),
 }
 
-// --- Flat visible-row view ---
 #[derive(Clone, Debug)]
 pub(super) enum RowKind {
     Layer {
@@ -184,30 +152,24 @@ pub(super) enum RowKind {
 pub(super) struct VisibleRow {
     pub(super) kind: RowKind,
     pub(super) depth: usize,
-    // Extra visual indent (in depth steps) from adjustment layers above this row
-    // in its sibling list. Separate from `depth` so structural/drag logic keys
-    // off the true tree depth while the row still draws indented.
     pub(super) adjust_indent: usize,
-    // `None` parent means this row sits at the tree root.
     pub(super) parent_id: Option<String>,
     pub(super) idx_in_parent: usize,
 }
 
-// --- Click zone ---
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum HitZone {
     Handle,
     Eye,
-    Edit,    // adjustment layers only: the "edit settings" sliders left of the eye
-    Mask,    // adjustment layers only: the "show mask" toggle left of the sliders
-    Clip,    // clipped layers only: the gutter elbow; click releases the clip
-    Chevron, // groups only
-    Folder,  // groups only: the folder icon; selects the folder's contents
-    Swatch,  // layers only
+    Edit,
+    Mask,
+    Clip,
+    Chevron,
+    Folder,
+    Swatch,
     Body,
 }
 
-// --- Drag state ---
 #[derive(Clone, Debug)]
 pub(super) struct Drag {
     from_row: usize,
@@ -215,43 +177,29 @@ pub(super) struct Drag {
     pointer_y: f64,
     grab_offset_y: f64,
     zone: HitZone,
-    // Smoothed indent offset of the floating preview, in depth units.
     animated_depth_offset: f64,
-    // Per-row Y nudge from the row's natural slot, in pixels.
     row_y_anim: Vec<f64>,
     last_frame_time_us: i64,
 }
 
-/// Eases the rows from where the drag had them into where the committed drop
-/// put them. Offsets are held against the *post*-drop layout and scaled by
-/// what is left of the animation, so the resting state is no offset at all.
 #[derive(Clone, Debug)]
 pub(super) struct DropSettle {
-    // Position of the dropped block, plus the id expected there: any edit that
-    // moves it invalidates the animation.
     from_row: usize,
     span: usize,
     id: String,
-    // Release position and indent of the block, relative to where it landed.
     offset_y: f64,
     depth_offset: f64,
-    // Same, per row, for everything still sliding out of the way.
     row_y: Vec<f64>,
-    // 0 at release, 1 once landed.
     progress: f64,
     last_frame_time_us: i64,
 }
 
 impl DropSettle {
-    /// Fraction of the release offsets still to travel.
     fn remaining(&self) -> f64 {
         let t = self.progress.clamp(0.0, 1.0);
-        // Ease-out cubic: leaves the pointer at speed, decelerates into place.
         (1.0 - t).powi(3)
     }
 
-    /// Whether this still describes the list it was built for. An undo or a
-    /// layer edit can land mid-animation and re-lay-out the rows underneath it.
     fn matches(&self, rows: &[VisibleRow]) -> bool {
         self.span > 0
             && self.row_y.len() == rows.len()
@@ -260,59 +208,34 @@ impl DropSettle {
     }
 }
 
-/// A block lifted above the list: the rows the pointer holds, or the ones it
-/// just dropped and that are still settling. Both draw the same way.
 struct FloatBlock {
     from: usize,
     span: usize,
-    // Y the block's first row is drawn at.
     top: f64,
-    // Indent offset from the row's real depth, in depth units.
     depth_offset: f64,
-    // 1 while the pointer holds the block, easing to 0 as it lands. Drives the
-    // shadow and the card a row carries while it has no container of its own.
     lift: f64,
 }
 
-// --- Ui ---
 #[derive(Clone)]
 pub(super) struct Ui {
     pub(super) state: LayerState,
     pub(super) tree: Rc<RefCell<Vec<LayerNode>>>,
     pub(super) drag: Rc<RefCell<Option<Drag>>>,
-    // Set between a drop and the rows reaching their new slots.
     pub(super) drop_settle: Rc<RefCell<Option<DropSettle>>>,
-    // A tick callback is already driving `drop_settle`; back-to-back drops
-    // replace the state rather than stacking a second callback on it.
     pub(super) settle_ticking: Rc<Cell<bool>>,
     pub(super) thumbnails: Rc<RefCell<Vec<Option<cairo::ImageSurface>>>>,
     pub(super) multi_selected: Rc<RefCell<HashSet<String>>>,
-    // Mutually exclusive with `state.active()`: only one of layer/group is primary.
     pub(super) active_group: Rc<RefCell<Option<String>>>,
-    // Late-bound callback that reloads the blend-mode/opacity controls from the
-    // current selection. Invoked whenever the selection changes.
     pub(super) blend_sync: Rc<RefCell<Option<Rc<dyn Fn()>>>>,
-    // Id of the adjustment layer whose mask is toggled into view (mirrors the
-    // canvas state so the row's mask button can draw its on/off state).
     pub(super) mask_view: Rc<RefCell<Option<String>>>,
-    // Icon currently under the pointer (row index + zone), for the hover
-    // highlight. Only the clickable per-row icons (eye / sliders / mask) set it.
     pub(super) hover: Rc<RefCell<Option<(usize, HitZone)>>>,
-    // Vertical scroll of the list. We scroll by a draw offset rather than a
-    // GtkScrolledWindow so autoscroll never re-allocates the drawing area (which
-    // would cancel an in-progress stylus reorder). `value` is the content pixel
-    // at the top of the viewport.
     pub(super) vadj: gtk::Adjustment,
-    // Cheap hash of the last selection (active, active_group, multi_selected)
-    // mirrored into LayerState, so the per-draw sync can skip the work when
-    // nothing changed. A drag-reorder resets it via `invalidate_selection_sync`.
     synced_selection_sig: Rc<Cell<Option<u64>>>,
 }
 
 impl Ui {
     fn new(state: LayerState) -> Self {
         let snapshot = state.snapshot();
-        // Canvas index 0 is the bottom layer; flip so tree index 0 is the top.
         let tree: Vec<LayerNode> = snapshot
             .iter()
             .rev()
@@ -335,9 +258,6 @@ impl Ui {
         }
     }
 
-    /// Cheap allocation-free hash of the raw selection inputs, for the per-draw
-    /// sync guard. `multi_selected` is a set, so its ids are folded in with XOR
-    /// (order-independent) plus the count.
     fn selection_sig(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -353,16 +273,11 @@ impl Ui {
         acc.wrapping_add(ms.len() as u64)
     }
 
-    /// Content pixel currently at the top of the viewport.
     fn scroll_offset(&self) -> f64 {
         self.vadj.value()
     }
 
-    /// Reload the blend-mode/opacity controls from the current selection.
     fn sync_blend_controls(&self) {
-        // Selection (or the tree, via `refresh`) just changed at every caller of
-        // this - force the shared selection mirror fresh now (not only on the next
-        // panel redraw) so a tool switch right after a multi-select sees it.
         self.sync_selection_to_state_forced();
         let cb = self.blend_sync.borrow().clone();
         if let Some(cb) = cb {
@@ -370,7 +285,6 @@ impl Ui {
         }
     }
 
-    /// Selected layers as flat canvas indices, in stack order.
     fn selected_indices(&self) -> Vec<usize> {
         let snapshot = self.state.snapshot();
         self.selected_layer_ids_in_order()
@@ -384,7 +298,6 @@ impl Ui {
         self.state.active().and_then(|i| snap.get(i).map(|l| l.id.clone()))
     }
 
-    // Leaves the user has selected, in tree order; group selections expand to their leaves.
     pub(super) fn selected_layer_ids_in_order(&self) -> Vec<String> {
         let snapshot = self.state.snapshot();
         let tree = self.tree.borrow();
@@ -423,9 +336,6 @@ impl Ui {
         ordered
     }
 
-    // All selected leaf ids in tree order, INCLUDING leaves inside collapsed
-    // groups (selected_layer_ids_in_order only walks expanded rows). Mirrored
-    // into LayerState so tools (Transform) act on the whole selection.
     pub(super) fn selected_leaf_ids_all(&self) -> Vec<String> {
         let snapshot = self.state.snapshot();
         let tree = self.tree.borrow();
@@ -457,11 +367,6 @@ impl Ui {
             .collect()
     }
 
-    // Mirror the current selection into shared LayerState so tools can read the
-    // whole selection, not just the active layer. Guarded on a cheap signature so
-    // the per-draw call is a no-op when the selection hasn't changed; use
-    // `sync_selection_to_state_forced` after a tree change (same raw selection,
-    // different leaves).
     pub(super) fn sync_selection_to_state(&self) {
         let sig = self.selection_sig();
         if self.synced_selection_sig.get() == Some(sig) {
@@ -471,25 +376,15 @@ impl Ui {
         self.synced_selection_sig.set(Some(sig));
     }
 
-    // Mirror the selection unconditionally (the raw-selection signature can be
-    // unchanged while the resolved leaves differ, e.g. after a group edit).
     pub(super) fn sync_selection_to_state_forced(&self) {
         self.state.set_selected_leaves(self.selected_leaf_ids_all());
         self.synced_selection_sig.set(Some(self.selection_sig()));
     }
 
-    // Invalidate the sync guard so the next `sync_selection_to_state` resyncs
-    // once. Call after a tree edit that changes group membership without changing
-    // the raw selection (a drag-reorder), whose resolved leaves the signature
-    // can't otherwise detect.
     pub(super) fn invalidate_selection_sync(&self) {
         self.synced_selection_sig.set(None);
     }
 
-    // Top-level selected nodes (layers and whole subgroups) in tree order, for
-    // grouping. Unlike selected_layer_ids_in_order, a selected subgroup stays
-    // intact rather than being flattened to its leaves, so grouping a mix of
-    // groups and layers preserves the subgroups.
     pub(super) fn selected_nodes_for_grouping(&self) -> Vec<String> {
         let tree = self.tree.borrow();
         let mut wanted: HashSet<String> = self.multi_selected.borrow().clone();
@@ -508,9 +403,6 @@ impl Ui {
     }
 }
 
-// Walk the tree; record a selected node's id and skip its subtree (so a nested
-// selection inside an already-selected group is not double-counted), otherwise
-// descend into unselected groups. Order follows the stored canvas order.
 fn collect_top_selected(nodes: &[LayerNode], wanted: &HashSet<String>, out: &mut Vec<String>) {
     for n in nodes {
         match n {
@@ -530,7 +422,6 @@ fn collect_top_selected(nodes: &[LayerNode], wanted: &HashSet<String>, out: &mut
     }
 }
 
-// --- Tree utilities ---
 fn compute_visible_rows(
     tree: &[LayerNode],
     snapshot: &[oxiedraw_core::document::Layer],
@@ -548,12 +439,6 @@ fn collect_rows(
     parent_id: Option<&str>,
     rows: &mut Vec<VisibleRow>,
 ) {
-    // An adjustment layer affects everything below it (the rows after it in this
-    // sibling list, which are lower in z-order), so those rows get an extra
-    // indent step - as if the adjustment opened a group around them. This is
-    // purely visual (`adjust_indent`); `depth` stays the true tree depth so the
-    // drag/group logic is unaffected. `base_extra` carries an enclosing group's
-    // accumulated adjustment indent down to its children.
     let mut extra = 0usize;
     for (i, node) in nodes.iter().enumerate() {
         let indent_here = base_extra + extra;
@@ -604,26 +489,16 @@ fn collect_rows(
     }
 }
 
-/// Visual nesting depth of a row: real folder depth plus the extra step an
-/// adjustment layer opens over the rows it covers. Both are the same
-/// relationship - "these rows live under that one" - so both get boxed the same
-/// way. The clip indent is deliberately excluded: a clipped layer is still a
-/// sibling of its base, it just borrows a gutter to draw its rod in.
 fn tree_depth(row: &VisibleRow) -> usize {
     row.depth + row.adjust_indent
 }
 
-/// Layers and folders share one id space.
 fn row_id(row: &VisibleRow) -> &str {
     match &row.kind {
         RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.as_str(),
     }
 }
 
-/// The rows a container row encloses: everything after it, up to the first row
-/// that is not nested inside it. Empty when it holds nothing visible - a
-/// collapsed or empty folder, or an adjustment with nothing beneath it - in
-/// which case no box is drawn.
 fn contained_rows(rows: &[VisibleRow], i: usize) -> usize {
     let depth = tree_depth(&rows[i]);
     rows.iter()
@@ -632,37 +507,22 @@ fn contained_rows(rows: &[VisibleRow], i: usize) -> usize {
         .count()
 }
 
-/// `true` when this row opens a container. A folder always does, collapsed or
-/// not - it is a container whether or not you can currently see inside it, and
-/// having it change shape on expand would make the list jump. An adjustment
-/// layer only does when it actually covers something.
 fn opens_box(rows: &[VisibleRow], i: usize) -> bool {
     matches!(rows[i].kind, RowKind::Group { .. }) || contained_rows(rows, i) > 0
 }
 
-/// How many boxes a row sits inside. A container row counts its own, so it
-/// lines up with the contents it encloses - the box is what shows the nesting,
-/// not a difference in indent.
 pub(super) fn box_depth(rows: &[VisibleRow], i: usize) -> usize {
     tree_depth(&rows[i]) + usize::from(opens_box(rows, i))
 }
 
-/// Left edge of the content at nesting level `level`.
 fn nest_left(level: usize) -> f64 {
     nest_left_f(count_f64(level))
 }
 
-/// As [`nest_left`] but at a fractional level, for a row easing between depths
-/// mid-drag.
 fn nest_left_f(level: f64) -> f64 {
     LIST_PADDING + level * NEST_INSET
 }
 
-/// Bottom edge of the container opened at `i`, including its own padding.
-///
-/// Several containers can end on the same row - a folder whose last child is a
-/// folder - and each still owes a full pad, so their edges have to nest rather
-/// than land on top of each other.
 fn container_bottom(rows: &[VisibleRow], layout: &RowLayout, i: usize) -> f64 {
     let last = i + contained_rows(rows, i);
     let depth = tree_depth(&rows[i]);
@@ -673,38 +533,20 @@ fn container_bottom(rows: &[VisibleRow], layout: &RowLayout, i: usize) -> f64 {
     layout.bottom(last) + NEST_PAD * count_f64(inside + 1)
 }
 
-/// Right edge of every row and container, whatever their nesting.
-///
-/// Nesting only insets the left, so the eye / drag-handle rail keeps one x for
-/// the whole list: a layer's controls must not shift just because it was moved
-/// into a folder.
 fn nest_right(width: f64) -> f64 {
     (width - LIST_PADDING_RIGHT).max(LIST_PADDING)
 }
 
-/// Everything the clip gutter needs to draw one row, derived from its
-/// neighbours. Rows are in display order (index 0 is the topmost), so the layer
-/// a clipped row binds to is the next *following* sibling that is not itself
-/// clipped - the one drawn directly beneath it.
 #[derive(Clone, Copy, Default)]
 pub(super) struct ClipInfo {
     pub(super) clipped: bool,
-    /// The row directly above is clipped too, so the bracket continues upward.
     pub(super) clipped_above: bool,
-    /// The row directly below is clipped too, so this row is not the one that
-    /// turns the corner into the base.
     pub(super) clipped_below: bool,
-    /// A base resolved. `false` draws the bracket without its corner: the flag
-    /// is kept but inactive.
     pub(super) has_base: bool,
-    /// The resolved base is hidden, so this row does not render either.
     pub(super) base_hidden: bool,
-    /// Some row above clips to this one.
     pub(super) is_base: bool,
 }
 
-// Two rows are clip neighbours only inside one sibling list: same parent and
-// same tree depth. Rows at a different depth belong to a folder in between.
 fn same_sibling_list(a: &VisibleRow, b: &VisibleRow) -> bool {
     a.depth == b.depth && a.parent_id == b.parent_id
 }
@@ -716,14 +558,10 @@ fn row_clipped(row: &VisibleRow) -> bool {
 pub(super) fn clip_info(rows: &[VisibleRow], i: usize) -> ClipInfo {
     let row = &rows[i];
     if !matches!(row.kind, RowKind::Layer { .. }) {
-        // Folders neither clip nor serve as a base: there is no single slot
-        // whose alpha could be the mask.
         return ClipInfo::default();
     }
     let clipped = row_clipped(row);
 
-    // The row directly above is what clips onto this one: its downward scan
-    // for a base stops at the first unclipped row, which is this one.
     let clipped_above = i
         .checked_sub(1)
         .is_some_and(|a| same_sibling_list(row, &rows[a]) && row_clipped(&rows[a]));
@@ -738,7 +576,6 @@ pub(super) fn clip_info(rows: &[VisibleRow], i: usize) -> ClipInfo {
         .get(i + 1)
         .is_some_and(|b| same_sibling_list(row, b) && row_clipped(b));
 
-    // Resolve the base by scanning down for the first unclipped sibling.
     let mut has_base = false;
     let mut base_hidden = false;
     for below in rows.iter().skip(i + 1) {
@@ -765,7 +602,6 @@ pub(super) fn clip_info(rows: &[VisibleRow], i: usize) -> ClipInfo {
     }
 }
 
-// Reconciles the tree with the canvas: drops gone layers, prepends new ones at root.
 fn reconcile_tree(tree: &mut Vec<LayerNode>, snapshot: &[oxiedraw_core::document::Layer]) {
     let tree_ids = collect_leaf_ids(tree);
     let snap_ids: HashSet<&str> = snapshot.iter().map(|l| l.id.as_str()).collect();
@@ -817,7 +653,6 @@ fn take_node(nodes: &mut Vec<LayerNode>, id: &str) -> Option<LayerNode> {
     None
 }
 
-// `idx_in_parent == usize::MAX` means "append".
 fn insert_after(
     tree: &mut Vec<LayerNode>,
     node: LayerNode,
@@ -884,12 +719,8 @@ pub(super) fn leaf_ids_top_first(nodes: &[LayerNode]) -> Vec<String> {
     ids
 }
 
-/// Sort flat `LayerNode::Layer` entries in the tree (including inside groups)
-/// so their order matches the canvas snapshot. Canvas index 0 = bottom layer =
-/// tree position last; canvas top = tree position 0. Group structure is preserved.
 pub(super) fn sync_tree_order_from_canvas(tree: &mut [LayerNode], canvas: &Canvas) {
     let snap = canvas.layers().snapshot();
-    // top-first order: canvas top (highest index) first
     let ordered: Vec<&str> = snap.iter().rev().map(|l| l.id.as_str()).collect();
     sort_nodes_by_canvas_order(tree, &ordered);
 }
@@ -923,10 +754,6 @@ fn first_leaf_id(nodes: &[LayerNode]) -> Option<&str> {
     None
 }
 
-/// Record a drag-drop into history: the canvas z-order change `before` ->
-/// `after` plus, if the move also restructured folders (dragged a node in/out
-/// of a group), the folder-tree change. Both are captured so one undo reverses
-/// the whole drop. No-op when nothing changed.
 fn record_reorder(
     history: &Rc<RefCell<HistoryStack>>,
     before: &[String],
@@ -957,8 +784,6 @@ fn record_reorder(
     }
 }
 
-/// The panel tree on one line, top row first: `Sky, Ink[Lines, Fills], Paper`.
-/// Layer ids are swapped for names so the line reads like the panel looks.
 fn format_tree_inline(nodes: &[LayerNode], names: &HashMap<&str, &str>) -> String {
     nodes
         .iter()
@@ -974,10 +799,6 @@ fn format_tree_inline(nodes: &[LayerNode], names: &HashMap<&str, &str>) -> Strin
         .join(", ")
 }
 
-/// One line per drag-drop. A group carries all its leaves, and dropping a layer
-/// past a folder can shuffle several others, so the three cases are reported
-/// apart: a plain single-layer move, a multi-layer shuffle, and a group move.
-/// The resulting tree rides along so the whole outcome is one grep away.
 fn log_layer_move(
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
@@ -1019,9 +840,6 @@ fn log_layer_move(
     }
 }
 
-/// Compute a sequence of `(from, to)` single-layer moves that transform the
-/// `before` id order into `after`. Each move is independently invertible, so a
-/// `Batch` of the resulting `LayerReorder`s round-trips cleanly through undo.
 pub(super) fn reorder_steps(before: &[String], after: &[String]) -> Vec<(usize, usize)> {
     let mut cur = before.to_vec();
     let mut steps = Vec::new();
@@ -1038,10 +856,6 @@ pub(super) fn reorder_steps(before: &[String], after: &[String]) -> Vec<(usize, 
     steps
 }
 
-// Drives the canvas's flat layer order from the tree. Tree top = canvas top.
-// Tree leaves the canvas doesn't have, and ids repeated in the tree, are dropped
-// first: the target positions are canvas indices, so a tree holding more leaves
-// than the canvas has layers would walk off the end of the stack.
 pub(super) fn sync_canvas_order(tree: &[LayerNode], canvas: &mut Canvas) {
     let mut current: Vec<String> =
         canvas.layers().snapshot().iter().map(|l| l.id.clone()).collect();
@@ -1065,8 +879,6 @@ pub(super) fn sync_canvas_order(tree: &[LayerNode], canvas: &mut Canvas) {
     }
 }
 
-// Convert the panel tree (top-first) into the core folder tree (canvas order,
-// bottom-first) and push it to the canvas so adjustments scope to their folder.
 fn node_to_core(node: &LayerNode) -> LayerTreeNode {
     match node {
         LayerNode::Layer(id) => LayerTreeNode::layer(id.clone()),
@@ -1083,9 +895,6 @@ pub(super) fn tree_to_core(nodes: &[LayerNode]) -> Vec<LayerTreeNode> {
     nodes.iter().rev().map(node_to_core).collect()
 }
 
-/// Record a folder-structure change (group create / ungroup / rename) for undo.
-/// `before`/`after` are core folder trees. No-op when unchanged. Wrapped in a
-/// labelled `Batch` so the undo toast reads sensibly.
 pub(super) fn record_tree_edit(
     history: &Rc<RefCell<HistoryStack>>,
     before: Vec<LayerTreeNode>,
@@ -1101,10 +910,6 @@ pub(super) fn record_tree_edit(
     });
 }
 
-// `masked_leaves` (which leaves a group's eye hid, for the toggle-on restore)
-// isn't carried by the core folder tree, so collect it by id before re-adopting
-// the core tree and overlay it back, keeping the restore set across refreshes.
-// The eye's on/off state itself is derived from leaves (see below), not carried.
 fn collect_group_masks(nodes: &[LayerNode], out: &mut std::collections::HashMap<String, HashSet<String>>) {
     for n in nodes {
         if let LayerNode::Group(g) = n {
@@ -1125,9 +930,6 @@ fn overlay_group_masks(nodes: &mut [LayerNode], masks: &std::collections::HashMa
     }
 }
 
-// A group's eye reflects its leaves: on if any (recursive) leaf is visible.
-// Derived rather than stored through history, so it stays correct after an undo
-// that flips leaf visibility. Returns whether `nodes` holds any visible leaf.
 fn derive_group_visibility(nodes: &mut [LayerNode], visible: &HashSet<String>) -> bool {
     let mut any = false;
     for n in nodes.iter_mut() {
@@ -1164,20 +966,12 @@ fn node_from_core(node: &LayerTreeNode) -> LayerNode {
     }
 }
 
-// Rebuild the panel tree (top-first) from the core folder tree (bottom-first),
-// used when a saved document is loaded.
 pub(super) fn tree_from_core(nodes: &[LayerTreeNode]) -> Vec<LayerNode> {
-    // node_from_core seeds GROUP_COUNTER past every loaded id, so replacements
-    // minted in the dedup pass below can't collide with a surviving group.
     let mut tree: Vec<LayerNode> = nodes.iter().rev().map(node_from_core).collect();
     dedup_group_ids(&mut tree, &mut HashSet::new());
     tree
 }
 
-// Heal duplicate group ids from pre-fix corruption: two groups sharing an id
-// phantom-link (expanding or selecting one drives the other). The first keeps
-// its id; later duplicates get a fresh one. Persisted once the panel commits
-// its tree back to the canvas.
 fn dedup_group_ids(nodes: &mut [LayerNode], seen: &mut HashSet<String>) {
     for node in nodes {
         if let LayerNode::Group(g) = node {
@@ -1190,44 +984,27 @@ fn dedup_group_ids(nodes: &mut [LayerNode], seen: &mut HashSet<String>) {
     }
 }
 
-// Push the current panel folder structure to the canvas (recomposites so
-// folder-scoped adjustments update). Call after any folder-structure change.
 pub(super) fn commit_groups(tree: &[LayerNode], canvas: &mut Canvas) {
     if let Err(e) = canvas.set_layer_tree(tree_to_core(tree)) {
         tracing::error!(error = %e, "failed to push folder tree to canvas");
     }
 }
 
-// Like `commit_groups` but for metadata-only changes (rename / expand) that
-// don't change the composite: stores the tree for persistence without a
-// recomposite.
 pub(super) fn commit_groups_quiet(tree: &[LayerNode], canvas: &mut Canvas) {
     canvas.set_layer_tree_quiet(tree_to_core(tree));
 }
 
-// --- New-layer placement ---------------------------------------------------
-
-/// Which kind of layer the add buttons create. Both land relative to the
-/// current selection; only the core call and default name differ.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum NewLayerKind {
     Raster,
     Adjustment,
 }
 
-/// Where a freshly added layer should slot into the tree, captured from the
-/// selection before the add (creating a layer moves the active selection onto
-/// the new layer, so the old selection has to be read first).
 enum InsertAnchor {
-    // Nothing selected: the new layer goes on top of everything (tree root).
     Top,
-    // Directly above the selected node, at its level. `parent_id` is the
-    // enclosing group (None = tree root), `idx` the node's slot in that parent.
     Above { parent_id: Option<String>, idx: usize },
 }
 
-// Read the current primary selection (a group takes precedence over a layer,
-// mirroring their mutual exclusivity) into an anchor for the next add.
 fn capture_insert_anchor(ui: &Ui) -> InsertAnchor {
     let tree = ui.tree.borrow();
     if let Some(gid) = ui.active_group.borrow().as_ref()
@@ -1245,8 +1022,6 @@ fn capture_insert_anchor(ui: &Ui) -> InsertAnchor {
     InsertAnchor::Top
 }
 
-// Slot `node` into the tree at `anchor`. Inserting at the anchor's own index
-// puts the new node just above it (index 0 is the topmost row).
 fn insert_node_at_anchor(tree: &mut Vec<LayerNode>, node: LayerNode, anchor: &InsertAnchor) {
     match anchor {
         InsertAnchor::Top => tree.insert(0, node),
@@ -1260,7 +1035,6 @@ fn insert_node_at_anchor(tree: &mut Vec<LayerNode>, node: LayerNode, anchor: &In
     }
 }
 
-// Build the undo record for the layer at `idx` (already created on the canvas).
 fn capture_layer_add(canvas: &Rc<RefCell<Canvas>>, idx: usize) -> Option<HistoryAction> {
     let mut c = canvas.borrow_mut();
     let layer = c.layers().snapshot().get(idx)?.clone();
@@ -1278,11 +1052,6 @@ fn capture_layer_add(canvas: &Rc<RefCell<Canvas>>, idx: usize) -> Option<History
     })
 }
 
-/// Create a layer and drop it just above the current selection instead of on
-/// top of the whole stack. Respects groups: a selected layer inside a folder
-/// spawns inside that folder above it; a selected folder spawns above the whole
-/// folder. Records the add for undo and leaves the new layer selected. Returns
-/// its final index. View refresh (redraw / height) is the caller's job.
 pub(super) fn create_layer_at_selection(
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
@@ -1318,8 +1087,6 @@ pub(super) fn create_layer_at_selection(
     );
     *ui.active_group.borrow_mut() = None;
 
-    // Push the new order to the canvas so z-order matches the tree, then mirror
-    // the folder structure (folder-scoped adjustments recomposite off it).
     sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
 
@@ -1346,7 +1113,6 @@ pub(super) fn create_layer_at_selection(
     Ok(final_idx)
 }
 
-// Wraps the listed nodes in a new group at the topmost position any of them held.
 pub(super) fn group_nodes(
     tree: &mut Vec<LayerNode>,
     ids: &[String],
@@ -1481,10 +1247,6 @@ fn find_group_position_inner(
     None
 }
 
-// Used by "duplicate group": each leaf is remapped through `id_map`, each group
-// gets a fresh id so the copy and the original are independent. Leaves missing
-// from `id_map` (their canvas copy failed - layer limit, mostly) are dropped;
-// keeping the source id would put one layer in two places in the tree.
 pub(super) fn mirror_tree(
     nodes: &[LayerNode],
     id_map: &std::collections::HashMap<String, String>,
@@ -1537,9 +1299,6 @@ pub(super) fn group_leaf_ids(nodes: &[LayerNode], group_id: &str) -> Vec<String>
     Vec::new()
 }
 
-// --- Public build entry point ---
-/// Returns the panel widget and a callback that rebuilds the layer list from
-/// current canvas state (for use after undo/redo).
 pub(crate) fn build(
     layers: &LayerState,
     canvas: &Rc<RefCell<Canvas>>,
@@ -1555,9 +1314,6 @@ pub(crate) fn build(
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
-    // Filled by the session with the canvas info bar's chip setter. Called
-    // whenever the selection or its lock state changes, which is the same
-    // moment the blend strip re-syncs.
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Box,
@@ -1613,7 +1369,7 @@ pub(crate) fn build(
             prepare_reorder,
             alpha_lock_observer,
         );
-    let (components_page, refresh_components, component_begin_rename) = super::components::build(
+    let (components_page, refresh_components, component_begin_rename) = components::build(
         Rc::clone(components),
         Rc::clone(on_edit_component),
         Rc::clone(history),
@@ -1621,7 +1377,6 @@ pub(crate) fn build(
     stack.add_named(&layers_page, Some("layers"));
     stack.add_named(&components_page, Some("components"));
 
-    // Window-level F2 routes to whichever tab is showing.
     let begin_rename: Rc<dyn Fn()> = {
         let stack = stack.clone();
         Rc::new(move || {
@@ -1640,9 +1395,6 @@ pub(crate) fn build(
     content.append(&stack);
     panel.append(&content);
 
-    // Component-edit gating: while a component is open, replace the
-    // Layers/Components toggle with an "Editing component: X [Done]" banner in
-    // the same spot, force the Layers page, and disable nesting.
     let set_editing: Rc<dyn Fn(Option<String>)> = {
         let tabs = tabs.clone();
         let stack = stack.clone();
@@ -1674,9 +1426,6 @@ pub(crate) fn build(
     )
 }
 
-/// Build the component edit-mode banner (hidden by default), shown in place of
-/// the Layers/Components toggle while a component is open. The "Done" button
-/// invokes the late-bound exit closure in `component_exit`.
 fn build_edit_banner(
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
 ) -> (gtk::Box, gtk::Label) {
@@ -1776,8 +1525,6 @@ fn build_layers_page(
         .build();
 
     let ui = Ui::new((*layers).clone());
-    // A loaded document carries its folder tree on the canvas; seed the panel
-    // from it so saved folders reappear. Reconciled below against the snapshot.
     {
         let core_tree = canvas.borrow().layer_tree().to_vec();
         if !core_tree.is_empty() {
@@ -1802,10 +1549,6 @@ fn build_layers_page(
     );
     actions::install_context_menu(&area, &ui, layer_clipboard);
 
-    // Layer gio actions (copy/cut/paste/duplicate/...) are app-global by name.
-    // With multiple documents each panel would clobber the previous one's, so
-    // wrap installation in a closure the active tab re-runs to re-point the
-    // shared action names at this document.
     let reinstall_actions: Rc<dyn Fn()> = {
         let area = area.clone();
         let ui = ui.clone();
@@ -1845,10 +1588,8 @@ fn build_layers_page(
         &lock_btn,
     ));
 
-    // List body: the drawing area plus our own vertical scrollbar. We manage the
-    // scroll offset ourselves (via `ui.vadj`) instead of a GtkScrolledWindow so
-    // that autoscroll during a reorder only redraws - it never re-allocates the
-    // drawing area, which would cancel an in-progress stylus grab.
+    // Scroll by draw offset, not a ScrolledWindow: re-allocating the area during
+    // autoscroll cancels an in-progress stylus reorder (as does connect_cancel).
     let list_row = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     list_row.set_vexpand(true);
     list_row.set_hexpand(true);
@@ -1859,13 +1600,10 @@ fn build_layers_page(
     page.append(&list_row);
     page.append(&build_layers_footer());
 
-    // Redraw on any scroll (wheel, scrollbar drag, autoscroll).
     {
         let area = area.clone();
         ui.vadj.connect_value_changed(move |_| area.queue_draw());
     }
-    // Auto-hide the scrollbar when everything fits, mirroring the old
-    // ScrolledWindow's Automatic policy.
     {
         let scrollbar = scrollbar.clone();
         let update = move |adj: &gtk::Adjustment| {
@@ -1874,9 +1612,6 @@ fn build_layers_page(
         update(&ui.vadj);
         ui.vadj.connect_changed(move |adj| update(adj));
     }
-    // Viewport height changed: refresh the page size (and thus the scrollbar
-    // thumb / auto-hide). Done here, outside the draw callback, so toggling the
-    // scrollbar's visibility happens in a safe context.
     {
         let ui = ui.clone();
         let area_w = area.clone();
@@ -1885,7 +1620,6 @@ fn build_layers_page(
             area_w.queue_draw();
         });
     }
-    // Mouse-wheel / touchpad scrolling over the list.
     {
         let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);
         let ui = ui.clone();
@@ -1898,20 +1632,12 @@ fn build_layers_page(
         area.add_controller(wheel);
     }
 
-    // Rebuild tree from canvas state, update height, and redraw. Called after
-    // undo/redo so the panel stays in sync with mutations applied to the canvas.
     let refresh = {
         let ui = ui.clone();
         let area = area.clone();
         let canvas = Rc::clone(canvas);
         Rc::new(move || {
             let c = canvas.borrow();
-            // Re-adopt the folder structure from the canvas, which is the source
-            // of truth for undo/redo (a group create/edit/delete is applied
-            // there). Carry over UI-only group state (eye toggle, masked leaves)
-            // by id so a refresh unrelated to grouping doesn't reset it. Guarded
-            // on a non-empty canvas tree: a never-grouped document keeps its
-            // empty tree, and the build-time flat seed stands.
             {
                 let mut tree = ui.tree.borrow_mut();
                 if !c.layer_tree().is_empty() {
@@ -1925,8 +1651,6 @@ fn build_layers_page(
             let snap = c.layers().snapshot();
             reconcile_tree(&mut ui.tree.borrow_mut(), &snap);
             sync_tree_order_from_canvas(&mut ui.tree.borrow_mut(), &c);
-            // Re-derive each group's eye from its leaves so it reflects any
-            // visibility change an undo/redo just applied.
             let visible_ids: HashSet<String> =
                 snap.iter().filter(|l| l.visible).map(|l| l.id.clone()).collect();
             derive_group_visibility(&mut ui.tree.borrow_mut(), &visible_ids);
@@ -1938,14 +1662,11 @@ fn build_layers_page(
         }) as Rc<dyn Fn()>
     };
 
-    // Provider used by app-level actions (e.g. filters) that need the set of
-    // layers the user currently has selected, including the active one.
     let selected_ids = {
         let ui = ui.clone();
         Rc::new(move || ui.selected_layer_ids_in_order()) as Rc<dyn Fn() -> Vec<String>>
     };
 
-    // Triggered by the window-level F2 shortcut: rename the active layer/group.
     let begin_rename = {
         let area = area.clone();
         let ui = ui.clone();
@@ -1954,9 +1675,6 @@ fn build_layers_page(
         Rc::new(move || begin_rename_active(&area, &ui, &canvas, &history)) as Rc<dyn Fn()>
     };
 
-    // Adjustment layers are created from an app-global action outside the panel;
-    // this lets it slot the new layer next to the selection (like the + button)
-    // and returns the layer's index so the caller can open its editor.
     let create_adjustment = {
         let ui = ui.clone();
         let canvas = Rc::clone(canvas);
@@ -1979,7 +1697,6 @@ fn build_layers_page(
     (page, refresh, selected_ids, reinstall_actions, begin_rename, create_adjustment)
 }
 
-// Returns `"Label (Ctrl+G)"`, or just `label` when the action has no binding.
 fn tooltip_with_accel(label: &str, action_id: &str) -> String {
     let settings = AppSettings::load();
     match accel_parts_for(action_id, &settings) {
@@ -1988,8 +1705,6 @@ fn tooltip_with_accel(label: &str, action_id: &str) -> String {
     }
 }
 
-/// The strip above the list: create buttons left, alpha lock right. The toggle
-/// comes back with the bar because the blend controls drive its state.
 fn build_layers_header(
     ui: &Ui,
     area: &gtk::DrawingArea,
@@ -2056,8 +1771,6 @@ fn build_layers_header(
         .build();
     header.append(&spacer);
 
-    // Fixed 34x34 so the strip never reflows, and rounded rather than circular
-    // so the part-locked bar under the glyph has an edge to sit on.
     let lock_btn = gtk::ToggleButton::builder()
         .icon_name("oxiedraw-alpha-lock-symbolic")
         .tooltip_text("Lock alpha - paint only where this layer already has pixels")
@@ -2071,7 +1784,6 @@ fn build_layers_header(
     (header, lock_btn)
 }
 
-// Button sensitivity is driven from the action's enabled flag.
 fn build_layers_footer() -> gtk::Box {
     let footer = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2099,17 +1811,12 @@ fn build_layers_footer() -> gtk::Box {
     footer
 }
 
-/// Blend-mode dropdown + opacity slider, shown between the header and the layer
-/// list. Both span the panel width and apply to every selected layer; a control
-/// is only pushed onto its layers when the user actually touches it (a guard
-/// suppresses the programmatic updates the sync callback makes on selection).
 fn build_blend_controls(
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
     redraw: &RedrawHandle,
     history: &Rc<RefCell<HistoryStack>>,
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
-    // Built by the header; reloads off the selection like the other controls.
     lock_btn: &gtk::ToggleButton,
 ) -> gtk::Box {
     let controls = gtk::Box::builder()
@@ -2126,7 +1833,6 @@ fn build_blend_controls(
     opacity.set_hexpand(true);
     opacity.set_draw_value(false);
     opacity.set_tooltip_text(Some("Opacity of the selected layers"));
-    // Match the brush opacity slider so stylus drags actually move it.
     crate::widgets::slider::install_pen_drag(&opacity);
 
     let opacity_row = gtk::Box::builder()
@@ -2145,19 +1851,11 @@ fn build_blend_controls(
     controls.append(&mode_dropdown);
     controls.append(&opacity_row);
 
-    // True while the sync callback is writing the widgets, so their change
-    // handlers don't treat the programmatic update as a user edit.
     let guard = Rc::new(std::cell::Cell::new(false));
-    // Per-layer (id, blend, opacity) captured at the start of a slider drag, so
-    // the whole drag commits as one undoable history entry on settle. Keyed by
-    // id so a reorder during the debounce window can't mis-attribute it.
     let drag_origin: Rc<RefCell<Option<Vec<(String, BlendMode, f32)>>>> =
         Rc::new(RefCell::new(None));
     let commit_source: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
 
-    // Record the in-progress opacity drag as one history entry, comparing each
-    // origin layer (by id) against its current opacity. Safe when no drag is
-    // active. Does not touch the debounce timer; callers manage that slot.
     let commit_opacity: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let history = Rc::clone(history);
@@ -2187,7 +1885,6 @@ fn build_blend_controls(
         })
     };
 
-    // --- sync: reload the controls from the current selection ---
     let sync: Rc<dyn Fn()> = {
         let ui = ui.clone();
         let guard = Rc::clone(&guard);
@@ -2199,8 +1896,6 @@ fn build_blend_controls(
         let commit_opacity = Rc::clone(&commit_opacity);
         let commit_source = Rc::clone(&commit_source);
         Rc::new(move || {
-            // A selection change ends any in-progress opacity drag: flush its
-            // pending history entry now so the next drag starts clean.
             if let Some(src) = commit_source.borrow_mut().take() {
                 src.remove();
             }
@@ -2209,16 +1904,11 @@ fn build_blend_controls(
             let sensitive = !indices.is_empty();
             mode_dropdown.set_sensitive(sensitive);
             opacity.set_sensitive(sensitive);
-            // Show the primary (active) layer's values, falling back to the
-            // first selected one.
             let primary = ui.state.active().filter(|i| indices.contains(i))
                 .or_else(|| indices.first().copied());
             let (blend, op) = primary
                 .and_then(|i| ui.state.blend(i))
                 .unwrap_or((BlendMode::Normal, 1.0));
-            // Alpha lock: on when the whole selection is locked, mixed when
-            // only part of it is, insensitive when nothing in the selection can
-            // carry the flag (an adjustment slot holds an opaque mask).
             let snapshot = ui.state.snapshot();
             let lockable: Vec<_> = indices
                 .iter()
@@ -2243,8 +1933,6 @@ fn build_blend_controls(
             lock_btn.set_active(all_locked);
             guard.set(false);
 
-            // The canvas chip tracks the active layer alone: it answers "can I
-            // paint here right now", not "what is selected".
             let active_locked = ui
                 .state
                 .active()
@@ -2256,9 +1944,6 @@ fn build_blend_controls(
             }
         })
     };
-    // Routed through the action rather than an action_name binding, so the
-    // toggle's own state stays driven by `sync` and a click cannot both flip
-    // the button and run the action twice.
     {
         let guard = Rc::clone(&guard);
         lock_btn.connect_toggled(move |_| {
@@ -2276,7 +1961,6 @@ fn build_blend_controls(
     sync();
     *ui.blend_sync.borrow_mut() = Some(Rc::clone(&sync));
 
-    // --- blend mode changed: applies to every selected layer at once ---
     {
         let ui = ui.clone();
         let canvas = Rc::clone(canvas);
@@ -2325,7 +2009,6 @@ fn build_blend_controls(
         });
     }
 
-    // --- opacity changed: live apply each event, one history entry per drag ---
     {
         let ui = ui.clone();
         let canvas = Rc::clone(canvas);
@@ -2347,8 +2030,6 @@ fn build_blend_controls(
             if indices.is_empty() {
                 return;
             }
-            // Capture the pre-drag state once, on the first event of a drag.
-            // Keyed by id so the commit survives a reorder mid-debounce.
             if drag_origin.borrow().is_none() {
                 let snapshot = ui.state.snapshot();
                 let origin: Vec<(String, BlendMode, f32)> = indices
@@ -2370,7 +2051,6 @@ fn build_blend_controls(
             }
             redraw.request();
 
-            // Debounce: commit one history entry once the drag settles.
             if let Some(src) = commit_source.borrow_mut().take() {
                 src.remove();
             }
@@ -2390,8 +2070,6 @@ fn build_blend_controls(
     controls
 }
 
-/// Record one or more `LayerBlend` actions as a single undoable unit (a bare
-/// action for one layer, a `Batch` for several). No-op when empty.
 fn record_blend_actions(history: &Rc<RefCell<HistoryStack>>, mut actions: Vec<HistoryAction>) {
     let action = match actions.len() {
         0 => return,
@@ -2404,18 +2082,11 @@ fn record_blend_actions(history: &Rc<RefCell<HistoryStack>>, mut actions: Vec<Hi
     history.borrow_mut().record(action);
 }
 
-// --- Height ---
 #[allow(clippy::cast_precision_loss)]
 const fn count_f64(n: usize) -> f64 {
     n as f64
 }
 
-/// Vertical placement of every visible row.
-///
-/// The pitch is not uniform: a container's padding has to come from somewhere,
-/// and the 4px inter-row gap is not enough, so opening or closing one adds
-/// `NEST_PAD` of space. Everything that positions or hit-tests a row goes
-/// through this, so drawing and input can never disagree about where a row is.
 pub(super) struct RowLayout {
     tops: Vec<f64>,
     total: f64,
@@ -2428,9 +2099,6 @@ impl RowLayout {
         for i in 0..rows.len() {
             if opens_box(rows, i) {
                 opening[i] += NEST_PAD;
-                // Several containers can end on the same row - a nested folder
-                // whose last child is also the outer folder's last child - and
-                // each one owes its own padding.
                 closing_pad[i + contained_rows(rows, i)] += NEST_PAD;
             }
         }
@@ -2453,21 +2121,16 @@ impl RowLayout {
     }
 
     pub(super) fn top(&self, index: usize) -> f64 {
-        // Past the end: used for "drop below everything" clamps.
         self.tops
             .get(index)
             .copied()
             .unwrap_or(self.total - LIST_PADDING)
     }
 
-    /// Bottom edge of the row's own box, excluding any container padding.
     fn bottom(&self, index: usize) -> f64 {
         self.top(index) + ITEM_HEIGHT
     }
 
-    /// The slot a dragged block whose top is at `top_y` should land in: the row
-    /// whose own top is nearest. A plain divide by the row pitch would drift
-    /// here, because container padding makes that pitch uneven.
     pub(super) fn slot_nearest(&self, top_y: f64) -> usize {
         let mut best = 0;
         let mut best_d = f64::MAX;
@@ -2485,7 +2148,6 @@ impl RowLayout {
         self.total
     }
 
-    /// The row containing `y`, or `None` in the space between rows.
     pub(super) fn at(&self, y: f64) -> Option<usize> {
         self.tops
             .iter()
@@ -2494,9 +2156,6 @@ impl RowLayout {
 
 }
 
-/// Keep the scroll adjustment in sync with the content and viewport size, then
-/// clamp the current offset. `viewport_h` of 0 (not yet allocated) leaves the
-/// page size alone - the draw callback sets it once a real height is known.
 fn update_list_metrics(ui: &Ui, viewport_h: f64) {
     let snapshot = ui.state.snapshot();
     let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
@@ -2522,13 +2181,10 @@ pub(super) fn sync_height(area: &gtk::DrawingArea, ui: &Ui) {
     area.queue_draw();
 }
 
-// --- Drawing ---
 fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
     let ui = ui.clone();
     area.set_draw_func(move |widget, ctx, width_px, _h| {
         let palette = Palette::resolve(widget);
-        // Keep the shared selection mirror fresh for tools (e.g. Transform);
-        // any selection change queues a redraw, so this always runs after it.
         ui.sync_selection_to_state();
         let snapshot = ui.state.snapshot();
         let drag = ui.drag.borrow().clone();
@@ -2539,31 +2195,20 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
         let thumbnails = ui.thumbnails.borrow();
         let width = f64::from(width_px);
 
-        // Paint the window colour ourselves rather than inheriting whatever the
-        // `.sidebar` style class supplies, so the list sits on the app's real
-        // background and the rows' card colour reads against it. Done before the
-        // scroll translate, so it covers the viewport rather than the content.
         set_source(ctx, palette.window_bg);
         ctx.paint().ok();
 
-        // Manual scroll: translate the whole list up by the scroll offset. The
-        // adjustment metrics are maintained by sync_height (content) and the
-        // area's resize handler (viewport), never from inside draw.
         ctx.translate(0.0, -ui.scroll_offset());
 
         let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
         let layout = RowLayout::new(&rows);
         let count = rows.len();
-        // No hover highlight mid-drag (rows are sliding around).
         let hover = if drag.is_none() { *ui.hover.borrow() } else { None };
 
-        // The block held above the list: owned by a live drag, then handed to
-        // the drop animation so nothing changes at the release.
         let float = drag
             .as_ref()
             .filter(|d| d.zone == HitZone::Handle && d.from_row < count)
             .map(|d| {
-                // Span covers a group header plus its expanded children.
                 let span = drag_span(&rows, d.from_row);
                 let max_top = if count > span {
                     layout.top(count - span)
@@ -2590,7 +2235,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 })
             });
 
-        // Y nudge from a row's natural slot, making room for the held block.
         let row_offset = |r: usize| -> f64 {
             if let Some(d) = drag.as_ref().filter(|d| d.zone == HitZone::Handle) {
                 return d.row_y_anim.get(r).copied().unwrap_or(0.0);
@@ -2601,10 +2245,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 .map_or(0.0, |s| s.row_y.get(r).copied().unwrap_or(0.0) * s.remaining())
         };
 
-        // Nesting surfaces go down first so every row sits on top of its own
-        // container. Containers wholly inside the floating block are skipped
-        // here and drawn with it instead, so the block keeps its appearance
-        // while it moves.
         for (row_idx, _) in rows.iter().enumerate() {
             if !opens_box(&rows, row_idx) {
                 continue;
@@ -2616,8 +2256,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 continue;
             }
             let level = tree_depth(&rows[row_idx]);
-            // Follow the reorder animation: the first and last rows carry the
-            // container's edges with them.
             draw_nest_box(
                 ctx,
                 count_f64(level),
@@ -2665,16 +2303,11 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
             let (from, span) = (f.from, f.span);
             let anim = f.depth_offset;
 
-            // Laid out on its own so its internal container padding survives
-            // the trip, then shifted to where the block is currently drawn.
             let block: Vec<VisibleRow> = rows[from..(from + span).min(count)].to_vec();
             let block_layout = RowLayout::new(&block);
             let shift = f.top - block_layout.top(0);
-            // Nesting within the block is measured from its own root level.
             let block_base = tree_depth(&block[0]);
 
-            // The shadow traces what is actually held: a folder's container
-            // outline, or a lone layer's own row.
             {
                 let level = (count_f64(tree_depth(&block[0])) + anim).max(0.0);
                 let (sx, sy, sw, sh, radius) = if opens_box(&block, 0) {
@@ -2691,8 +2324,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 draw_drop_shadow(ctx, sx, sy, sw, sh, radius, f.lift);
             }
 
-            // Containers inside the block, so a dragged folder keeps its
-            // surface instead of its rows going transparent over the page.
             for (j, _) in block.iter().enumerate() {
                 if !opens_box(&block, j) {
                     continue;
@@ -2725,10 +2356,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                     RowKind::Layer { id, .. } => active_id.as_deref() == Some(id.as_str()),
                     RowKind::Group { id, .. } => active_group.as_deref() == Some(id.as_str()),
                 };
-                // Whether the row paints its own fill is decided within the
-                // block: a lone dragged layer has no container travelling with
-                // it however nested it was, so it carries a card and gives it
-                // back as it lands.
                 let nest = box_depth(&rows, row_idx);
                 let depth_f = (count_f64(nest) + anim).max(0.0);
                 let lifted_bg = if box_depth(&block, i) == block_base { 1.0 } else { 0.0 };
@@ -2738,8 +2365,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
                 let is_text = row_is_text(&ui, row);
                 let is_adjustment = row_is_adjustment(&ui, row);
                 let mask_active = is_adjustment && row_mask_active(&ui, row);
-                // No neighbours to connect to: keep the clip badge, drop the
-                // rod and terminus.
                 let mut clip = clip_info(&rows, row_idx);
                 clip.clipped_above = false;
                 clip.clipped_below = false;
@@ -2750,7 +2375,6 @@ fn install_list_draw(area: &gtk::DrawingArea, ui: &Ui) {
     });
 }
 
-// 1 for a layer or collapsed group; expanded group covers header plus children.
 fn drag_span(rows: &[VisibleRow], from_row: usize) -> usize {
     let Some(first) = rows.get(from_row) else { return 0 };
     let group_depth = match &first.kind {
@@ -2768,13 +2392,6 @@ fn drag_span(rows: &[VisibleRow], from_row: usize) -> usize {
     span
 }
 
-/// The row list as it will be once a drag of `span` rows from `from` lands at
-/// `to`, `depth_delta` levels deeper or shallower than it started.
-///
-/// Built with the same [`displaced_row`] mapping the animation uses, so the two
-/// can never disagree about where a row ends up. The depth shift matters as
-/// much as the order: a drop that reparents changes which rows a folder
-/// contains, and therefore where every container's padding falls.
 fn reordered_rows(
     rows: &[VisibleRow],
     from: usize,
@@ -2792,8 +2409,6 @@ fn reordered_rows(
         };
         let mut row = row.clone();
         if dragged {
-            // The whole block shifts by the same delta, so rows inside a
-            // dragged folder keep their depth relative to its header.
             row.depth = usize::try_from(
                 isize::try_from(row.depth).unwrap_or(0).saturating_add(depth_delta),
             )
@@ -2803,8 +2418,6 @@ fn reordered_rows(
             *slot = Some(row);
         }
     }
-    // Any slot the mapping did not cover keeps its original row, so the layout
-    // is always over a complete list.
     placed
         .into_iter()
         .enumerate()
@@ -2812,7 +2425,6 @@ fn reordered_rows(
         .collect()
 }
 
-// Where a non-dragged row should sit while a span of rows is being moved.
 fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     match from.cmp(&to) {
         std::cmp::Ordering::Less => {
@@ -2825,16 +2437,12 @@ fn displaced_row(row: usize, from: usize, span: usize, to: usize) -> usize {
     }
 }
 
-/// Where the list was drawn when the pointer came up. Keyed by row id so it
-/// survives the reorder that follows.
 struct ReleaseVisual {
     row_tops: HashMap<String, f64>,
     block_top: f64,
     block_depth: f64,
 }
 
-/// Mirrors what the draw function put on screen for the drag's last frame, so
-/// the settle starts where the user last saw things.
 fn release_visual(rows: &[VisibleRow], drag: &Drag, span: usize) -> ReleaseVisual {
     let layout = RowLayout::new(rows);
     let count = rows.len();
@@ -2859,10 +2467,6 @@ fn release_visual(rows: &[VisibleRow], drag: &Drag, span: usize) -> ReleaseVisua
     }
 }
 
-/// The gap between the release and the committed drop, as offsets to unwind.
-/// `rows` is the final list, so this runs after the reorder. Rows the drag
-/// never touched get one too - their make-room easing was interrupted. `None`
-/// when nothing moved far enough to animate.
 fn settle_from_release(
     rows: &[VisibleRow],
     before: &ReleaseVisual,
@@ -2877,7 +2481,7 @@ fn settle_from_release(
         .enumerate()
         .map(|(r, row)| {
             if r >= from_row && r < from_row + span {
-                return 0.0; // the block travels as a unit, via `offset_y`
+                return 0.0;
             }
             before
                 .row_tops
@@ -2908,7 +2512,6 @@ fn settle_from_release(
     })
 }
 
-/// Run [`settle_from_release`] as an animation.
 fn start_drop_settle(
     ui: &Ui,
     area: &gtk::DrawingArea,
@@ -2926,8 +2529,6 @@ fn start_drop_settle(
     };
     *ui.drop_settle.borrow_mut() = Some(settle);
 
-    // One callback drives however many drops happen: a second drop while the
-    // first is landing replaces the state under it.
     if ui.settle_ticking.replace(true) {
         return;
     }
@@ -2960,21 +2561,13 @@ fn start_drop_settle(
     });
 }
 
-/// Three tones carry the list's structure: the panel sits on `window_bg`, rows
-/// are `card` on top of it, and a container's fill sits between the two so a
-/// group reads as a surface holding cards rather than another card.
 #[derive(Clone, Copy)]
 struct Palette {
-    /// The panel's own background - the app's real window colour.
     window_bg: Rgb,
-    /// A row's fill. libadwaita's card colour, which is what a raised surface
-    /// over the window background is supposed to be.
     row_bg: Rgb,
     accent_bg: Rgb,
     accent_fg: Rgb,
     fg: Rgb,
-    /// Alpha lock's warning yellow, and what goes on top of it. Both fixed
-    /// rather than following the row, which would tint them on the active one.
     lock_accent: Rgb,
     lock_glyph: Rgb,
 }
@@ -2983,9 +2576,6 @@ impl Palette {
     fn resolve(widget: &gtk::DrawingArea) -> Self {
         let fg = lookup(widget, "view_fg_color").unwrap_or(FALLBACK_FG);
         let window_bg = lookup(widget, "window_bg_color").unwrap_or(FALLBACK_WINDOW_BG);
-        // `card_bg_color` is translucent white in libadwaita's dark themes, so
-        // it has to be composited over the window colour rather than used raw -
-        // taking its RGB alone would paint every row near-white.
         let row_bg = lookup_rgba(widget, "card_bg_color")
             .map_or(FALLBACK_ROW_BG, |c| over(c, window_bg));
         Self {
@@ -2999,11 +2589,6 @@ impl Palette {
         }
     }
 
-    /// Fill for a surface at nesting `level`. Level 0 - a root row, or a
-    /// top-level container - is the plain card colour sitting on the window.
-    /// Deeper containers lean slightly toward the foreground so a container
-    /// inside a container still separates from its parent, which in a dark
-    /// theme lifts it and in a light one shades it.
     fn surface(&self, level: usize) -> Rgb {
         if level == 0 {
             return self.row_bg;
@@ -3012,9 +2597,6 @@ impl Palette {
         lerp_rgb(self.row_bg, self.fg, t)
     }
 
-    /// What is already painted behind a row at level `nest` - the enclosing
-    /// container's fill, or the panel at the root. Lets a landing row fade its
-    /// card out rather than dropping it in one frame.
     fn backdrop(&self, nest: usize) -> Rgb {
         nest.checked_sub(1)
             .map_or(self.window_bg, |level| self.surface(level))
@@ -3036,7 +2618,6 @@ fn lookup_rgba(widget: &gtk::DrawingArea, name: &str) -> Option<(f64, f64, f64, 
     ))
 }
 
-/// Composite a straight-alpha colour over an opaque one.
 fn over((r, g, b, a): (f64, f64, f64, f64), bg: Rgb) -> Rgb {
     (
         a.mul_add(r - bg.0, bg.0),
@@ -3045,8 +2626,6 @@ fn over((r, g, b, a): (f64, f64, f64, f64), bg: Rgb) -> Rgb {
     )
 }
 
-/// Whether a visible row maps to a component-instance layer (for the accent
-/// swatch outline).
 fn row_is_component(ui: &Ui, row: &VisibleRow) -> bool {
     match &row.kind {
         RowKind::Layer { flat_idx, .. } => ui
@@ -3077,7 +2656,6 @@ pub(super) fn row_is_adjustment(ui: &Ui, row: &VisibleRow) -> bool {
     }
 }
 
-// Whether this row's adjustment mask is currently toggled into canvas view.
 fn row_mask_active(ui: &Ui, row: &VisibleRow) -> bool {
     match &row.kind {
         RowKind::Layer { id, .. } => ui.mask_view.borrow().as_deref() == Some(id.as_str()),
@@ -3085,8 +2663,6 @@ fn row_mask_active(ui: &Ui, row: &VisibleRow) -> bool {
     }
 }
 
-// Row state is a flat set of independent flags; bundling them into a struct
-// would only move the same booleans behind another name.
 #[allow(clippy::fn_params_excessive_bools)]
 fn draw_row(
     ctx: &cairo::Context,
@@ -3104,18 +2680,11 @@ fn draw_row(
     mask_active: bool,
     hover_zone: Option<HitZone>,
     clip: ClipInfo,
-    // Nesting level the row sits at, which picks the surface it is drawn over.
     nest: usize,
-    // How much of its own card the row paints. All or nothing except while a
-    // dragged row, which has no container travelling with it, fades its own
-    // card back out as it lands.
     own_bg: f64,
 ) {
-    // `depth_f` is the animated nesting level during a drag; it tracks `nest`
-    // except while a dragged row is easing between levels.
     let left = LIST_PADDING + depth_f * NEST_INSET;
     let right = nest_right(width);
-    // A clipped row spends one gutter column on its rod, inside the box.
     let indent = if clip.clipped { INDENT_STEP } else { 0.0 };
     let row_w = (right - left).max(0.0);
 
@@ -3124,18 +2693,9 @@ fn draw_row(
     };
     let alpha_locked = matches!(row.kind, RowKind::Layer { alpha_locked: true, .. });
 
-    // Dimmed either by its own eye, or because the thing it depends on is gone:
-    // a hidden base, or no base at all. The eye itself keeps full alpha in the
-    // latter cases, so "hidden by me" stays distinguishable from "hidden by
-    // something upstream" before the user clicks it.
     let eye_dim = !visible;
     let dim = eye_dim || clip.base_hidden || (clip.clipped && !clip.has_base);
 
-    // A row inside a container already sits on that container's surface, so it
-    // paints no fill of its own - stacking a second card on the first only
-    // muddies the nesting. Selection still paints, since that is the row
-    // standing out from its surroundings rather than describing structure. A
-    // partial card mixes against the backdrop, so zero paints nothing.
     let surface = palette.surface(nest);
     let bg = if is_active {
         Some(palette.accent_bg)
@@ -3157,8 +2717,6 @@ fn draw_row(
         ctx.fill().ok();
     }
 
-    // The clip rod runs in the gutter left of the row's fill, so it is drawn
-    // after it. Nesting itself is drawn as a box, under all the rows.
     let (rod, rod_alpha) = if is_active {
         (palette.accent_fg, 0.85)
     } else {
@@ -3172,8 +2730,6 @@ fn draw_row(
     match &row.kind {
         RowKind::Layer { .. } => {
             if clip.clipped {
-                // Hover brightens it, so the narrow gutter still reads as
-                // something you can click.
                 let alpha = if hover_zone == Some(HitZone::Clip) { 1.0 } else { rod_alpha };
                 draw_clip_rod(ctx, left, top, clip, rod, alpha);
             }
@@ -3185,9 +2741,6 @@ fn draw_row(
             }
             draw_swatch(ctx, sx, sy, thumbnail);
             if alpha_locked {
-                // The badge knocks its padlock out in whatever the row sits
-                // on, which is its own fill when it has one and the container's
-                // surface when it does not.
                 draw_alpha_lock_badge(
                     ctx,
                     sx,
@@ -3202,8 +2755,6 @@ fn draw_row(
                 ctx.pop_group_to_source().ok();
                 ctx.paint_with_alpha(0.4).ok();
             }
-            // Component instances get a 2px accent outline on the swatch to
-            // distinguish them from raster layers.
             if is_component {
                 rounded_rect(ctx, sx + 1.0, sy + 1.0, SWATCH_SIZE - 2.0, SWATCH_SIZE - 2.0, SWATCH_RADIUS);
                 set_source(ctx, palette.accent_bg);
@@ -3215,8 +2766,6 @@ fn draw_row(
             let eye_cx = handle_left - ITEM_INNER_PAD - EYE_RADIUS;
             let eye_cy = top + ITEM_HEIGHT / 2.0;
 
-            // Adjustment layers carry two icons left of the eye: the "edit
-            // settings" sliders (next to the eye) and the "show mask" toggle.
             let sliders_cx = eye_cx - EYE_RADIUS - EDIT_EYE_GAP - EDIT_RADIUS;
             let mask_cx = sliders_cx - EDIT_RADIUS - EDIT_EYE_GAP - MASK_RADIUS;
             let controls_left = if is_adjustment {
@@ -3274,8 +2823,6 @@ fn draw_row(
                 text_left,
                 top + ITEM_HEIGHT / 2.0,
                 text_max_w,
-                // The active row already reads as the target through its accent
-                // fill; underlining it too is noise.
                 clip.is_base && !is_active,
             );
             if dim {
@@ -3294,8 +2841,6 @@ fn draw_row(
                 if hover_zone == Some(HitZone::Mask) {
                     draw_icon_hover_bg(ctx, mask_cx, eye_cy, MASK_RADIUS, palette.fg);
                 }
-                // Toggle state: on = full icon, off = dimmed. Use icon_color so
-                // it stays visible against the accent background of an active row.
                 draw_mask(ctx, mask_cx, eye_cy, MASK_RADIUS, icon_color, dim || !mask_active);
             }
             set_source(ctx, icon_color);
@@ -3368,25 +2913,10 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: f64) -> Rgb {
     )
 }
 
-/// The clip rod's x, given the left edge of the row's nesting level. The rod
-/// lives in the gutter a clipped row's extra indent frees up, which starts at
-/// exactly that edge.
 fn connector_x(nest_left: f64) -> f64 {
     nest_left + CONNECTOR_INSET
 }
 
-/// The container surface behind a folder (or an adjustment layer) and
-/// everything it covers, including the container row itself. Drawn under the
-/// rows, so it reads as the thing holding them.
-///
-/// `first_top` / `last_top` are the y of the container row and of the last row
-/// it encloses, already in scroll space.
-/// Soft drop shadow behind a dragged block.
-///
-/// Cairo has no blur, so this stacks concentric rounded rects at a low constant
-/// alpha: the number of layers covering a pixel falls off with distance, which
-/// gives the gradient for the cost of a few fills. A real blur would mean an
-/// offscreen surface every frame, for something the pointer is moving anyway.
 fn draw_drop_shadow(
     ctx: &cairo::Context,
     x: f64,
@@ -3416,7 +2946,6 @@ fn draw_drop_shadow(
     ctx.restore().ok();
 }
 
-/// `top` / `bottom` are the container's own edges, padding already applied.
 fn draw_nest_box(ctx: &cairo::Context, level: f64, width: f64, top: f64, bottom: f64, color: Rgb) {
     let left = nest_left_f(level);
     let w = nest_right(width) - left;
@@ -3428,10 +2957,6 @@ fn draw_nest_box(ctx: &cairo::Context, level: f64, width: f64, top: f64, bottom:
     ctx.fill().ok();
 }
 
-/// The clip rod: an inverted branch. A clipped layer's parent is the layer
-/// *below* it, so the rod runs down the column its clip indent freed up and is
-/// terminated by the base row itself (see [`draw_clip_terminus`]) rather than
-/// hooking back into the clipped row - which would read as clipping to itself.
 fn draw_clip_rod(ctx: &cairo::Context, nest_left: f64, top: f64, info: ClipInfo, color: Rgb, alpha: f64) {
     let x = connector_x(nest_left);
     ctx.save().ok();
@@ -3439,24 +2964,17 @@ fn draw_clip_rod(ctx: &cairo::Context, nest_left: f64, top: f64, info: ClipInfo,
     ctx.set_line_width(CONNECTOR_WIDTH);
     ctx.set_line_cap(cairo::LineCap::Round);
 
-    // A run of clipped rows joins into one rod; the topmost starts inset so it
-    // reads as a beginning rather than a cut-off line.
     let start = if info.clipped_above { top - ITEM_GAP } else { top + 10.0 };
     ctx.move_to(x, start);
     if info.has_base {
-        // Straight through to the row below - the base picks it up from there.
         ctx.line_to(x, top + ITEM_HEIGHT);
     } else {
-        // Nothing to land on: stop short, and the missing terminus *is* the
-        // "unresolved" state.
         ctx.line_to(x, top + ITEM_HEIGHT - 10.0);
     }
     ctx.stroke().ok();
     ctx.restore().ok();
 }
 
-/// The end of a clip rod, drawn by the base layer's own row: the rod enters
-/// from above and turns into the row, stopping just short of its thumbnail.
 fn draw_clip_terminus(ctx: &cairo::Context, nest_left: f64, top: f64, color: Rgb, alpha: f64) {
     let x = connector_x(nest_left);
     let cy = top + ITEM_HEIGHT / 2.0;
@@ -3478,10 +2996,6 @@ fn draw_clip_terminus(ctx: &cairo::Context, nest_left: f64, top: f64, color: Rgb
     ctx.restore().ok();
 }
 
-/// The alpha-lock badge, knocked out of the thumbnail's bottom-right corner.
-/// The halo takes the row's background so the badge separates from whatever
-/// thumbnail is behind it; the padlock takes `glyph`, since cutting it in the
-/// row colour turned it accent-coloured on the active row.
 fn draw_alpha_lock_badge(
     ctx: &cairo::Context,
     sx: f64,
@@ -3491,7 +3005,6 @@ fn draw_alpha_lock_badge(
     glyph: Rgb,
     alpha: f64,
 ) {
-    // Overhangs the swatch by 1px on each side so it never sits on the edge.
     let cx = sx + SWATCH_SIZE - 12.0;
     let cy = sy + SWATCH_SIZE - 12.0;
 
@@ -3504,7 +3017,6 @@ fn draw_alpha_lock_badge(
     ctx.arc(cx, cy, LOCK_DISC_D / 2.0, 0.0, TAU);
     ctx.fill().ok();
 
-    // Padlock cut back out of the disc: shackle arc over a body.
     ctx.set_source_rgba(glyph.0, glyph.1, glyph.2, 0.8 * alpha);
     ctx.set_line_width(1.3);
     ctx.new_path();
@@ -3560,17 +3072,14 @@ fn draw_eye(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, open: bool, color: R
     ctx.set_source_rgba(color.0, color.1, color.2, alpha);
     ctx.set_line_width(1.5);
     if open {
-        // Almond outline
         ctx.move_to(cx - r, cy);
         ctx.curve_to(cx - r * 0.5, cy - r * 0.65, cx + r * 0.5, cy - r * 0.65, cx + r, cy);
         ctx.curve_to(cx + r * 0.5, cy + r * 0.65, cx - r * 0.5, cy + r * 0.65, cx - r, cy);
         ctx.close_path();
         ctx.stroke().ok();
-        // Pupil
         ctx.arc(cx, cy, r * 0.38, 0.0, TAU);
         ctx.fill().ok();
     } else {
-        // Closed eyelid: the bottom curve of the almond, no strike-through.
         ctx.set_line_cap(cairo::LineCap::Round);
         ctx.move_to(cx - r, cy);
         ctx.curve_to(
@@ -3583,16 +3092,12 @@ fn draw_eye(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, open: bool, color: R
     ctx.restore().ok();
 }
 
-// Subtle rounded background drawn behind a clickable row icon while it is
-// hovered. `color` is the foreground tint, applied at a low alpha.
 fn draw_icon_hover_bg(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb) {
     ctx.arc(cx, cy, r + 4.0, 0.0, TAU);
     ctx.set_source_rgba(color.0, color.1, color.2, 0.14);
     ctx.fill().ok();
 }
 
-// Horizontal "sliders" icon (two tracks, each with an offset knob) marking an
-// adjustment layer's edit-settings button.
 fn draw_sliders(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim: bool) {
     ctx.save().ok();
     let alpha = if dim { 0.35 } else { 1.0 };
@@ -3603,7 +3108,6 @@ fn draw_sliders(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim:
     let left = cx - r;
     let right = cx + r;
     let knob = r * 0.34;
-    // Top track: knob sits left of centre. Bottom track: knob sits right.
     for (ty, knob_x) in [(cy - r * 0.45, cx - r * 0.3), (cy + r * 0.45, cx + r * 0.3)] {
         ctx.move_to(left, ty);
         ctx.line_to(right, ty);
@@ -3614,18 +3118,14 @@ fn draw_sliders(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim:
     ctx.restore().ok();
 }
 
-// "Show mask" toggle: a ring with a filled right half. Same glyph on or off -
-// only the alpha differs (full when on, dimmed when off), driven by `dim`.
 fn draw_mask(ctx: &cairo::Context, cx: f64, cy: f64, r: f64, color: Rgb, dim: bool) {
     ctx.save().ok();
     let alpha = if dim { 0.35 } else { 1.0 };
     ctx.set_source_rgba(color.0, color.1, color.2, alpha);
     let rr = r * 0.85;
-    // Outline ring.
     ctx.set_line_width(1.4);
     ctx.arc(cx, cy, rr, 0.0, TAU);
     ctx.stroke().ok();
-    // Filled right half (top -> bottom along the right side).
     ctx.arc(cx, cy, rr - 0.7, -TAU / 4.0, TAU / 4.0);
     ctx.close_path();
     ctx.fill().ok();
@@ -3655,14 +3155,12 @@ fn draw_folder(ctx: &cairo::Context, cx: f64, cy: f64, w: f64, h: f64) {
     let y = cy - h / 2.0;
     let tab_w = w * 0.42;
     let tab_h = h * 0.24;
-    // Tab
     ctx.move_to(x, y + tab_h);
     ctx.line_to(x + tab_w * 0.75, y + tab_h);
     ctx.line_to(x + tab_w, y);
     ctx.line_to(x, y);
     ctx.close_path();
     ctx.fill().ok();
-    // Body
     ctx.rectangle(x, y + tab_h, w, h - tab_h);
     ctx.fill().ok();
 }
@@ -3671,10 +3169,6 @@ fn draw_label(ctx: &cairo::Context, text: &str, x: f64, cy: f64, max_w: f64) {
     draw_label_underlined(ctx, text, x, cy, max_w, false);
 }
 
-/// `underline` marks the base of a clip stack: 1px under the name only, so the
-/// elbow above it has something to land on. It also covers the two cases
-/// adjacency alone misses - a one-row stack, and a base scrolled to the edge of
-/// the viewport with its stack above the fold.
 fn draw_label_underlined(
     ctx: &cairo::Context,
     text: &str,
@@ -3736,8 +3230,6 @@ fn rounded_rect(ctx: &cairo::Context, x: f64, y: f64, width: f64, height: f64, r
     ctx.close_path();
 }
 
-// --- Input ---
-/// Which zone of a row was clicked?
 fn hit_zone(
     x: f64,
     y_in_row: f64,
@@ -3747,26 +3239,20 @@ fn hit_zone(
     has_edit: bool,
     clipped: bool,
 ) -> HitZone {
-    // Must mirror `draw_row`: nesting insets both sides, and a clipped row
-    // spends one further gutter column on its rod.
     let nest_left = nest_left(nest);
     let content_left = nest_left + if clipped { INDENT_STEP } else { 0.0 };
     let right = nest_right(widget_width);
 
-    // Handle (rightmost).
     let handle_left = right - ITEM_INNER_PAD - HANDLE_WIDTH;
     if x >= handle_left - 4.0 {
         return HitZone::Handle;
     }
 
-    // Eye (just left of handle).
     let eye_cx = handle_left - ITEM_INNER_PAD - EYE_RADIUS;
     if (x - eye_cx).abs() <= EYE_RADIUS + 4.0 {
         return HitZone::Eye;
     }
 
-    // Adjustment icons: edit-settings sliders (left of the eye), then the
-    // show-mask toggle (left of the sliders).
     if has_edit {
         let sliders_cx = eye_cx - EYE_RADIUS - EDIT_EYE_GAP - EDIT_RADIUS;
         if (x - sliders_cx).abs() <= EDIT_RADIUS + 4.0 {
@@ -3778,22 +3264,15 @@ fn hit_zone(
         }
     }
 
-    // Clip gutter, left of the row's content. Deliberately narrow: 20px is
-    // below a comfortable stylus target, so this is the secondary path and the
-    // context menu / keybind carry the feature. Widening it would come
-    // straight out of the name column.
     if clipped && x >= nest_left && x <= nest_left + CLIP_GUTTER_W {
         return HitZone::Clip;
     }
 
-    // Chevron or swatch (leftmost content).
     if is_group {
         let chevron_right = content_left + ITEM_INNER_PAD + CHEVRON_SIZE + 4.0;
         if x <= chevron_right {
             return HitZone::Chevron;
         }
-        // Folder icon sits just right of the chevron; clicking it selects the
-        // folder's contents.
         let folder_x = chevron_right;
         if x >= folder_x && x <= folder_x + FOLDER_W {
             return HitZone::Folder;
@@ -3809,15 +3288,6 @@ fn hit_zone(
     HitZone::Body
 }
 
-// Warning yellow rather than the accent, which the active row already uses.
-// A lit toggle repeats the canvas chip exactly; 0.26 tracks
-// `theme::WARNING_WASH_ALPHA`, so change both together. A part-locked
-// selection gets a fainter wash plus a bar under the glyph.
-//
-// Hover is spelled out because these rules sit at application priority and
-// would otherwise mask the theme's, leaving a lit button dead under the
-// pointer. The node is `button`, not `togglebutton` - GTK4 gives
-// GtkToggleButton a `button` node with a `.toggle` class.
 fn load_lock_toggle_css() {
     let provider = gtk::CssProvider::new();
     provider.load_from_string(
@@ -3852,8 +3322,6 @@ fn load_lock_toggle_css() {
     }
 }
 
-/// Set the clipping-mask flag on one layer and record it as its own undo step.
-/// Shared by the gutter click, the context menu and the keybind.
 pub(super) fn set_layer_clipped(
     canvas: &Rc<RefCell<Canvas>>,
     history: &Rc<RefCell<HistoryStack>>,
@@ -3876,9 +3344,6 @@ pub(super) fn set_layer_clipped(
     });
 }
 
-/// Make `flat_idx` the active layer and open the adjustment editor on it. The
-/// `layer-add-adjustment` action edits the active adjustment layer in place, so
-/// selecting first targets the right one regardless of prior selection.
 pub(super) fn open_adjustment_editor(ui: &Ui, area: &gtk::DrawingArea, flat_idx: usize) {
     ui.multi_selected.borrow_mut().clear();
     ui.state.select_index(flat_idx);
@@ -3890,10 +3355,6 @@ pub(super) fn open_adjustment_editor(ui: &Ui, area: &gtk::DrawingArea, flat_idx:
         }
 }
 
-/// Give a vertical scrollbar stylus pen-drag handling, so it can be dragged with
-/// a tablet pen (GTK4 drops continuous stylus drags on the built-in gesture). In
-/// GTK4 `GtkScrollbar` wraps an adjustment directly (it is not a `GtkRange`), so
-/// map the pen's Y position over the widget height onto the adjustment value.
 fn install_scrollbar_pen_drag(sb: &gtk::Scrollbar) {
     let stylus = gtk::GestureStylus::new();
     stylus.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3910,9 +3371,6 @@ fn install_scrollbar_pen_drag(sb: &gtk::Scrollbar) {
             if height <= 0.0 || span <= page {
                 return;
             }
-            // Center the thumb on the pen so it tracks 1:1: map over the travel
-            // the thumb actually has (height minus its own size), not the whole
-            // widget height.
             let thumb = (page / span * height).clamp(SCROLL_THUMB_MIN, height);
             let travel = (height - thumb).max(1.0);
             let t = ((y - thumb / 2.0) / travel).clamp(0.0, 1.0);
@@ -3944,9 +3402,6 @@ fn install_scrollbar_pen_drag(sb: &gtk::Scrollbar) {
     sb.add_controller(stylus);
 }
 
-/// True when the controller's current event came from a tablet pen or eraser.
-/// Used to keep the mouse `GestureDrag` from also handling stylus events, which
-/// are routed through a dedicated `GestureStylus` instead.
 fn event_is_stylus(controller: &impl IsA<gtk::EventController>) -> bool {
     controller
         .current_event_device()
@@ -3964,22 +3419,13 @@ fn install_list_input(
     on_edit_component: &Rc<dyn Fn(String)>,
     prepare_reorder: &Rc<dyn Fn()>,
 ) {
-    // Shared drag logic, driven by both the mouse (GestureDrag) and the stylus
-    // (GestureStylus). GestureDrag drops pen motion on GTK4, so the pen path is
-    // routed through a dedicated stylus gesture below; the closures here keep
-    // the two paths identical.
-
-    // --- drag begin ---
     let on_begin: Rc<dyn Fn(f64, f64)> = {
         let area_w = area.clone();
         let ui = ui.clone();
         Rc::new(move |x: f64, y: f64| {
-            // Guard against both gestures starting a drag for the same press.
             if ui.drag.borrow().is_some() {
                 return;
             }
-            // Land any settling drop at once: the new gesture has to act on
-            // where the rows really are.
             ui.drop_settle.borrow_mut().take();
             let snapshot = ui.state.snapshot();
             let rows = compute_visible_rows(&ui.tree.borrow(), &snapshot);
@@ -4014,11 +3460,8 @@ fn install_list_input(
             if zone == HitZone::Handle {
                 area_w.set_cursor(gtk::gdk::Cursor::from_name("row-resize", None).as_ref());
 
-                // Runs every frame while a handle drag is in flight; smooths
-                // the floating preview's indent and the "make room" Y nudges.
                 let tick_ui = ui.clone();
                 area_w.add_tick_callback(move |widget, clock| {
-                    // Borrow only briefly so the tree/state borrow below is free.
                     let (from_row, current_row, last_us) = {
                         let d = tick_ui.drag.borrow();
                         match d.as_ref() {
@@ -4036,8 +3479,6 @@ fn install_list_input(
                         ((now - last_us) as f64 * 1e-6).clamp(0.0, 0.1)
                     };
 
-                    // Auto-scroll when the grabbed row nears a viewport edge. Speed
-                    // ramps linearly from zero at the zone boundary to max at the edge.
                     let mut current_row = current_row;
                     {
                         let vadj = tick_ui.vadj.clone();
@@ -4065,8 +3506,6 @@ fn install_list_input(
                             let applied = new_val - vadj.value();
                             if applied != 0.0 {
                                 vadj.set_value(new_val);
-                                // Keep the drop indicator under the stationary pointer
-                                // as content scrolls beneath it.
                                 let snapshot = tick_ui.state.snapshot();
                                 let scroll_rows =
                                     compute_visible_rows(&tick_ui.tree.borrow(), &snapshot);
@@ -4105,11 +3544,6 @@ fn install_list_input(
                                 .find(|r| matches!(&r.kind, RowKind::Group { id, .. } if id == gid))
                                 .map_or(1, |r| r.depth + 1)
                         });
-                        // Rows as they will be once dropped, reparenting
-                        // included. The animation has to aim at *that* layout:
-                        // container padding moves with the reorder, so easing
-                        // toward the current layout's slots would leave rows a
-                        // pad out of place and snap on drop.
                         let depth_delta = isize::try_from(target_depth).unwrap_or(0)
                             - isize::try_from(orig_depth).unwrap_or(0);
                         let after = reordered_rows(&rows, from_row, span, to, depth_delta);
@@ -4123,7 +3557,6 @@ fn install_list_input(
                         )
                     };
 
-                    // Exponential smoothing, ~95% in 0.1s.
                     let alpha = 1.0 - (-dt / (0.1 / 3.0)).exp();
 
                     {
@@ -4154,7 +3587,6 @@ fn install_list_input(
         })
     };
 
-    // --- drag update (pointer_y is the absolute Y in the area) ---
     let on_update: Rc<dyn Fn(f64)> = {
         let area_w = area.clone();
         let ui = ui.clone();
@@ -4174,7 +3606,6 @@ fn install_list_input(
         })
     };
 
-    // --- drag end ---
     let on_end: Rc<dyn Fn(f64, f64, gdk::ModifierType)> = {
         let area_w = area.clone();
         let ui = ui.clone();
@@ -4254,8 +3685,6 @@ fn install_list_input(
                         && let RowKind::Layer { id, flat_idx, .. } = &rows[d.from_row].kind {
                             let turn_on = ui.mask_view.borrow().as_deref() != Some(id.as_str());
                             let new_view = turn_on.then(|| id.clone());
-                            // Editing the mask paints the active layer, so adopt
-                            // this one when turning the view on.
                             if turn_on {
                                 ui.multi_selected.borrow_mut().clear();
                                 ui.state.select_index(*flat_idx);
@@ -4280,15 +3709,11 @@ fn install_list_input(
                         }
                 }
                 HitZone::Handle => {
-                    // Sampled before the reorder: this is where the settle
-                    // animation has to start from.
                     let span = drag_span(&rows, d.from_row);
                     let released = release_visual(&rows, &d, span);
                     let held_id = rows.get(d.from_row).map(|r| row_id(r).to_string());
 
                     if d.from_row != d.current_row {
-                        // A reorder mutates the layer stack; commit any in-progress
-                        // transform first so it can't write onto a shifted index.
                         prepare_reorder();
                         let dragged_row = rows.get(d.from_row);
                         let Some((dragged_id, dragged_name, dragged_group)) =
@@ -4306,8 +3731,6 @@ fn install_list_input(
                             return;
                         };
 
-                        // Canvas id order before the reorder. Works for both single
-                        // layers and groups (which move several layers at once).
                         let before_order: Vec<String> = canvas.borrow().layers()
                             .snapshot().iter().map(|l| l.id.clone()).collect();
                         let tree_before = tree_to_core(&ui.tree.borrow());
@@ -4355,8 +3778,6 @@ fn install_list_input(
                                 &after_order,
                             );
 
-                            // Group membership may have changed without touching
-                            // the raw selection; force the next sync to re-resolve.
                             ui.invalidate_selection_sync();
                             sync_height(&area_w, &ui);
                             redraw.request();
@@ -4377,8 +3798,6 @@ fn install_list_input(
                 HitZone::Folder if is_click => {
                     if d.from_row < rows.len()
                         && let RowKind::Group { id, .. } = &rows[d.from_row].kind {
-                            // Map the folder's leaf layers to canvas indices and
-                            // select the union of their alpha.
                             let leaf_ids = group_leaf_ids(&ui.tree.borrow(), id);
                             let order: Vec<String> = canvas.borrow().layers()
                                 .snapshot().iter().map(|l| l.id.clone()).collect();
@@ -4398,7 +3817,6 @@ fn install_list_input(
                             RowKind::Layer { id, .. } | RowKind::Group { id, .. } => id.clone(),
                         };
                         if shift {
-                            // Range from current primary anchor to the clicked row, inclusive.
                             let anchor_id = ui
                                 .active_id()
                                 .or_else(|| ui.active_group.borrow().clone());
@@ -4421,7 +3839,6 @@ fn install_list_input(
                                 ms.insert(rid);
                             }
                         } else if ctrl {
-                            // Promote the current primary into the set so adding to it accumulates.
                             let mut ms = ui.multi_selected.borrow_mut();
                             if let Some(aid) = ui.active_id() {
                                 ms.insert(aid);
@@ -4455,8 +3872,6 @@ fn install_list_input(
                         actions::refresh_action_sensitivity(&ui);
                         ui.sync_blend_controls();
                         area_w.queue_draw();
-                        // Re-present in case the selection change affects the
-                        // canvas. Cheap when nothing changed: present() short-circuits.
                         redraw.request();
                     }
                 }
@@ -4464,15 +3879,8 @@ fn install_list_input(
         })
     };
 
-    // A drag is owned by exactly one gesture for its whole lifetime. Without
-    // this, the mouse GestureDrag (which still tracks the pen via pointer
-    // emulation) fires a spurious drag_end when autoscroll scrolls the viewport
-    // and breaks the emulated grab - dropping the pen reorder. Owner: 0 none,
-    // 1 mouse, 2 pen.
     let drag_owner = Rc::new(std::cell::Cell::new(0u8));
 
-    // Mouse drag; defers to the stylus gesture for pen input. Gesture Y is
-    // viewport-relative; add the scroll offset to reach content space.
     let drag_gesture = gtk::GestureDrag::new();
     drag_gesture.set_button(gdk::BUTTON_PRIMARY);
     {
@@ -4515,14 +3923,8 @@ fn install_list_input(
     }
     area.add_controller(drag_gesture);
 
-    // Stylus drag - GestureDrag drops pen motion on GTK4, so drive the shared
-    // logic from a dedicated stylus gesture on the `area`. This works during
-    // autoscroll because we scroll by a draw offset (`ui.vadj`), which only
-    // redraws - the area is never re-allocated, so the pen grab survives.
-    // Coordinates arrive viewport-relative; add the scroll offset for content.
     let stylus = gtk::GestureStylus::new();
     {
-        // Viewport-space start point, for click-vs-drag distance at release.
         let start = Rc::new(std::cell::Cell::new((0.0_f64, 0.0_f64)));
         {
             let drag_owner = Rc::clone(&drag_owner);
@@ -4564,15 +3966,10 @@ fn install_list_input(
                 on_end(x - sx, y - sy, modifiers);
             });
         }
-        // Deliberately no `connect_cancel`: when autoscroll runs, GtkGestureStylus
-        // cancels its sequence, but it keeps delivering raw down/motion/up events
-        // for the pen that is still in contact. Aborting the drag on cancel would
-        // drop the layer mid-autoscroll; instead we keep the drag alive and let
-        // the real pen-up (which still fires) finish it.
+        // No `connect_cancel`: the real pen-up finishes the drag.
     }
     area.add_controller(stylus);
 
-    // Double-click to rename.
     let rename_click = gtk::GestureClick::new();
     rename_click.set_button(gdk::BUTTON_PRIMARY);
     {
@@ -4592,8 +3989,6 @@ fn install_list_input(
             let layout = RowLayout::new(&rows);
             let Some(row_idx) = layout.at(cy) else { return };
             let row = &rows[row_idx];
-            // Double-clicking a component layer opens the component for editing
-            // instead of renaming the layer.
             if let RowKind::Layer { flat_idx, .. } = &row.kind
                 && let Some(LayerKind::Component(inst)) = ui_c.state.kind(*flat_idx)
             {
@@ -4648,8 +4043,6 @@ fn install_list_input(
             );
                 (row_idx, zone)
             });
-            // The handle previews the drag (row-resize); the other clickable
-            // zones use the pointer hand; everything else keeps the default.
             let cursor_name = hit.and_then(|(_, zone)| match zone {
                 HitZone::Handle => Some("row-resize"),
                 HitZone::Eye
@@ -4661,7 +4054,6 @@ fn install_list_input(
                 | HitZone::Swatch => Some("pointer"),
                 HitZone::Body => None,
             });
-            // Only the interactive (non-drag) icons take a hover highlight.
             let hover = hit.filter(|(_, zone)| {
                 matches!(zone, HitZone::Eye | HitZone::Edit | HitZone::Mask | HitZone::Clip)
             });
@@ -4686,8 +4078,6 @@ fn install_list_input(
     }
     area.add_controller(motion);
 
-    // Cairo-drawn rows carry no widgets, so the clip gutter names its base (or
-    // says why it has none) through the drawing area's own tooltip query.
     area.set_has_tooltip(true);
     {
         let ui = ui.clone();
@@ -4730,17 +4120,13 @@ fn install_list_input(
     }
 }
 
-/// Name of the layer a clipped row binds to, for the gutter tooltip.
 fn clip_base_name(rows: &[VisibleRow], i: usize) -> Option<String> {
     let row = rows.get(i)?;
     for below in rows.iter().skip(i + 1) {
-        // Leaving the sibling list ends the search: a clip never reaches past
-        // its own folder.
         if !same_sibling_list(row, below) {
             return None;
         }
         match &below.kind {
-            // A clipped row is skipped: it shares the base being looked for.
             RowKind::Layer { clipped: true, .. } => {}
             RowKind::Layer { name, .. } => return Some(name.clone()),
             RowKind::Group { .. } => return None,
@@ -4749,10 +4135,6 @@ fn clip_base_name(rows: &[VisibleRow], i: usize) -> Option<String> {
     None
 }
 
-// Toggling a group's eye must not overwrite per-leaf state. We record which
-// leaves we hid and restore exactly those on toggle-on; anything the user
-// flipped manually while the group was hidden stays as they left it. Every leaf
-// we flip is recorded so the group eye undoes like a single layer's eye.
 fn toggle_group_visibility(
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
@@ -4778,9 +4160,6 @@ fn toggle_group_visibility(
 
     let mut changes: Vec<HistoryAction> = Vec::new();
     let new_mask: HashSet<String> = if new_vis {
-        // Restore exactly the leaves the group hid. If that set was lost (e.g.
-        // an intervening undo cleared it), fall back to showing every leaf so
-        // the eye can't get stuck "on" with nothing visible.
         let restore_all = prior_mask.is_empty();
         for (lid, idx) in &leaf_indices {
             if (restore_all || prior_mask.contains(lid))
@@ -4886,7 +4265,6 @@ fn show_rename_popover(
         } else {
             let before = tree_to_core(&ui.tree.borrow());
             rename_group_in_tree(&mut ui.tree.borrow_mut(), &id, new_name.trim().to_string());
-            // Folder name is metadata-only (no composite change) but must persist.
             commit_groups_quiet(&ui.tree.borrow(), &mut canvas.borrow_mut());
             let after = tree_to_core(&ui.tree.borrow());
             record_tree_edit(&history, before, after, "Rename group");
@@ -4895,29 +4273,18 @@ fn show_rename_popover(
         pop_c.popdown();
     });
 
-    // Dismissal is handled by the popover's autohide (click-away / Escape). A
-    // focus-leave handler dismisses too eagerly: when opened via F2 or the
-    // context menu the panel isn't focused, so the entry's focus bounces during
-    // mapping and would instantly close the popover.
-
-    // Defer the popup so it survives a context menu closing in the same tick:
-    // popping up a second autohide popover synchronously gets it dismissed.
     glib::idle_add_local_once(move || {
         popover_rc.popup();
         entry.grab_focus();
     });
 }
 
-/// Open the rename popover on the currently active layer or group. Used by the
-/// F2 shortcut and the context-menu "Rename" entries.
 pub(super) fn begin_rename_active(
     area: &gtk::DrawingArea,
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
     history: &Rc<RefCell<HistoryStack>>,
 ) {
-    // Unmapped means the layers panel is hidden (e.g. the Crop tool swapped in
-    // its own sidebar): there's no row to anchor a rename popover to.
     if !area.is_mapped() {
         return;
     }
@@ -4948,9 +4315,6 @@ fn insertion_index(layout: &RowLayout, top_y: f64) -> usize {
     layout.slot_nearest(top_y)
 }
 
-// Picks the parent/index where a dragged node should land, given the row
-// immediately above the drop point. Returns `idx == usize::MAX` to mean
-// "insert as first child" (used for prepend-to-root or drop-into-empty-group).
 fn resolve_insert_target(rows2: &[VisibleRow], current_row: usize) -> (Option<String>, usize) {
     if current_row == 0 || rows2.is_empty() {
         return (None, usize::MAX);
@@ -4958,12 +4322,10 @@ fn resolve_insert_target(rows2: &[VisibleRow], current_row: usize) -> (Option<St
     let above_idx = (current_row - 1).min(rows2.len() - 1);
     let Some(above) = rows2.get(above_idx) else { return (None, rows2.len()) };
 
-    // Drop right under an expanded group header lands as that group's first child.
     if let RowKind::Group { id, expanded: true, .. } = &above.kind {
         return (Some(id.clone()), usize::MAX);
     }
 
-    // Last child of a group: escape up so the drop becomes a sibling of the group.
     if above.parent_id.is_some() {
         let is_last_child = rows2
             .get(above_idx + 1)
@@ -4979,11 +4341,9 @@ fn resolve_insert_target(rows2: &[VisibleRow], current_row: usize) -> (Option<St
         }
     }
 
-    // Case 3: sibling after the above row.
     (above.parent_id.clone(), above.idx_in_parent)
 }
 
-// --- Tests ---
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5016,17 +4376,8 @@ mod tests {
         }
     }
 
-    // Mirrors `tree`: a row hangs off its parent by a tee unless it is the last
-    // child, and each ancestor keeps a bar in its own column only while that
-    // ancestor still has siblings to come.
     #[test]
     fn a_container_shares_a_nesting_level_with_what_it_holds() {
-        // Group
-        //   a
-        //   Subgroup
-        //     b
-        // Group2
-        //   c
         let rows = vec![
             group_row("g", true, None, 0, 0),
             named_layer_row("a", Some("g"), 0, 1, false, true),
@@ -5036,8 +4387,6 @@ mod tests {
             named_layer_row("c", Some("g2"), 0, 1, false, true),
         ];
 
-        // The header sits inside its own box, level with its contents: the box
-        // is what shows the nesting, so there is no indent step between them.
         assert_eq!(box_depth(&rows, 0), 1, "Group is inside its own box");
         assert_eq!(box_depth(&rows, 1), 1, "and so is what it holds");
         assert_eq!(contained_rows(&rows, 0), 3, "a, Subgroup and b");
@@ -5051,9 +4400,6 @@ mod tests {
         assert_eq!(box_depth(&rows, 5), 1);
     }
 
-    // Container padding has to come out of the vertical rhythm, so the row
-    // pitch is not uniform. Everything that places or hit-tests a row goes
-    // through RowLayout for exactly this reason.
     #[test]
     fn a_container_adds_its_padding_to_the_rows_it_wraps() {
         let flat = vec![
@@ -5067,8 +4413,6 @@ mod tests {
             "ungrouped rows keep the plain pitch"
         );
 
-        // Same two rows, now inside a folder: the header's own padding pushes
-        // it down, and the folder's bottom padding pushes anything after it.
         let nested = vec![
             group_row("g", true, None, 0, 0),
             named_layer_row("a", Some("g"), 0, 1, false, true),
@@ -5086,13 +4430,8 @@ mod tests {
         );
     }
 
-    // The reorder animation eases each row toward where it will actually be.
-    // Aiming at the *current* layout's slots instead leaves rows a container
-    // pad out of place, which shows up as a jump the moment the drag is
-    // dropped and the real positions take over.
     #[test]
     fn the_drag_animation_lands_where_the_drop_will_put_things() {
-        // A folder, then a root row below it - drag that root row to the top.
         let rows = vec![
             group_row("g", true, None, 0, 0),
             named_layer_row("Layer 3", Some("g"), 0, 1, false, true),
@@ -5103,8 +4442,6 @@ mod tests {
         let before = RowLayout::new(&rows);
         let after = RowLayout::new(&reordered_rows(&rows, from, span, to, 0));
 
-        // Every row the drag pushes down moves by exactly one row pitch: the
-        // folder's padding travels with it, so nothing shifts by more.
         let pitch = ITEM_HEIGHT + ITEM_GAP;
         for r in 0..from {
             let slot = displaced_row(r, from, span, to);
@@ -5115,7 +4452,6 @@ mod tests {
             );
         }
 
-        // And the dragged row's own resting place is the top of the list.
         assert!((after.top(to) - LIST_PADDING).abs() < f64::EPSILON);
     }
 
@@ -5138,11 +4474,6 @@ mod tests {
         assert_eq!(names(&reordered_rows(&rows, 0, 2, 1, 0)), ["c", "a", "b"]);
     }
 
-    // Dropping a row *into* a folder changes its depth, and therefore which
-    // rows that folder contains - so the predicted layout has to reparent too.
-    // Without it the folder looks empty in the prediction, its padding lands in
-    // the wrong place, and every row under it eases to a wrong target and then
-    // snaps back on drop.
     #[test]
     fn the_drag_animation_accounts_for_dropping_into_a_folder() {
         let rows = vec![
@@ -5153,8 +4484,6 @@ mod tests {
             named_layer_row("Layer 2", Some("g"), 2, 1, false, true),
             named_layer_row("Background", None, 2, 0, false, true),
         ];
-        // Layer 5 moves from the root down one slot, becoming the folder's
-        // first child: one level deeper.
         let (from, span, to, delta) = (0usize, 1usize, 1usize, 1isize);
         let before = RowLayout::new(&rows);
         let after_rows = reordered_rows(&rows, from, span, to, delta);
@@ -5165,8 +4494,6 @@ mod tests {
         );
 
         let after = RowLayout::new(&after_rows);
-        // The folder header rises by one pitch; everything already inside it
-        // stays exactly where it is.
         let header = after.top(displaced_row(1, from, span, to)) - before.top(1);
         assert!(
             (header + ITEM_HEIGHT + ITEM_GAP).abs() < f64::EPSILON,
@@ -5181,13 +4508,10 @@ mod tests {
         }
     }
 
-    // --- drop settle ---
     fn drag_mid_flight(from_row: usize, to: usize, block_top: f64, eased: &[f64]) -> Drag {
         Drag {
             from_row,
             current_row: to,
-            // The draw function reads `pointer_y - grab_offset_y` as the top
-            // edge, so this is one degree of freedom, not two.
             pointer_y: block_top,
             grab_offset_y: 0.0,
             zone: HitZone::Handle,
@@ -5197,8 +4521,6 @@ mod tests {
         }
     }
 
-    // At release every row must be drawn exactly where the drag had it.
-    // Anything else is the snap this animation exists to remove.
     #[test]
     fn the_drop_settle_starts_from_where_the_drag_left_off() {
         let rows = vec![
@@ -5207,9 +4529,6 @@ mod tests {
             named_layer_row("Layer 2", Some("g"), 1, 1, false, true),
             named_layer_row("Background", None, 1, 0, false, true),
         ];
-        // Background dragged to the top and released mid-slide: the block is
-        // short of its slot, and the rows making room for it are short of
-        // theirs (30px of the 48 they owe).
         let (from, span, to) = (3usize, 1usize, 0usize);
         let drag = drag_mid_flight(from, to, 20.0, &[30.0, 30.0, 30.0, 0.0]);
         let released = release_visual(&rows, &drag, span);
@@ -5234,14 +4553,11 @@ mod tests {
             assert!((drawn - was).abs() < 1e-9, "row {r} jumps {}px", drawn - was);
         }
 
-        // Once it has run, every offset is spent.
         let mut landed = settle;
         landed.progress = 1.0;
         assert!(landed.remaining().abs() < f64::EPSILON);
     }
 
-    // A reparenting drag is still easing its indent at release; the remainder
-    // has to be carried into the landing rather than popping a level sideways.
     #[test]
     fn the_drop_settle_carries_an_unfinished_reparent_indent() {
         let rows = vec![
@@ -5251,7 +4567,6 @@ mod tests {
         ];
         let (from, span, to) = (0usize, 1usize, 1usize);
         let mut drag = drag_mid_flight(from, to, 8.0, &[0.0, 0.0, 0.0]);
-        // 70% of the way from root to inside the folder.
         drag.animated_depth_offset = 0.7;
         let released = release_visual(&rows, &drag, span);
 
@@ -5265,8 +4580,6 @@ mod tests {
         );
     }
 
-    // Pressing the handle without moving is not a drop, and must not kick off
-    // an animation of nothing.
     #[test]
     fn a_handle_press_that_moved_nothing_does_not_animate() {
         let rows = vec![
@@ -5295,8 +4608,6 @@ mod tests {
         (a.0 - b.0).abs() < 1e-9 && (a.1 - b.1).abs() < 1e-9 && (a.2 - b.2).abs() < 1e-9
     }
 
-    // The container whose box is painted directly behind a row: itself when it
-    // opens one, otherwise the innermost container covering it.
     fn painter_of(rows: &[VisibleRow], i: usize) -> Option<usize> {
         if opens_box(rows, i) {
             return Some(i);
@@ -5306,16 +4617,8 @@ mod tests {
             .find(|&j| opens_box(rows, j) && j + contained_rows(rows, j) >= i)
     }
 
-    // A landing row mixes its card into what is behind it, so it has to end on
-    // the colour already there. One level out and every drop into a folder
-    // finishes on a flash.
     #[test]
     fn a_lifted_card_fades_into_whatever_is_actually_behind_the_row() {
-        // Group
-        //   Subgroup
-        //     b
-        //   a
-        // root
         let rows = vec![
             group_row("g", true, None, 0, 0),
             group_row("sub", true, Some("g"), 0, 1),
@@ -5335,8 +4638,6 @@ mod tests {
         }
     }
 
-    // Offsets are described against the post-drop list, so an edit that
-    // re-lays-out the rows has to void them, not apply them to the wrong ones.
     #[test]
     fn a_stale_drop_settle_is_ignored() {
         let rows = vec![
@@ -5361,8 +4662,6 @@ mod tests {
         );
     }
 
-    // Folders that end on the same row must not land their bottom edges on top
-    // of each other - each still owes a full pad, so the edges nest.
     #[test]
     fn containers_ending_together_stagger_their_bottoms() {
         let rows = vec![
@@ -5373,7 +4672,6 @@ mod tests {
         ];
         let layout = RowLayout::new(&rows);
         let leaf_bottom = layout.bottom(3);
-        // Innermost first, each one a pad further down than the last.
         for (i, expected_pads) in [(2usize, 1.0_f64), (1, 2.0), (0, 3.0)] {
             let got = container_bottom(&rows, &layout, i);
             let want = expected_pads.mul_add(NEST_PAD, leaf_bottom);
@@ -5386,7 +4684,6 @@ mod tests {
 
     #[test]
     fn nested_containers_each_pay_their_own_padding() {
-        // Two containers close on the same row, so the row after clears both.
         let rows = vec![
             group_row("g", true, None, 0, 0),
             group_row("sub", true, Some("g"), 0, 1),
@@ -5401,7 +4698,6 @@ mod tests {
         );
     }
 
-    // Hit-testing has to agree with what was drawn, padding included.
     #[test]
     fn the_gap_between_rows_belongs_to_no_row() {
         let rows = vec![
@@ -5419,9 +4715,6 @@ mod tests {
         assert_eq!(layout.at(LIST_PADDING / 2.0), None, "nor does one above the list");
     }
 
-    // A folder is a container whether or not you can see inside it, so it keeps
-    // its surface when collapsed - otherwise the row would change shape on
-    // every expand.
     #[test]
     fn a_collapsed_folder_keeps_its_container() {
         let rows = vec![
@@ -5434,7 +4727,6 @@ mod tests {
         assert_eq!(box_depth(&rows, 1), 0, "the row after it is not inside");
     }
 
-    // An adjustment layer is a plain layer until it actually covers something.
     #[test]
     fn an_adjustment_covering_nothing_gets_no_container() {
         let mut adjustment = named_layer_row("adj", None, 0, 0, false, true);
@@ -5455,8 +4747,6 @@ mod tests {
         assert_eq!(box_depth(&rows, 2), 0);
     }
 
-    // An adjustment layer indents the rows it affects, and that reads as the
-    // same relationship a folder has, so it draws the same connector.
     #[test]
     fn adjustment_scope_nests_like_a_folder() {
         let mut adjustment = named_layer_row("adj", None, 0, 0, false, true);
@@ -5470,8 +4760,6 @@ mod tests {
         assert_eq!(box_depth(&rows, 1), 1);
     }
 
-    // Rows are in display order: index 0 is the topmost, so a clipped row binds
-    // to the row *after* it.
     #[test]
     fn clip_bracket_spans_a_stack_and_corners_once() {
         let rows = vec![
@@ -5497,7 +4785,6 @@ mod tests {
 
     #[test]
     fn clip_without_a_base_is_inactive() {
-        // Bottom-most row is clipped: nothing below to bind to.
         let rows = vec![named_layer_row("lonely", None, 0, 0, true, true)];
         let info = clip_info(&rows, 0);
         assert!(info.clipped);
@@ -5517,7 +4804,6 @@ mod tests {
 
     #[test]
     fn clipping_does_not_reach_across_sibling_lists() {
-        // The clipped row is inside a folder; the row below it is not a sibling.
         let rows = vec![
             named_layer_row("inside", Some("g"), 0, 1, true, true),
             named_layer_row("outside", None, 1, 0, false, true),
@@ -5558,7 +4844,6 @@ mod tests {
         })
     }
 
-    // Collect every group id in a UI tree, depth-first.
     fn collect_group_ids(nodes: &[LayerNode], out: &mut Vec<String>) {
         for node in nodes {
             if let LayerNode::Group(g) = node {
@@ -5568,11 +4853,8 @@ mod tests {
         }
     }
 
-    // --- tree_from_core group-id healing ---
     #[test]
     fn tree_from_core_heals_duplicate_group_ids() {
-        // Two sibling groups share an id (the pre-fix corruption that
-        // phantom-links them); a third is unique.
         let core = vec![
             core_group("g0000000000000001", vec![]),
             core_group("g0000000000000002", vec![]),
@@ -5601,7 +4883,6 @@ mod tests {
         assert_eq!(unique.len(), ids.len(), "nested group ids should be unique: {ids:?}");
     }
 
-    // --- mirror_tree ---
     fn panel_group(id: &str, children: Vec<LayerNode>) -> LayerNode {
         LayerNode::Group(GroupData {
             id: id.to_string(),
@@ -5615,7 +4896,6 @@ mod tests {
 
     #[test]
     fn mirror_tree_drops_leaves_that_were_not_duplicated() {
-        // "b" hit the layer limit, so it never made it into the id map.
         let src = vec![
             LayerNode::Layer("a".into()),
             panel_group("g1", vec![LayerNode::Layer("b".into()), LayerNode::Layer("c".into())]),
@@ -5629,7 +4909,6 @@ mod tests {
         assert_eq!(leaf_ids_top_first(&mirror), vec!["a2".to_string(), "c2".to_string()]);
     }
 
-    // --- drag_span ---
     #[test]
     fn drag_span_layer_is_one() {
         let rows = vec![layer_row(None, 0, 0)];
@@ -5654,19 +4933,17 @@ mod tests {
 
     #[test]
     fn drag_span_nested_groups() {
-        // outer(depth 0) > inner(depth 1) > leaf(depth 2); sibling at depth 0
         let rows = vec![
             group_row("outer", true, None, 0, 0),
             group_row("inner", true, Some("outer"), 0, 1),
             layer_row(Some("inner"), 0, 2),
-            layer_row(None, 1, 0), // sibling after outer
+            layer_row(None, 1, 0),
         ];
-        assert_eq!(drag_span(&rows, 0), 3); // outer header + inner header + leaf
-        assert_eq!(drag_span(&rows, 1), 2); // inner header + leaf
-        assert_eq!(drag_span(&rows, 3), 1); // plain sibling layer
+        assert_eq!(drag_span(&rows, 0), 3);
+        assert_eq!(drag_span(&rows, 1), 2);
+        assert_eq!(drag_span(&rows, 3), 1);
     }
 
-    // --- reorder_steps ---
     fn ids(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
     }
@@ -5697,14 +4974,12 @@ mod tests {
 
     #[test]
     fn reorder_steps_group_move_reconstructs_target() {
-        // Two layers moved together past a third - a group drag.
         let before = ids(&["a", "b", "c", "d"]);
         let after = ids(&["c", "a", "b", "d"]);
         let steps = reorder_steps(&before, &after);
         assert_eq!(apply_steps(&before, &steps), after);
     }
 
-    // --- displaced_row ---
     #[test]
     fn displaced_row_no_movement() {
         for i in 0..5 {
@@ -5714,7 +4989,6 @@ mod tests {
 
     #[test]
     fn displaced_row_move_down() {
-        // from=1, span=1, to=3 - rows [2,3] shift up by 1
         assert_eq!(displaced_row(0, 1, 1, 3), 0);
         assert_eq!(displaced_row(2, 1, 1, 3), 1);
         assert_eq!(displaced_row(3, 1, 1, 3), 2);
@@ -5723,7 +4997,6 @@ mod tests {
 
     #[test]
     fn displaced_row_move_up() {
-        // from=3, span=1, to=1 - rows [1,2] shift down by 1
         assert_eq!(displaced_row(0, 3, 1, 1), 0);
         assert_eq!(displaced_row(1, 3, 1, 1), 2);
         assert_eq!(displaced_row(2, 3, 1, 1), 3);
@@ -5732,13 +5005,10 @@ mod tests {
 
     #[test]
     fn displaced_row_group_span_move_down() {
-        // from=0, span=2 (group header + child), to=2
-        // Non-dragged rows [2,4) all shift up by 2.
         assert_eq!(displaced_row(2, 0, 2, 2), 0);
         assert_eq!(displaced_row(3, 0, 2, 2), 1);
     }
 
-    // --- resolve_insert_target ---
     #[test]
     fn resolve_prepend_at_row_zero() {
         let rows = vec![layer_row(None, 0, 0)];
@@ -5749,7 +5019,6 @@ mod tests {
 
     #[test]
     fn resolve_after_plain_layer() {
-        // One root layer; drop after it (current_row = 1).
         let rows = vec![layer_row(None, 0, 0)];
         let (parent, idx) = resolve_insert_target(&rows, 1);
         assert_eq!(parent, None);
@@ -5758,22 +5027,17 @@ mod tests {
 
     #[test]
     fn resolve_first_child_after_expanded_group_header() {
-        // current_row = 1 -> "above" is the expanded group header.
-        // Drop just below an expanded header -> first child of the group.
         let rows = vec![
             group_row("g1", true, None, 0, 0),
             layer_row(Some("g1"), 0, 1),
         ];
         let (parent, idx) = resolve_insert_target(&rows, 1);
         assert_eq!(parent, Some("g1".to_owned()));
-        assert_eq!(idx, usize::MAX); // first-child sentinel
+        assert_eq!(idx, usize::MAX);
     }
 
     #[test]
     fn resolve_escape_group_when_above_is_last_child() {
-        // rows: [Group(expanded, root), Child(depth1), Sibling(depth0)]
-        // current_row = 2 -> "above" is Child, the last child (next row is depth 0).
-        // Should escape to root, after the group.
         let rows = vec![
             group_row("g1", true, None, 0, 0),
             layer_row(Some("g1"), 0, 1),
@@ -5781,13 +5045,11 @@ mod tests {
         ];
         let (parent, idx) = resolve_insert_target(&rows, 2);
         assert_eq!(parent, None);
-        assert_eq!(idx, 0); // after the group (group is root[0])
+        assert_eq!(idx, 0);
     }
 
     #[test]
     fn resolve_inside_group_middle_child() {
-        // current_row = 2 -> "above" is Child1, NOT the last child (Child2 follows).
-        // Should insert as sibling after Child1 inside the group.
         let rows = vec![
             group_row("g1", true, None, 0, 0),
             layer_row(Some("g1"), 0, 1), // Child1
@@ -5812,8 +5074,6 @@ mod tests {
 
     #[test]
     fn collect_top_selected_keeps_subgroups_intact() {
-        // Root has: layer "a", subgroup "g" {c, d}, layer "b". User selected the
-        // subgroup and both loose layers - all at root depth.
         let tree = vec![
             LayerNode::Layer("a".into()),
             ui_group("g", vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())]),
@@ -5823,14 +5083,11 @@ mod tests {
             ["a".to_string(), "g".to_string(), "b".to_string()].into_iter().collect();
         let mut out = Vec::new();
         collect_top_selected(&tree, &wanted, &mut out);
-        // The group id survives instead of being flattened to c, d.
         assert_eq!(out, vec!["a".to_string(), "g".to_string(), "b".to_string()]);
     }
 
     #[test]
     fn collect_top_selected_skips_nested_selection_under_selected_group() {
-        // Both the group and a child are selected; the child must not be
-        // double-counted or pulled out of the group.
         let tree = vec![ui_group(
             "g",
             vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())],
@@ -5844,9 +5101,6 @@ mod tests {
 
     #[test]
     fn group_nodes_wraps_subgroup_intact() {
-        // Tree (top-first): layer "a", subgroup "g"{c, d}, layer "b". Grouping
-        // the subgroup together with the two loose layers must keep "g" a group,
-        // not flatten it to c/d, and preserve child order.
         let mut tree = vec![
             LayerNode::Layer("a".into()),
             ui_group("g", vec![LayerNode::Layer("c".into()), LayerNode::Layer("d".into())]),

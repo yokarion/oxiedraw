@@ -74,7 +74,7 @@ impl DmabufImage {
         // premultiplied-gamma bytes and we want them stored verbatim.
         let format = DISPLAY_FORMAT;
         // COLOR_ATTACHMENT: the present pass renders straight into this image
-        // (the colour-space conversion). TRANSFER/SAMPLED kept for flexibility.
+        // (the color-space conversion). TRANSFER/SAMPLED kept for flexibility.
         let usage = vk::ImageUsageFlags::COLOR_ATTACHMENT
             | vk::ImageUsageFlags::TRANSFER_DST
             | vk::ImageUsageFlags::TRANSFER_SRC

@@ -1,4 +1,3 @@
-//! Hue ring + HSV triangle drawing and pointer logic.
 
 use std::cell::Cell;
 use std::f64::consts::TAU;
@@ -100,7 +99,6 @@ fn classify_pointer(geom: &WheelGeom, x: f64, y: f64, hue: f64) -> DragMode {
     if point_in_triangle(geom, hue, x, y) {
         return DragMode::Triangle;
     }
-    // fall back to whichever is closer
     if r > (geom.inner_r + geom.outer_r) * 0.5 {
         DragMode::Hue
     } else {
@@ -177,13 +175,11 @@ fn draw_hue_ring(ctx: &cairo::Context, geom: &WheelGeom) {
         ctx.line_to(geom.cx, geom.cy);
         ctx.fill().ok();
     }
-    // punch out the inner disk
     ctx.set_operator(cairo::Operator::Clear);
     ctx.arc(geom.cx, geom.cy, geom.inner_r, 0.0, TAU);
     ctx.fill().ok();
     ctx.set_operator(cairo::Operator::Over);
 
-    // outer + inner stroke
     ctx.set_source_rgba(0.0, 0.0, 0.0, 0.45);
     ctx.set_line_width(1.0);
     ctx.arc(geom.cx, geom.cy, geom.outer_r, 0.0, TAU);
@@ -210,8 +206,7 @@ fn draw_hue_indicator(ctx: &cairo::Context, geom: &WheelGeom, hue: f64) {
 }
 
 fn triangle_vertices(geom: &WheelGeom, hue: f64) -> [(f64, f64); 3] {
-    // The hue vertex sits at the angle on the ring matching the current hue;
-    // the other two vertices follow at 120deg offsets.
+    // Hue vertex on the ring at the current hue, the other two at 120deg.
     let base = hue * TAU;
     let angles = [base, base + TAU / 3.0, base + 2.0 * TAU / 3.0];
     let vertex = |a: f64| {
@@ -336,6 +331,3 @@ fn draw_sv_indicator(ctx: &cairo::Context, geom: &WheelGeom, hue: f64, s: f64, v
     ctx.stroke().ok();
 }
 
-// ---------------------------------------------------------------------------
-// Primary / secondary swatch
-// ---------------------------------------------------------------------------

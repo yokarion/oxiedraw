@@ -1,14 +1,14 @@
 #version 450
 
 // Jump-flood resolve pass for the adjustment-layer stroke: turn the converged
-// nearest-seed offset field into a coloured band along the backdrop's alpha
+// nearest-seed offset field into a colored band along the backdrop's alpha
 // edge, gated by the adjustment layer's grayscale mask. This is the tail of the
 // old brute-force stroke shader; only the distance lookup changed (a texture
 // read of the flooded field instead of a per-pixel disc scan).
 //
 // Signed distance is positive inside the silhouette, negative outside. `offset`
 // slides the band from fully inside (-1) through centred (0) to fully outside
-// (+1). Output is premultiplied; colour arrives straight sRGB and is linearised
+// (+1). Output is premultiplied; color arrives straight sRGB and is linearised
 // to match the sRGB attachment.
 
 layout(location = 0) in vec2 v_uv;
@@ -19,7 +19,7 @@ layout(set = 0, binding = 1) uniform sampler2D u_backdrop; // alpha = silhouette
 layout(set = 0, binding = 2) uniform sampler2D u_mask;     // .r = effect gate
 
 layout(push_constant) uniform Push {
-    vec4 color;  // rgb = straight sRGB colour, a unused
+    vec4 color;  // rgb = straight sRGB color, a unused
     vec4 params; // x = opacity, y = thickness (px), z = offset (-1..1), w = softness
     vec4 texel;  // unused here
 } push;

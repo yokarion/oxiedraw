@@ -43,7 +43,7 @@ impl VulkanRenderer {
 
     /// Set whether the layer being painted is alpha-locked. While set, every
     /// pass that writes into a layer keeps that layer's alpha exactly as it
-    /// was, so paint can only recolour pixels that already exist.
+    /// was, so paint can only recolor pixels that already exist.
     pub fn set_alpha_lock(&mut self, locked: bool) {
         self.alpha_lock = locked;
     }

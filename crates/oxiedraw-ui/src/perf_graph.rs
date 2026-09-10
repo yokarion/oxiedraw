@@ -42,7 +42,7 @@ type Breakdown = [f32; SEGMENTS];
 
 // -- Palette -------------------------------------------------------------------
 // Categorical slots 1-6 of the validated dark-surface palette, in stack order,
-// plus a neutral gray for the residual. Adjacent pairs clear the colour-vision
+// plus a neutral gray for the residual. Adjacent pairs clear the color-vision
 // separation gate against this panel's surface, and the legend carries identity
 // so nothing depends on hue alone.
 
@@ -269,7 +269,7 @@ impl PerfGraph {
         self.tick(gpu, profile);
 
         // Panel background + subtle border. Kept mostly opaque so the chart
-        // colours read the same over light and dark canvas areas.
+        // colors read the same over light and dark canvas areas.
         rounded_rect(cr, OX, OY, PANEL_W, PANEL_H, 9.0);
         cr.set_source_rgba(0.055, 0.055, 0.07, 0.93);
         cr.fill_preserve().ok();
@@ -728,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn every_segment_has_a_colour_and_label() {
+    fn every_segment_has_a_color_and_label() {
         assert_eq!(SEGMENT_COLORS.len(), SEGMENTS);
         assert_eq!(segment_label(IDLE), IDLE_LABEL);
         for (i, stage) in Stage::ALL.iter().enumerate() {

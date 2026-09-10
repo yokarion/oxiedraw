@@ -209,7 +209,7 @@ pub struct Layer {
     /// (see `build_composite_steps`), so reorders and deletes re-resolve on
     /// their own and there is no repair pass.
     pub clipped: bool,
-    /// Lock transparent pixels: paint can change colour but never alpha, so
+    /// Lock transparent pixels: paint can change color but never alpha, so
     /// every write is confined to pixels that already exist. Composites
     /// identically either way - this only constrains future writes.
     pub alpha_locked: bool,

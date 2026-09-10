@@ -1,5 +1,5 @@
 //! Gradient-overlay GPU resources: a fullscreen pipeline that samples a
-//! baked colour LUT along a Linear/Radial/Square ramp and OVER-blends the
+//! baked color LUT along a Linear/Radial/Square ramp and OVER-blends the
 //! result into the bound target (preview image during drag, layer image at
 //! commit).
 //!

@@ -26,7 +26,7 @@ pub(crate) struct GradientBar {
 }
 
 impl GradientBar {
-    /// Repaint after the ramp changed elsewhere (e.g. a stop recoloured
+    /// Repaint after the ramp changed elsewhere (e.g. a stop recolored
     /// through the picker).
     pub(crate) fn refresh(&self) {
         self.widget.queue_draw();
@@ -128,7 +128,7 @@ fn draw_checker(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64) {
 }
 
 /// A pin handle pointing up into the ramp, its body filled with the stop
-/// colour over a checkerboard so partial opacity shows.
+/// color over a checkerboard so partial opacity shows.
 fn draw_handle(cr: &gtk::cairo::Context, cx: f64, color: Color, opacity: f32, selected: bool) {
     let apex_y = INSET + RAMP_H - 1.0;
     let top_y = apex_y + 5.0;
@@ -144,7 +144,7 @@ fn draw_handle(cr: &gtk::cairo::Context, cx: f64, color: Color, opacity: f32, se
         cr.close_path();
     };
 
-    // Checkerboard body then the colour at its alpha.
+    // Checkerboard body then the color at its alpha.
     draw_checker(cr, cx - half, top_y, HANDLE_W, bottom_y - top_y);
     trace(cr);
     set_rgba(cr, color, opacity);

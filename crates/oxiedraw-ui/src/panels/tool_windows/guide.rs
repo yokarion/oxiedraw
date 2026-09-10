@@ -1,11 +1,3 @@
-//! Drawing Guide sidebar panel.
-//!
-//! Replaces the normal right panel while the Drawing Guide tool is active
-//! (like the crop panel) - the top bar's symmetry button is what enters it.
-//! Edits the per-document [`GuideState`]: guide type, symmetry mode,
-//! mirror/rotational, assisted drawing, and appearance. The two on-canvas nodes
-//! handle position and rotation; that same button switches the guide off again,
-//! and Cancel / Done live in the tool-options bar.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -38,8 +30,6 @@ pub(crate) fn build(
         .build();
     panel.add_css_class("oxiedraw-chrome");
 
-    // Guard set while `refresh` writes widget values, so value-changed handlers
-    // don't loop a notify back through the state.
     let syncing = Rc::new(Cell::new(false));
     let refreshers: Refreshers = Rc::new(RefCell::new(Vec::new()));
 
@@ -55,18 +45,12 @@ pub(crate) fn build(
 
     content.append(&build_header());
 
-    // One unified card grid: the three symmetry variants plus grid / isometric
-    // / perspective, each a selectable guide type (like the crop overlay cards).
     content.append(&section_label("Guide Type"));
     content.append(&build_guide_cards(guide, canvas, colors, &syncing, &refreshers));
 
-    // Behaviour switches (boxed list), only meaningful for symmetry.
     let behavior = build_behavior_list(guide, &syncing, &refreshers);
     content.append(&behavior);
 
-    // Appearance: opacity + thickness (+ grid spacing for grid/iso), then the
-    // colour ramp slider(s) at the bottom of the same boxed list (one per
-    // vanishing point in perspective mode).
     content.append(&section_label("Appearance"));
     let (appearance, grid_row, rays_row) = build_appearance_list(guide, &syncing, &refreshers);
     setup_color_rows(&appearance, guide, &syncing, &refreshers);
@@ -74,7 +58,6 @@ pub(crate) fn build(
 
     content.append(&build_position_section(guide, canvas));
 
-    // Show/hide the kind-specific bits when the config changes.
     {
         let behavior = behavior.clone();
         let grid_row = grid_row.clone();
@@ -86,7 +69,6 @@ pub(crate) fn build(
         }));
     }
 
-    // Run all refreshers now and on any external change.
     {
         let guide_c = guide.clone();
         let syncing_c = Rc::clone(&syncing);
@@ -104,19 +86,12 @@ pub(crate) fn build(
         guide.connect_changed(Box::new(run));
     }
 
-    let scroll = gtk::ScrolledWindow::builder()
-        .hscrollbar_policy(gtk::PolicyType::Never)
-        .vscrollbar_policy(gtk::PolicyType::Automatic)
-        .vexpand(true)
-        .build();
-    scroll.set_child(Some(&content));
-    panel.append(&scroll);
+    // No scroller of its own: nested in the frame's it reports no natural
+    // height, which collapses the window to a sliver.
+    panel.append(&content);
     panel
 }
 
-// ---------------------------------------------------------------------------
-// Header
-// ---------------------------------------------------------------------------
 
 fn build_header() -> gtk::Box {
     let row = gtk::Box::builder()
@@ -139,16 +114,9 @@ fn build_header() -> gtk::Box {
     row
 }
 
-// ---------------------------------------------------------------------------
-// Unified guide-type cards
-// ---------------------------------------------------------------------------
-
-/// A selectable guide type. The three symmetry variants and the grid / iso /
-/// perspective kinds are all presented as one flat card grid.
 #[derive(Clone, Copy)]
 struct GuidePreset {
     kind: GuideKind,
-    /// The symmetry mode, for `GuideKind::Symmetry` presets.
     symmetry: Option<SymmetryMode>,
     label: &'static str,
 }
@@ -162,8 +130,6 @@ const PRESETS: [GuidePreset; 6] = [
     GuidePreset { kind: GuideKind::Perspective, symmetry: None, label: "Perspective" },
 ];
 
-/// Index of the preset matching the current config (symmetry mode for the
-/// Symmetry kind, otherwise the first card for that kind).
 fn preset_index(cfg: &GuideConfig) -> usize {
     PRESETS
         .iter()
@@ -191,7 +157,6 @@ fn build_guide_cards(
         b.set_group(Some(&buttons[0]));
     }
 
-    // Lay the cards out three per row.
     let mut row = new_card_row();
     for (i, (btn, preset)) in buttons.iter().zip(PRESETS.iter()).enumerate() {
         {
@@ -200,15 +165,11 @@ fn build_guide_cards(
             let colors = colors.clone();
             let syncing = Rc::clone(syncing);
             let preset = *preset;
-            // `clicked` (not `toggled`) so re-picking the already-selected card
-            // still applies (the switched-off guide starts from nothing again).
             btn.connect_clicked(move |btn| {
                 if syncing.get() {
                     return;
                 }
                 let primary = color_to_rgb(colors.current());
-                // With the guide switched off there is no config to edit, so
-                // picking a card starts a fresh centred one of that type.
                 if guide.config.borrow().is_none() {
                     *guide.config.borrow_mut() = Some(fresh_config(&canvas, btn));
                 }
@@ -217,8 +178,6 @@ fn build_guide_cards(
                     if let Some(m) = preset.symmetry {
                         c.symmetry = m;
                     }
-                    // Perspective starts with one vanishing point (primary
-                    // colour); tapping the canvas adds more (up to three).
                     if preset.kind == GuideKind::Perspective && c.vanishing_points.is_empty() {
                         let color = vp_default_color(0, primary);
                         c.vanishing_points
@@ -228,7 +187,6 @@ fn build_guide_cards(
             });
         }
         btn.set_hexpand(true);
-        // Keep the cards square as the sidebar width changes.
         btn.add_tick_callback(|b, _| {
             let w = b.width();
             if w > 0 && b.height_request() != w {
@@ -294,7 +252,6 @@ fn make_preset_card(preset: GuidePreset) -> gtk::ToggleButton {
     btn
 }
 
-/// Draw a mini preview of a guide preset inside a card.
 fn draw_preset_icon(cr: &gtk::cairo::Context, w: i32, h: i32, preset: GuidePreset) {
     use std::f64::consts::{FRAC_PI_2, FRAC_PI_3, FRAC_PI_4};
 
@@ -305,7 +262,6 @@ fn draw_preset_icon(cr: &gtk::cairo::Context, w: i32, h: i32, preset: GuidePrese
     let r = (wf.min(hf) / 2.0) - 6.0;
     let (x1, y1, x2, y2) = (6.0, 6.0, wf - 6.0, hf - 6.0);
 
-    // Faint frame like the crop cards.
     cr.set_source_rgba(0.5, 0.5, 0.5, 0.35);
     cr.set_line_width(1.0);
     cr.rectangle(4.0, 4.0, wf - 8.0, hf - 8.0);
@@ -341,7 +297,6 @@ fn draw_preset_icon(cr: &gtk::cairo::Context, w: i32, h: i32, preset: GuidePrese
             }
         }
         (GuideKind::Isometric, _) => {
-            // An isometric cube: a hexagon with a central Y (three visible edges).
             let verts: Vec<(f64, f64)> = (0..6)
                 .map(|k| {
                     let a = FRAC_PI_2 + f64::from(k) * FRAC_PI_3;
@@ -359,7 +314,6 @@ fn draw_preset_icon(cr: &gtk::cairo::Context, w: i32, h: i32, preset: GuidePrese
             }
         }
         (GuideKind::Perspective, _) => {
-            // Rays converging toward a point above the card.
             let vx = cx;
             let vy = y1 - 2.0;
             for x in [x1, cx, x2] {
@@ -371,9 +325,6 @@ fn draw_preset_icon(cr: &gtk::cairo::Context, w: i32, h: i32, preset: GuidePrese
     cr.stroke().ok();
 }
 
-// ---------------------------------------------------------------------------
-// Behaviour switches
-// ---------------------------------------------------------------------------
 
 fn build_behavior_list(guide: &GuideState, syncing: &Rc<Cell<bool>>, refreshers: &Refreshers) -> gtk::ListBox {
     let list = gtk::ListBox::new();
@@ -401,9 +352,6 @@ fn build_behavior_list(guide: &GuideState, syncing: &Rc<Cell<bool>>, refreshers:
     list
 }
 
-// ---------------------------------------------------------------------------
-// Appearance (opacity / thickness / grid spacing)
-// ---------------------------------------------------------------------------
 
 fn build_appearance_list(
     guide: &GuideState,
@@ -426,8 +374,6 @@ fn build_appearance_list(
     (list, grid, rays)
 }
 
-/// Which colour a colour slider edits: the guide-wide line colour, or one
-/// vanishing point's colour (perspective mode).
 #[derive(Clone, Copy, PartialEq)]
 enum ColorTarget {
     Guide,
@@ -454,8 +400,6 @@ impl ColorTarget {
     }
 }
 
-/// A colour slider bound to a target, in a boxed-list row. Values are integer
-/// percentages (0..100) - no fractional input, since the ramp is coarse.
 fn make_color_slider(
     label: &str,
     initial: f32,
@@ -483,7 +427,6 @@ fn make_color_slider(
             }
         },
     );
-    // The exact ramp position is meaningless as a number - just show the bar.
     slider.hide_spin();
     slider.widget.set_margin_top(6);
     slider.widget.set_margin_bottom(6);
@@ -492,18 +435,14 @@ fn make_color_slider(
     slider
 }
 
-/// Add the colour ramp slider(s) to the bottom of the appearance boxed list:
-/// one "Color" slider normally, or one per vanishing point in perspective mode.
-/// The rows are rebuilt only when the structure changes (kind or VP count), so
-/// dragging a slider doesn't tear its own widget down mid-drag.
+// Rebuilt only on a structural change, or a slider drag tears its own widget
+// down mid-drag.
 fn setup_color_rows(
     list: &gtk::ListBox,
     guide: &GuideState,
     syncing: &Rc<Cell<bool>>,
     refreshers: &Refreshers,
 ) {
-    // (structural signature, live slider rows) so a rebuild only happens on a
-    // real structure change, not on every value edit.
     type Rows = (Option<(GuideKind, usize)>, Vec<(ColorTarget, GradientSlider)>);
     let state: Rc<RefCell<Rows>> = Rc::new(RefCell::new((None, Vec::new())));
 
@@ -541,22 +480,16 @@ fn setup_color_rows(
             st.0 = Some(sig);
         }
 
-        // Refresh values (e.g. after load / repick). `syncing` is set around
-        // refreshers, so this doesn't loop back through the sliders' on_change.
         for (target, slider) in &st.1 {
             slider.set_value(f64::from(target.get(cfg)) * 100.0);
         }
     }));
 }
 
-/// Straight RGB (`0.0..=1.0`) for a [`oxiedraw_core::color::Color`].
 fn color_to_rgb(c: oxiedraw_core::color::Color) -> (f32, f32, f32) {
     (f32::from(c.r) / 255.0, f32::from(c.g) / 255.0, f32::from(c.b) / 255.0)
 }
 
-// ---------------------------------------------------------------------------
-// Position
-// ---------------------------------------------------------------------------
 
 fn build_position_section(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> gtk::Box {
     let outer = gtk::Box::builder()
@@ -572,8 +505,6 @@ fn build_position_section(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> g
     hint.inline_css("font-size: 12px;");
     outer.append(&hint);
 
-    // Reset restores the default guide (type, appearance and position) and
-    // leaves it visible - switching guides off is the button's job, not this.
     let reset = gtk::Button::with_label("Reset");
     reset.set_halign(gtk::Align::Start);
     {
@@ -588,8 +519,6 @@ fn build_position_section(guide: &GuideState, canvas: &Rc<RefCell<Canvas>>) -> g
     outer
 }
 
-/// A fresh guide centred on the canvas, its line colour seeded to roughly match
-/// the theme accent. `widget` is any realized widget, used to read that accent.
 fn fresh_config(canvas: &Rc<RefCell<Canvas>>, widget: &impl IsA<gtk::Widget>) -> GuideConfig {
     let size = canvas.borrow().size();
     let mut cfg = GuideConfig::centered(size.width, size.height);
@@ -598,9 +527,6 @@ fn fresh_config(canvas: &Rc<RefCell<Canvas>>, widget: &impl IsA<gtk::Widget>) ->
     cfg
 }
 
-// ---------------------------------------------------------------------------
-// Small widget helpers
-// ---------------------------------------------------------------------------
 
 fn section_label(text: &str) -> gtk::Label {
     let lbl = gtk::Label::builder().label(text).halign(gtk::Align::Start).build();
@@ -608,7 +534,6 @@ fn section_label(text: &str) -> gtk::Label {
     lbl
 }
 
-/// An `AdwActionRow` with a trailing switch bound to a bool field.
 fn switch_row(
     title: &str,
     subtitle: &str,
@@ -639,7 +564,6 @@ fn switch_row(
     row
 }
 
-/// An `AdwActionRow` with a trailing horizontal slider bound to an f32 field.
 #[allow(clippy::too_many_arguments)]
 fn slider_row(
     title: &str,

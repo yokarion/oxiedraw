@@ -2,7 +2,7 @@
 //! through the public `Canvas` API.
 //!
 //! The four mask ops (Replace / Add / Subtract / Intersect) are separate
-//! pipelines that differ only in their colour blend state, and they write the
+//! pipelines that differ only in their color blend state, and they write the
 //! R channel only because the mask is R8. A pipeline that widened that write
 //! mask, or picked the wrong blend op, would corrupt the mask silently - the
 //! composite would still render, just against the wrong region. These pin the
@@ -628,7 +628,7 @@ fn white() -> Vec<u8> {
 }
 
 /// Full-canvas opaque black. Nothing of the backdrop survives the blend, so
-/// the display shows the ramp colour scaled by coverage and nothing else.
+/// the display shows the ramp color scaled by coverage and nothing else.
 fn black() -> Vec<u8> {
     let n = (SIZE.width * SIZE.height) as usize;
     let mut px = vec![0u8; n * 4];

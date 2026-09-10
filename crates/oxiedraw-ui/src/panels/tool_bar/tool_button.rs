@@ -14,13 +14,8 @@ const SIZE: i32 = 40;
 const INDICATOR_SIZE: f64 = 7.0;
 const ACTIVE_CSS_CLASS: &str = "accent";
 
-/// Build a toolbar button for a tool group.
-///
-/// Returns the overlay widget, the underlying `ToggleButton` (for radio-group
-/// linking by the caller), and the `active_subtool` cell (so the caller can
-/// build a programmatic setter). `programmatic` is a shared guard: when `true`
-/// the `toggled` handler only updates CSS and does not call `on_change`, which
-/// prevents infinite recursion when the setter activates a button from code.
+// `programmatic` is the guard that stops the setter recursing: with it set, the
+// `toggled` handler restyles and nothing more.
 pub(super) fn build(
     group_name: &'static str,
     action_id: Option<&'static str>,
@@ -58,22 +53,15 @@ pub(super) fn build(
         let active_sub_c = Rc::clone(&active_subtool);
         let prog_c = Rc::clone(&programmatic);
         btn.connect_toggled(move |b| {
-            // Always sync the accent CSS class.
             if b.is_active() {
                 b.add_css_class(ACTIVE_CSS_CLASS);
             } else {
                 b.remove_css_class(ACTIVE_CSS_CLASS);
             }
-            // Skip on_change when the activation came from the setter - the
-            // caller already ran all tool-switch logic, and recursing into it
-            // again (especially for Transform) would be expensive and wrong.
             if prog_c.get() {
                 return;
             }
             if b.is_active() {
-                // Don't set the active tool here - `on_change` does it, and
-                // doing it first hides the tool being left from everything
-                // that needs to wind it down.
                 on_change_c(active_sub_c.get());
             }
         });
@@ -104,9 +92,8 @@ pub(super) fn build(
         let popover_for_dbl = popover.clone();
         let dbl_click = gtk::GestureClick::new();
         dbl_click.set_button(1);
-        // Capture phase so the press sequence is counted before the
-        // ToggleButton's own click gesture consumes it, otherwise the
-        // double-press is never reliably detected.
+        // Capture phase, or the ToggleButton's own gesture consumes the press
+        // before the double-press is counted.
         dbl_click.set_propagation_phase(gtk::PropagationPhase::Capture);
         dbl_click.connect_released(move |gesture, n_press, _, _| {
             if n_press >= 2 {

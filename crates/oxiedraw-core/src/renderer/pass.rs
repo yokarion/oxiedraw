@@ -1,7 +1,7 @@
 //! Shared construction helpers for the fullscreen-triangle passes.
 //!
 //! Nearly every effect in this renderer is the same shape: no vertex input
-//! (verts come from `gl_VertexIndex`), dynamic viewport/scissor, one colour
+//! (verts come from `gl_VertexIndex`), dynamic viewport/scissor, one color
 //! attachment, and some combined-image-samplers plus a push-constant block.
 //! Only the shaders, the blend mode, the push size and the binding count
 //! actually differ, so those are the parameters here and everything else is
@@ -178,7 +178,7 @@ pub(super) fn over_blend() -> vk::PipelineColorBlendAttachmentState {
 }
 
 /// DST_OUT: `out = dst * (1 - src.a)`. The eraser's compositing - the
-/// shader's premultiplied colour is discarded (src factor zero) and only
+/// shader's premultiplied color is discarded (src factor zero) and only
 /// its alpha scales the target down.
 pub(super) fn dst_out_blend() -> vk::PipelineColorBlendAttachmentState {
     vk::PipelineColorBlendAttachmentState::default()
@@ -192,11 +192,11 @@ pub(super) fn dst_out_blend() -> vk::PipelineColorBlendAttachmentState {
         .alpha_blend_op(vk::BlendOp::ADD)
 }
 
-/// Alpha-locked OVER: paints colour but leaves the destination's alpha exactly
-/// as it was, so a stroke can only recolour pixels that already exist.
+/// Alpha-locked OVER: paints color but leaves the destination's alpha exactly
+/// as it was, so a stroke can only recolor pixels that already exist.
 ///
 /// For premultiplied `src` over `dst`, holding the output alpha at `dst.a`
-/// makes the correct colour `dst.rgb * (1 - src.a) + src.rgb * dst.a`, which is
+/// makes the correct color `dst.rgb * (1 - src.a) + src.rgb * dst.a`, which is
 /// what these factors compute. Alpha takes the destination untouched
 /// (`src * 0 + dst * 1`). No destination read is needed, so this works as a
 /// drop-in pipeline variant on any pass that composites into a layer.
@@ -222,7 +222,7 @@ pub(super) fn replace_blend() -> vk::PipelineColorBlendAttachmentState {
 /// A fullscreen-triangle graphics pipeline.
 ///
 /// Everything not named here is fixed: no vertex input, triangle list,
-/// fill/no-cull raster, 1 sample, dynamic viewport + scissor, one colour
+/// fill/no-cull raster, 1 sample, dynamic viewport + scissor, one color
 /// attachment with an RGBA write mask, subpass 0.
 pub(super) struct FullscreenPass<'a> {
     pub vert_spv: &'a [u8],

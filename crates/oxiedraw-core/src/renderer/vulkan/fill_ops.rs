@@ -43,7 +43,7 @@ impl VulkanRenderer {
         self.write_staging_to_image(image, extent)
     }
 
-    /// Activate the fill overlay. The premultiplied colour and the
+    /// Activate the fill overlay. The premultiplied color and the
     /// owning layer index are captured here so `render_preview` can pick
     /// them up; per-frame radius updates go through `set_fill_reveal`.
     pub fn begin_fill_overlay(
@@ -153,7 +153,7 @@ impl VulkanRenderer {
     }
 
     /// Fill overlay pass - binds the overlay descriptor set, pushes
-    /// the colour + reveal radius, draws the fullscreen triangle into
+    /// the color + reveal radius, draws the fullscreen triangle into
     /// `framebuffer` (the target-plus-overlay scratch).
     fn cmd_compose_fill_overlay(
         &mut self,

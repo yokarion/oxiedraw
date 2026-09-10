@@ -32,7 +32,7 @@ impl VulkanRenderer {
 
     /// Read back the display dmabuf that `present_to_display` last wrote, as
     /// BGRA8 (row-major, no padding). Unlike [`Self::read_canvas`] these pixels
-    /// are premultiplied *gamma* (`srgb(colour) * alpha`) - the form GTK's
+    /// are premultiplied *gamma* (`srgb(color) * alpha`) - the form GTK's
     /// sRGB-space compositing expects. Test/diagnostic helper: the live path
     /// hands this buffer to GTK instead of reading it back.
     pub fn read_display(&mut self) -> Result<Vec<u8>, RendererError> {

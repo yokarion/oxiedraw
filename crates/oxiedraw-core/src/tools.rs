@@ -564,7 +564,7 @@ impl SelectionTool {
 
 /// State for the Fill tool (currently only the bucket variant has settings).
 ///
-/// `tolerance` is the maximum colour difference (0..=255, RMS across
+/// `tolerance` is the maximum color difference (0..=255, RMS across
 /// BGRA) between a candidate pixel and the seed pixel for the bucket
 /// flood-fill to include it. 0 = exact match only.
 ///
@@ -752,7 +752,7 @@ impl GradientType {
     }
 }
 
-/// One gradient stop: a colour + opacity anchored at `position` (0..=1)
+/// One gradient stop: a color + opacity anchored at `position` (0..=1)
 /// along the ramp. Serialised into the project as the document default.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct GradientStop {
@@ -818,7 +818,7 @@ impl GradientSettings {
     }
 
     /// Bake the ramp into a premultiplied **linear** RGBA LUT for the GPU
-    /// (`GRADIENT_LUT_SIZE` texels, 4 floats each). Colours are sRGB-lerped
+    /// (`GRADIENT_LUT_SIZE` texels, 4 floats each). Colors are sRGB-lerped
     /// then converted to linear so the canvas result matches the UI preview.
     #[must_use]
     pub fn bake_lut(&self) -> Vec<f32> {
@@ -837,7 +837,7 @@ impl GradientSettings {
         out
     }
 
-    /// Insert a stop at `t`, interpolating its colour + opacity from the
+    /// Insert a stop at `t`, interpolating its color + opacity from the
     /// current ramp. Returns the index of the new stop after re-sorting.
     pub fn insert_stop(&mut self, t: f32) -> usize {
         let t = t.clamp(0.0, 1.0);
@@ -876,12 +876,12 @@ impl GradientSettings {
 /// Live state for the Gradient tool.
 ///
 /// `settings` is `None` until the user edits a stop; while `None` the ramp is
-/// derived from the primary/secondary colours (see [`Self::resolve`]). Once
+/// derived from the primary/secondary colors (see [`Self::resolve`]). Once
 /// concrete it is what gets persisted to the project as the document default.
 pub struct GradientState {
     pub settings: Rc<RefCell<Option<GradientSettings>>>,
     pub gradient_type: Rc<Cell<GradientType>>,
-    /// Index of the stop currently bound to the colour picker + panel fields.
+    /// Index of the stop currently bound to the color picker + panel fields.
     pub selected_stop: Rc<Cell<usize>>,
     changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
 }
@@ -917,7 +917,7 @@ impl GradientState {
     }
 
     /// Effective ramp: stored settings if present, else a two-stop ramp
-    /// seeded from the primary (0%) and secondary (100%) colours.
+    /// seeded from the primary (0%) and secondary (100%) colors.
     #[must_use]
     pub fn resolve(&self, colors: &ColorState) -> GradientSettings {
         if let Some(s) = self.settings.borrow().as_ref() {
@@ -931,7 +931,7 @@ impl GradientState {
         }
     }
 
-    /// Promote `None` settings to a concrete ramp (seeded from the colours)
+    /// Promote `None` settings to a concrete ramp (seeded from the colors)
     /// so subsequent edits persist. Returns nothing; edit via `settings`.
     pub fn ensure_owned(&self, colors: &ColorState) {
         if self.settings.borrow().is_none() {

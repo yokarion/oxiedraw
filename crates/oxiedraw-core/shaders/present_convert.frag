@@ -31,7 +31,7 @@ vec3 linear_to_srgb(vec3 c) {
 // Blender weight-paint ramp: blue at the faintest selection through to red at
 // fully selected. Walking the five spectrum stops (rather than lerping blue
 // straight to red) keeps red and blue from ever being lit at once, so the ramp
-// has no magenta/purple in it. Display-space colours, so no linearisation.
+// has no magenta/purple in it. Display-space colors, so no linearisation.
 vec3 heat_ramp(float v) {
     const vec3 stops[5] = vec3[5](
         vec3(0.0, 0.0, 1.0), // blue

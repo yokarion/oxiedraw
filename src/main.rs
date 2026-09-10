@@ -14,7 +14,7 @@
 //! - `oxiedraw_core::renderer` - GPU pipelines, layer compositing and the dmabuf
 //!   display path. Its module docs carry the image/pipeline tables.
 //! - `oxiedraw_ui::session` - one `DocumentSession` per open tab, plus the
-//!   `GlobalState` shared across tabs (brushes, colours, fonts, clipboard).
+//!   `GlobalState` shared across tabs (brushes, colors, fonts, clipboard).
 //! - `oxiedraw_core::history` - every undoable edit is one `HistoryAction`
 //!   variant. The exhaustive match is deliberate: adding a variant makes the
 //!   compiler point at everything that must handle it.

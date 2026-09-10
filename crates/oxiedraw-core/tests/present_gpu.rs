@@ -1,4 +1,4 @@
-//! GPU integration tests for the present colour-space conversion, driven
+//! GPU integration tests for the present color-space conversion, driven
 //! through the public `Canvas` API.
 //!
 //! The canvas holds premultiplied linear; the display dmabuf has to hold
@@ -125,7 +125,7 @@ fn present_regamma_premultiplies_semitransparent_pixels() {
     );
 }
 
-/// Semi-transparent colour (not just grey) converts per channel, and alpha is
+/// Semi-transparent color (not just grey) converts per channel, and alpha is
 /// carried through untouched.
 #[test]
 fn present_converts_each_channel_independently() {

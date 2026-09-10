@@ -435,7 +435,7 @@ impl VulkanRenderer {
 
     /// Record (no submit) the full jump-flood stroke band into `Scratch::A`:
     /// seed the backdrop silhouette, flood the nearest-edge distance field with
-    /// halving step sizes, then resolve the coloured band. Descriptor sets are
+    /// halving step sizes, then resolve the colored band. Descriptor sets are
     /// taken from the input ring starting at `*cursor` (one per pass, advanced
     /// past those used), so the chain can share a submission with other passes.
     /// `push` is the 48-byte resolve push (color, params, texel); `thickness`
@@ -488,7 +488,7 @@ impl VulkanRenderer {
             src = dst;
         }
 
-        // Resolve: colour the band from the converged field into Scratch::A.
+        // Resolve: color the band from the converged field into Scratch::A.
         let resolve_set = self.filter_resources.input_set(*cursor);
         *cursor += 1;
         let coord_view = self.filter_resources.coord_view(src);

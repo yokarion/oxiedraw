@@ -1,4 +1,3 @@
-//! Appearance page (window decoration toggle).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,7 +25,7 @@ pub(super) fn build_appearance_page(
     row.connect_active_notify(move |r| {
         let visible = r.is_active();
         settings.borrow_mut().appearance.show_window_decorations = visible;
-        settings.borrow().save();
+        settings.borrow_mut().save_keeping_layout();
         apply_decorations(visible);
     });
 
@@ -35,4 +34,3 @@ pub(super) fn build_appearance_page(
     page
 }
 
-// Keybinds page

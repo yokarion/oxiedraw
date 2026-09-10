@@ -300,7 +300,7 @@ pub struct VulkanRenderer {
     pub(super) fill_active: bool,
     /// Current reveal radius in normalised mask space (0.0..1.0).
     pub(super) fill_reveal: f32,
-    /// Premultiplied fill colour pushed to the overlay shader each frame.
+    /// Premultiplied fill color pushed to the overlay shader each frame.
     pub(super) fill_color_premul: [f32; 4],
     /// Layer index the fill is being applied to (used to splice the
     /// overlay in at the right z-order during the preview composite).
@@ -308,7 +308,7 @@ pub struct VulkanRenderer {
     /// True when the fill went underneath the layer's existing pixels
     /// rather than over them, so hiding it during the reveal means
     /// taking its share back out (DST_OUT) rather than painting the seed
-    /// colour over it.
+    /// color over it.
     pub(super) fill_behind: bool,
 
     pub(super) shape_overlay: ManuallyDrop<ShapeOverlayResources>,
@@ -352,10 +352,10 @@ pub struct VulkanRenderer {
     /// Layer indices the filter applies to (z-order independent).
     pub(super) filter_affected: Vec<usize>,
 
-    /// Colour-smudge dab pipeline `(layout, pipeline)`, built lazily on first
+    /// Color-smudge dab pipeline `(layout, pipeline)`, built lazily on first
     /// smudge stroke (most sessions never use it). Samples `blend_scratch`
     /// (a per-dab copy of the target layer) + `smudge_before`, and deposits the
-    /// dragged colour lerped from the pre-stroke layer by opacity.
+    /// dragged color lerped from the pre-stroke layer by opacity.
     pub(super) smudge_pipeline: Option<(vk::PipelineLayout, vk::Pipeline)>,
     /// Pre-stroke snapshot of the smudged layer `(image, pool, set)`, taken at
     /// stroke start; the dab shader lerps from it so opacity is a ceiling.
@@ -376,7 +376,7 @@ pub struct VulkanRenderer {
     /// one we just wrote while the next present targets a different buffer.
     pub(super) display: Vec<DmabufImage>,
     pub(super) display_cursor: usize,
-    /// Present-time colour-space conversion (premultiplied-linear canvas ->
+    /// Present-time color-space conversion (premultiplied-linear canvas ->
     /// premultiplied-gamma display) so GTK's sRGB-space checker composite is
     /// correct for semi-transparent pixels.
     pub(super) present_convert: ManuallyDrop<PresentConvertPipeline>,

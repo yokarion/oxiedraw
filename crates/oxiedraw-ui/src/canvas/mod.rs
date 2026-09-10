@@ -680,7 +680,7 @@ impl Viewport {
         widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation)
     }
 
-    /// The canvas `Picture` widget, once wired. Used to read theme colours.
+    /// The canvas `Picture` widget, once wired. Used to read theme colors.
     pub(crate) fn picture_widget(&self) -> Option<gtk::Picture> {
         self.picture.borrow().clone()
     }

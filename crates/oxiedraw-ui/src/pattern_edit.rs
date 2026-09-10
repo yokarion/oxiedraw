@@ -398,7 +398,7 @@ impl PatternEdit {
             canvas_size,
             zoom,
         );
-        // Without this the overlay keeps the colour it was tinted with and the
+        // Without this the overlay keeps the color it was tinted with and the
         // bake lays down the new one.
         colors.connect_changed(Box::new({
             let edit = edit.clone();
@@ -1159,7 +1159,7 @@ fn nearest_on_polyline(points: &[Point], at: Point) -> Option<(usize, Point, f32
     best
 }
 
-/// Turn a coverage tile into a premultiplied BGRA block in the active colour,
+/// Turn a coverage tile into a premultiplied BGRA block in the active color,
 /// clipped to the canvas, ready to upload as the overlay. `clip` is the same
 /// per-pixel limit the bake applies (see [`PreviewClip`]), or the preview shows
 /// fur that vanishes when it is applied.
@@ -1585,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_becomes_premultiplied_paint_in_the_active_colour() {
+    fn coverage_becomes_premultiplied_paint_in_the_active_color() {
         let canvas = Size::new(8, 8);
         let out = tint(&tile(0, 0, 4, 4, 128), Color::new(255, 0, 0), None, canvas)
             .expect("a block");

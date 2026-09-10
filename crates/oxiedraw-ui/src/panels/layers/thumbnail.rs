@@ -1,4 +1,3 @@
-//! Background thumbnail refresh for the layers panel.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -20,11 +19,8 @@ pub(super) fn start_thumbnail_refresh(
 ) {
     let ui = ui.clone();
     let last_ver = Rc::new(Cell::new(0u64));
-    // Per-layer content versions seen at the last refresh, so we re-read only
-    // the layers that actually changed (GPU readback is the expensive part).
+    // Only changed layers are re-read: the GPU readback is the expensive part.
     let mut last_layer_vers: Vec<u64> = Vec::new();
-    // Reused across ticks and across layers so each refresh doesn't churn
-    // a fresh full-canvas allocation per layer.
     let mut scratch: Vec<u8> = Vec::new();
     glib::timeout_add_local(Duration::from_millis(150), move || {
         let _span = frame_profile::span(frame_profile::Stage::Timers);
@@ -37,8 +33,7 @@ pub(super) fn start_thumbnail_refresh(
         }
         let size = canvas.borrow().size();
         let count = ui.state.len();
-        // A change in layer count (add/remove/reorder shrinks/grows or shifts)
-        // invalidates the index->version mapping; rebuild every thumbnail then.
+        // A changed layer count invalidates the index-to-version mapping.
         let structure_changed = last_layer_vers.len() != count;
         let mut thumbs = ui.thumbnails.borrow_mut();
         thumbs.resize_with(count, || None);
@@ -67,9 +62,6 @@ pub(super) fn start_thumbnail_refresh(
     });
 }
 
-/// Downscale `bgra` (full canvas pixels, `B8G8R8A8` premultiplied) into a
-/// `SWATCH_SIZE x SWATCH_SIZE` cairo surface, preserving aspect ratio
-/// with transparent letterboxing. Nearest-neighbour sampling.
 pub(super) fn make_thumbnail(bgra: &[u8], src_w: u32, src_h: u32) -> cairo::ImageSurface {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let sz_i = SWATCH_SIZE as i32;

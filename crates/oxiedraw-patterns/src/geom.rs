@@ -33,7 +33,7 @@ pub struct Element {
     /// `true` to fill the contour, `false` to stroke the polyline.
     pub fill: bool,
     /// `true` for a stroke that travels back the way it came. Carried so a
-    /// preview can colour the two apart; the rasteriser does not care.
+    /// preview can color the two apart; the rasteriser does not care.
     pub reverse: bool,
 }
 

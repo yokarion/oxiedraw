@@ -7,7 +7,7 @@
 //! `n` across it) and randomness is keyed on element ids rather than a stream,
 //! so editing the curve re-maps what exists instead of reshuffling it. Pure CPU
 //! and deterministic; output is 8-bit coverage ([`CoverageTile`]) the canvas
-//! tints with the active colour.
+//! tints with the active color.
 //!
 //! # Example
 //! ```

@@ -1,4 +1,4 @@
-//! GPU integration tests for the colour-smudge (Real Brush) path.
+//! GPU integration tests for the color-smudge (Real Brush) path.
 
 #![allow(clippy::unwrap_used)]
 // Diagnostic prints for the --nocapture runs of these GPU tests.
@@ -86,7 +86,7 @@ fn white_smudge_over_transparent_is_not_dark() {
     let mut buf = Vec::new();
     canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
     // BGRA8 premultiplied. Scan the whole stroke band for the "dark blob"
-    // signature: a covered pixel whose un-premultiplied colour reads dark.
+    // signature: a covered pixel whose un-premultiplied color reads dark.
     let w = size.width as usize;
     let mut max_alpha = 0u8;
     let mut dark_count = 0;
@@ -110,10 +110,10 @@ fn white_smudge_over_transparent_is_not_dark() {
 }
 
 /// Smudge must actually smear: painting from a red region into a blue region
-/// with no paint colour (colour rate ~0 via zero pressure keeps it a pure
+/// with no paint color (color rate ~0 via zero pressure keeps it a pure
 /// smear) drags red into blue at the boundary.
 #[test]
-fn smudge_drags_colour_across_a_boundary() {
+fn smudge_drags_color_across_a_boundary() {
     let size = Size::new(200, 40);
     let mut canvas = Canvas::headless(size).unwrap();
     // Left half red, right half blue (opaque).
@@ -262,13 +262,13 @@ fn vec_black(size: Size) -> Vec<u8> {
     px
 }
 
-/// Smudge over a solid colour should smear it, and the deposited alpha along
+/// Smudge over a solid color should smear it, and the deposited alpha along
 /// the stroke centre should be reasonably even (no strong per-dab beading).
 #[test]
 fn smudge_stroke_alpha_is_even() {
     let size = Size::new(240, 40);
     let mut canvas = Canvas::headless(size).unwrap();
-    // Opaque red base so there's colour to smear.
+    // Opaque red base so there's color to smear.
     let mut red = vec![0u8; (size.width * size.height) as usize * 4];
     for px in red.chunks_exact_mut(4) {
         px.copy_from_slice(&[0, 0, 255, 255]); // BGRA red

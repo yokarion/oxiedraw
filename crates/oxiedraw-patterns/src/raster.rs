@@ -1,6 +1,6 @@
 //! Turning generated geometry into an 8-bit coverage tile.
 //!
-//! Coverage only, never colour: the canvas tints it at composite time as it does
+//! Coverage only, never color: the canvas tints it at composite time as it does
 //! a brush stroke. Elements union rather than accumulate, so a tuft of twenty
 //! overlapping spikes reads as one silhouette rather than a stack.
 
@@ -567,7 +567,7 @@ mod tests {
         assert!((126..=130).contains(&value), "coverage {value}");
     }
 
-    // The whole stroke is a single flat colour.
+    // The whole stroke is a single flat color.
     #[test]
     fn overlapping_strokes_in_one_element_do_not_compound() {
         let zigzag = ribbon(

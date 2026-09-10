@@ -190,7 +190,7 @@ impl TextEditor {
         self.restyle(engine, |s| s.underline = on);
     }
 
-    /// Set the colour over the selection, or the whole box when nothing is
+    /// Set the color over the selection, or the whole box when nothing is
     /// selected.
     pub fn set_color(&mut self, engine: &mut TextEngine, color: Color) {
         self.restyle(engine, move |s| s.color = color);

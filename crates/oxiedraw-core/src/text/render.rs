@@ -1,7 +1,7 @@
 //! Rasterize [`TextContent`] into a canvas-sized layer slot.
 //!
 //! Shapes the runs with cosmic-text (per-run font, size, weight, style and
-//! colour via [`cosmic_text::Attrs`]), rasterizes the glyphs to premultiplied
+//! color via [`cosmic_text::Attrs`]), rasterizes the glyphs to premultiplied
 //! sRGB BGRA8, draws underlines, and places the block in the layer slot at the
 //! text box position/alignment. Axis-aligned boxes blit directly (crisp);
 //! rotated boxes go through the same affine resample as component instances.
@@ -388,7 +388,7 @@ fn clip_bounds(resize: ResizeMode, box_rect: super::TextBox, canvas_w: u32, canv
 
 /// Rasterize glyphs + underlines from `buffer` into `buf` at `(origin_x,
 /// origin_y)`, clipped to `clip`. `default_color` is used for glyphs/underlines
-/// whose run didn't set an explicit colour.
+/// whose run didn't set an explicit color.
 #[allow(clippy::too_many_arguments)]
 fn paint_into(
     buffer: &Buffer,
@@ -467,7 +467,7 @@ fn blend_rect(
     }
 }
 
-/// Our opaque sRGB colour as an opaque cosmic-text colour.
+/// Our opaque sRGB color as an opaque cosmic-text color.
 pub(crate) fn ct_color(color: Color) -> CtColor {
     CtColor::rgba(color.r, color.g, color.b, 255)
 }

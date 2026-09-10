@@ -20,12 +20,12 @@ use crate::text::fonts::FontMeta;
 /// scoped to their enclosing folder. Absent in pre-v7 files (loads as flat).
 /// v8 adds the document's default gradient stops (`gradient`), the persisted
 /// setting for the Gradient tool. Absent in pre-v8 files (tool falls back to
-/// primary/secondary colours).
+/// primary/secondary colors).
 /// v9 adds the persisted view rotation (`view_rotation`, radians), so reopening
 /// restores the canvas angle. Absent in pre-v9 files (loads at 0).
 /// v10 adds the drawing guide (`guide`): symmetry / grid / perspective config.
 /// Absent in pre-v10 files (no guide).
-/// v11 adds guide line colours (a position along the guide colour ramp): a
+/// v11 adds guide line colors (a position along the guide color ramp): a
 /// `color` on the guide and a per-vanishing-point `color`. Absent in pre-v11
 /// files (both default to the ramp's blue).
 /// v12 adds the per-layer `clipped` (clipping mask) and `alpha_locked` flags.
@@ -106,7 +106,7 @@ pub struct DocumentData {
     #[serde(default)]
     pub layer_tree: Vec<LayerTreeNode>,
     /// Document default gradient stops for the Gradient tool. Absent (pre-v8)
-    /// or `None` = derive the ramp from the primary/secondary colours.
+    /// or `None` = derive the ramp from the primary/secondary colors.
     #[serde(default)]
     pub gradient: Option<crate::tools::GradientSettings>,
     /// Persisted view rotation in radians. Absent (pre-v9) = 0 (no rotation).

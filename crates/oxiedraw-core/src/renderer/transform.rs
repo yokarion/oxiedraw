@@ -6,7 +6,7 @@
 //! extension/off-canvas pass).
 //!
 //! Render-pass-compatible with the canvas render pass - any framebuffer
-//! built around a `CANVAS_FORMAT` colour attachment can be the target.
+//! built around a `CANVAS_FORMAT` color attachment can be the target.
 
 use ash::{Device, vk};
 

@@ -412,7 +412,7 @@ pub const SCHEMA: &[ParamDef] = &[
         id: "back_alpha",
         label: "Back opacity",
         group: "Depth",
-        tooltip: "Coverage of the furthest rank. Below 1.0 the ranks read as depth, but the mass is no longer one flat colour",
+        tooltip: "Coverage of the furthest rank. Below 1.0 the ranks read as depth, but the mass is no longer one flat color",
         kind: ParamKind::Float {
             min: 0.05,
             max: 1.0,

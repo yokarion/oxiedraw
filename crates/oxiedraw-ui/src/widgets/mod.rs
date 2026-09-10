@@ -1,8 +1,7 @@
-//! Shared, reusable widget builders. Each submodule exposes a
-//! `pub(crate) fn build(...) -> <Widget>` shared across panels.
+//! Shared widget builders, each submodule exposing a `build(...)` used across
+//! the panels.
 
 pub(crate) mod boxed_list;
-pub(crate) mod canvas_info_bar;
 pub(crate) mod gradient_bar;
 pub(crate) mod gradient_slider;
 pub(crate) mod slider;

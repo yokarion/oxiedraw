@@ -178,7 +178,7 @@ pub fn symmetry_copies(elements: &[CanvasElement], symmetry: &Symmetry) -> Vec<C
     out
 }
 
-/// Composite a generated coverage tile onto layer pixels in one flat colour, on
+/// Composite a generated coverage tile onto layer pixels in one flat color, on
 /// the terms a brush stamp uses: premultiplied sRGB BGRA, source-over, clipped
 /// by the selection mask. `layer` is canvas-sized and edited in place.
 pub fn paint_coverage(
@@ -436,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_lands_as_premultiplied_paint_in_the_active_colour() {
+    fn coverage_lands_as_premultiplied_paint_in_the_active_color() {
         let (w, h) = (200_u32, 140_u32);
         let tile = fur_tile(w, h);
         let mut layer = vec![0_u8; (w * h * 4) as usize];
@@ -457,7 +457,7 @@ mod tests {
             assert_eq!(g, 0, "green leaked into a red pattern");
             assert!(
                 r <= a,
-                "not premultiplied: colour {r} exceeds coverage {a} at {i}"
+                "not premultiplied: color {r} exceeds coverage {a} at {i}"
             );
         }
     }

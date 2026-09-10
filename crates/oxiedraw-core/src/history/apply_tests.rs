@@ -248,7 +248,7 @@ fn multiply_blend_darkens_canvas() {
     let top = c.add_layer("Top").expect("add");
     paint(&mut c, top, [0.4, 0.6, 0.8, 1.0]);
 
-    // Normal opaque: canvas shows the top layer's colour.
+    // Normal opaque: canvas shows the top layer's color.
     c.set_layer_blend(top, BlendMode::Normal, 1.0).expect("normal");
     let normal = canvas_center_bgra(&mut c);
 
@@ -832,7 +832,7 @@ fn transform_preview_warped_layer_moves() {
     }
     c.restore_layer(top, &top_px).expect("write top");
     c.set_layer_blend(top, BlendMode::Normal, 1.0).expect("normal");
-    // Reference colour of the bottom layer at a pixel the top never covers.
+    // Reference color of the bottom layer at a pixel the top never covers.
     let red_below = {
         c.set_layer_blend(top, BlendMode::Normal, 0.0).expect("hide");
         let p = canvas_center_bgra(&mut c);

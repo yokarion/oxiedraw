@@ -258,10 +258,10 @@ pub struct Dynamics {
     /// light touch reads grainy/broken and a firm press lays a solid line.
     #[serde(default)]
     pub texture_strength: Option<Mapping>,
-    /// Smudge family: colour-pickup rate, `0..=1`.
+    /// Smudge family: color-pickup rate, `0..=1`.
     #[serde(default)]
     pub smudge_rate: Option<Mapping>,
-    /// Smudge family: paint-colour mix rate, `0..=1`.
+    /// Smudge family: paint-color mix rate, `0..=1`.
     #[serde(default)]
     pub color_rate: Option<Mapping>,
 }
@@ -318,8 +318,8 @@ pub fn evaluate(
     }
     // `Color` does not yet have an alpha channel, so hue / sat / val
     // dynamics are deferred until the stroke buffer is promoted to RGBA
-    // (see `renderer/mod.rs`). Until then, per-dab colour is the stroke
-    // colour as set by the preset.
+    // (see `renderer/mod.rs`). Until then, per-dab color is the stroke
+    // color as set by the preset.
     let _ = dab.color;
 }
 

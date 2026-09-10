@@ -133,7 +133,7 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
-    /// Set the accent colour used for the guide nodes (straight RGB).
+    /// Set the accent color used for the guide nodes (straight RGB).
     pub(crate) fn set_guide_accent(&self, accent: (f32, f32, f32)) {
         self.imp().guide_accent.set(accent);
     }
@@ -806,7 +806,7 @@ fn render_guide_texture(
 const MARK_LEN_PX: f64 = 35.0;
 const MARK_MIN_GAP_PX: f64 = 55.0;
 
-/// The Pattern tool's overlay: the guide curve in the accent colour and a
+/// The Pattern tool's overlay: the guide curve in the accent color and a
 /// draggable point at every node. The pattern itself is composited into the
 /// canvas image, not drawn here, so it is already under the layer's effects by
 /// the time this runs.
@@ -953,7 +953,7 @@ fn draw_guide_overlay_cairo(
         GuideKind::Perspective => {}
     }
 
-    // Solid line in the guide's chosen ramp colour (opacity/thickness honoured).
+    // Solid line in the guide's chosen ramp color (opacity/thickness honoured).
     let (lr, lg, lb) = oxiedraw_core::guides::guide_line_color(guide.color);
     cr.set_line_width(thickness);
     cr.set_source_rgba(f64::from(lr), f64::from(lg), f64::from(lb), alpha);
@@ -1029,7 +1029,7 @@ fn draw_perspective(
         })
     };
 
-    // Each VP carries its screen position plus its own ramp colour.
+    // Each VP carries its screen position plus its own ramp color.
     let vps: Vec<(f64, f64, f32)> = guide
         .vanishing_points
         .iter()
@@ -1040,10 +1040,10 @@ fn draw_perspective(
     }
 
     // Rays fanned evenly from every vanishing point, clipped to the widget and
-    // stroked SOLID in that point's colour. Solid strokes are far cheaper than
+    // stroked SOLID in that point's color. Solid strokes are far cheaper than
     // gradient ones, and the fade is applied afterwards as a single mask fill
     // whose cost is independent of the ray/point count. Stroked per VP so each
-    // fan can take its own colour.
+    // fan can take its own color.
     let rays = guide.perspective_rays.max(1);
     cr.set_line_width(thickness);
     for &(vx, vy, color) in &vps {
@@ -1255,7 +1255,7 @@ fn clip_line_to_rect(px: f64, py: f64, dx: f64, dy: f64, w: f64, h: f64) -> Opti
     (t0 <= t1).then_some((t0, t1))
 }
 
-/// The position (filled disc) and rotation (ring) nodes in the accent colour.
+/// The position (filled disc) and rotation (ring) nodes in the accent color.
 fn draw_guide_nodes(cr: &gtk::cairo::Context, ox: f64, oy: f64, angle: f64, r: f64, g: f64, b: f64) {
     let (s, c) = angle.sin_cos();
     let hx = ox + c * GUIDE_ROT_HANDLE_DIST;
@@ -2137,7 +2137,7 @@ mod imp {
         /// rotation nodes and brightens the guide lines.
         pub(super) guide_editing: Cell<bool>,
         /// Theme accent (straight RGB) for the guide nodes, kept fixed like
-        /// Procreate's blue/green handles while the line colour is user-chosen.
+        /// Procreate's blue/green handles while the line color is user-chosen.
         pub(super) guide_accent: Cell<(f32, f32, f32)>,
         /// Cached rendered guide overlay + the inputs it was built from. The
         /// overlay (esp. the isometric/grid line families) is expensive to
@@ -2155,7 +2155,7 @@ mod imp {
         /// Bumped on every armed settle timer; the timer only acts if it still
         /// holds the latest generation (debounce over a burst of motion frames).
         pub(super) guide_zoom_gen: Cell<u64>,
-        /// Bumped every snapshot to jitter the backdrop colour below the 8-bit
+        /// Bumped every snapshot to jitter the backdrop color below the 8-bit
         /// quantisation step, so GSK's node diff always damages the whole widget.
         /// See the backdrop in `snapshot`.
         pub(super) repaint_jitter: Cell<u8>,
@@ -2363,7 +2363,7 @@ mod imp {
             // dark tile-boundary seams, which trail behind a moving cursor.
             // Overlays used to guarantee a full repaint by being full-widget
             // cairo nodes, at the cost of a canvas-sized CPU surface per frame.
-            // Instead, jitter this node's colour below the 8-bit quantisation
+            // Instead, jitter this node's color below the 8-bit quantisation
             // step: GSK's node diff compares the floats and damages the whole
             // widget, while the rendered pixels are bit-identical.
             //

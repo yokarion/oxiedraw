@@ -66,7 +66,7 @@ pub struct Canvas {
     /// Assisted Drawing is set. Each painted dab is reproduced across these
     /// copies at stamp time. `None` = no reproduction.
     active_symmetry: Option<crate::guides::Symmetry>,
-    /// True while the in-flight stroke is a colour-smudge brush. Smudge dabs
+    /// True while the in-flight stroke is a color-smudge brush. Smudge dabs
     /// paint straight into the active layer via the GPU smudge path instead of
     /// accumulating in the stroke buffer, so `stamp` / `stamp_and_present` /
     /// `commit_stroke` take a different branch. Set by `set_smudge_stroke`.
@@ -247,12 +247,12 @@ impl Canvas {
         self.renderer.set_stroke_buildup(buildup);
     }
 
-    /// Opt the in-flight stroke into the colour-smudge path. Call right after
+    /// Opt the in-flight stroke into the color-smudge path. Call right after
     /// `begin_stroke`. Smudge dabs paint straight into the active layer (the
     /// GPU smudge path) rather than the stroke buffer, so overlapping the
-    /// layer's own colours smears them. The caller must have captured the
+    /// layer's own colors smears them. The caller must have captured the
     /// layer's pre-stroke pixels for undo (smudge mutates the layer live).
-    /// Whether the in-flight stroke is a colour-smudge brush (paints straight
+    /// Whether the in-flight stroke is a color-smudge brush (paints straight
     /// into the layer). Undo reads its before-state from the smudge snapshot.
     #[must_use]
     pub const fn is_smudge_stroke(&self) -> bool {
@@ -906,7 +906,7 @@ impl Canvas {
 
     /// Read back the display dmabuf that [`Self::present`] last wrote, as BGRA8
     /// bytes (row-major, no padding). These are premultiplied *gamma*
-    /// (`srgb(colour) * alpha`), not the premultiplied-linear form
+    /// (`srgb(color) * alpha`), not the premultiplied-linear form
     /// [`Self::read_pixels`] returns. Test/diagnostic helper - the live path
     /// hands this buffer to GTK rather than reading it back.
     pub fn read_display(&mut self) -> Result<Vec<u8>, RendererError> {
@@ -1632,7 +1632,7 @@ impl Canvas {
     pub fn commit_fill(&mut self, layer_idx: usize, pixels: &[u8]) -> Result<(), RendererError> {
         // The fill is computed on the CPU and written whole, so it misses the
         // GPU blend variant the other tools use. Re-impose the lock here on the
-        // same terms: colour may change, alpha may not.
+        // same terms: color may change, alpha may not.
         if self.layers.alpha_lock_active(layer_idx) {
             let before = self.renderer.read_layer(layer_idx)?;
             let mut locked = pixels.to_vec();
@@ -1658,8 +1658,8 @@ impl Canvas {
     ) -> Result<(), RendererError> {
         use crate::canvas::fill::FillPaint;
         // A fill that replaced the region is hidden by painting the seed
-        // colour back over it; one that went in underneath is hidden by
-        // taking its share out again, so it needs no colour.
+        // color back over it; one that went in underneath is hidden by
+        // taking its share out again, so it needs no color.
         let (color_premul, behind) = match result.paint {
             FillPaint::Behind => ([0.0, 0.0, 0.0, 1.0], true),
             FillPaint::Over { seed } => {
@@ -2600,7 +2600,7 @@ impl Canvas {
     /// clicking a folder's icon to select everything inside it.
     ///
     /// Adjustment layers are skipped: their image slot holds a grayscale
-    /// *mask*, not colour, and it defaults to fully opaque - unioning it in
+    /// *mask*, not color, and it defaults to fully opaque - unioning it in
     /// would select the whole canvas rather than the painted artwork.
     pub fn select_from_layers_alpha(&mut self, indices: &[usize]) -> Result<(), RendererError> {
         let mut shape: Vec<u8> = Vec::new();
@@ -2655,7 +2655,7 @@ fn split_layer_by_mask(layer: &[u8], mask: &[u8]) -> (Vec<u8>, Vec<u8>) {
 }
 
 /// Re-impose an alpha lock on `new` (premultiplied BGRA8) using `old`'s alpha:
-/// keep the new colour, keep the old alpha. Where the op left nothing behind
+/// keep the new color, keep the old alpha. Where the op left nothing behind
 /// (new alpha 0) the old pixel is restored whole, so an operation that would
 /// have erased is a no-op rather than a black hole.
 fn apply_alpha_lock_bgra(new: &mut [u8], old: &[u8]) {
@@ -2704,8 +2704,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn alpha_lock_keeps_alpha_and_takes_colour() {
-        // Opaque red under, opaque blue painted over: colour changes, alpha holds.
+    fn alpha_lock_keeps_alpha_and_takes_color() {
+        // Opaque red under, opaque blue painted over: color changes, alpha holds.
         let mut new = vec![255, 0, 0, 255];
         let old = vec![0, 0, 255, 255];
         apply_alpha_lock_bgra(&mut new, &old);
@@ -2918,12 +2918,12 @@ mod tests {
         assert_eq!(px[i + 3], 255, "unclipped layer covers the whole canvas");
     }
 
-    /// Painting an alpha-locked layer recolours the pixels that exist and adds
+    /// Painting an alpha-locked layer recolors the pixels that exist and adds
     /// none. The lock rides a blend-state variant, so this exercises the real
     /// GPU path rather than the CPU helper the fill tool uses.
     #[cfg(feature = "gpu-tests")]
     #[test]
-    fn alpha_lock_recolours_without_growing_the_layer() {
+    fn alpha_lock_recolors_without_growing_the_layer() {
         let (w, h) = (32_usize, 16_usize);
         let mut canvas = Canvas::headless(Size::new(w as u32, h as u32)).expect("canvas init");
 
@@ -2970,7 +2970,7 @@ mod tests {
             [px[i], px[i + 1], px[i + 2], px[i + 3]]
         };
 
-        // Where the layer had pixels, the stroke recoloured them and left alpha
+        // Where the layer had pixels, the stroke recolored them and left alpha
         // untouched.
         let painted = at(4, 8);
         assert_eq!(painted[3], 255, "alpha lock must not change alpha");
@@ -3452,7 +3452,7 @@ mod tests {
     }
 
     /// Brush stroke composited through a selection mask gets clipped:
-    /// pixels inside the mask receive the stroke colour; pixels outside
+    /// pixels inside the mask receive the stroke color; pixels outside
     /// stay transparent.
     #[cfg(feature = "gpu-tests")]
     #[test]

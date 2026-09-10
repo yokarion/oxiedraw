@@ -38,7 +38,7 @@ pub(super) struct FillOverlayResources {
     pub descriptor_set: vk::DescriptorSet,
 
     pub layout: vk::PipelineLayout,
-    /// Paints the seed colour back over the un-revealed pixels - undoes
+    /// Paints the seed color back over the un-revealed pixels - undoes
     /// a fill that replaced the region.
     pub pipeline: vk::Pipeline,
     /// Takes the fill's share back out of the un-revealed pixels -
@@ -81,7 +81,7 @@ impl FillOverlayResources {
         )?;
         let layout = pipeline_layout(device, descriptor_set_layout, FILL_OVERLAY_PUSH_BYTES)?;
         // Premultiplied OVER - the un-revealed pixels get the seed
-        // colour painted back on top of the committed fill.
+        // color painted back on top of the committed fill.
         let mut pass = FullscreenPass {
             vert_spv: COMPOSITE_VERT_SPV,
             frag_spv: FILL_OVERLAY_FRAG_SPV,

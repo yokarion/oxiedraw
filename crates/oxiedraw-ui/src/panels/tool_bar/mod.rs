@@ -1,3 +1,8 @@
+//! One toggle button per tool group, sub-tools on a long-press popover. The
+//! buttons wrap to whatever room the bar is given, which is the flow box's
+//! doing - do not swap it for a grid, whose minimum width is every column
+//! added up and so could never be narrowed, let alone re-wrap.
+
 mod tool_button;
 
 use std::cell::Cell;
@@ -8,6 +13,38 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 
 const WIDTH: i32 = 40;
+
+fn load_css() {
+    let provider = gtk::CssProvider::new();
+    provider.load_from_string(
+        ".oxiedraw-toolbar,
+        .oxiedraw-toolbar > flowboxchild,
+        .oxiedraw-toolbar > flowboxchild:hover,
+        .oxiedraw-toolbar > flowboxchild:focus,
+        .oxiedraw-toolbar > flowboxchild:focus-visible,
+        .oxiedraw-toolbar > flowboxchild:active,
+        .oxiedraw-toolbar > flowboxchild:selected {
+            padding: 0;
+            margin: 0;
+            min-width: 0;
+            min-height: 0;
+            border: none;
+            border-radius: 0;
+            background: none;
+            background-color: transparent;
+            background-image: none;
+            box-shadow: none;
+            outline: none;
+        }",
+    );
+    if let Some(display) = gtk::gdk::Display::default() {
+        gtk::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    }
+}
 
 struct ToolGroupSpec {
     name: &'static str,
@@ -88,22 +125,31 @@ static GROUPS: [ToolGroupSpec; 11] = [
     },
 ];
 
-/// Build the left toolbar.
-///
-/// Returns the bar widget and a setter closure. Call the setter with a `Tool`
-/// to programmatically activate the matching toggle button without triggering
-/// the `on_change` callback (safe to call from inside `on_change`).
 pub(crate) fn build(
     tools: &ToolState,
     on_change: &Rc<dyn Fn(Tool)>,
 ) -> (gtk::Box, impl Fn(Tool) + use<>) {
+    load_css();
+
     let bar = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .width_request(WIDTH)
         .build();
     bar.add_css_class("oxiedraw-chrome");
+    let grid = gtk::FlowBox::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .selection_mode(gtk::SelectionMode::None)
+        .homogeneous(true)
+        .min_children_per_line(1)
+        .max_children_per_line(u32::try_from(GROUPS.len()).unwrap_or(1))
+        .row_spacing(0)
+        .column_spacing(0)
+        .halign(gtk::Align::Fill)
+        .valign(gtk::Align::Start)
+        .build();
+    grid.add_css_class("oxiedraw-toolbar");
+    bar.append(&grid);
 
-    // Shared guard: when true, `toggled` handlers skip `on_change`.
     let programmatic = Rc::new(Cell::new(false));
 
     let mut first_btn: Option<gtk::ToggleButton> = None;
@@ -124,7 +170,9 @@ pub(crate) fn build(
             first_btn = Some(toggle.clone());
         }
         groups.push((spec.subtools, toggle, active_sub));
-        bar.append(&overlay);
+        overlay.set_hexpand(true);
+        overlay.set_vexpand(true);
+        grid.append(&overlay);
     }
 
     let setter = {
@@ -141,10 +189,6 @@ pub(crate) fn build(
                     return;
                 }
             }
-            // Tools with no button here (the Drawing Guide lives in the top
-            // bar): clear the selection, or the bar keeps pointing at a tool
-            // that isn't active - and clicking that button, already active,
-            // would emit nothing and strand the user in the other tool.
             prog.set(true);
             for (_, btn, _) in &groups {
                 btn.set_active(false);

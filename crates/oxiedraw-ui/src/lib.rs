@@ -1,10 +1,6 @@
-//! OxieDraw GTK/relm4 UI crate.
-//!
-//! The only crate that touches GTK/relm4. One `relm4` component (`AppModel`)
-//! owns the whole window; panels are plain widgets, each exposing a
-//! `pub(crate) fn build() -> <Widget>`. The canvas is the exception: its
-//! `gtk::Picture` stays inline in the `view!` tree so `init` can grab the
-//! realized widget and call `canvas::wire(...)`.
+//! The only crate that touches GTK. One relm4 component owns the window, the
+//! panels are plain widgets in [`panels`], and where they may go plus the
+//! saved arrangements are in [`layout`].
 
 mod actions;
 mod adjustments;
@@ -14,14 +10,15 @@ mod brush_picker;
 mod canvas;
 mod canvas_paintable;
 mod clipboard;
+mod dock;
 mod export_window;
 mod filters;
 mod font_previews;
-mod left_bar;
+mod layout;
+mod panels;
 mod perf_graph;
 mod preferences_window;
 mod project_io;
-mod right_bar;
 mod session;
 mod settings;
 mod splash;
@@ -31,7 +28,6 @@ mod pattern_edit;
 mod text_edit;
 mod theme;
 mod toaster;
-mod tool_options_bar;
 mod top_bar;
 mod widgets;
 
@@ -41,15 +37,10 @@ use relm4::RelmApp;
 
 const APP_ID: &str = "com.yokarion.oxiedraw";
 
-/// Resource path the icon tree is registered under; see `build.rs`.
 const ICON_RESOURCE_PATH: &str = "/com/yokarion/oxiedraw/icons";
 
-// hicolor icon tree (tool symbolics + themed app icon), compiled into a
-// GResource by `build.rs` so the binary is self-contained.
 const ICON_GRESOURCE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/oxiedraw-icons.gresource"));
 
-// Registers the embedded icon GResource. Leaked into a `'static` so the
-// registration outlives the process; gio holds the bytes for icon lookups.
 fn register_icon_resources() {
     use gtk::{gio, glib};
 
@@ -60,16 +51,14 @@ fn register_icon_resources() {
     }
 }
 
-/// Process-start instant, set at the top of [`run`]. Used to log the time to a
-/// ready-to-use window.
 pub(crate) static STARTUP: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
 
 #[must_use]
 pub fn run() -> ExitCode {
     let _ = STARTUP.set(std::time::Instant::now());
     register_icon_resources();
-    // The splash drives the slow startup work and reveals the main window when
-    // it finishes, so the window must not be auto-shown on activate.
+    // The splash reveals the main window when it finishes, so it must not be
+    // auto-shown on activate.
     let app = RelmApp::new(APP_ID).visible_on_activate(false);
     app.run::<app::AppModel>(app::AppInit::default());
     ExitCode::SUCCESS

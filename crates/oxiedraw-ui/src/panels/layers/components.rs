@@ -1,9 +1,3 @@
-//! Components tab in the right sidebar.
-//!
-//! Shows the per-document component library as a grid of flat dark preview
-//! cards, each with its name centred below it. Empty components show a
-//! placeholder glyph. Cards can be selected, removed (X, top-right), and
-//! opened for editing (double-click). A "New" button appends a blank one.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -23,13 +17,9 @@ const CHECKER_SIZE: f64 = 8.0;
 const GRID_SPACING: u32 = 8;
 const FALLBACK_ACCENT: (f64, f64, f64) = (0.21, 0.52, 0.89);
 
-/// Late-bound grid-rebuild closure. Cards capture the slot (not the closure
-/// itself) to avoid an Rc cycle, and read it back when they need a rebuild.
+// Cards capture the slot, not the closure: capturing it would be an Rc cycle.
 type RefreshSlot = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
-/// Build the Components page. Returns the page widget and a `refresh` closure
-/// that rebuilds the card grid from the current library state (call after the
-/// library changes outside this panel, e.g. on leaving edit mode).
 pub(super) fn build(
     library: Rc<RefCell<ComponentLibrary>>,
     on_edit: Rc<dyn Fn(String)>,
@@ -42,16 +32,10 @@ pub(super) fn build(
         .hexpand(true)
         .build();
 
-    // Currently selected component id (visual highlight only).
     let selected: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
     let refresh_slot: RefreshSlot = Rc::new(RefCell::new(None));
-    // Card DrawingAreas of the current grid, so a selection change can redraw
-    // them in place instead of rebuilding the grid.
     let card_areas: Rc<RefCell<Vec<gtk::DrawingArea>>> = Rc::new(RefCell::new(Vec::new()));
 
-    // A plain Grid rather than a FlowBox: FlowBox grabs button presses for its
-    // own selection/activation, which swallows the cards' click + drag-source
-    // gestures. Grid is a pure layout container and passes events through.
     let grid = gtk::Grid::builder()
         .column_spacing(GRID_SPACING as i32)
         .row_spacing(GRID_SPACING as i32)
@@ -82,7 +66,6 @@ pub(super) fn build(
     stack.add_named(&scroll, Some("grid"));
     stack.add_named(&empty_label, Some("empty"));
 
-    // -- refresh: rebuild the grid from the library --------------------
     let refresh: Rc<dyn Fn()> = {
         let grid = grid.clone();
         let stack = stack.clone();
@@ -125,7 +108,6 @@ pub(super) fn build(
     };
     *refresh_slot.borrow_mut() = Some(Rc::clone(&refresh));
 
-    // -- header (New button) -------------------------------------------
     let header = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(6)
@@ -154,7 +136,6 @@ pub(super) fn build(
     page.append(&header);
     page.append(&stack);
 
-    // Rename the selected component's card (window-level F2 via the right bar).
     let begin_rename: Rc<dyn Fn()> = {
         let library = Rc::clone(&library);
         let selected = Rc::clone(&selected);
@@ -171,7 +152,6 @@ pub(super) fn build(
                 (pos, lib.components[pos].name.clone())
             };
             let area = card_areas.borrow().get(idx).cloned();
-            // Skip when the card isn't mapped (panel hidden behind the Crop sidebar).
             if let Some(area) = area.filter(gtk::prelude::WidgetExt::is_mapped) {
                 show_rename_popover(&area, &id, &name, &library, &refresh_slot, &history);
             }
@@ -182,7 +162,6 @@ pub(super) fn build(
     (page, refresh, begin_rename)
 }
 
-/// Pick a default "Component N" name not already taken.
 fn next_component_name(lib: &ComponentLibrary) -> String {
     let mut n = lib.len() + 1;
     loop {
@@ -194,8 +173,6 @@ fn next_component_name(lib: &ComponentLibrary) -> String {
     }
 }
 
-/// Pop up a small entry over `parent` to rename the component `id`. Commits on
-/// Enter, dismisses on focus-out, and rebuilds the grid so the new name shows.
 fn show_rename_popover(
     parent: &gtk::DrawingArea,
     id: &str,
@@ -237,18 +214,13 @@ fn show_rename_popover(
             trigger_refresh(&refresh_slot);
         });
     }
-    // Dismissal is handled by the popover's autohide (click-away / Escape); a
-    // focus-leave handler closes too eagerly when the card isn't focused.
-
-    // Defer the popup so it survives the context menu closing in the same tick:
-    // popping up a second autohide popover synchronously gets it dismissed.
+    // Deferred, or the context menu closing in the same tick dismisses it.
     glib::idle_add_local_once(move || {
         popover.popup();
         entry.grab_focus();
     });
 }
 
-/// Record a just-added component (New or Duplicate) onto the undo stack.
 fn record_added(
     history: &Rc<RefCell<HistoryStack>>,
     library: &Rc<RefCell<ComponentLibrary>>,
@@ -263,7 +235,6 @@ fn record_added(
     }
 }
 
-/// Snapshot a component, remove it, and record the removal for undo.
 fn remove_and_record(
     history: &Rc<RefCell<HistoryStack>>,
     library: &Rc<RefCell<ComponentLibrary>>,
@@ -284,8 +255,8 @@ fn remove_and_record(
     }
 }
 
-/// Schedule a grid rebuild on the next idle tick. Deferring keeps us from
-/// destroying the very widget whose click/gesture handler is running.
+// Deferred to an idle, or the rebuild destroys the widget whose own gesture
+// handler is running.
 fn trigger_refresh(slot: &RefreshSlot) {
     let slot = Rc::clone(slot);
     glib::idle_add_local_once(move || {
@@ -309,8 +280,6 @@ fn build_card(
     card_areas: &Rc<RefCell<Vec<gtk::DrawingArea>>>,
     history: &Rc<RefCell<HistoryStack>>,
 ) -> gtk::Widget {
-    // A never-drawn component shows the placeholder glyph instead of its
-    // (fully transparent) master.
     let blank = is_blank(master);
     let surface = surface_from_bgra(master, cw, ch);
 
@@ -321,8 +290,6 @@ fn build_card(
         .build();
     {
         let surface = surface.clone();
-        // Read the selection live so selecting only needs a redraw, never a
-        // widget rebuild (a rebuild mid-gesture would break double-click/drag).
         let selected_id = Rc::clone(selected_id);
         let id_draw = id.to_string();
         area.set_draw_func(move |area, cr, w, h| {
@@ -331,7 +298,6 @@ fn build_card(
             let hf = f64::from(h);
             let radius = 10.0;
 
-            // Flat dark card.
             rounded_rect(cr, 0.5, 0.5, wf - 1.0, hf - 1.0, radius);
             cr.set_source_rgb(CARD_BG.0, CARD_BG.1, CARD_BG.2);
             cr.fill().ok();
@@ -368,7 +334,6 @@ fn build_card(
     overlay.set_child(Some(&area));
     card_areas.borrow_mut().push(area.clone());
 
-    // Remove, top-right.
     let remove_btn = gtk::Button::builder()
         .icon_name("window-close-symbolic")
         .halign(gtk::Align::End)
@@ -395,7 +360,6 @@ fn build_card(
     }
     overlay.add_overlay(&remove_btn);
 
-    // Drag source: carries the component id so it can be dropped on the canvas.
     let drag = gtk::DragSource::builder()
         .actions(gtk::gdk::DragAction::COPY)
         .build();
@@ -407,7 +371,6 @@ fn build_card(
     }
     area.add_controller(drag);
 
-    // Click: single selects (redraw only), double opens for editing.
     let click = gtk::GestureClick::new();
     {
         let selected_id = Rc::clone(selected_id);
@@ -419,8 +382,6 @@ fn build_card(
                 on_edit(id.clone());
             } else {
                 *selected_id.borrow_mut() = Some(id.clone());
-                // Redraw all cards so the selection border moves - no rebuild,
-                // which would destroy this widget mid double-click / drag.
                 for a in card_areas.borrow().iter() {
                     a.queue_draw();
                 }
@@ -429,7 +390,6 @@ fn build_card(
     }
     area.add_controller(click);
 
-    // Per-card actions backing the right-click menu (Rename / Duplicate / Delete).
     let actions = gio::SimpleActionGroup::new();
     {
         let library = Rc::clone(library);
@@ -482,7 +442,6 @@ fn build_card(
     }
     area.insert_action_group("card", Some(&actions));
 
-    // Right-click context menu.
     let menu = gio::Menu::new();
     menu.append(Some("Rename"), Some("card.rename"));
     menu.append(Some("Duplicate"), Some("card.duplicate"));
@@ -514,7 +473,6 @@ fn build_card(
     }
     area.add_controller(secondary);
 
-    // Card sits above its centred title.
     let card = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(4)
@@ -532,8 +490,6 @@ fn build_card(
     card.upcast()
 }
 
-/// Build a cairo surface from premultiplied BGRA8 pixels. Returns `None` if the
-/// buffer is empty or mis-sized.
 fn surface_from_bgra(bgra: &[u8], w: u32, h: u32) -> Option<cairo::ImageSurface> {
     if w == 0 || h == 0 || bgra.len() != (w * h * 4) as usize {
         return None;
@@ -554,8 +510,6 @@ fn surface_from_bgra(bgra: &[u8], w: u32, h: u32) -> Option<cairo::ImageSurface>
     Some(surface)
 }
 
-/// Paint `surf` (size `cw x ch`) scaled to fit inside `w x h`, centred,
-/// preserving aspect ratio, with nearest-neighbour sampling.
 fn paint_contained(
     cr: &cairo::Context,
     surf: &cairo::ImageSurface,
@@ -584,8 +538,6 @@ fn paint_contained(
     cr.restore().ok();
 }
 
-/// Transparency checker behind a preview. The two greys mirror the canvas
-/// checker (0xEB / 0xC7); a smaller cell suits the thumbnail scale.
 fn draw_checker(cr: &cairo::Context, w: i32, h: i32) {
     let w = f64::from(w);
     let h = f64::from(h);
@@ -607,12 +559,10 @@ fn draw_checker(cr: &cairo::Context, w: i32, h: i32) {
     }
 }
 
-/// True when every pixel is fully transparent (a never-drawn component).
 fn is_blank(bgra: &[u8]) -> bool {
     bgra.is_empty() || bgra.chunks_exact(4).all(|p| p[3] == 0)
 }
 
-/// Centred "Empty" caption shown for never-drawn components.
 fn draw_empty_caption(cr: &cairo::Context, w: i32, h: i32) {
     let wf = f64::from(w);
     let hf = f64::from(h);

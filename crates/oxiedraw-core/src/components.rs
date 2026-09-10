@@ -387,7 +387,7 @@ fn blend_layer_over(dst: &mut [u8], src: &[u8], mode: BlendMode, opacity: f32) {
                     }
                 }
             };
-            // Source colour mixed toward the blended colour by backdrop alpha,
+            // Source color mixed toward the blended color by backdrop alpha,
             // then standard premultiplied src-over.
             let src_color = sc + (blended - sc) * da;
             let out_lin = src_color * sa + d[ch] * (1.0 - sa);

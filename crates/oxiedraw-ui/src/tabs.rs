@@ -1,9 +1,5 @@
-//! Tab/document lifecycle.
-//!
-//! [`TabManager`] owns the open [`DocumentSession`]s, swaps the active
-//! document's tool-options bar and right sidebar into the window's slot
-//! containers when the selected tab changes, and routes the File-menu
-//! operations (New / Open / Save / Save As / Close / Quit) to the active tab.
+// Owns the open documents, puts the active one's panels in the dock's slots,
+// and routes the File-menu operations to whichever tab is in front.
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -20,6 +16,7 @@ use relm4::gtk;
 use relm4::gtk::glib;
 
 use crate::canvas::Viewport;
+use crate::layout::PanelId;
 use crate::session::{DocumentSession, GlobalState, SetActiveToolSlot};
 
 pub(crate) struct TabManager {
@@ -27,14 +24,13 @@ pub(crate) struct TabManager {
     pub(crate) set_active_tool_late: SetActiveToolSlot,
     pub(crate) set_left_bar: Rc<dyn Fn(Tool)>,
     pub(crate) tab_view: adw::TabView,
-    pub(crate) tool_options_slot: gtk::Box,
-    pub(crate) right_bar_slot: gtk::Box,
+    pub(crate) dock: Rc<crate::dock::DockHost>,
+    pub(crate) layouts: Rc<crate::dock::manager::LayoutManager>,
     pub(crate) sessions: RefCell<Vec<Rc<DocumentSession>>>,
     pub(crate) active: RefCell<Option<Rc<DocumentSession>>>,
     pub(crate) root: adw::ApplicationWindow,
     pub(crate) history_capacity: usize,
     pub(crate) untitled_counter: Cell<u32>,
-    /// When the last autosave ran; the tick measures the interval against it.
     pub(crate) last_autosave: Cell<Instant>,
 }
 
@@ -43,14 +39,11 @@ impl TabManager {
         self.active.borrow().clone()
     }
 
-    /// Resolver for the currently focused viewport (used by zoom actions).
     pub(crate) fn active_viewport_provider(self: &Rc<Self>) -> Rc<dyn Fn() -> Option<Viewport>> {
         let manager = Rc::clone(self);
         Rc::new(move || manager.active().map(|s| s.viewport.clone()))
     }
 
-    /// Window-level "set the active tool": updates the shared tool state, the
-    /// left toolbar toggle, and runs the active document's tool-apply logic.
     pub(crate) fn set_active_tool(&self, t: Tool) {
         let previous = self.global.tools.active.get();
         if previous != t {
@@ -61,12 +54,8 @@ impl TabManager {
                 "tool selected"
             );
         }
-        // Leaving a text edit (or any tool switch) commits the in-flight box.
         if let Some(s) = self.active.borrow().as_ref() {
             s.text_edit.commit();
-            // Keyed on the tool being switched to, not on which one is being
-            // left: `previous` is only as trustworthy as every caller, and a
-            // curve left live paints its handles over whatever comes next.
             if t != Tool::Pattern {
                 s.pattern_edit.leave();
             }
@@ -78,18 +67,12 @@ impl TabManager {
         }
     }
 
-    /// Switch the active document's drawing guide on or off (the top bar's
-    /// symmetry button). Switching it on also enters the Drawing Guide tool so
-    /// the nodes can be dragged - Done / Cancel leave that tool with the guide
-    /// still live. Switching it off puts the config aside, so the next toggle
-    /// brings the same guide back instead of a fresh default.
     pub(crate) fn set_guide_enabled(&self, on: bool) {
         let Some(session) = self.active() else { return };
         if on {
             if let Some(stashed) = session.guide.stash.borrow_mut().take() {
                 *session.guide.config.borrow_mut() = Some(stashed);
             }
-            // `apply_tool` seeds a centred, accent-coloured guide if none exists.
             self.set_active_tool(Tool::DrawingGuide);
         } else {
             let live = session.guide.config.borrow_mut().take();
@@ -99,10 +82,6 @@ impl TabManager {
                 self.set_active_tool(Tool::Brush);
             }
         }
-        // The guide rewrites every stroke while it is on (mirroring, snapping),
-        // so its on/off edges are worth a line - unlike the per-stroke detail.
-        // Logged after the swap: the live guide is in `config` while on and in
-        // `stash` once off, so this reads whichever side now holds it.
         let kind = session
             .guide
             .config
@@ -113,10 +92,6 @@ impl TabManager {
         tracing::info!(target: "oxiedraw::tool", on, ?kind, "drawing guide toggled");
     }
 
-    /// Push the active document's guide on/off state into `app.guide-toggle`,
-    /// which the top-bar button follows. The button is not the only thing that
-    /// turns a guide on - picking a type in the settings popup does too, as do
-    /// tab switches, project loads and the tool's Cancel.
     pub(crate) fn sync_guide_toggle(&self) {
         let on = self
             .active()
@@ -139,7 +114,6 @@ impl TabManager {
         }
     }
 
-    /// Create a blank document of the given size and open it in a new tab.
     pub(crate) fn new_document(self: &Rc<Self>, size: Size) -> Rc<DocumentSession> {
         let title = self.next_untitled_title();
         tracing::info!(
@@ -160,11 +134,11 @@ impl TabManager {
         session
     }
 
-    /// Register an already-built session as a tab and select it.
     pub(crate) fn add_session(self: &Rc<Self>, session: &Rc<DocumentSession>) {
-        // Keep the top-bar symmetry button in step with this document's guide,
-        // whichever side changed it. Weak on both ends: the manager owns the
-        // sessions, and a session owns this callback.
+        session
+            .tool_windows
+            .apply_anchors(&self.layouts.current_layout());
+
         {
             let manager = Rc::downgrade(self);
             let owner = Rc::downgrade(session);
@@ -182,31 +156,19 @@ impl TabManager {
         page.set_title(&session.display_title());
         *session.tab_page.borrow_mut() = Some(page.clone());
         self.sessions.borrow_mut().push(Rc::clone(session));
-        // Selecting fires `selected-page`, which calls `activate`; also activate
-        // directly so the first tab is wired before any signal plumbing exists.
         self.tab_view.set_selected_page(&page);
         self.activate(session);
     }
 
-    /// Make `session` the active document: swap its chrome into the window slots,
-    /// re-point the doc-scoped gio actions, and sync the shared tool visuals.
     pub(crate) fn activate(&self, session: &Rc<DocumentSession>) {
-        // Close any liquify session on the tab being left. The active tool is
-        // global but `apply_tool` only reaches the foreground document, so a
-        // session on a background tab would otherwise stay live: its preview
-        // splice hides later edits to that layer (`Canvas::present` branches on
-        // renderer state, not on the tool), and the next bake would overwrite
-        // them from a stale snapshot with no history entry.
+        // `apply_tool` only reaches the foreground document, so a session left
+        // live on a background tab later bakes over it from a stale snapshot.
         if let Some(previous) = self.active.borrow().as_ref()
             && !Rc::ptr_eq(previous, session)
         {
             (previous.liquify_flush)();
-            // The tool is shared, so a curve left on a background tab would
-            // bake its pixels onto whatever document is in front.
             previous.pattern_edit.leave();
         }
-        // Only a real change of document is a tab switch; `activate` also runs
-        // again for the tab that is already in front (add_session, re-selects).
         let switched = self
             .active
             .borrow()
@@ -221,29 +183,32 @@ impl TabManager {
             );
         }
         *self.active.borrow_mut() = Some(Rc::clone(session));
-        set_slot_child(&self.tool_options_slot, &session.tool_options);
-        set_slot_child(&self.right_bar_slot, &session.right_bar);
+        self.fill_document_panels();
         (session.reinstall_actions)();
-        // Transient toasts are drawn into the active document's canvas surface;
-        // re-point them so a toast lands on the tab the user is looking at.
         self.global
             .toaster
             .set_target(session.viewport.paintable().clone());
 
-        // Reflect the shared tool in this document's panels without the
-        // destructive side effects of a full tool switch (no transform lift,
-        // no crop default rect). Those only run on an explicit tool change.
         let t = self.global.tools.active.get();
         (session.set_tool_options)(t);
-        (session.set_right_panel_tool)(t);
+        (session.set_tool_window)(t);
         self.sync_guide_toggle();
         session.viewport.paintable().set_crop_active(t == Tool::Crop);
         session.viewport.paintable().set_transform_active(t == Tool::Transform);
-        // Same reason as the two above: the tool is shared, so a document that
-        // was in the background while it changed has stale overlay flags - here,
-        // guide nodes that would be drawn (or missing) against the active tool.
         session.viewport.paintable().set_guide_editing(t == Tool::DrawingGuide);
         session.viewport.redraw_handle().request();
+    }
+
+    pub(crate) fn fill_document_panels(&self) {
+        let Some(session) = self.active() else { return };
+        for (id, widget) in [
+            (PanelId::ToolOptions, &session.tool_options),
+            (PanelId::ColorPicker, &session.color_picker),
+            (PanelId::Layers, &session.layers),
+            (PanelId::CanvasInfo, &session.canvas_info),
+        ] {
+            self.dock.fill(id, widget);
+        }
     }
 
     fn session_for_page(&self, page: &adw::TabPage) -> Option<Rc<DocumentSession>> {
@@ -254,7 +219,6 @@ impl TabManager {
             .cloned()
     }
 
-    /// `selected-page` handler: activate the document behind the new page.
     pub(crate) fn on_page_selected(&self) {
         if let Some(page) = self.tab_view.selected_page()
             && let Some(session) = self.session_for_page(&page)
@@ -263,14 +227,10 @@ impl TabManager {
         }
     }
 
-    /// `close-page` handler. Returns whether we are handling the close
-    /// asynchronously (`Stop`) - i.e. an unsaved document needs confirmation.
     pub(crate) fn on_close_page(self: &Rc<Self>, page: &adw::TabPage) -> glib::Propagation {
         let Some(session) = self.session_for_page(page) else {
             return glib::Propagation::Proceed;
         };
-        // Before the dirty check, or a document whose only unsaved work is the
-        // curve on screen reads as clean and closes without asking.
         session.pattern_edit.leave();
         if !session.is_dirty() {
             return glib::Propagation::Proceed;
@@ -300,9 +260,6 @@ impl TabManager {
             None::<&gio::Cancellable>,
             move |result| match result {
                 Ok(2) => {
-                    // Save: write straight to disk when a path exists, then
-                    // close. Without a path, keep the tab open and prompt for a
-                    // location (the user can close again once it's saved).
                     if session.file_path.borrow().is_some() {
                         crate::project_io::save(&session, &manager.root, false);
                         manager.tab_view.close_page_finish(&page, true);
@@ -317,11 +274,8 @@ impl TabManager {
         );
     }
 
-    /// Window close-request handler: if any open document has unsaved changes,
-    /// hold the window open and route every tab through the normal close flow so
-    /// each dirty document gets a Save/Discard/Cancel prompt. The window closes
-    /// once the last tab is gone (via `on_page_detached`).
     pub(crate) fn on_window_close_request(self: &Rc<Self>) -> glib::Propagation {
+        self.layouts.flush();
         let any_dirty = self.sessions.borrow().iter().any(|s| s.is_dirty());
         if !any_dirty {
             return glib::Propagation::Proceed;
@@ -334,11 +288,8 @@ impl TabManager {
         glib::Propagation::Stop
     }
 
-    /// `page-detached` handler: drop the session and close the window if the
-    /// last tab is gone.
     pub(crate) fn on_page_detached(self: &Rc<Self>, page: &adw::TabPage) {
         if let Some(session) = self.session_for_page(page) {
-            // A closed tab no longer needs its autosave recovery copy.
             session.clear_recovery();
         }
         self.sessions
@@ -349,11 +300,7 @@ impl TabManager {
         }
     }
 
-    /// Tick that autosaves the open documents once the configured interval has
-    /// elapsed. Reads enabled/interval live, so preferences changes apply at
-    /// once.
     pub(crate) fn start_autosave_timer(self: &Rc<Self>) {
-        // The finest interval offered is 10s, so a 5s tick is granular enough.
         const TICK: Duration = Duration::from_secs(5);
         let weak = Rc::downgrade(self);
         glib::timeout_add_local(TICK, move || {
@@ -363,7 +310,6 @@ impl TabManager {
             };
             let cfg = &manager.global.autosave;
             if !cfg.enabled.get() {
-                // Keep the clock from firing a burst the moment autosave is re-enabled.
                 manager.last_autosave.set(Instant::now());
                 return glib::ControlFlow::Continue;
             }
@@ -378,7 +324,6 @@ impl TabManager {
         });
     }
 
-    /// Open a loaded project in a fresh tab.
     pub(crate) fn open_loaded(self: &Rc<Self>, project: OxieProject, path: PathBuf) {
         let size = Size::new(project.document.canvas_width, project.document.canvas_height);
         let title = path.file_stem().map_or_else(
@@ -393,8 +338,6 @@ impl TabManager {
             title,
         );
 
-        // Load embedded fonts into the shared engine so text layers render and
-        // stay editable even if those fonts aren't installed on this machine.
         if !project.font_bytes.is_empty() {
             let mut engine = self.global.text_engine.borrow_mut();
             for bytes in project.font_bytes.values() {
@@ -409,21 +352,16 @@ impl TabManager {
                 return;
             }
         }
-        // Restore the document's default gradient stops (if the file has any).
         session
             .gradient
             .settings
             .borrow_mut()
             .clone_from(&project.document.gradient);
 
-        // Restore the persisted view rotation. The centering tick that runs on
-        // the first frame re-centres pan for this angle (see fit_and_center).
         session
             .viewport
             .set_rotation_raw(project.document.view_rotation);
 
-        // Restore the persisted drawing guide and push its symmetry + overlay
-        // to the canvas (notify_changed drives the session's guide sync).
         session
             .guide
             .config
@@ -431,7 +369,6 @@ impl TabManager {
             .clone_from(&project.document.guide);
         session.guide.notify_changed();
 
-        // Restore the per-document component library.
         *session.components.borrow_mut() = project::load::build_components(&project);
         (session.refresh_components)();
         *session.file_path.borrow_mut() = Some(path);
@@ -443,7 +380,6 @@ impl TabManager {
         self.add_session(&session);
     }
 
-    /// Wire the tab signals (selection / close / detach) to this manager.
     pub(crate) fn connect_tab_signals(self: &Rc<Self>) {
         {
             let manager = Rc::clone(self);
@@ -462,11 +398,7 @@ impl TabManager {
         }
     }
 
-    /// Register the File-menu gio actions (New / Open / Save / Save As / Close /
-    /// Quit) plus the per-document edit/select/zoom/tool actions, all routed to
-    /// the active tab.
     pub(crate) fn register_actions(self: &Rc<Self>, app: &gtk::Application) {
-        // -- New --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("new", None);
@@ -475,7 +407,6 @@ impl TabManager {
             });
             app.add_action(&action);
         }
-        // -- Open --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("open", None);
@@ -487,7 +418,6 @@ impl TabManager {
             });
             app.add_action(&action);
         }
-        // -- Save / Save As --
         for (id, force_dialog) in [("save", false), ("save-as", true)] {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new(id, None);
@@ -498,7 +428,6 @@ impl TabManager {
             });
             app.add_action(&action);
         }
-        // -- Close Tab --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("close-tab", None);
@@ -509,7 +438,6 @@ impl TabManager {
             });
             app.add_action(&action);
         }
-        // -- Quit --
         {
             let app_c = app.clone();
             let action = gio::SimpleAction::new("quit", None);
@@ -517,7 +445,6 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // -- Undo / Redo --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("undo", None);
@@ -538,7 +465,6 @@ impl TabManager {
             });
             app.add_action(&action);
         }
-        // -- Rename (active layer/group, or selected component) --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("rename", None);
@@ -550,7 +476,6 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // -- Selection --
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("select-all", None);
@@ -582,7 +507,6 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // -- Tool select --
         let tool_actions: &[(&str, Tool)] = &[
             ("select-cursor", Tool::Cursor),
             (
@@ -608,25 +532,17 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // Symmetry on/off (the top bar's button). Stateful boolean, like the
-        // eraser toggle, so the button and the manager's own state pushes drive
-        // the same thing (and it is bindable if it ever earns a shortcut).
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new_stateful("guide-toggle", None, &false.to_variant());
             action.connect_change_state(move |_, state| {
                 let on = state.and_then(glib::Variant::get::<bool>).unwrap_or(false);
                 manager.set_guide_enabled(on);
-                // Publish what actually happened - with no open document there
-                // is no guide to switch on.
                 manager.sync_guide_toggle();
             });
             app.add_action(&action);
         }
 
-        // Drawing Guide commit / cancel (tool-bar buttons). Both leave the tool
-        // with the guide still on; Cancel first rolls back to the snapshot taken
-        // when the tool was entered, so only the on-canvas edit is discarded.
         {
             let manager = Rc::clone(self);
             let done = gio::SimpleAction::new("guide-done", None);
@@ -638,10 +554,6 @@ impl TabManager {
             let cancel = gio::SimpleAction::new("guide-cancel", None);
             cancel.connect_activate(move |_, _| {
                 if let Some(s) = manager.active.borrow().as_ref() {
-                    // Only roll back a document that actually entered the tool.
-                    // The tool is shared, so this bar is showing for a tab that
-                    // may never have taken a snapshot - restoring `None` there
-                    // would silently delete a guide nobody was editing.
                     let snapshot = s.guide.entry_snapshot.borrow().clone();
                     if snapshot.is_some() {
                         *s.guide.config.borrow_mut() = snapshot;
@@ -653,14 +565,9 @@ impl TabManager {
             app.add_action(&cancel);
         }
 
-        // Liquify Apply / Cancel / Restore All (top-bar buttons, mirroring the
-        // Crop tool). Apply and Cancel both leave the tool; Restore All only
-        // zeroes the field, so the user stays in Liquify and can keep warping.
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("liquify-apply", None);
-            // Each stroke is already baked and recorded, so Apply is just
-            // "I'm done" - the tool switch closes the session.
             action.connect_activate(move |_, _| manager.set_active_tool(Tool::Brush));
             app.add_action(&action);
         }
@@ -686,10 +593,6 @@ impl TabManager {
             app.add_action(&action);
         }
 
-        // Eraser mode toggle (brush). Stateful boolean action: the brush bar's
-        // toggle button binds to it by name (so every tab's button reflects the
-        // shared state), and the keybinding activates it. The handler mirrors
-        // the state into the shared ToolState that the stroke path reads.
         {
             let manager = Rc::clone(self);
             let action =
@@ -704,11 +607,3 @@ impl TabManager {
     }
 }
 
-/// Replace the single child of a slot container with `child`. The previous
-/// child is unparented (it is owned by its document session, not the slot).
-fn set_slot_child(slot: &gtk::Box, child: &gtk::Widget) {
-    while let Some(existing) = slot.first_child() {
-        slot.remove(&existing);
-    }
-    slot.append(child);
-}

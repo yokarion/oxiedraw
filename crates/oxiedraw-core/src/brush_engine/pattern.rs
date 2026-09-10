@@ -32,7 +32,7 @@ impl PatternData {
     /// Decode a PNG buffer into a premultiplied-RGBA `PatternData`.
     /// Mirrors the loader inside `format::load` so brushes loaded from
     /// archives and patterns picked at runtime through the UI live in
-    /// the same colour space.
+    /// the same color space.
     pub fn from_png_bytes(bytes: &[u8]) -> Result<Self, String> {
         let decoder = png::Decoder::new(bytes);
         let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
@@ -226,7 +226,7 @@ impl PatternData {
     /// Build a square `dim` pattern from a per-pixel coverage function
     /// returning `0..=1`. The value is written to all channels (the
     /// grain shaders read alpha; premultiplied white keeps it valid for
-    /// any path that reads colour).
+    /// any path that reads color).
     fn from_value_fn(dim: u32, f: impl Fn(u32, u32) -> f32) -> Self {
         let dim_usize = dim as usize;
         let mut rgba = vec![0u8; dim_usize * dim_usize * 4];

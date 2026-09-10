@@ -6,8 +6,8 @@
 //! so it can be cached inside the `.oxiebrush` archive.
 //!
 //! The stroke is painted in *white* on a transparent background - the
-//! display path treats the alpha channel as a mask and recolours with
-//! the theme foreground colour, so previews stay theme-aware despite
+//! display path treats the alpha channel as a mask and recolors with
+//! the theme foreground color, so previews stay theme-aware despite
 //! being cached.
 //!
 //! A single 320x80 canvas is held in a `thread_local!` `RefCell` so the
@@ -67,7 +67,7 @@ thread_local! {
 
 /// Render `preset` to a PNG-encoded preview suitable for caching in
 /// the `.oxiebrush` archive. The image is white-on-transparent so the
-/// alpha channel can be used as a recolour mask at display time.
+/// alpha channel can be used as a recolor mask at display time.
 ///
 /// Returns `Err(reason)` if the canvas can't be initialised or if the
 /// stroke fails. Callers should fall back to a Cairo preview in that

@@ -1,4 +1,3 @@
-//! Keybind page: per-action rows, click to record a new shortcut.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -12,14 +11,10 @@ use crate::settings::AppSettings;
 use crate::settings::keybinds::{ALL_ACTION_GROUPS, ActionInfo, format_accel};
 
 pub(super) struct RowHandles {
-    /// `None` for the sentinel `"__reset_all__"` entry.
+    // `None` for the sentinel `"__reset_all__"` entry.
     row: Option<adw::ActionRow>,
     key_suffix_box: gtk::Box,
-    /// For real rows: the per-row <- reset button.
-    /// For the `"__reset_all__"` sentinel: the global reset-all button.
     reset_all_btn: gtk::Button,
-    /// Per-row reset button; same widget as `reset_all_btn` for real rows  - 
-    /// stored separately so `refresh_row` can toggle its visibility.
     row_reset_btn: gtk::Button,
 }
 
@@ -33,7 +28,6 @@ pub(super) fn build_keybinds_page(
     page.set_title("Keybinds");
     page.set_icon_name(Some("input-keyboard-symbolic"));
 
-    // -- Header group: info label + reset-all button ---------------------------
     let total_actions: usize = ALL_ACTION_GROUPS.iter().map(|g| g.actions.len()).sum();
     let n_groups = ALL_ACTION_GROUPS.len();
 
@@ -49,7 +43,6 @@ pub(super) fn build_keybinds_page(
     reset_all_btn.add_css_class("pill");
     update_reset_all_label(&reset_all_btn, initial_count);
 
-    // Store reset_all_btn reference in row_handles under a sentinel key
     let dummy_box = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let dummy_btn = gtk::Button::new();
     row_handles.borrow_mut().insert(
@@ -70,7 +63,7 @@ pub(super) fn build_keybinds_page(
         let reset_all_btn2 = reset_all_btn.clone();
         reset_all_btn.connect_clicked(move |_| {
             settings.borrow_mut().keybinds.clear();
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
             if let Some(gio_app) = gio::Application::default()
                 && let Ok(app) = gio_app.downcast::<gtk::Application>() {
                     apply_all_accels(&app, &settings.borrow());
@@ -94,7 +87,6 @@ pub(super) fn build_keybinds_page(
         });
     }
 
-    // Search entry + reset-all button in a toolbar row inside the header group
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     toolbar.set_margin_top(8);
 
@@ -107,7 +99,6 @@ pub(super) fn build_keybinds_page(
     header_group.add(&toolbar);
     page.add(&header_group);
 
-    // -- One PreferencesGroup per action group ---------------------------------
     for group in ALL_ACTION_GROUPS {
         let pref_group = adw::PreferencesGroup::new();
         pref_group.set_title(group.label);
@@ -132,7 +123,6 @@ pub(super) fn build_keybinds_page(
         page.add(&pref_group);
     }
 
-    // Search filtering (wired after all rows are registered)
     {
         let row_handles = Rc::clone(&row_handles);
         let settings_rc = Rc::clone(&settings);
@@ -163,7 +153,6 @@ pub(super) fn build_keybinds_page(
                     .resolve_accel(&settings)
                     .is_some_and(|accel| {
                         let parts = format_accel(accel);
-                        // match "ctrl+s", "ctrls", or any individual part like "ctrl" or "s"
                         parts.join("+").to_lowercase().contains(&query)
                             || parts.join("").to_lowercase().contains(&query)
                             || parts.iter().any(|p| p.to_lowercase().contains(&query))
@@ -192,12 +181,10 @@ pub(super) fn build_action_row(
     let current_accel = action.resolve_accel(settings);
     let is_modified = settings.keybinds.contains_key(action.id);
 
-    // Key badge suffix box
     let key_box = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     key_box.set_valign(gtk::Align::Center);
     populate_key_box(&key_box, current_accel, false);
 
-    // Per-row reset button (<-), visible only when modified
     let reset_btn = gtk::Button::from_icon_name("edit-undo-symbolic");
     reset_btn.add_css_class("flat");
     reset_btn.add_css_class("circular");
@@ -208,13 +195,11 @@ pub(super) fn build_action_row(
     row.add_suffix(&key_box);
     row.add_suffix(&reset_btn);
 
-    // Show subtitle when modified
     if is_modified
         && let Some(default) = action.default_accel {
             row.set_subtitle(&format!("Default: {}", format_accel(default).join("+")));
         }
 
-    // Row activation -> enter recording mode
     {
         let action_id = action.id.to_string();
         let recording_id = Rc::clone(&recording_id);
@@ -223,10 +208,8 @@ pub(super) fn build_action_row(
         row.connect_activated(move |_| {
             let currently_recording = recording_id.borrow().as_deref() == Some(&action_id);
             if currently_recording {
-                // Cancel
                 *recording_id.borrow_mut() = None;
             } else {
-                // Cancel any previous recording row first
                 if let Some(prev_id) = recording_id.borrow().clone() {
                     *recording_id.borrow_mut() = None;
                     refresh_row(
@@ -249,7 +232,6 @@ pub(super) fn build_action_row(
         });
     }
 
-    // Per-row reset button click
     {
         let action_id = action.id.to_string();
         let settings_rc = Rc::clone(&settings_rc);
@@ -258,7 +240,7 @@ pub(super) fn build_action_row(
         let modified_count = Rc::clone(&modified_count);
         reset_btn.connect_clicked(move |_| {
             settings_rc.borrow_mut().keybinds.remove(&action_id);
-            settings_rc.borrow().save();
+            settings_rc.borrow_mut().save_keeping_layout();
             if let Some(gio_app) = gio::Application::default()
                 && let Ok(app) = gio_app.downcast::<gtk::Application>() {
                     apply_all_accels(&app, &settings_rc.borrow());
@@ -309,17 +291,14 @@ pub(super) fn refresh_row(
     let is_modified = settings.keybinds.contains_key(action_id);
     let current_accel = info.resolve_accel(settings);
 
-    // Recording CSS class
     if is_recording {
         row.add_css_class("keybind-recording-row");
     } else {
         row.remove_css_class("keybind-recording-row");
     }
 
-    // Key badge suffix
     populate_key_box(&h.key_suffix_box, current_accel, is_recording);
 
-    // Subtitle
     if is_recording {
         row.set_subtitle("Press a key combination...  (Esc to cancel . Backspace to unbind)");
     } else if is_modified {
@@ -332,17 +311,14 @@ pub(super) fn refresh_row(
         row.set_subtitle("");
     }
 
-    // Per-row reset button visibility
     h.row_reset_btn.set_visible(is_modified && !is_recording);
 
-    // Update global reset-all button label if a count was provided
     if let Some(count) = new_modified_count
         && let Some(sentinel) = handles.get("__reset_all__") {
             update_reset_all_label(&sentinel.reset_all_btn, count);
         }
 }
 
-// Helpers
 
 pub(super) fn populate_key_box(key_box: &gtk::Box, accel: Option<&str>, is_recording: bool) {
     while let Some(child) = key_box.first_child() {
@@ -350,7 +326,6 @@ pub(super) fn populate_key_box(key_box: &gtk::Box, accel: Option<&str>, is_recor
     }
 
     if is_recording {
-        // Show dashed placeholder box
         let placeholder = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         placeholder.set_size_request(28, 28);
         placeholder.add_css_class("key-recording-placeholder");
@@ -416,8 +391,6 @@ pub(super) fn is_modifier_key(k: gdk::Key) -> bool {
     )
 }
 
-/// Map a bare modifier key to its accel string, for modifier-only bindings
-/// (canvas rotate / snap). Returns `None` for non-modifier or unsupported keys.
 pub(super) fn modifier_only_accel(keyval: gdk::Key) -> Option<&'static str> {
     match keyval {
         gdk::Key::Shift_L | gdk::Key::Shift_R => Some("<Shift>"),
@@ -452,4 +425,3 @@ pub(super) fn build_accel_string(keyval: gdk::Key, state: gdk::ModifierType) -> 
     s
 }
 
-// CSS

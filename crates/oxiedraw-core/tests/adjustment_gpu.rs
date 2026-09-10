@@ -488,9 +488,9 @@ fn stroke_preview_above_adjustment_does_not_show_mask() {
 
 /// Stroke an opaque square sitting on a transparent backdrop: with an outside
 /// offset, pixels just beyond the silhouette edge should pick up the stroke
-/// colour, while the far corners stay transparent.
+/// color, while the far corners stay transparent.
 #[test]
-fn stroke_colours_the_silhouette_edge() {
+fn stroke_colors_the_silhouette_edge() {
     let size = Size::new(32, 32);
     let mut canvas = Canvas::headless(size).unwrap();
 
@@ -528,7 +528,7 @@ fn stroke_colours_the_silhouette_edge() {
     let (b, g, r, a) = at(10, 16);
     assert!(
         a > 100 && r > 120 && g < 120 && b < 120,
-        "expected stroke colour just outside the edge, got B{b} G{g} R{r} A{a}"
+        "expected stroke color just outside the edge, got B{b} G{g} R{r} A{a}"
     );
 
     // A far corner stays transparent (no edge nearby to stroke).

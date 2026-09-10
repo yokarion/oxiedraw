@@ -7,8 +7,8 @@
 // of the accumulator rather than relying on fixed-function blending.
 //
 // Both inputs are premultiplied; the output is premultiplied too. The blend
-// math follows the W3C Compositing spec: the source colour mixed towards the
-// blended colour by the backdrop alpha, then plain src-over.
+// math follows the W3C Compositing spec: the source color mixed towards the
+// blended color by the backdrop alpha, then plain src-over.
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
@@ -72,7 +72,7 @@ void main() {
         default: blended = sc; break;                                        // Normal
     }
 
-    // Source colour mixed towards the blended colour by the backdrop alpha,
+    // Source color mixed towards the blended color by the backdrop alpha,
     // then standard src-over. Output stays premultiplied.
     vec3 src_color = mix(sc, blended, d.a);
     float out_a = s.a + d.a * (1.0 - s.a);

@@ -3,7 +3,7 @@
 //! Rendering each family in its own face live during scroll loads fonts on the
 //! fly and stutters on systems with many fonts. Instead each name is
 //! rasterized once into a `gdk::MemoryTexture` (tinted to the libadwaita text
-//! colour) and the dropdown blits the cached image. Rasterizing everything
+//! color) and the dropdown blits the cached image. Rasterizing everything
 //! takes a couple of seconds with hundreds of fonts, so the startup splash
 //! does it incrementally via [`FontPreviews::render_one`]; until a preview
 //! exists the dropdown falls back to plain text.
@@ -47,7 +47,7 @@ impl FontPreviews {
     }
 }
 
-/// The libadwaita window text colour for the current scheme, as an opaque
+/// The libadwaita window text color for the current scheme, as an opaque
 /// approximation (alpha is folded into the rendered coverage anyway).
 pub(crate) fn theme_text_color() -> Color {
     if adw::StyleManager::default().is_dark() {

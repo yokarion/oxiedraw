@@ -1,11 +1,11 @@
-//! Colour-smudge dab path (Krita colorsmudge, smearing mode).
+//! Color-smudge dab path (Krita colorsmudge, smearing mode).
 //!
 //! Unlike the mask brushes - which accumulate an R8 coverage mask in the
 //! stroke buffer and composite it with a single tint at commit - a smudge
-//! dab deposits a *sampled* colour that varies along the stroke. Each dab is
+//! dab deposits a *sampled* color that varies along the stroke. Each dab is
 //! painted straight into the target layer: the layer is copied into
 //! `blend_scratch` before a batch of dabs, and every dab samples that copy at
-//! the drag-shifted position (dragging the colour under the previous dab onto
+//! the drag-shifted position (dragging the color under the previous dab onto
 //! the current one) and composites it OVER the layer. Fully GPU - no readback.
 
 use ash::vk;
@@ -169,7 +169,7 @@ impl VulkanRenderer {
     }
 
     /// Paint a batch of smudge dabs into layer `layer_idx`. `paint_linear` is
-    /// the premultiplied-linear brush colour (RGB + alpha 1). The whole batch
+    /// the premultiplied-linear brush color (RGB + alpha 1). The whole batch
     /// samples one pre-batch copy of the layer, so dabs within a batch smear
     /// from the same source; state carries across batches through the layer
     /// itself (each new batch re-copies it).

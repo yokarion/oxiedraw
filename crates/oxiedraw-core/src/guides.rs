@@ -277,13 +277,13 @@ mod point_serde {
 }
 
 /// A perspective vanishing point in canvas-space coordinates, with its own
-/// line colour (a position along the guide colour ramp) so each point's rays
+/// line color (a position along the guide color ramp) so each point's rays
 /// are drawn in a distinct hue.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct VanishingPoint {
     pub x: f32,
     pub y: f32,
-    /// Ray colour as a position `0.0..=1.0` along the guide ramp. Absent in
+    /// Ray color as a position `0.0..=1.0` along the guide ramp. Absent in
     /// pre-v11 files (defaults to the ramp's blue).
     #[serde(default = "default_guide_color")]
     pub color: f32,
@@ -328,7 +328,7 @@ pub struct GuideConfig {
     /// Perspective vanishing points (1 to 3). Empty for other kinds.
     #[serde(default)]
     pub vanishing_points: Vec<VanishingPoint>,
-    /// Line colour as a position `0.0..=1.0` along the guide colour ramp
+    /// Line color as a position `0.0..=1.0` along the guide color ramp
     /// (see [`guide_line_color`]). Stored as the slider position so the ramp
     /// stays the single source of truth. Absent in pre-v11 files.
     #[serde(default = "default_guide_color")]
@@ -344,7 +344,7 @@ fn default_guide_color() -> f32 {
     0.13
 }
 
-/// Resolve a guide line colour from its ramp position `t` (`0.0..=1.0`).
+/// Resolve a guide line color from its ramp position `t` (`0.0..=1.0`).
 /// The ramp is a fixed, non-cyclic sweep: black -> blue -> cyan -> green ->
 /// yellow -> orange -> red -> purple -> pink -> white (10 evenly spaced stops).
 #[must_use]
@@ -374,9 +374,9 @@ pub fn guide_line_color(t: f32) -> (f32, f32, f32) {
     )
 }
 
-/// Nearest ramp position (`0.0..=1.0`) to an arbitrary RGB colour (channels
-/// `0.0..=1.0`). Used to seed a guide's colour from the theme accent or a VP's
-/// from the primary colour - the ramp is coarse, so this only *approximately*
+/// Nearest ramp position (`0.0..=1.0`) to an arbitrary RGB color (channels
+/// `0.0..=1.0`). Used to seed a guide's color from the theme accent or a VP's
+/// from the primary color - the ramp is coarse, so this only *approximately*
 /// matches, which is the intent ("barely match").
 #[must_use]
 pub fn guide_pos_from_rgb(r: f32, g: f32, b: f32) -> f32 {
@@ -395,7 +395,7 @@ pub fn guide_pos_from_rgb(r: f32, g: f32, b: f32) -> f32 {
     best_t
 }
 
-/// Default ramp colour for vanishing point `index`: the primary colour for the
+/// Default ramp color for vanishing point `index`: the primary color for the
 /// first point, then a 60-degree hue step per subsequent point, each snapped to
 /// the ramp. Saturation/value are floored so a dull or near-gray primary still
 /// lands on a visible ramp hue.

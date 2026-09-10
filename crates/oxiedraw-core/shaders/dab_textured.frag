@@ -79,6 +79,6 @@ float apply_texture(float coverage) {
 
 void main() {
     float coverage = apply_texture(base_coverage());
-    // v_color is premultiplied; scale colour + alpha by coverage * flow.
+    // v_color is premultiplied; scale color + alpha by coverage * flow.
     out_color = v_color * coverage * v_flow;
 }

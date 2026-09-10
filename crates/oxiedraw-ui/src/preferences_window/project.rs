@@ -1,6 +1,3 @@
-//! Project page: document-level settings. Currently rolling numbered backups
-//! and background autosave; a home for future document management (templates,
-//! recent files, etc.).
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -10,8 +7,7 @@ use adw::prelude::*;
 use crate::session::AutosaveConfig;
 use crate::settings::AppSettings;
 
-/// Autosave interval choices, as `(label, seconds)`. The combo index maps
-/// straight into this table.
+// The combo index maps straight into this table.
 const INTERVALS: &[(&str, u32)] = &[
     ("10 seconds", 10),
     ("30 seconds", 30),
@@ -29,7 +25,6 @@ fn interval_index(secs: u32) -> u32 {
     INTERVALS
         .iter()
         .position(|(_, s)| *s == secs)
-        // Default to "5 minutes" when the stored value isn't one of the presets.
         .unwrap_or(5) as u32
 }
 
@@ -43,7 +38,6 @@ pub(super) fn build_project_page(
 
     let save = settings.borrow().save.clone();
 
-    // -- Backups group ---------------------------------------------------------
     let backup_group = adw::PreferencesGroup::new();
     backup_group.set_title("Backups");
     backup_group.set_description(Some(
@@ -66,7 +60,7 @@ pub(super) fn build_project_page(
         let settings = Rc::clone(&settings);
         backup_expander.connect_enable_expansion_notify(move |e| {
             settings.borrow_mut().save.backups_enabled = e.enables_expansion();
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
     {
@@ -75,14 +69,13 @@ pub(super) fn build_project_page(
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let v = r.value() as usize;
             settings.borrow_mut().save.backup_count = v;
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
         });
     }
 
     backup_group.add(&backup_expander);
     page.add(&backup_group);
 
-    // -- Autosave group --------------------------------------------------------
     let autosave_group = adw::PreferencesGroup::new();
     autosave_group.set_title("Autosave");
 
@@ -109,7 +102,7 @@ pub(super) fn build_project_page(
         autosave_expander.connect_enable_expansion_notify(move |e| {
             let enabled = e.enables_expansion();
             settings.borrow_mut().save.autosave_enabled = enabled;
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
             autosave.enabled.set(enabled);
         });
     }
@@ -121,7 +114,7 @@ pub(super) fn build_project_page(
                 .copied()
                 .unwrap_or(("5 minutes", 300));
             settings.borrow_mut().save.autosave_interval_secs = secs;
-            settings.borrow().save();
+            settings.borrow_mut().save_keeping_layout();
             autosave.interval_secs.set(secs);
         });
     }
@@ -145,7 +138,6 @@ mod tests {
 
     #[test]
     fn interval_index_falls_back_to_five_minutes() {
-        // 45s is not one of the presets - pick the 5-minute default (index 5).
         assert_eq!(interval_index(45), 5);
         assert_eq!(INTERVALS[interval_index(45) as usize].1, 300);
     }

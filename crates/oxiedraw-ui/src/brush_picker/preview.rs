@@ -3,7 +3,7 @@
 //! Renders a sample S-curve stroke by feeding synthetic `SpawnInput`s through
 //! `Dynamics::evaluate` (the same routine the GPU stamp path uses), with a
 //! `sin` pressure envelope ramping 0 -> 1 -> 0. Each `Dab` is rasterised with
-//! a radial gradient (soft-round / textured) or a hard square (pixel). Colour
+//! a radial gradient (soft-round / textured) or a hard square (pixel). Color
 //! comes from `gtk::Widget::color()` (CSS `@theme_fg_color`), so previews track
 //! the theme like symbolic icons.
 

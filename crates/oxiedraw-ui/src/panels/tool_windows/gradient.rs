@@ -1,7 +1,3 @@
-//! Gradient tool panel: the stop bar plus Position/Opacity fields and a delete
-//! button, shown above the colour picker while the tool is active. Selecting a
-//! stop points the colour picker at it and editing the picker writes back; the
-//! `syncing` and `active` flags keep that two-way link from looping.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -16,15 +12,12 @@ use crate::widgets::boxed_list;
 
 const MARGIN: i32 = 12;
 
-/// Build the gradient panel. Returns the widget (a revealer) and a setter the
-/// right-bar tool switch calls: `true` when the Gradient tool is active (show
-/// + bind the picker), `false` otherwise.
-pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widget, Rc<dyn Fn(bool)>) {
+// Selecting a stop points the color picker at it and editing the picker writes
+// back; `syncing` and `active` keep that two-way link from looping.
+pub(crate) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widget, Rc<dyn Fn(bool)>) {
     let syncing = Rc::new(Cell::new(false));
     let active = Rc::new(Cell::new(false));
 
-    // Transparent column (no card): the ramp sits directly on the sidebar,
-    // the numeric controls go in a boxed list below it.
     let content = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .spacing(8)
@@ -34,7 +27,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         .margin_end(MARGIN)
         .build();
 
-    // Position control: spin (0-100) with a trailing delete-stop button.
     let pos_adj = gtk::Adjustment::new(0.0, 0.0, 100.0, 1.0, 10.0, 0.0);
     let pos_spin = gtk::SpinButton::builder()
         .adjustment(&pos_adj)
@@ -50,7 +42,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         .build();
     delete_btn.add_css_class("flat");
 
-    // Opacity control: slider (0..1).
     let opac_scale = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 1.0, 0.01);
     opac_scale.set_hexpand(true);
     opac_scale.set_draw_value(false);
@@ -60,12 +51,10 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
     list.append(&boxed_list::row("Position", &pos_spin, &[&delete_widget]));
     list.append(&boxed_list::row("Opacity", &opac_scale, &[]));
 
-    // The bar is built after the field closures so its callbacks can drive
-    // them; wire it in via a slot.
+    // Built after the field closures so its callbacks can drive them.
     let bar_slot: Rc<std::cell::RefCell<Option<GradientBar>>> =
         Rc::new(std::cell::RefCell::new(None));
 
-    // Push the selected stop's values into the fields + the colour picker.
     let select_stop: Rc<dyn Fn(usize)> = {
         let gradient = gradient.clone();
         let colors = colors.clone();
@@ -80,7 +69,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
             syncing.set(true);
             pos_spin.set_value(f64::from(stop.position) * 100.0);
             opac_scale.set_value(f64::from(stop.opacity));
-            // Bind the picker to this stop's colour (wheel jumps to it).
             colors.set_current(stop.color);
             colors.notify_changed();
             syncing.set(false);
@@ -92,8 +80,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         colors,
         Rc::clone(&select_stop),
         {
-            // Stops changed (insert / move / delete): let external listeners
-            // (e.g. the cursor overlay) know the ramp changed.
             let gradient = gradient.clone();
             Rc::new(move || gradient.notify_changed())
         },
@@ -103,7 +89,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
     content.append(&list);
     *bar_slot.borrow_mut() = Some(bar);
 
-    // Position spin -> move the selected stop.
     {
         let gradient = gradient.clone();
         let colors = colors.clone();
@@ -130,7 +115,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         });
     }
 
-    // Opacity slider -> set the selected stop's opacity.
     {
         let gradient = gradient.clone();
         let colors = colors.clone();
@@ -156,7 +140,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         });
     }
 
-    // Delete button -> remove the selected stop.
     {
         let gradient = gradient.clone();
         let colors = colors.clone();
@@ -183,7 +166,6 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         });
     }
 
-    // Picker -> selected stop colour (only while active + not self-syncing).
     {
         let gradient = gradient.clone();
         let colors_bus = colors.clone();
@@ -210,26 +192,17 @@ pub(super) fn build(gradient: &GradientState, colors: &ColorState) -> (gtk::Widg
         }));
     }
 
-    let revealer = gtk::Revealer::builder()
-        .transition_type(gtk::RevealerTransitionType::SlideDown)
-        .child(&content)
-        .reveal_child(false)
-        .build();
-
     let set_active: Rc<dyn Fn(bool)> = {
-        let revealer = revealer.clone();
         let active = Rc::clone(&active);
         let select_stop = Rc::clone(&select_stop);
         let gradient = gradient.clone();
         Rc::new(move |on: bool| {
             active.set(on);
-            revealer.set_reveal_child(on);
             if on {
-                // Sync fields + picker to the current selection on entry.
                 select_stop(gradient.selected_stop.get());
             }
         })
     };
 
-    (revealer.upcast(), set_active)
+    (content.upcast(), set_active)
 }

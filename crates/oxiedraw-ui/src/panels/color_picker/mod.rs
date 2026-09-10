@@ -1,12 +1,6 @@
-//! Krita-style HSV color picker: a hue ring with a rotating HSV triangle,
-//! a primary/secondary swatch, RGB spin buttons and a hex entry.
-//!
-//! Persistent colors live in core's `ColorState`; the picker wraps it in
-//! `PickerState`, which adds working HSV so achromatic stored colors don't
-//! clobber the hue, plus a `syncing` flag. All four input surfaces (wheel,
-//! swatch, spinners, hex) write through the same state and end in one
-//! `refresh` closure that repopulates every widget; `syncing` guards against
-//! the resulting widget-callback recursion.
+//! A hue ring with a rotating HSV triangle, a primary/secondary swatch, RGB
+//! spin buttons and a hex entry. Every input writes through one state and ends
+//! in one `refresh`; `syncing` guards the callback recursion that causes.
 
 mod swatch;
 mod wheel;
@@ -32,8 +26,6 @@ pub(super) const SWATCH_INNER: f64 = 30.0;
 pub(super) const SWATCH_OFFSET: f64 = 14.0;
 pub(super) const SWATCH_TOTAL: i32 = 44;
 
-/// Wraps the core `ColorState` with picker-only working HSV and a `syncing`
-/// flag used to break update loops between widget callbacks.
 #[derive(Debug, Clone)]
 pub(super) struct PickerState {
     pub(super) colors: ColorState,
@@ -60,10 +52,6 @@ impl PickerState {
         self.commit_color(c);
     }
 
-    /// Set the active colour and broadcast it on the `ColorState` bus so other
-    /// listeners (e.g. live text recolouring) react. `syncing` is held across
-    /// the notify so the picker's own change-listener skips reloading (it
-    /// already holds the correct state); external changes leave it clear.
     pub(super) fn commit_color(&self, c: Color) {
         self.syncing.set(true);
         self.colors.set_current(c);
@@ -71,7 +59,6 @@ impl PickerState {
         self.syncing.set(false);
     }
 
-    /// Preserve hue to avoid jumps in achromatic regions.
     pub(super) fn load_hsv_from_current(&self) {
         let (h, s, v) = self.colors.current().to_hsv();
         if s > f32::EPSILON {
@@ -82,11 +69,37 @@ impl PickerState {
     }
 }
 
+pub(crate) const MIN_SIZE: i32 = WHEEL_SIZE + PANEL_MARGIN * 2;
+
+const INPUTS_HEIGHT: i32 = 120;
+
+const INPUTS_MIN_HEIGHT: i32 = MIN_SIZE + INPUTS_HEIGHT;
+
+// A breakpoint because GTK4 has no size-allocate signal, and the bin ignores
+// its child's minimum - a token request would let the wheel be clipped.
+fn hide_inputs_when_short(content: &gtk::Box, inputs: &impl IsA<gtk::Widget>) -> adw::BreakpointBin {
+    let needed = content.measure(gtk::Orientation::Horizontal, -1).0;
+    let bin = adw::BreakpointBin::builder()
+        .child(content)
+        .width_request(needed.max(MIN_SIZE))
+        .height_request(MIN_SIZE)
+        .hexpand(true)
+        .vexpand(true)
+        .build();
+    let condition = adw::BreakpointCondition::new_length(
+        adw::BreakpointConditionLengthType::MaxHeight,
+        f64::from(INPUTS_MIN_HEIGHT),
+        adw::LengthUnit::Px,
+    );
+    let breakpoint = adw::Breakpoint::new(condition);
+    breakpoint.add_setter(inputs.as_ref(), "visible", Some(&false.to_value()));
+    adw::prelude::BreakpointBinExt::add_breakpoint(&bin, breakpoint);
+    bin
+}
+
 pub(crate) fn build(colors: ColorState) -> gtk::Box {
     let state = PickerState::new(colors);
 
-    // Outer panel fills the Paned slot edge-to-edge so the chrome background
-    // has no gaps; inner box owns the padding.
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
         .vexpand(true)
@@ -115,23 +128,18 @@ pub(crate) fn build(colors: ColorState) -> gtk::Box {
     let (rgb_hex_row, refresh_inputs) = build_inputs(&state, &wheel, &swatch);
     content.append(&rgb_hex_row);
 
-    panel.append(&content);
+    panel.append(&hide_inputs_when_short(&content, &rgb_hex_row));
 
     install_wheel_draw(&wheel, &state);
     install_wheel_input(&wheel, &state, &refresh_inputs);
     install_swatch_draw(&swatch, &state);
     install_swatch_input(&swatch, &state, &refresh_inputs);
 
-    // Redraw the picker when the color is changed from outside the widget
-    // (e.g. the canvas color-picker tool). Reload the working HSV first so
-    // the wheel indicator tracks the picked color.
     {
         let colors = state.colors.clone();
         let state = state.clone();
         let refresh = Rc::clone(&refresh_inputs);
         colors.connect_changed(Box::new(move || {
-            // Skip reloading when the picker itself is the source (it already
-            // has the right HSV); only react to external changes.
             if state.syncing.get() {
                 return;
             }
@@ -177,7 +185,8 @@ fn build_inputs(
         .build();
     let hex_entry = gtk::Entry::builder()
         .max_length(7)
-        .width_chars(8)
+        .width_chars(7)
+        .max_width_chars(7)
         .placeholder_text("#000000")
         .build();
     hex_col.append(&hex_label);
@@ -256,7 +265,6 @@ fn build_inputs(
         let state = state.clone();
         let refresh = Rc::clone(&refresh);
         let hex_entry_cb = hex_entry.clone();
-        // Apply on focus loss as well as Enter.
         let focus = gtk::EventControllerFocus::new();
         focus.connect_leave(move |_| {
             if state.syncing.get() {
@@ -291,6 +299,8 @@ fn build_channel_row(parent: &gtk::Box, label: &str) -> gtk::SpinButton {
         .digits(0)
         .numeric(true)
         .hexpand(true)
+        .width_chars(3)
+        .max_width_chars(3)
         .build();
     row.append(&lbl);
     row.append(&spin);

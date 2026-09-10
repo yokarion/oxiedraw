@@ -149,7 +149,7 @@ impl PaintTarget for BatchStamp<'_> {
     }
 }
 
-/// `PaintTarget` for colour-smudge brushes. Each dab is painted straight into
+/// `PaintTarget` for color-smudge brushes. Each dab is painted straight into
 /// the active layer via the GPU smudge path (no stroke buffer). `prev_center`
 /// carries across `paint_dabs` calls so each dab's drag vector is relative to
 /// the previous one; the caller seeds it from and reads it back into canvas
