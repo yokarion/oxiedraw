@@ -12,7 +12,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::document::{BlendMode, LayerGroup, LayerKind, LayerState, LayerTreeNode};
+use oxiedraw_core::document::{BlendMode, LayerGroup, LayerState, LayerTreeNode};
 use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerExtension};
 use relm4::gtk;
@@ -1364,7 +1364,6 @@ pub(crate) fn build(
             select_folder_content,
             history,
             layer_extensions,
-            on_edit_component,
             prepare_delete,
             prepare_reorder,
             alpha_lock_observer,
@@ -1505,7 +1504,6 @@ fn build_layers_page(
     select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
-    on_edit_component: &Rc<dyn Fn(String)>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
@@ -1544,7 +1542,6 @@ fn build_layers_page(
         select_layer_content,
         select_folder_content,
         history,
-        on_edit_component,
         prepare_reorder,
     );
     actions::install_context_menu(&area, &ui, layer_clipboard);
@@ -3416,7 +3413,6 @@ fn install_list_input(
     select_layer_content: &Rc<dyn Fn(usize)>,
     select_folder_content: &Rc<dyn Fn(Vec<usize>)>,
     history: &Rc<RefCell<HistoryStack>>,
-    on_edit_component: &Rc<dyn Fn(String)>,
     prepare_reorder: &Rc<dyn Fn()>,
 ) {
     let on_begin: Rc<dyn Fn(f64, f64)> = {
@@ -3969,49 +3965,6 @@ fn install_list_input(
         // No `connect_cancel`: the real pen-up finishes the drag.
     }
     area.add_controller(stylus);
-
-    let rename_click = gtk::GestureClick::new();
-    rename_click.set_button(gdk::BUTTON_PRIMARY);
-    {
-        let area_w = area.clone();
-        let ui_c = ui.clone();
-        let canvas_c = Rc::clone(&canvas);
-        let history = Rc::clone(history);
-        let on_edit_component = Rc::clone(on_edit_component);
-        rename_click.connect_pressed(move |gesture, n_press, _x, y| {
-            if n_press != 2 {
-                return;
-            }
-            gesture.set_state(gtk::EventSequenceState::Claimed);
-            let cy = y + ui_c.scroll_offset();
-            let snapshot = ui_c.state.snapshot();
-            let rows = compute_visible_rows(&ui_c.tree.borrow(), &snapshot);
-            let layout = RowLayout::new(&rows);
-            let Some(row_idx) = layout.at(cy) else { return };
-            let row = &rows[row_idx];
-            if let RowKind::Layer { flat_idx, .. } = &row.kind
-                && let Some(LayerKind::Component(inst)) = ui_c.state.kind(*flat_idx)
-            {
-                on_edit_component(inst.component_id);
-                return;
-            }
-            let (row_id, current_name, is_layer) = match &row.kind {
-                RowKind::Layer { id, name, .. } => (id.clone(), name.clone(), true),
-                RowKind::Group { id, name, .. } => (id.clone(), name.clone(), false),
-            };
-            show_rename_popover(
-                &area_w,
-                row_id,
-                current_name,
-                is_layer,
-                &ui_c,
-                &canvas_c,
-                layout.top(row_idx) - ui_c.scroll_offset(),
-                &history,
-            );
-        });
-    }
-    area.add_controller(rename_click);
 
     let motion = gtk::EventControllerMotion::new();
     {
