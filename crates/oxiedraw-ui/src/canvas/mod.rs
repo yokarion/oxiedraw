@@ -6,6 +6,8 @@
 
 mod crop_geom;
 pub(crate) mod primary_drag;
+mod resample;
+mod stroke_tip;
 mod transform_geometry;
 
 use std::cell::{Cell, RefCell};
@@ -191,6 +193,11 @@ pub(crate) struct RenderPump {
     /// timer presenting between input events starves a tablet's event
     /// stream until the compositer decides the pen lifted.
     on_tick: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    /// Moves the view from the resampled pointer (`install_pan`).
+    nav_tick: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    /// Stamps the stroke dabs due this frame (`primary_drag`).
+    stroke_tick: Rc<RefCell<Option<Box<dyn Fn()>>>>,
+    pacing: Rc<RefCell<Option<crate::pacing_trace::PacingTrace>>>,
 }
 
 impl RenderPump {
@@ -206,12 +213,23 @@ impl RenderPump {
             active: Rc::new(Cell::new(0)),
             installed: Rc::new(Cell::new(false)),
             on_tick: Rc::new(RefCell::new(None)),
+            nav_tick: Rc::new(RefCell::new(None)),
+            stroke_tick: Rc::new(RefCell::new(None)),
+            pacing: Rc::new(RefCell::new(crate::pacing_trace::PacingTrace::from_env())),
         }
     }
 
     /// Cloneable slot for the per-frame callback described on `on_tick`.
     pub(crate) fn tick_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
         Rc::clone(&self.on_tick)
+    }
+
+    pub(crate) fn nav_tick_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
+        Rc::clone(&self.nav_tick)
+    }
+
+    pub(crate) fn stroke_tick_handle(&self) -> Rc<RefCell<Option<Box<dyn Fn()>>>> {
+        Rc::clone(&self.stroke_tick)
     }
 
     /// Begin (or join) an interaction: ensure the per-frame present tick runs.
@@ -225,22 +243,26 @@ impl RenderPump {
             return;
         };
         let me = self.clone();
-        area.add_tick_callback(move |area, _clock| {
+        area.add_tick_callback(move |area, clock| {
             if me.active.get() == 0 {
                 me.installed.set(false);
                 return gtk::glib::ControlFlow::Break;
             }
-            // Advance any canvas animation first, so whatever it changed
-            // rides out on this frame's present rather than needing one
-            // of its own.
-            let tick = me.on_tick.borrow();
-            if let Some(cb) = tick.as_ref() {
-                cb();
+            if let Some(trace) = me.pacing.borrow_mut().as_mut() {
+                trace.begin_tick();
             }
-            drop(tick);
+            // Advance the stroke, the view and any canvas animation first, so
+            // whatever they changed rides out on this frame's present rather
+            // than needing one of its own.
+            run_slot(&me.stroke_tick);
+            run_slot(&me.nav_tick);
+            run_slot(&me.on_tick);
             let changed = me.canvas.borrow().present_would_redraw();
-            if changed {
+            me.paintable.request_damage();
+            let present_us = if changed {
+                let started = Instant::now();
                 present_into_paintable(&mut me.canvas.borrow_mut(), &me.paintable, area);
+                u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
             } else {
                 // Canvas pixels are unchanged - a pan/zoom that only moves the view,
                 // or a gap between stylus event bursts. Skip the costly dmabuf
@@ -249,6 +271,10 @@ impl RenderPump {
                 // this, a pan redraws only on input events, so a stylus's bursty
                 // delivery makes panning visibly jitter while a mouse stays smooth.
                 area.queue_draw();
+                0
+            };
+            if let Some(trace) = me.pacing.borrow_mut().as_mut() {
+                trace.end_tick(clock, present_us);
             }
             gtk::glib::ControlFlow::Continue
         });
@@ -257,6 +283,14 @@ impl RenderPump {
     /// End one interaction; the tick stops once the last one ends.
     pub(crate) fn disarm(&self) {
         self.active.set(self.active.get().saturating_sub(1));
+    }
+}
+
+/// The slot stays borrowed for the call, so a callback must not replace it.
+fn run_slot(slot: &RefCell<Option<Box<dyn Fn()>>>) {
+    let slot = slot.borrow();
+    if let Some(cb) = slot.as_ref() {
+        cb();
     }
 }
 
@@ -848,6 +882,7 @@ fn install_motion(
         // Runs during strokes too (both controllers sit on the same widget), so
         // its cost belongs to the input stage on the perf overlay.
         let _span = frame_profile::span(frame_profile::Stage::Input);
+        crate::pacing_trace::note_input();
         #[allow(clippy::cast_possible_truncation)]
         cursor_pos.set(Point::new(x as f32, y as f32));
 
@@ -1186,6 +1221,7 @@ fn install_pattern_secondary(
 fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
     let drag = gtk::GestureDrag::new();
     drag.set_button(BUTTON_MIDDLE);
+    let resampler = Rc::new(RefCell::new(resample::PointerResampler::new()));
 
     {
         let last = Rc::clone(&viewport.pan_last_offset);
@@ -1201,6 +1237,7 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let animator = viewport.rotation_animator();
         let pump = viewport.render_pump.clone();
         let area_c = area.clone();
+        let resampler = Rc::clone(&resampler);
         drag.connect_drag_begin(move |gesture, start_x, start_y| {
             pump.arm();
             last.set(Point::ZERO);
@@ -1238,6 +1275,9 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
             } else {
                 nav.set(NavDrag::Pan);
                 area_c.set_cursor_from_name(Some("grabbing"));
+                // Motion samples only: seeding the press would make the first
+                // interval estimate the press-to-first-move delay.
+                resampler.borrow_mut().begin();
             }
         });
     }
@@ -1257,6 +1297,7 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let animator = viewport.rotation_animator();
         let picture = Rc::clone(&viewport.picture);
         let area_c = area.clone();
+        let resampler = Rc::clone(&resampler);
         drag.connect_drag_update(move |gesture, dx, dy| {
             #[allow(clippy::cast_possible_truncation)]
             let offset = Point::new(dx as f32, dy as f32);
@@ -1311,9 +1352,14 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
                 pan.set(new_pan);
                 zoom.set(new_zoom);
             } else {
-                let new_pan = pan_increment(pan.get(), last.get(), offset);
-                last.set(offset);
-                pan.set(new_pan);
+                // The pump's tick applies these; an untimed event goes direct.
+                let event_ms = gesture.current_event_time();
+                if event_ms == 0 {
+                    apply_pan_offset(&pan, &last, &sync, offset);
+                } else {
+                    resampler.borrow_mut().push(f64::from(event_ms), offset);
+                }
+                return;
             }
             sync.commit();
             // The render pump (armed at drag-begin) re-presents every frame, so
@@ -1324,7 +1370,17 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let nav = Rc::clone(&viewport.nav);
         let pump = viewport.render_pump.clone();
         let area_c = area.clone();
-        drag.connect_drag_end(move |_, _, _| {
+        let pan = Rc::clone(&viewport.pan);
+        let last = Rc::clone(&viewport.pan_last_offset);
+        let sync = viewport.view_sync();
+        drag.connect_drag_end(move |_, offset_x, offset_y| {
+            // The gesture's own final offset, so the view ends where the
+            // pointer did however the updates were delivered.
+            if nav.get() == NavDrag::Pan {
+                #[allow(clippy::cast_possible_truncation)]
+                let offset = Point::new(offset_x as f32, offset_y as f32);
+                apply_pan_offset(&pan, &last, &sync, offset);
+            }
             nav.set(NavDrag::None);
             pump.disarm();
             // Drop the grab / zoom cursor; the next motion event restores
@@ -1333,7 +1389,35 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         });
     }
 
+    // Move the view every frame from the resampled pointer position.
+    {
+        let nav = Rc::clone(&viewport.nav);
+        let pan = Rc::clone(&viewport.pan);
+        let last = Rc::clone(&viewport.pan_last_offset);
+        let sync = viewport.view_sync();
+        let resampler = Rc::clone(&resampler);
+        *viewport.render_pump.nav_tick_handle().borrow_mut() = Some(Box::new(move || {
+            if nav.get() != NavDrag::Pan {
+                return;
+            }
+            let offset = resampler.borrow().sample();
+            if let Some(offset) = offset {
+                apply_pan_offset(&pan, &last, &sync, offset);
+            }
+        }));
+    }
+
     area.add_controller(drag);
+}
+
+fn apply_pan_offset(pan: &Cell<Point>, last: &Cell<Point>, sync: &ViewSync, offset: Point) {
+    let new_pan = pan_increment(pan.get(), last.get(), offset);
+    last.set(offset);
+    if new_pan == pan.get() {
+        return;
+    }
+    pan.set(new_pan);
+    sync.commit();
 }
 
 /// Compute the new pan position from the current pan and a fresh cumulative

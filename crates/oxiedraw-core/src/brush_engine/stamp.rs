@@ -303,7 +303,7 @@ impl PresetStrokeRenderer {
         self.dist_since_last_dab = chord - (s - step);
 
         if !self.dabs.is_empty() {
-            target.paint_dabs(&self.dabs);
+            target.paint_segment_dabs(&self.dabs, p1.time_ms, p2.time_ms);
         }
     }
 

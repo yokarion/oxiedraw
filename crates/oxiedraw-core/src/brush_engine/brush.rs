@@ -92,6 +92,11 @@ pub trait PaintTarget {
     /// the `Rc` inside `Textured` is not cloned per push.
     fn set_family(&mut self, family: &BrushFamily);
     fn paint_dabs(&mut self, dabs: &[Dab]);
+    /// One segment's dabs, drawn between the samples at `from_ms` and `to_ms`.
+    fn paint_segment_dabs(&mut self, dabs: &[Dab], from_ms: u64, to_ms: u64) {
+        let _ = (from_ms, to_ms);
+        self.paint_dabs(dabs);
+    }
 }
 
 pub trait StrokeRenderer {

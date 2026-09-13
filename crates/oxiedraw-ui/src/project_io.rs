@@ -141,6 +141,7 @@ fn write_project(
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();
+    let snapshot_started = std::time::Instant::now();
     let snapshot = {
         // Full GPU readback of every layer, on the main thread - the one part of
         // a save that can visibly hitch a stroke.
@@ -177,6 +178,11 @@ fn write_project(
             }
         }
     };
+    tracing::debug!(
+        ms = snapshot_started.elapsed().as_secs_f64() * 1000.0,
+        layers = session.viewport.canvas().borrow().layers().len(),
+        "save snapshot read back from the GPU on the main thread"
+    );
 
     session.global.save_in_progress.set(true);
     let pending = (kind == SaveKind::Manual)

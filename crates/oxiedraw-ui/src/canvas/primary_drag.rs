@@ -35,6 +35,7 @@ use relm4::gtk::prelude::*;
 use crate::canvas_paintable::CanvasPaintable;
 use crate::settings::{AppSettings, ShapeCorrectionSettings};
 
+use super::stroke_tip::{DeferredDabs, stamp_runs};
 use super::{RenderPump, Viewport};
 use super::{
     BUTTON_PRIMARY, crop_geom, present_into_paintable, pressure_from, sample_from,
@@ -126,6 +127,8 @@ pub(super) struct PrimaryDragHandler {
     /// (a `read_to_string` + JSON parse) saturated the main thread at stylus
     /// report rates and jittered the frame clock. They can't change mid-stroke.
     stroke_shape_correction: RefCell<ShapeCorrectionSettings>,
+    /// Segment dabs held back and stamped by time from the render pump.
+    deferred_dabs: Rc<RefCell<DeferredDabs>>,
     // -- crop ------------------------------------------------------------
     crop: CropState,
     crop_handle: Rc<Cell<CropHandle>>,
@@ -807,6 +810,7 @@ impl PrimaryDragHandler {
         self.pending_opacity.set(opacity);
         self.pending_erase.set(erase);
         self.stroke_points.borrow_mut().clear();
+        self.deferred_dabs.borrow_mut().begin();
 
         let canvas_pos = widget_to_canvas(x, y, &self.pan, &self.zoom, &self.rotation);
         // Arm Drawing Assist snapping for this stroke (grid/iso/perspective);
@@ -890,12 +894,33 @@ impl PrimaryDragHandler {
         // Reset the 2 s idle timer - it fires only when movement stops.
         self.reset_idle_timer();
 
-        let mut canvas = self.canvas.borrow_mut();
-        if let Err(e) = canvas.stamp(|target| {
-            self.brush_engine.push_sample(sample, target);
-        }) {
-            tracing::error!(error = %e, "stamp push_sample failed");
+        // Smudge picks its colour up from the layer as it stamps, so it keeps
+        // stamping straight away; the rest defer to the pump (see `stroke_tip`).
+        let smudge = self.canvas.borrow().is_smudge_stroke();
+        if smudge {
+            let mut canvas = self.canvas.borrow_mut();
+            if let Err(e) = canvas.stamp(|target| {
+                self.brush_engine.push_sample(sample, target);
+            }) {
+                tracing::error!(error = %e, "stamp push_sample failed");
+            }
+            return;
         }
+        let mut deferred = self.deferred_dabs.borrow_mut();
+        #[allow(clippy::cast_precision_loss)]
+        deferred.begin_sample(sample.time_ms as f64);
+        self.brush_engine.push_sample(sample, &mut *deferred);
+    }
+
+    fn release_due_dabs(&self) {
+        if !self.brush_engine.is_drawing() {
+            return;
+        }
+        let due = self.deferred_dabs.borrow_mut().take_due();
+        if due.is_empty() {
+            return;
+        }
+        stamp_runs(&mut self.canvas.borrow_mut(), &due);
     }
 
     fn brush_end(&self) {
@@ -927,6 +952,10 @@ impl PrimaryDragHandler {
         }
 
         let mut canvas = self.canvas.borrow_mut();
+        // Land what the pump has not released, so the commit and the undo
+        // capture below see the whole stroke.
+        let held = self.deferred_dabs.borrow_mut().take_all();
+        stamp_runs(&mut canvas, &held);
         // end_stroke is a no-op if shape correction already ended the engine stroke.
         if let Err(e) = canvas.stamp(|target| {
             self.brush_engine.end_stroke(target);
@@ -1072,6 +1101,7 @@ impl PrimaryDragHandler {
         let correction_handle = Rc::clone(&self.pending_correction);
         let capture_handle = Rc::clone(&self.pending_capture);
         let history_handle = Rc::clone(&self.history);
+        let deferred_t = Rc::clone(&self.deferred_dabs);
 
         let src = glib::timeout_add_local(
             std::time::Duration::from_millis(u64::from(sc.trigger_delay_ms)),
@@ -1100,9 +1130,11 @@ impl PrimaryDragHandler {
                     return glib::ControlFlow::Break;
                 }
 
-                // Stamp the freehand tail dabs so the buffer is complete.
+                // Stamp the held and freehand tail dabs so the buffer is complete.
                 {
                     let mut canvas_ref = canvas_t.borrow_mut();
+                    let held = deferred_t.borrow_mut().take_all();
+                    stamp_runs(&mut canvas_ref, &held);
                     if let Err(e) = canvas_ref.stamp(|t| {
                         brush_engine_t.end_stroke(t);
                     }) {
@@ -3128,6 +3160,7 @@ pub(super) fn install_primary_drag(
         pending_timer: Rc::new(RefCell::new(None)),
         pending_correction: Rc::new(RefCell::new(None)),
         stroke_shape_correction: RefCell::new(ShapeCorrectionSettings::default()),
+        deferred_dabs: Rc::new(RefCell::new(DeferredDabs::new())),
         crop: crop.clone(),
         crop_handle: Rc::new(Cell::new(CropHandle::None)),
         crop_start: Rc::new(Cell::new(Point::ZERO)),
@@ -3222,6 +3255,16 @@ pub(super) fn install_primary_drag(
             fill_reveal_tick(&ctx);
             if let Some(h) = weak.upgrade() {
                 h.liquify_hold_tick();
+            }
+        }));
+    }
+
+    // Weak for the same reason as above.
+    {
+        let weak = Rc::downgrade(&handler);
+        *viewport.render_pump().stroke_tick_handle().borrow_mut() = Some(Box::new(move || {
+            if let Some(h) = weak.upgrade() {
+                h.release_due_dabs();
             }
         }));
     }

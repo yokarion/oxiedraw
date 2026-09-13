@@ -15,6 +15,7 @@ mod export_window;
 mod filters;
 mod font_previews;
 mod layout;
+mod pacing_trace;
 mod panels;
 mod perf_graph;
 mod preferences_window;

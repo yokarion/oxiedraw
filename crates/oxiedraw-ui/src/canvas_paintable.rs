@@ -27,6 +27,8 @@ use relm4::gtk::subclass::prelude::ObjectSubclassIsExt;
 
 /// One checker tile side, in canvas pixels. Matches the cairo path.
 const CHECKER_TILE: u32 = 128;
+
+const BACKDROP_BLUE: f32 = 0.14;
 /// One cell inside a tile, in canvas pixels. `TILE = 2 * CELL`.
 const CHECKER_CELL: u32 = 64;
 
@@ -402,6 +404,13 @@ impl CanvasPaintable {
     /// polling GPU timings when they're needed).
     pub(crate) fn perf_enabled(&self) -> bool {
         self.imp().perf.borrow().enabled()
+    }
+
+    /// Damage the next snapshot even when nothing visible changed: GTK skips
+    /// the commit for an empty frame, and without that commit's frame callback
+    /// the frame clock paces the next cycle at 60 Hz instead of the refresh.
+    pub(crate) fn request_damage(&self) {
+        self.imp().force_damage.set(true);
     }
 
     /// Stash the latest GPU `(render_ms, present_ms)` for the perf overlay. Keeps
@@ -2037,7 +2046,7 @@ fn draw_gradient_cursor_cairo(cr: &gtk::cairo::Context, overlay: &GradientCursor
 
 mod imp {
     use super::{
-        BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
+        BACKDROP_BLUE, BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
         GradientCursorOverlay, GuideCacheEntry, GuideCacheKey, PendingMarquee, Point, RefCell,
         TransformRect,
         append_brush_cursor, apply_view_rotation, draw_color_picker_cairo,
@@ -2159,6 +2168,8 @@ mod imp {
         /// quantisation step, so GSK's node diff always damages the whole widget.
         /// See the backdrop in `snapshot`.
         pub(super) repaint_jitter: Cell<u8>,
+        /// See `request_damage`.
+        pub(super) force_damage: Cell<bool>,
         /// Performance overlay (toggle with F3). Records one sample per snapshot
         /// and paints itself in the top-left corner.
         pub(super) perf: RefCell<super::PerfGraph>,
@@ -2228,6 +2239,7 @@ mod imp {
                 guide_do_rerender: Cell::new(false),
                 guide_zoom_gen: Cell::new(0),
                 repaint_jitter: Cell::new(0),
+                force_damage: Cell::new(false),
                 perf: RefCell::new(super::PerfGraph::default()),
             }
         }
@@ -2243,6 +2255,16 @@ mod imp {
     impl ObjectImpl for CanvasPaintable {}
 
     impl CanvasPaintable {
+        /// Backdrop blue nudged below the 8-bit quantisation step: GSK's node
+        /// diff compares the floats, so the node is damaged while the pixels
+        /// stay identical. A long odd cycle rather than a two-value flip, which
+        /// an even number of snapshots per frame would silently cancel out.
+        fn jittered_backdrop_blue(&self) -> f32 {
+            let jitter = self.repaint_jitter.get().wrapping_add(1);
+            self.repaint_jitter.set(jitter);
+            f32::from(jitter % 251).mul_add(1e-7, BACKDROP_BLUE)
+        }
+
         /// Schedule a debounced crisp re-render of the guide overlay once pan /
         /// zoom stops (during motion it's a cheap translated+scaled blit). Each
         /// call supersedes the previous via a generation counter, so only the
@@ -2350,6 +2372,7 @@ mod imp {
 
     impl PaintableImpl for CanvasPaintable {
         fn snapshot(&self, snapshot: &gdk::Snapshot, width: f64, height: f64) {
+            crate::pacing_trace::note_snapshot();
             // Drain the stage timings before opening this frame's own span, so
             // the sample covers a whole frame ending with the previous snapshot.
             let profile = frame_profile::take_frame();
@@ -2363,14 +2386,8 @@ mod imp {
             // dark tile-boundary seams, which trail behind a moving cursor.
             // Overlays used to guarantee a full repaint by being full-widget
             // cairo nodes, at the cost of a canvas-sized CPU surface per frame.
-            // Instead, jitter this node's color below the 8-bit quantisation
-            // step: GSK's node diff compares the floats and damages the whole
-            // widget, while the rendered pixels are bit-identical.
-            //
-            // A long cycle rather than a 2-value flip: were this snapshot ever
-            // called an even number of times per frame, alternating would land
-            // on the same value each frame and the damage would silently
-            // vanish, taking the seams with it.
+            // Jittering this full-widget node's colour damages the whole widget
+            // for free instead.
             //
             // Only while the brush cursor is up, which is exactly the case the
             // old full-widget cairo node covered. Forcing it unconditionally
@@ -2379,13 +2396,21 @@ mod imp {
             // (selection ants, crop, transform) still force their own.
             #[allow(clippy::cast_possible_truncation)]
             let widget_rect = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
-            let mut blue = 0.14;
-            if self.brush_cursor.borrow().is_some() {
-                let jitter = self.repaint_jitter.get().wrapping_add(1);
-                self.repaint_jitter.set(jitter);
-                blue += f32::from(jitter % 251) * 1e-7;
-            }
+            let blue = if self.brush_cursor.borrow().is_some() {
+                self.jittered_backdrop_blue()
+            } else {
+                BACKDROP_BLUE
+            };
             snapshot.append_color(&gdk::RGBA::new(0.12, 0.12, blue, 1.0), &widget_rect);
+
+            // 1b. One backdrop-coloured pixel under everything else, so the
+            // pump's frame is never an empty one - see `request_damage`.
+            if self.force_damage.replace(false) {
+                snapshot.append_color(
+                    &gdk::RGBA::new(0.12, 0.12, self.jittered_backdrop_blue(), 1.0),
+                    &graphene::Rect::new(0.0, 0.0, 1.0, 1.0),
+                );
+            }
 
             #[allow(clippy::cast_precision_loss)]
             let canvas_w = self.canvas_w.get() as f32;
