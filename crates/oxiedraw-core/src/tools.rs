@@ -73,6 +73,23 @@ impl CropAspectRatio {
             Self::SixteenNine => Some(16.0 / 9.0),
         }
     }
+
+    /// Presets carry no orientation, so a portrait rect keeps a portrait lock.
+    pub fn oriented_to(self, rect: CropRect) -> Option<f32> {
+        let ratio = self.ratio()?;
+        let n = rect.normalized();
+        Some(if n.h > n.w { ratio.recip() } else { ratio })
+    }
+
+    /// Whether `rect` has exactly this ratio, either way round. Free fits any rect.
+    pub fn matches(self, rect: CropRect) -> bool {
+        let Some(ratio) = self.oriented_to(rect) else {
+            return true;
+        };
+        let n = rect.normalized();
+        // Forgives float noise only; a whole-pixel miss is at least 1/9 px off.
+        (n.w - n.h * ratio).abs() <= n.w * 1e-6
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -1102,5 +1119,32 @@ mod gradient_tests {
         assert_eq!(r.stops.len(), 2);
         assert_eq!(r.stops[0].color, Color::new(10, 20, 30));
         assert_eq!(r.stops[1].color, Color::new(40, 50, 60));
+    }
+}
+
+
+#[cfg(test)]
+mod crop_tests {
+    use super::*;
+
+    #[test]
+    fn ratio_matches_only_exact_sizes() {
+        let rect = |w: f32, h: f32| CropRect::new(0.0, 0.0, w, h);
+        assert!(CropAspectRatio::SixteenNine.matches(rect(1920.0, 1080.0)));
+        assert!(CropAspectRatio::SixteenNine.matches(rect(1080.0, 1920.0)));
+        assert!(CropAspectRatio::SixteenNine.matches(rect(900.0, 506.25)));
+        assert!(!CropAspectRatio::SixteenNine.matches(rect(1921.0, 1080.0)));
+        assert!(!CropAspectRatio::FourThree.matches(rect(4001.0, 3001.0)));
+        assert!(!CropAspectRatio::Square.matches(rect(32_000.0, 31_999.0)));
+        assert!(CropAspectRatio::Free.matches(rect(1921.0, 1080.0)));
+    }
+
+    #[test]
+    fn locked_resize_still_matches() {
+        let ratio = CropAspectRatio::SixteenNine.ratio().unwrap_or(1.0);
+        for width in [7.0_f32, 333.0, 1000.0, 31_999.0] {
+            let rect = CropRect::new(0.0, 0.0, width, width / ratio);
+            assert!(CropAspectRatio::SixteenNine.matches(rect), "{rect:?}");
+        }
     }
 }

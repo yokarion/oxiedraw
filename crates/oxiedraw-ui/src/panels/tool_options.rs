@@ -7,8 +7,8 @@ use std::rc::Rc;
 use oxiedraw_core::brush_engine::BrushEngine;
 use oxiedraw_core::liquify::{LiquifyMode, LiquifyState};
 use oxiedraw_core::tools::{
-    CropState, FillState, FillTool, GradientState, GradientType, SelectionEdit, SelectionState,
-    SelectionTool, ShapeState, Tool, ToolState, TransformFilter, TransformState,
+    CropRect, CropState, FillState, FillTool, GradientState, GradientType, SelectionEdit,
+    SelectionState, SelectionTool, ShapeState, Tool, ToolState, TransformFilter, TransformState,
 };
 use relm4::RelmWidgetExt;
 use relm4::gtk;
@@ -497,7 +497,6 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
         swap_btn.connect_clicked(move |_| {
             if let Some(r) = crop_c.rect.get() {
                 let n = r.normalized();
-                use oxiedraw_core::tools::CropRect;
                 crop_c.rect.set(Some(CropRect::new(n.x, n.y, n.h, n.w)));
                 crop_c.notify_rect_changed();
             }
@@ -565,36 +564,20 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
         {
             let crop_cc = crop_c.clone();
             let syncing_c = Rc::clone(&syncing);
-            let h_cc = h_c.clone();
             w_spin.connect_value_changed(move |spin| {
-                if syncing_c.get() {
-                    return;
+                if !syncing_c.get() {
+                    let width = spin.value() as f32;
+                    resize_crop(&crop_cc, |n, ratio| (width, ratio.map_or(n.h, |r| width / r)));
                 }
-                if let Some(r) = crop_cc.rect.get() {
-                    let n = r.normalized();
-                    use oxiedraw_core::tools::CropRect;
-                    #[allow(clippy::cast_possible_truncation)]
-                    crop_cc
-                        .rect
-                        .set(Some(CropRect::new(n.x, n.y, spin.value() as f32, n.h)));
-                }
-                let _ = h_cc;
             });
         }
         {
             let crop_cc = crop_c.clone();
             let syncing_c = Rc::clone(&syncing);
             h_spin.connect_value_changed(move |spin| {
-                if syncing_c.get() {
-                    return;
-                }
-                if let Some(r) = crop_cc.rect.get() {
-                    let n = r.normalized();
-                    use oxiedraw_core::tools::CropRect;
-                    #[allow(clippy::cast_possible_truncation)]
-                    crop_cc
-                        .rect
-                        .set(Some(CropRect::new(n.x, n.y, n.w, spin.value() as f32)));
+                if !syncing_c.get() {
+                    let height = spin.value() as f32;
+                    resize_crop(&crop_cc, |n, ratio| (ratio.map_or(n.w, |r| height * r), height));
                 }
             });
         }
@@ -616,6 +599,17 @@ fn build_crop_page(crop: &CropState, on_apply: Rc<dyn Fn()>) -> gtk::Box {
     row
 }
 
+// Keeps the top-left corner; `size` gets the current rect and the active ratio lock.
+fn resize_crop(crop: &CropState, size: impl FnOnce(CropRect, Option<f32>) -> (f32, f32)) {
+    let Some(rect) = crop.rect.get() else {
+        return;
+    };
+    let n = rect.normalized();
+    let (w, h) = size(n, crop.aspect_ratio.get().oriented_to(n));
+    crop.rect.set(Some(CropRect::new(n.x, n.y, w, h)));
+    crop.notify_rect_changed();
+}
+
 use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::tools::CropAspectRatio;
 
@@ -627,15 +621,20 @@ fn build_ratio_dropdown(crop: &CropState) -> gtk::DropDown {
     dropdown.connect_selected_notify(move |d| {
         let ratio = CropAspectRatio::from_index(d.selected());
         crop_c.aspect_ratio.set(ratio);
-        if let (Some(r), Some(rx)) = (crop_c.rect.get(), ratio.ratio()) {
-            let n = r.normalized();
-            use oxiedraw_core::tools::CropRect;
-            crop_c
-                .rect
-                .set(Some(CropRect::new(n.x, n.y, n.w, n.w / rx)));
-            crop_c.notify_rect_changed();
+        if ratio.ratio().is_some() {
+            resize_crop(&crop_c, |n, ratio| (n.w, ratio.map_or(n.h, |r| n.w / r)));
         }
     });
+
+    // Entering the crop tool can drop the lock back to Free.
+    let crop_c = crop.clone();
+    let dropdown_c = dropdown.clone();
+    crop.connect_rect_changed(Box::new(move || {
+        let selected = crop_c.aspect_ratio.get().to_index();
+        if dropdown_c.selected() != selected {
+            dropdown_c.set_selected(selected);
+        }
+    }));
     dropdown
 }
 

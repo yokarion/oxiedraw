@@ -22,8 +22,8 @@ use oxiedraw_core::history::{
 use oxiedraw_core::guides::{GuideConfig, GuideState, Symmetry};
 use oxiedraw_core::renderer::RendererError;
 use oxiedraw_core::tools::{
-    CropRect, CropState, FillState, GradientState, SelectionState, ShapeState, TargetKind, Tool,
-    ToolState, TransformFilter, TransformRect, TransformState, TransformTarget,
+    CropAspectRatio, CropRect, CropState, FillState, GradientState, SelectionState, ShapeState,
+    TargetKind, Tool, ToolState, TransformFilter, TransformRect, TransformState, TransformTarget,
 };
 use oxiedraw_utils::frame_profile;
 use oxiedraw_utils::geometry::Size;
@@ -1826,6 +1826,22 @@ fn refresh_selection_after_history(
     selection.notify_changed();
 }
 
+// Start from the whole canvas, and drop a ratio lock the crop doesn't already have.
+fn enter_crop(crop: &CropState, canvas_size: Size) {
+    let existing = crop.rect.get();
+    let rect = existing.unwrap_or_else(|| {
+        CropRect::new(0.0, 0.0, canvas_size.width as f32, canvas_size.height as f32)
+    });
+    let ratio_mismatch = !crop.aspect_ratio.get().matches(rect);
+    if ratio_mismatch {
+        crop.aspect_ratio.set(CropAspectRatio::Free);
+    }
+    if existing.is_none() || ratio_mismatch {
+        crop.rect.set(Some(rect));
+        crop.notify_rect_changed();
+    }
+}
+
 fn build_apply_tool(
     viewport: &Viewport,
     crop: &CropState,
@@ -1885,12 +1901,9 @@ fn build_apply_tool(
             redraw_for_tool.request();
         }
         paintable.set_gradient_cursor(None);
-        if t == Tool::Crop && crop_for_tool.rect.get().is_none() {
-            let cs = canvas_for_tool.borrow().size();
-            #[allow(clippy::cast_precision_loss)]
-            let default_rect = CropRect::new(0.0, 0.0, cs.width as f32, cs.height as f32);
-            crop_for_tool.rect.set(Some(default_rect));
-            crop_for_tool.notify_rect_changed();
+        if t == Tool::Crop {
+            let canvas_size = canvas_for_tool.borrow().size();
+            enter_crop(&crop_for_tool, canvas_size);
         }
 
         paintable.set_transform_active(t == Tool::Transform);

@@ -1242,22 +1242,18 @@ impl PrimaryDragHandler {
         };
         // Rotation-aware inverse map, matching crop_begin and the other tools.
         let cur = widget_to_canvas(sx + dx, sy + dy, &self.pan, &self.zoom, &self.rotation);
-        let (cx, cy) = (cur.x, cur.y);
-        let sc = self.crop_start.get();
-        let old = self.crop_start_rect.get();
-
-        let new_rect = crop_geom::compute_new_rect(self.crop_handle.get(), old, sc, cx, cy);
-        let new_rect = crop_geom::constrain_rect(
-            new_rect,
-            self.crop.aspect_ratio.get(),
-            self.crop_handle.get(),
-        );
-        let new_rect = if self.crop.snap_to_canvas.get() {
-            new_rect
-                .map(|r| crop_geom::snap_rect_to_canvas(r, self.canvas_size.get(), self.zoom.get()))
-        } else {
-            new_rect
-        };
+        let handle = self.crop_handle.get();
+        let start_rect = self.crop_start_rect.get();
+        // Read per event so pressing or releasing Shift mid-drag takes effect.
+        let (shift, _) = modifiers_from_gesture(gesture);
+        let ratio = crop_geom::drag_ratio(self.crop.aspect_ratio.get(), shift, handle, start_rect);
+        let snap = self
+            .crop
+            .snap_to_canvas
+            .get()
+            .then(|| crop_geom::CanvasSnap::new(self.canvas_size.get(), self.zoom.get()));
+        let new_rect =
+            crop_geom::drag_rect(handle, start_rect, self.crop_start.get(), cur, ratio, snap);
 
         self.crop.rect.set(new_rect);
         // NB: deliberately do NOT call notify_rect_changed() here. It syncs the
