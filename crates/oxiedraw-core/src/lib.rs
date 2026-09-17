@@ -24,6 +24,7 @@ pub mod brush_engine;
 pub mod canvas;
 pub mod color;
 pub mod components;
+pub mod curves;
 pub mod document;
 pub mod effects;
 pub mod enum_meta;

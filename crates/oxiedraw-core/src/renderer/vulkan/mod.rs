@@ -11,6 +11,7 @@
 //! - `transform_ops` - GPU affine transform applied to a single layer
 
 mod adjust_ops;
+mod curves_ops;
 mod fill_ops;
 mod filter_ops;
 mod gradient_ops;
@@ -45,6 +46,7 @@ use oxiedraw_utils::geometry::Size;
 
 use super::RendererError;
 use super::composite::CompositePipeline;
+use super::curves_lut::CurveLutAtlas;
 use super::dab::DabBuffers;
 use super::device;
 use super::dmabuf::{DISPLAY_FORMAT, DmabufImage};
@@ -351,6 +353,7 @@ pub struct VulkanRenderer {
     pub(super) filter_spec: crate::filters::FilterSpec,
     /// Layer indices the filter applies to (z-order independent).
     pub(super) filter_affected: Vec<usize>,
+    pub(super) curve_atlas: ManuallyDrop<CurveLutAtlas>,
 
     /// Color-smudge dab pipeline `(layout, pipeline)`, built lazily on first
     /// smudge stroke (most sessions never use it). Samples `blend_scratch`
@@ -588,6 +591,7 @@ impl VulkanRenderer {
             layer_composite_pipeline.descriptor_set_layout,
             layer_composite_pipeline.sampler,
         )?;
+        let curve_atlas = CurveLutAtlas::new(&dev.device, &mut allocator)?;
         // Shares the filter set + pipeline layout, so it has to follow them.
         let clip_mask_pipeline = ClipMaskPipeline::new(
             &dev.device,
@@ -715,6 +719,7 @@ impl VulkanRenderer {
             filter_active: false,
             filter_spec: crate::filters::FilterSpec::Invert,
             filter_affected: Vec::new(),
+            curve_atlas: ManuallyDrop::new(curve_atlas),
             smudge_pipeline: None,
             smudge_before: None,
             liquify_pipelines: None,
@@ -819,6 +824,11 @@ impl VulkanRenderer {
                 ),
                 full_image_barrier(
                     this.gradient_overlay.lut.handle,
+                    vk::ImageLayout::UNDEFINED,
+                    vk::ImageLayout::GENERAL,
+                ),
+                full_image_barrier(
+                    this.curve_atlas.image.handle,
                     vk::ImageLayout::UNDEFINED,
                     vk::ImageLayout::GENERAL,
                 ),
@@ -1423,6 +1433,7 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.composite_pipeline).destroy(&self.device);
             ManuallyDrop::take(&mut self.filter_resources)
                 .destroy(&self.device, &mut self.allocator);
+            ManuallyDrop::take(&mut self.curve_atlas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.gradient_overlay)
                 .destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.shape_overlay).destroy(&self.device);

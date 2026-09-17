@@ -4,6 +4,7 @@ use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
 use crate::brush_engine::{Dab, PaintTarget};
 use crate::color::Color;
+use crate::curves::Histogram;
 use crate::document::{
     build_composite_steps, BlendMode, CompositeStep, LayerKind, LayerState, LayerTreeNode,
 };
@@ -806,6 +807,49 @@ impl Canvas {
         }
         self.renderer.write_layer(idx, &px)?;
         Ok(())
+    }
+
+    /// Levels of what the adjustment at `idx` changes: its folder's backdrop,
+    /// inside its mask and, when clipped, inside the base layer.
+    pub fn adjustment_histogram(&mut self, idx: usize) -> Result<Histogram, RendererError> {
+        let mut snapshot = self.layers.snapshot();
+        if let Some(layer) = snapshot.get_mut(idx) {
+            layer.visible = true;
+        }
+        let steps = self.preview_steps(&snapshot);
+        let Some((backdrop, clip_base)) = backdrop_steps(&steps, idx) else {
+            return Ok(Histogram::default());
+        };
+        let pixels = self.renderer.read_composite_steps(&backdrop)?;
+        let mut mask: Vec<u8> = self
+            .renderer
+            .read_layer(idx)?
+            .chunks_exact(4)
+            .map(|px| px[2])
+            .collect();
+        if let Some(base) = clip_base {
+            let base_pixels = self.renderer.read_layer(base)?;
+            for (gate, px) in mask.iter_mut().zip(base_pixels.chunks_exact(4)) {
+                if px[3] == 0 {
+                    *gate = 0;
+                }
+            }
+        }
+        Ok(Histogram::from_bgra(&pixels, Some(&mask)))
+    }
+
+    pub fn layers_histogram(&mut self, indices: &[usize]) -> Result<Histogram, RendererError> {
+        let mask = if self.selection_active() {
+            Some(self.renderer.read_selection_mask()?)
+        } else {
+            None
+        };
+        let mut histogram = Histogram::default();
+        for &idx in indices {
+            let pixels = self.renderer.read_layer(idx)?;
+            histogram.add_bgra(&pixels, mask.as_deref());
+        }
+        Ok(histogram)
     }
 
     /// Composite steps for a preview: the scoped walk when clipping or folder
@@ -2633,6 +2677,31 @@ impl Canvas {
     }
 }
 
+/// What `idx` composites onto (earlier steps in its innermost folder), plus its clip base.
+fn backdrop_steps(
+    steps: &[CompositeStep],
+    idx: usize,
+) -> Option<(Vec<CompositeStep>, Option<usize>)> {
+    let at = steps.iter().position(|s| s.layer_index() == Some(idx))?;
+    let CompositeStep::Layer { clip_base, .. } = steps[at] else {
+        return None;
+    };
+    let mut nested = 0usize;
+    let mut start = 0;
+    for i in (0..at).rev() {
+        match steps[i] {
+            CompositeStep::ExitGroup => nested += 1,
+            CompositeStep::EnterGroup if nested == 0 => {
+                start = i + 1;
+                break;
+            }
+            CompositeStep::EnterGroup => nested -= 1,
+            CompositeStep::Layer { .. } => {}
+        }
+    }
+    Some((steps[start..at].to_vec(), clip_base))
+}
+
 /// Split BGRA8 `layer` by R8 `mask`: returns `(masked, remaining)` where
 /// `masked = layer * (mask/255)` and `remaining = layer * (1 - mask/255)`.
 /// All four channels (premultiplied alpha) are scaled, so the result is
@@ -2702,6 +2771,36 @@ mod tests {
     use crate::brush_engine::{BrushEngine, InputSample};
 
     use super::*;
+
+    #[test]
+    fn backdrop_steps_stay_inside_the_innermost_folder() {
+        use CompositeStep::{EnterGroup, ExitGroup};
+        let layer = CompositeStep::layer;
+        let clipped = CompositeStep::Layer {
+            idx: 5,
+            clip_base: Some(4),
+        };
+        let steps = [
+            layer(0),
+            EnterGroup,
+            layer(1),
+            EnterGroup,
+            layer(2),
+            ExitGroup,
+            layer(3),
+            ExitGroup,
+            layer(4),
+            clipped,
+        ];
+        let inner = steps[2..6].to_vec();
+        assert_eq!(backdrop_steps(&steps, 3), Some((inner, None)));
+        assert_eq!(backdrop_steps(&steps, 1), Some((Vec::new(), None)));
+        assert_eq!(backdrop_steps(&steps, 4), Some((steps[..8].to_vec(), None)));
+        assert_eq!(backdrop_steps(&steps, 5), Some((steps[..9].to_vec(), Some(4))));
+        let reordered = [layer(3), layer(1)];
+        assert_eq!(backdrop_steps(&reordered, 1), Some((vec![layer(3)], None)));
+        assert_eq!(backdrop_steps(&steps, 9), None);
+    }
 
     #[test]
     fn alpha_lock_keeps_alpha_and_takes_color() {

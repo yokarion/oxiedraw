@@ -10,8 +10,8 @@
 //! stack is snapshotted on open: Cancel restores it, Apply records one
 //! `EffectEdit` undo step.
 //!
-//! The working model always carries one of every effect (Hue/Sat/Bright, Blur,
-//! Sharpen, Invert, Stroke) in that order; each sidebar checkbox drives its
+//! The working model always carries one of every effect (Hue/Sat/Bright, Curves,
+//! Blur, Sharpen, Invert, Stroke) in that order; each sidebar checkbox drives its
 //! `enabled` flag, so disabled effects stay in the stack (and round-trip) but
 //! cost nothing at composite time.
 
@@ -22,6 +22,7 @@ use std::rc::Rc;
 use adw::prelude::*;
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::Color;
+use oxiedraw_core::curves::Histogram;
 use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind, StrokeSoftness};
 use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
@@ -30,7 +31,7 @@ use relm4::gtk;
 use crate::canvas::RedrawHandle;
 use crate::toaster::Toaster;
 use crate::widgets::gradient_slider::{self, hsl_to_rgb};
-use crate::widgets::{boxed_list, slider};
+use crate::widgets::{boxed_list, curves_panel, slider};
 
 /// Shared handles the adjustment actions need, built per invocation from the
 /// active document.
@@ -82,6 +83,7 @@ pub(crate) fn add_or_edit(ctx: &AdjustmentContext) {
 /// here is the composite order (bottom to top).
 struct Working {
     hsb: Effect,
+    curves: Effect,
     blur: Effect,
     sharpen: Effect,
     invert: Effect,
@@ -106,6 +108,10 @@ impl Working {
                 |k| matches!(k, EffectKind::HueSatBright { .. }),
                 EffectKind::hue_sat_bright_identity(),
             ),
+            curves: find(
+                |k| matches!(k, EffectKind::Curves { .. }),
+                EffectKind::curves_identity(),
+            ),
             blur: find(
                 |k| matches!(k, EffectKind::Blur { .. }),
                 EffectKind::blur_default(),
@@ -126,6 +132,7 @@ impl Working {
         AdjustmentData {
             effects: vec![
                 self.hsb.clone(),
+                self.curves.clone(),
                 self.blur.clone(),
                 self.sharpen.clone(),
                 self.invert.clone(),
@@ -160,13 +167,17 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
     };
 
     let working = Rc::new(RefCell::new(Working::from_data(&before)));
+    // `Working` reshapes the stack, which alone is not an edit worth recording.
+    let edited = Rc::new(Cell::new(false));
 
     // Push the current working stack to the canvas and redraw (live preview).
     let apply_live: Rc<dyn Fn()> = {
         let ctx = ctx.clone();
         let working = Rc::clone(&working);
         let layer_id = layer_id.clone();
+        let edited = Rc::clone(&edited);
         Rc::new(move || {
+            edited.set(true);
             if let Some(idx) = layer_idx(&ctx.canvas, &layer_id) {
                 let data = working.borrow().assemble();
                 if let Err(e) = ctx.canvas.borrow_mut().set_layer_effects(idx, data) {
@@ -182,7 +193,7 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         .modal(false)
         .title("Adjustment Effects")
         .default_width(640)
-        .default_height(460)
+        .default_height(520)
         .resizable(true)
         .build();
 
@@ -209,12 +220,21 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         .build();
 
     add_effect_page(&sidebar, &stack, "hsb", &working.borrow().hsb);
+    add_effect_page(&sidebar, &stack, "curves", &working.borrow().curves);
     add_effect_page(&sidebar, &stack, "blur", &working.borrow().blur);
     add_effect_page(&sidebar, &stack, "sharpen", &working.borrow().sharpen);
     add_effect_page(&sidebar, &stack, "invert", &working.borrow().invert);
     add_effect_page(&sidebar, &stack, "stroke", &working.borrow().stroke);
+    let backdrop_levels = {
+        let canvas = Rc::clone(&ctx.canvas);
+        let layer_id = layer_id.clone();
+        move || {
+            let idx = layer_idx(&canvas, &layer_id)?;
+            canvas.borrow_mut().adjustment_histogram(idx).ok()
+        }
+    };
     // Fill the pages + wire the checkboxes now that the rows exist.
-    bind_pages(&sidebar, &stack, &working, &apply_live);
+    bind_pages(&sidebar, &stack, &working, &apply_live, backdrop_levels);
 
     {
         let stack = stack.clone();
@@ -258,7 +278,7 @@ fn open_editor(ctx: &AdjustmentContext, idx: usize) {
         apply_btn.connect_clicked(move |_| {
             applied.set(true);
             let after = working.borrow().assemble();
-            if after != before {
+            if edited.get() && after != before {
                 ctx.history.borrow_mut().record(HistoryAction::EffectEdit {
                     layer_id: layer_id.clone(),
                     before: before.clone(),
@@ -359,9 +379,11 @@ fn bind_pages(
     stack: &gtk::Stack,
     working: &Rc<RefCell<Working>>,
     apply_live: &Rc<dyn Fn()>,
+    backdrop_levels: impl FnOnce() -> Option<Histogram> + 'static,
 ) {
-    let selectors: [(&str, Select); 5] = [
+    let selectors: [(&str, Select); 6] = [
         ("hsb", |w| &mut w.hsb),
+        ("curves", |w| &mut w.curves),
         ("blur", |w| &mut w.blur),
         ("sharpen", |w| &mut w.sharpen),
         ("invert", |w| &mut w.invert),
@@ -380,6 +402,9 @@ fn bind_pages(
 
     if let Some(page) = page_box(stack, "hsb") {
         build_hsb_panel(&page, working, apply_live);
+    }
+    if let Some(page) = page_box(stack, "curves") {
+        build_curves_panel(&page, working, apply_live, backdrop_levels);
     }
     if let Some(page) = page_box(stack, "blur") {
         build_blur_panel(&page, working, apply_live);
@@ -529,6 +554,28 @@ fn build_hsb_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: 
 
 fn set_hsb(working: &Rc<RefCell<Working>>, f: impl FnOnce(&mut EffectKind)) {
     f(&mut working.borrow_mut().hsb.kind);
+}
+
+fn build_curves_panel(
+    page: &gtk::Box,
+    working: &Rc<RefCell<Working>>,
+    apply_live: &Rc<dyn Fn()>,
+    backdrop_levels: impl FnOnce() -> Option<Histogram> + 'static,
+) {
+    let EffectKind::Curves { curves } = working.borrow().curves.kind else {
+        return;
+    };
+    let panel = curves_panel::build(curves, backdrop_levels, {
+        let working = Rc::clone(working);
+        let apply_live = Rc::clone(apply_live);
+        move |edited| {
+            if let EffectKind::Curves { curves } = &mut working.borrow_mut().curves.kind {
+                *curves = edited;
+            }
+            apply_live();
+        }
+    });
+    page.append(&panel);
 }
 
 fn build_blur_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: &Rc<dyn Fn()>) {

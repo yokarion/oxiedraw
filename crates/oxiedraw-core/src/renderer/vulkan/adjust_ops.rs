@@ -191,6 +191,20 @@ impl VulkanRenderer {
         self.composite_steps_into(steps, root)
     }
 
+    /// Draws into the preview image, so it invalidates the preview cache.
+    pub fn read_composite_steps(
+        &mut self,
+        steps: &[CompositeStep],
+    ) -> Result<Vec<u8>, RendererError> {
+        self.clip = None;
+        let root = self.preview_accumulator();
+        self.composite_steps_into(steps, root)?;
+        self.invalidate_preview_cache();
+        let extent = self.canvas.extent;
+        self.read_image_to_staging(self.preview.handle, extent)?;
+        self.copy_staging_bytes()
+    }
+
     /// Live mask-edit preview: rebuild the whole canvas into the preview image
     /// with the adjustment at `target_idx` gated by its committed mask merged
     /// with the in-flight stroke, then present. Used while painting an
@@ -767,6 +781,10 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let erase = self.stroke_erase;
+        // Before recording: the batched frame is a single submit.
+        let above = visible_indices.iter().copied().filter(|&i| i > target_idx);
+        let curve_sets = self.adjustment_curve_sets(above);
+        self.prepare_curve_rows(&curve_sets)?;
         // Incremental dirty-rect: recompute only the dab region. Non-local
         // effects (Blur/Stroke) spread, so the effect output region (inner) is
         // the dab expanded by the effect margin, and the seed/input region
@@ -825,12 +843,14 @@ impl VulkanRenderer {
                 continue;
             }
             for effect in &data.effects {
-                if !effect.enabled {
+                if !effect.is_active() {
                     continue;
                 }
                 match effect.kind {
                     // filter + mask-mix
-                    EffectKind::HueSatBright { .. } | EffectKind::Invert => n += 2,
+                    EffectKind::HueSatBright { .. }
+                    | EffectKind::Curves { .. }
+                    | EffectKind::Invert => n += 2,
                     EffectKind::Blur { .. } => n += 3, // H + V + mask-mix
                     EffectKind::Sharpen { .. } => n += 4, // blur H + V + sharpen + mask-mix
                     // The jump-flood band must flood full-canvas (no dab clip),
@@ -967,7 +987,7 @@ impl VulkanRenderer {
         let render_pass = self.canvas_target.render_pass;
 
         for effect in &data.effects {
-            if !effect.enabled {
+            if !effect.is_active() {
                 continue;
             }
             let Some(spec) = effect.kind.as_filter_spec() else {
@@ -1046,7 +1066,7 @@ impl VulkanRenderer {
         self.cmd_compose_layer_blended(acc.image, acc.framebuffer, comp_set, 0, 1.0);
     }
 
-    /// Record (no submit) the Hsv / Blur pass chain reading `src` into a scratch
+    /// Record (no submit) the effect pass chain reading `src` into a scratch
     /// slot, advancing `cursor`. Returns the scratch holding the filtered result.
     fn cmd_produce_filtered_passes(
         &mut self,
@@ -1077,6 +1097,20 @@ impl VulkanRenderer {
                     .write_input(&self.device, set, src_view, src_view, src_view);
                 self.cmd_filter_pass3(
                     set, layout, pipeline, render_pass, fb, src_img, src_img, src_img, push,
+                );
+                Scratch::A
+            }
+            FilterSpec::Curves { curves } => {
+                let push = self.curves_push(&curves);
+                let (lut_view, lut_img) = self.curve_lut();
+                let pipeline = self.filter_resources.curves;
+                let fb = self.filter_resources.framebuffer(Scratch::A);
+                let set = self.filter_resources.input_set(*cursor);
+                *cursor += 1;
+                self.filter_resources
+                    .write_input(&self.device, set, src_view, lut_view, src_view);
+                self.cmd_filter_pass3(
+                    set, layout, pipeline, render_pass, fb, src_img, lut_img, src_img, push,
                 );
                 Scratch::A
             }
@@ -1246,12 +1280,14 @@ impl VulkanRenderer {
                 continue;
             }
             for effect in &data.effects {
-                if !effect.enabled {
+                if !effect.is_active() {
                     continue;
                 }
                 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                 let r = match effect.kind {
-                    EffectKind::HueSatBright { .. } | EffectKind::Invert => 0,
+                    EffectKind::HueSatBright { .. }
+                    | EffectKind::Curves { .. }
+                    | EffectKind::Invert => 0,
                     EffectKind::Blur { radius_x, radius_y } => {
                         radius_x.max(radius_y).ceil().max(0.0) as u32
                     }
@@ -1500,7 +1536,7 @@ impl VulkanRenderer {
         }
 
         for effect in &data.effects {
-            if !effect.enabled {
+            if !effect.is_active() {
                 continue;
             }
             let Some(spec) = effect.kind.as_filter_spec() else {

@@ -321,6 +321,11 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
                 default_accel: Some("<Primary>u"),
             },
             ActionInfo {
+                id: "filter-curves",
+                label: "Curves",
+                default_accel: Some("<Primary>m"),
+            },
+            ActionInfo {
                 id: "filter-invert",
                 label: "Invert",
                 default_accel: Some("<Primary>i"),

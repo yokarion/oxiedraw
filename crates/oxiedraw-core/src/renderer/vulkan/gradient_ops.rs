@@ -20,10 +20,8 @@ pub enum GradientKind {
     Square = 2,
 }
 
-/// Convert an `f32` to IEEE half-float bits. Gradient LUT values are
-/// premultiplied linear in `[0, 1]`, so subnormals flush to zero and there
-/// are no infinities to worry about.
-fn f32_to_f16_bits(f: f32) -> u16 {
+/// Half-float bits for a LUT value in `[0, 1]` (no subnormals or infinities).
+pub(super) fn f32_to_f16_bits(f: f32) -> u16 {
     let bits = f.to_bits();
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;

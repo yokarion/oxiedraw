@@ -1,7 +1,7 @@
 //! Filter UI: the Filters menu actions and their popups.
 //!
 //! Filters run on the GPU via the core `Canvas` filter API. Adjustable
-//! filters (HSV, blur, sharpen) open a reusable non-blocking popup
+//! filters (HSV, curves, blur, sharpen) open a reusable non-blocking popup
 //! ([`dialog::build`]) with a live preview that updates as the user drags
 //! the sliders; the layer pixels are only written on Apply. Invert has no
 //! parameters, so it applies immediately.
@@ -11,11 +11,13 @@
 
 mod dialog;
 mod blur;
+mod curves;
 mod hsv;
 mod invert;
 mod sharpen;
 
 pub(crate) use blur::show_blur;
+pub(crate) use curves::show_curves;
 pub(crate) use hsv::show_hsv;
 pub(crate) use invert::show_invert;
 pub(crate) use sharpen::show_sharpen;

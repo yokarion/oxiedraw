@@ -115,6 +115,7 @@
 //!   submit. Fusing them is a known optimization (TODO).
 
 mod composite;
+mod curves_lut;
 mod dab;
 mod device;
 mod dmabuf;

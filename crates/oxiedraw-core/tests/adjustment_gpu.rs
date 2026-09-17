@@ -8,6 +8,7 @@
 
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::Color;
+use oxiedraw_core::curves::{Curve, CurveChannel, CurvePoint, CurveSet};
 use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind, StrokeSoftness};
 use oxiedraw_utils::geometry::Size;
 
@@ -1517,4 +1518,133 @@ fn cropping_keeps_adjustment_layers_working() {
             "pixel {i} lost the adjustment across the crop: {px:?}"
         );
     }
+}
+
+fn curves_effect(channel: CurveChannel, level: u8) -> EffectKind {
+    let mut curves = CurveSet::default();
+    *curves.curve_mut(channel) =
+        Curve::from_points(&[CurvePoint::new(0, level), CurvePoint::new(255, level)]);
+    EffectKind::Curves { curves }
+}
+
+#[test]
+fn curves_adjustment_maps_the_backdrop() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    canvas
+        .add_layer_with_pixels("base", &solid(size, 40, 120, 200))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(adj, one_effect(curves_effect(CurveChannel::Red, 30)))
+        .unwrap();
+
+    let out = canvas.read_pixels().unwrap();
+    assert!(
+        near(out[2], 30, 1) && near(out[1], 120, 1) && near(out[0], 40, 1),
+        "got B{} G{} R{}",
+        out[0],
+        out[1],
+        out[2]
+    );
+}
+
+#[test]
+fn live_preview_below_curves_adjustments_shows_both() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let base = canvas
+        .add_layer_with_pixels("base", &solid(size, 40, 120, 200))
+        .unwrap();
+    let red = canvas.add_adjustment_layer("red").unwrap();
+    canvas
+        .set_layer_effects(red, one_effect(curves_effect(CurveChannel::Red, 30)))
+        .unwrap();
+    let blue = canvas.add_adjustment_layer("blue").unwrap();
+    canvas
+        .set_layer_effects(blue, one_effect(curves_effect(CurveChannel::Blue, 220)))
+        .unwrap();
+
+    canvas.layers().set_active(Some(base));
+    canvas
+        .begin_stroke(Color { r: 255, g: 255, b: 255 }, 1.0, false)
+        .unwrap();
+    let preview = canvas.read_pixels().unwrap();
+    assert!(
+        near(preview[2], 30, 1) && near(preview[0], 220, 1) && near(preview[1], 120, 1),
+        "batched preview lost a curve: B{} G{} R{}",
+        preview[0],
+        preview[1],
+        preview[2]
+    );
+}
+
+#[test]
+fn curves_histogram_sees_the_folder_backdrop_inside_the_mask() {
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let a = canvas
+        .add_layer_with_pixels("A-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    let b = canvas
+        .add_layer_with_pixels("B-red", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(adj, one_effect(curves_effect(CurveChannel::Rgb, 0)))
+        .unwrap();
+    let snap = canvas.layers().snapshot();
+    canvas
+        .set_layer_tree(vec![
+            LayerTreeNode::layer(snap[a].id.clone()),
+            LayerTreeNode::Group(LayerGroup {
+                id: "g1".to_string(),
+                name: "Folder".to_string(),
+                expanded: true,
+                children: vec![
+                    LayerTreeNode::layer(snap[b].id.clone()),
+                    LayerTreeNode::layer(snap[adj].id.clone()),
+                ],
+            }),
+        ])
+        .unwrap();
+
+    let half = 8 * 16;
+    let h = canvas.adjustment_histogram(adj).unwrap();
+    assert_eq!(h.channel(CurveChannel::Red)[255], half);
+    assert_eq!(h.channel(CurveChannel::Blue)[255], 0, "layer below the folder counted");
+    assert_eq!(h.channel(CurveChannel::Rgb).iter().sum::<u32>(), 3 * half);
+
+    let mut mask = solid(size, 255, 255, 255);
+    mask[..(16 * 8 * 4)].copy_from_slice(&solid(Size::new(16, 8), 0, 0, 0));
+    canvas.restore_layer(adj, &mask).unwrap();
+    let masked = canvas.adjustment_histogram(adj).unwrap();
+    assert_eq!(masked.channel(CurveChannel::Red)[255], half / 2);
+
+    let out = canvas.read_pixels().unwrap();
+    assert!(near(out[(16 * 2) * 4 + 2], 255, 1), "masked-off red stays red");
+    assert!(out[(16 * 12) * 4 + 2] <= 1, "adjusted red went black");
+}
+
+#[test]
+fn curves_histogram_of_a_clipped_adjustment_stays_on_its_base() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    canvas
+        .add_layer_with_pixels("paper-blue", &solid(size, 255, 0, 0))
+        .unwrap();
+    canvas
+        .add_layer_with_pixels("base-red", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(adj, one_effect(curves_effect(CurveChannel::Rgb, 0)))
+        .unwrap();
+    canvas.set_layer_clipped(adj, true).unwrap();
+
+    let h = canvas.adjustment_histogram(adj).unwrap();
+    assert_eq!(h.channel(CurveChannel::Red)[255], 8 * 16);
+    assert_eq!(h.channel(CurveChannel::Blue)[255], 0, "paper outside the base counted");
 }

@@ -30,8 +30,9 @@ use crate::text::fonts::FontMeta;
 /// files (both default to the ramp's blue).
 /// v12 adds the per-layer `clipped` (clipping mask) and `alpha_locked` flags.
 /// Absent in pre-v12 files (both off).
-pub const SCHEMA_VERSION: u32 = 12;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+/// v13 adds the Curves adjustment effect, so older builds refuse the file cleanly.
+pub const SCHEMA_VERSION: u32 = 13;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.

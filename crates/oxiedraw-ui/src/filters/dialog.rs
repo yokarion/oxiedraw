@@ -65,18 +65,25 @@ pub(super) fn build(
     // must not also run cancel (which would undo the just-committed work).
     let applied = Rc::new(Cell::new(false));
 
+    // Weak: a strong ref from inside the window would keep it alive when closed.
     {
-        let window = window.clone();
+        let window = window.downgrade();
         let applied = Rc::clone(&applied);
         apply_btn.connect_clicked(move |_| {
             applied.set(true);
             on_apply();
-            window.close();
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
         });
     }
     {
-        let window = window.clone();
-        cancel_btn.connect_clicked(move |_| window.close());
+        let window = window.downgrade();
+        cancel_btn.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        });
     }
     window.connect_close_request(move |_| {
         if !applied.get() {
@@ -89,10 +96,11 @@ pub(super) fn build(
     // adw::Window does not close on Escape on its own.
     {
         let key = gtk::EventControllerKey::new();
-        let window_c = window.clone();
-        key.connect_key_pressed(move |_, keyval, _, _| {
+        key.connect_key_pressed(move |controller, keyval, _, _| {
             if keyval == gtk::gdk::Key::Escape {
-                window_c.close();
+                if let Some(window) = controller.widget().and_downcast::<gtk::Window>() {
+                    window.close();
+                }
                 gtk::glib::Propagation::Stop
             } else {
                 gtk::glib::Propagation::Proceed

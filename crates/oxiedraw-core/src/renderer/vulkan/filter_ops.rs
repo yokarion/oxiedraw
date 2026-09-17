@@ -257,6 +257,21 @@ impl VulkanRenderer {
                 self.filter_pass(self.filter_resources.hsv, Scratch::A, layer_view, layer_img, push)?;
                 Scratch::A
             }
+            FilterSpec::Curves { curves } => {
+                self.prepare_curve_rows(&[curves])?;
+                let (lut_view, lut_img) = self.curve_lut();
+                let push = self.curves_push(&curves);
+                self.filter_pass2(
+                    self.filter_resources.curves,
+                    Scratch::A,
+                    layer_view,
+                    layer_img,
+                    lut_view,
+                    lut_img,
+                    push,
+                )?;
+                Scratch::A
+            }
             FilterSpec::Invert => {
                 self.filter_pass(
                     self.filter_resources.invert,

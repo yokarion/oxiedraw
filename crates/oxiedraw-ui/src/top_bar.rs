@@ -40,9 +40,11 @@ pub(crate) fn build(layout_control: &gtk::Widget) -> (gtk::WindowHandle, impl Fn
     ];
 
     for (label, model) in menus {
+        // Nested: a sliding submenu taller than its menu gets cropped.
+        let popover = gtk::PopoverMenu::from_model_full(model, gtk::PopoverMenuFlags::NESTED);
         let btn = gtk::MenuButton::builder()
             .label(*label)
-            .menu_model(model)
+            .popover(&popover)
             .valign(gtk::Align::Center)
             .build();
         btn.add_css_class("flat");
@@ -186,6 +188,7 @@ fn build_filters_menu() -> gio::Menu {
 
     let adjust = gio::Menu::new();
     adjust.append_item(&item("Hue/Saturation/Value...", "app.filter-hsv", None));
+    adjust.append_item(&item("Curves...", "app.filter-curves", None));
     adjust.append_item(&item("Invert", "app.filter-invert", None));
     menu.append_submenu(Some("Adjust"), &adjust);
 

@@ -1,4 +1,4 @@
-//! Layer filters: hue/saturation/value, invert, box blur, and unsharp
+//! Layer filters: hue/saturation/value, curves, invert, box blur, and unsharp
 //! sharpen.
 //!
 //! [`FilterSpec`] is the single source of truth for filter parameters,
@@ -11,6 +11,8 @@
 //! All pixel buffers are full-canvas BGRA8, premultiplied alpha, row-major
 //! with no padding - the same layout [`crate::canvas::Canvas::read_layer`]
 //! returns.
+
+use crate::curves::{CurveSet, LUT_SIZE, sample_baked};
 
 /// A destructive filter and its parameters. Copyable so the live-preview path
 /// can stash the latest value behind a `Cell` without allocation.
@@ -27,6 +29,8 @@ pub enum FilterSpec {
         saturation: f32,
         value: f32,
     },
+    /// Tone curves on the sRGB levels: each channel's, then the master curve.
+    Curves { curves: CurveSet },
     /// Invert colors. No parameters.
     Invert,
     /// Box blur with independent horizontal / vertical radii in pixels.
@@ -51,6 +55,7 @@ impl FilterSpec {
     pub const fn display_name(&self) -> &'static str {
         match self {
             Self::Hsv { .. } => "Hue/Saturation/Value",
+            Self::Curves { .. } => "Curves",
             Self::Invert => "Invert",
             Self::BoxBlur { .. } => "Blur",
             Self::Sharpen { .. } => "Sharpen",
@@ -93,6 +98,10 @@ pub fn apply_cpu(
             saturation,
             value,
         } => point_filter(src, |bgra| hsv_pixel(bgra, hue_degrees, saturation, value)),
+        FilterSpec::Curves { curves } => {
+            let lut = curves_lut_u8(&curves);
+            point_filter(src, |bgra| curves_pixel(bgra, &lut))
+        }
         FilterSpec::Invert => point_filter(src, invert_pixel),
         FilterSpec::BoxBlur { radius_x, radius_y } => {
             box_blur(src, w, h, radius_x.round() as i32, radius_y.round() as i32)
@@ -161,6 +170,30 @@ fn hsv_pixel(bgra: [u8; 4], hue_degrees: f32, sat: f32, val: f32) -> [u8; 4] {
         premul_u8(lift(nr), a),
         bgra[3],
     ]
+}
+
+fn curves_lut_u8(curves: &CurveSet) -> [[u8; 3]; LUT_SIZE] {
+    let master = curves.rgb.bake();
+    let channels = [curves.red.bake(), curves.green.bake(), curves.blue.bake()];
+    std::array::from_fn(|level| {
+        channels
+            .each_ref()
+            .map(|channel| (sample_baked(&master, channel[level]) * 255.0).round() as u8)
+    })
+}
+
+fn curves_pixel(bgra: [u8; 4], lut: &[[u8; 3]; LUT_SIZE]) -> [u8; 4] {
+    let alpha = bgra[3];
+    if alpha == 0 {
+        return [0, 0, 0, 0];
+    }
+    let a = f32::from(alpha) / 255.0;
+    let level = |c: u8| ((f32::from(c) / 255.0 / a).clamp(0.0, 1.0) * 255.0).round() as usize;
+    let r = lut[level(bgra[2])][0];
+    let g = lut[level(bgra[1])][1];
+    let b = lut[level(bgra[0])][2];
+    let out = |v: u8| premul_u8(f32::from(v) / 255.0, a);
+    [out(b), out(g), out(r), alpha]
 }
 
 fn premul_u8(straight: f32, alpha: f32) -> u8 {
@@ -420,6 +453,57 @@ mod tests {
         let src = [40u8, 80, 120, 255].repeat(16);
         let out = apply_cpu(FilterSpec::Sharpen { amount: 3.0 }, &src, 4, 4, None);
         assert_eq!(out, src, "sharpening a flat color is a no-op");
+    }
+
+    fn inverted_curve() -> crate::curves::Curve {
+        use crate::curves::{Curve, CurvePoint};
+        Curve::from_points(&[CurvePoint::new(0, 255), CurvePoint::new(255, 0)])
+    }
+
+    #[test]
+    fn identity_curves_are_lossless() {
+        let src = swatch();
+        let spec = FilterSpec::Curves {
+            curves: CurveSet::default(),
+        };
+        assert_eq!(apply_cpu(spec, &src, 2, 2, None), src);
+    }
+
+    #[test]
+    fn inverted_master_curve_matches_invert() {
+        let src = swatch();
+        let curves = CurveSet {
+            rgb: inverted_curve(),
+            ..CurveSet::default()
+        };
+        let out = apply_cpu(FilterSpec::Curves { curves }, &src, 2, 2, None);
+        assert_eq!(out, apply_cpu(FilterSpec::Invert, &src, 2, 2, None));
+    }
+
+    #[test]
+    fn channel_curve_only_touches_its_channel() {
+        let src = swatch();
+        let curves = CurveSet {
+            green: inverted_curve(),
+            ..CurveSet::default()
+        };
+        let out = apply_cpu(FilterSpec::Curves { curves }, &src, 2, 2, None);
+        for (o, s) in out.chunks_exact(4).zip(src.chunks_exact(4)) {
+            assert_eq!([o[0], o[2], o[3]], [s[0], s[2], s[3]]);
+            assert_eq!(o[1], 255 - s[1]);
+        }
+    }
+
+    #[test]
+    fn channel_curve_runs_before_the_master_curve() {
+        use crate::curves::{Curve, CurvePoint};
+        let curves = CurveSet {
+            rgb: inverted_curve(),
+            red: Curve::from_points(&[CurvePoint::new(0, 0), CurvePoint::new(255, 0)]),
+            ..CurveSet::default()
+        };
+        let out = apply_cpu(FilterSpec::Curves { curves }, &[0, 0, 200, 255], 1, 1, None);
+        assert_eq!(out[2], 255, "invert(red(200)) = invert(0)");
     }
 
     #[test]

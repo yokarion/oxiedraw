@@ -464,6 +464,7 @@ fn register_window_actions(
     {
         let filter_actions: &[(&str, fn(&crate::filters::FilterContext))] = &[
             ("filter-hsv", crate::filters::show_hsv),
+            ("filter-curves", crate::filters::show_curves),
             ("filter-invert", crate::filters::show_invert),
             ("filter-blur", crate::filters::show_blur),
             ("filter-sharpen", crate::filters::show_sharpen),

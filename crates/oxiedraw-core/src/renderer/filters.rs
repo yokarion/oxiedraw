@@ -1,4 +1,4 @@
-//! GPU resources for the layer filters (HSV, invert, box blur, sharpen).
+//! GPU resources for the layer filters (HSV, curves, invert, blur, sharpen).
 //!
 //! A filter turns one layer image into a fully-filtered copy by running a
 //! short chain of fullscreen passes that ping-pong between two canvas-sized
@@ -23,6 +23,7 @@ use super::resources::Image;
 
 const COMPOSITE_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/composite.vert.spv"));
 const HSV_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_hsv.frag.spv"));
+const CURVES_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_curves.frag.spv"));
 const INVERT_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_invert.frag.spv"));
 const BOX_BLUR_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_box_blur.frag.spv"));
@@ -98,6 +99,7 @@ pub(super) struct FilterResources {
     pub pipeline_layout: vk::PipelineLayout,
 
     pub hsv: vk::Pipeline,
+    pub curves: vk::Pipeline,
     pub invert: vk::Pipeline,
     pub box_blur: vk::Pipeline,
     pub sharpen: vk::Pipeline,
@@ -176,6 +178,7 @@ impl FilterResources {
 
         let pipeline_layout = create_pipeline_layout(device, input_set_layout)?;
         let hsv = create_pipeline(device, pipeline_layout, canvas_render_pass, HSV_FRAG_SPV)?;
+        let curves = create_pipeline(device, pipeline_layout, canvas_render_pass, CURVES_FRAG_SPV)?;
         let invert = create_pipeline(device, pipeline_layout, canvas_render_pass, INVERT_FRAG_SPV)?;
         let box_blur =
             create_pipeline(device, pipeline_layout, canvas_render_pass, BOX_BLUR_FRAG_SPV)?;
@@ -245,6 +248,7 @@ impl FilterResources {
             input_sets,
             pipeline_layout,
             hsv,
+            curves,
             invert,
             box_blur,
             sharpen,
@@ -350,6 +354,7 @@ impl FilterResources {
     pub(super) unsafe fn destroy(self, device: &Device, allocator: &mut Allocator) {
         unsafe {
             device.destroy_pipeline(self.hsv, None);
+            device.destroy_pipeline(self.curves, None);
             device.destroy_pipeline(self.invert, None);
             device.destroy_pipeline(self.box_blur, None);
             device.destroy_pipeline(self.sharpen, None);

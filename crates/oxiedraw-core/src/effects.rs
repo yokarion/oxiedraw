@@ -9,6 +9,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
+use crate::curves::CurveSet;
 use crate::filters::FilterSpec;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,6 +77,7 @@ pub enum EffectKind {
         saturation: f32,
         brightness: f32,
     },
+    Curves { curves: CurveSet },
     /// Box blur with independent horizontal / vertical radii in pixels - the
     /// same parameters as the destructive Blur filter. Maps to the separable
     /// `filter_box_blur`. The legacy single-`radius` field deserializes into
@@ -109,6 +111,7 @@ impl EffectKind {
     pub const fn display_name(&self) -> &'static str {
         match self {
             Self::HueSatBright { .. } => "Hue/Saturation/Brightness",
+            Self::Curves { .. } => "Curves",
             Self::Blur { .. } => "Blur",
             Self::Invert => "Invert",
             Self::Sharpen { .. } => "Sharpen",
@@ -132,6 +135,7 @@ impl EffectKind {
                 saturation,
                 value: brightness,
             }),
+            Self::Curves { curves } => Some(FilterSpec::Curves { curves }),
             Self::Blur { radius_x, radius_y } => Some(FilterSpec::BoxBlur { radius_x, radius_y }),
             Self::Invert => Some(FilterSpec::Invert),
             Self::Sharpen { amount } => Some(FilterSpec::Sharpen { amount }),
@@ -145,6 +149,13 @@ impl EffectKind {
             hue_degrees: 0.0,
             saturation: 1.0,
             brightness: 1.0,
+        }
+    }
+
+    #[must_use]
+    pub fn curves_identity() -> Self {
+        Self::Curves {
+            curves: CurveSet::default(),
         }
     }
 
@@ -193,6 +204,14 @@ impl Effect {
             kind,
         }
     }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        match self.kind {
+            EffectKind::Curves { curves } => self.enabled && !curves.is_identity(),
+            _ => self.enabled,
+        }
+    }
 }
 
 /// The payload of a `LayerKind::Adjustment`: an ordered effect stack applied
@@ -205,10 +224,10 @@ pub struct AdjustmentData {
 }
 
 impl AdjustmentData {
-    /// `true` when there is nothing to apply (no effects, or all disabled).
+    /// `true` when there is nothing to apply (no effects, or none active).
     #[must_use]
     pub fn is_noop(&self) -> bool {
-        self.effects.iter().all(|e| !e.enabled)
+        self.effects.iter().all(|e| !e.is_active())
     }
 }
 
@@ -241,6 +260,7 @@ mod tests {
         let data = AdjustmentData {
             effects: vec![
                 Effect::new(EffectKind::hue_sat_bright_identity()),
+                Effect::new(EffectKind::curves_identity()),
                 Effect {
                     id: "e000000000000001".into(),
                     enabled: false,
@@ -291,5 +311,21 @@ mod tests {
         assert!(!data.is_noop());
         data.effects[0].enabled = false;
         assert!(data.is_noop());
+    }
+
+    #[test]
+    fn unedited_curves_are_a_noop() {
+        use crate::curves::{Curve, CurvePoint};
+        let mut data = AdjustmentData {
+            effects: vec![Effect::new(EffectKind::curves_identity())],
+        };
+        assert!(data.is_noop());
+        data.effects[0].kind = EffectKind::Curves {
+            curves: CurveSet {
+                rgb: Curve::from_points(&[CurvePoint::new(0, 30), CurvePoint::new(255, 255)]),
+                ..CurveSet::default()
+            },
+        };
+        assert!(!data.is_noop());
     }
 }

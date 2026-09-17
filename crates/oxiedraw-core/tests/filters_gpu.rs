@@ -4,6 +4,7 @@
 #![allow(clippy::unwrap_used)]
 
 use oxiedraw_core::canvas::Canvas;
+use oxiedraw_core::curves::{Curve, CurveChannel, CurvePoint, CurveSet};
 use oxiedraw_core::filters::FilterSpec;
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::tools::SelectionMode;
@@ -275,4 +276,155 @@ fn sharpen_is_visible_on_a_soft_edge() {
         .max()
         .unwrap_or(0);
     assert!(max_delta > 8, "sharpen barely changed a soft gradient (max delta {max_delta})");
+}
+
+fn flat_curve(level: u8) -> Curve {
+    Curve::from_points(&[CurvePoint::new(0, level), CurvePoint::new(255, level)])
+}
+
+fn inverted_curve() -> Curve {
+    Curve::from_points(&[CurvePoint::new(0, 255), CurvePoint::new(255, 0)])
+}
+
+#[test]
+fn curves_invert_flips_srgb_levels() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 40, 120, 200)).unwrap();
+
+    let curves = CurveSet {
+        rgb: inverted_curve(),
+        ..CurveSet::default()
+    };
+    canvas.apply_filter(&[idx], FilterSpec::Curves { curves }).unwrap();
+    let out = canvas.read_layer(idx).unwrap();
+
+    assert!(near(out[0], 215, 2), "B={}", out[0]);
+    assert!(near(out[1], 135, 2), "G={}", out[1]);
+    assert!(near(out[2], 55, 2), "R={}", out[2]);
+    assert_eq!(out[3], 255, "alpha preserved");
+}
+
+#[test]
+fn channel_curve_runs_before_the_master_curve() {
+    let size = Size::new(8, 8);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 40, 120, 200)).unwrap();
+
+    let curves = CurveSet {
+        rgb: inverted_curve(),
+        red: flat_curve(0),
+        ..CurveSet::default()
+    };
+    canvas.apply_filter(&[idx], FilterSpec::Curves { curves }).unwrap();
+    let out = canvas.read_layer(idx).unwrap();
+
+    assert!(near(out[2], 255, 1), "invert(red(200)) = invert(0), got R={}", out[2]);
+    assert!(near(out[1], 135, 1), "G={}", out[1]);
+}
+
+#[test]
+fn layers_histogram_counts_inside_the_selection() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 0, 0, 255)).unwrap();
+
+    let whole = canvas.layers_histogram(&[idx]).unwrap();
+    assert_eq!(whole.channel(CurveChannel::Red)[255], 16 * 16);
+
+    canvas
+        .apply_selection_shape(
+            &SelectionShape::Rect(RectShape {
+                x: 0.0,
+                y: 0.0,
+                w: 8.0,
+                h: 16.0,
+            }),
+            SelectionMode::Replace,
+        )
+        .unwrap();
+    let selected = canvas.layers_histogram(&[idx]).unwrap();
+    assert_eq!(selected.channel(CurveChannel::Red)[255], 8 * 16);
+}
+
+#[test]
+fn identity_curves_leave_the_layer_alone() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let mut src = solid(size, 40, 120, 200);
+    let half = oxiedraw_utils::color::linear_to_srgb(0.5 * 0.25);
+    src[..4].copy_from_slice(&[half, half, half, 128]);
+    let idx = canvas.add_layer_with_pixels("t", &src).unwrap();
+
+    let spec = FilterSpec::Curves {
+        curves: CurveSet::default(),
+    };
+    canvas.apply_filter(&[idx], spec).unwrap();
+    let out = canvas.read_layer(idx).unwrap();
+
+    for (i, (a, b)) in src.iter().zip(out.iter()).enumerate() {
+        assert!(near(*a, *b, 1), "identity curves drifted at {i}: {a} vs {b}");
+    }
+}
+
+#[test]
+fn channel_curves_only_touch_their_channel() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 40, 120, 200)).unwrap();
+
+    let curves = CurveSet {
+        green: flat_curve(10),
+        ..CurveSet::default()
+    };
+    canvas.apply_filter(&[idx], FilterSpec::Curves { curves }).unwrap();
+    let out = canvas.read_layer(idx).unwrap();
+
+    assert!(near(out[0], 40, 1) && near(out[2], 200, 1), "B={} R={}", out[0], out[2]);
+    assert!(near(out[1], 10, 1), "G={}", out[1]);
+}
+
+#[test]
+fn many_distinct_curves_each_read_their_own_row() {
+    let size = Size::new(8, 8);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 0, 0, 0)).unwrap();
+
+    for step in 0..40u8 {
+        let level = 60 + step * 4;
+        let curves = CurveSet {
+            red: flat_curve(level),
+            ..CurveSet::default()
+        };
+        canvas.apply_filter(&[idx], FilterSpec::Curves { curves }).unwrap();
+        let out = canvas.read_layer(idx).unwrap();
+        assert!(near(out[2], level, 1), "step {step}: R={} want {level}", out[2]);
+    }
+}
+
+#[test]
+fn curves_preview_matches_apply() {
+    let size = Size::new(16, 16);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("t", &solid(size, 40, 120, 200)).unwrap();
+
+    let curves = CurveSet {
+        rgb: Curve::from_points(&[
+            CurvePoint::new(0, 0),
+            CurvePoint::new(90, 160),
+            CurvePoint::new(255, 255),
+        ]),
+        ..CurveSet::default()
+    };
+    let spec = FilterSpec::Curves { curves };
+    canvas.begin_filter(&[idx], FilterSpec::Curves { curves: CurveSet::default() });
+    canvas.update_filter(spec);
+    let preview = canvas.read_filter_preview().unwrap();
+    canvas.apply_filter(&[idx], spec).unwrap();
+    let applied = canvas.read_pixels().unwrap();
+
+    assert!(!near(preview[1], 120, 5), "preview did not change G={}", preview[1]);
+    for (a, b) in preview.iter().zip(applied.iter()) {
+        assert!(near(*a, *b, 1), "preview {a} vs applied {b}");
+    }
 }
