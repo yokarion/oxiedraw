@@ -25,7 +25,7 @@ use crate::document::CompositeStep;
 use crate::filters::FilterSpec;
 
 use super::super::RendererError;
-use super::super::filters::{JfaSlot, Scratch};
+use super::super::filters::{JfaSlot, Scratch, blur_push};
 use super::adjust_ops::PreviewTarget;
 use super::VulkanRenderer;
 
@@ -282,22 +282,27 @@ impl VulkanRenderer {
                 )?;
                 Scratch::A
             }
-            FilterSpec::BoxBlur { radius_x, radius_y } => {
+            FilterSpec::Blur {
+                kind,
+                radius_x,
+                radius_y,
+            } => {
+                let pipeline = self.filter_resources.blur(kind);
                 self.filter_pass(
-                    self.filter_resources.box_blur,
+                    pipeline,
                     Scratch::A,
                     layer_view,
                     layer_img,
-                    [inv_w, 0.0, radius_x, 0.0],
+                    blur_push(kind, [inv_w, 0.0], radius_x),
                 )?;
                 let a_view = self.filter_resources.scratch_a.view;
                 let a_img = self.filter_resources.scratch_a.handle;
                 self.filter_pass(
-                    self.filter_resources.box_blur,
+                    pipeline,
                     Scratch::B,
                     a_view,
                     a_img,
-                    [0.0, inv_h, radius_y, 0.0],
+                    blur_push(kind, [0.0, inv_h], radius_y),
                 )?;
                 Scratch::B
             }

@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::color::Color;
 use crate::curves::CurveSet;
-use crate::filters::FilterSpec;
+use crate::filters::{BlurKind, FilterSpec};
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -78,11 +78,12 @@ pub enum EffectKind {
         brightness: f32,
     },
     Curves { curves: CurveSet },
-    /// Box blur with independent horizontal / vertical radii in pixels - the
-    /// same parameters as the destructive Blur filter. Maps to the separable
-    /// `filter_box_blur`. The legacy single-`radius` field deserializes into
-    /// `radius_x` (with `radius_y` defaulting to 0) so old projects still load.
+    /// Same parameters as the destructive Blur filter. The legacy single
+    /// `radius` field deserializes into `radius_x` (with `radius_y` defaulting
+    /// to 0) and a missing `kind` into a box blur, so old projects still load.
     Blur {
+        #[serde(default)]
+        kind: BlurKind,
         #[serde(alias = "radius")]
         radius_x: f32,
         #[serde(default)]
@@ -136,7 +137,15 @@ impl EffectKind {
                 value: brightness,
             }),
             Self::Curves { curves } => Some(FilterSpec::Curves { curves }),
-            Self::Blur { radius_x, radius_y } => Some(FilterSpec::BoxBlur { radius_x, radius_y }),
+            Self::Blur {
+                kind,
+                radius_x,
+                radius_y,
+            } => Some(FilterSpec::Blur {
+                kind,
+                radius_x,
+                radius_y,
+            }),
             Self::Invert => Some(FilterSpec::Invert),
             Self::Sharpen { amount } => Some(FilterSpec::Sharpen { amount }),
             Self::Stroke { .. } => None,
@@ -162,6 +171,7 @@ impl EffectKind {
     #[must_use]
     pub const fn blur_default() -> Self {
         Self::Blur {
+            kind: BlurKind::Box,
             radius_x: 4.0,
             radius_y: 4.0,
         }
@@ -265,6 +275,7 @@ mod tests {
                     id: "e000000000000001".into(),
                     enabled: false,
                     kind: EffectKind::Blur {
+                        kind: BlurKind::Gaussian,
                         radius_x: 12.0,
                         radius_y: 8.0,
                     },
@@ -290,6 +301,7 @@ mod tests {
         assert_eq!(
             effect.kind,
             EffectKind::Blur {
+                kind: BlurKind::Box,
                 radius_x: 3.0,
                 radius_y: 0.0
             }

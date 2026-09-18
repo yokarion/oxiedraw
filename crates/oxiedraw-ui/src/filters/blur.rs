@@ -1,7 +1,8 @@
 use std::cell::Cell;
 use std::rc::Rc;
 
-use oxiedraw_core::filters::FilterSpec;
+use oxiedraw_core::enum_meta::EnumMeta;
+use oxiedraw_core::filters::{BlurKind, FilterSpec};
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 
@@ -12,7 +13,8 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
     open_adjustable(
         ctx,
         "Blur",
-        FilterSpec::BoxBlur {
+        FilterSpec::Blur {
+            kind: BlurKind::Box,
             radius_x: 0.0,
             radius_y: 0.0,
         },
@@ -28,7 +30,15 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
 
             let list = boxed_list::list();
 
-            let type_combo = gtk::DropDown::from_strings(&["Box Blur"]);
+            let type_combo = gtk::DropDown::from_strings(&BlurKind::labels());
+            type_combo.connect_selected_notify({
+                let spec = Rc::clone(spec);
+                let push = push.clone();
+                move |combo| {
+                    update_blur(&spec, |kind, _, _| *kind = BlurKind::from_index(combo.selected()));
+                    push();
+                }
+            });
             list.append(&boxed_list::row("Type", &type_combo, &[]));
 
             // Lock links the two radii so they move together (default on).
@@ -37,7 +47,7 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
                 let spec = Rc::clone(spec);
                 let push = push.clone();
                 move |v| {
-                    update_blur(&spec, |b| b.radius_x = v as f32);
+                    update_blur(&spec, |_, radius_x, _| *radius_x = v as f32);
                     push();
                 }
             });
@@ -45,7 +55,7 @@ pub(crate) fn show_blur(ctx: &FilterContext) {
                 let spec = Rc::clone(spec);
                 let push = push.clone();
                 move |v| {
-                    update_blur(&spec, |b| b.radius_y = v as f32);
+                    update_blur(&spec, |_, _, radius_y| *radius_y = v as f32);
                     push();
                 }
             });
@@ -116,23 +126,20 @@ fn wire_radius_lock(h_scale: &gtk::Scale, v_scale: &gtk::Scale, locked: &Rc<Cell
     }
 }
 
-fn update_blur(spec: &Rc<Cell<FilterSpec>>, f: impl FnOnce(&mut BlurFields)) {
-    if let FilterSpec::BoxBlur { radius_x, radius_y } = spec.get() {
-        let mut fields = BlurFields { radius_x, radius_y };
-        f(&mut fields);
-        spec.set(FilterSpec::BoxBlur {
-            radius_x: fields.radius_x,
-            radius_y: fields.radius_y,
-        });
+fn update_blur(spec: &Cell<FilterSpec>, f: impl FnOnce(&mut BlurKind, &mut f32, &mut f32)) {
+    let mut next = spec.get();
+    if let FilterSpec::Blur {
+        kind,
+        radius_x,
+        radius_y,
+    } = &mut next
+    {
+        f(kind, radius_x, radius_y);
     }
+    spec.set(next);
 }
 
 #[allow(clippy::cast_possible_truncation)]
 fn fmt_px(v: f64) -> String {
     format!("{} px", v.round() as i64)
-}
-
-struct BlurFields {
-    radius_x: f32,
-    radius_y: f32,
 }

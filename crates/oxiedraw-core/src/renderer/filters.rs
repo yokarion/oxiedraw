@@ -17,6 +17,8 @@
 use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
 
+use crate::filters::{BlurKind, gaussian_ratio};
+
 use super::RendererError;
 use super::pass::{FullscreenPass, nearest_clamp_sampler, pipeline_layout, replace_blend};
 use super::resources::Image;
@@ -27,6 +29,8 @@ const CURVES_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_
 const INVERT_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_invert.frag.spv"));
 const BOX_BLUR_FRAG_SPV: &[u8] =
     include_bytes!(concat!(env!("OUT_DIR"), "/filter_box_blur.frag.spv"));
+const GAUSSIAN_BLUR_FRAG_SPV: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/filter_gaussian_blur.frag.spv"));
 const SHARPEN_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/filter_sharpen.frag.spv"));
 const JFA_SEED_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jfa_seed.frag.spv"));
 const JFA_FLOOD_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/jfa_flood.frag.spv"));
@@ -43,6 +47,16 @@ pub(super) const FILTER_PUSH_BYTES: u32 = 16;
 pub(super) const INPUT_RING: usize = 16;
 /// Stroke resolve push: 3x vec4 (color, params, texel). See `jfa_resolve.frag`.
 pub(super) const STROKE_PUSH_BYTES: u32 = 48;
+
+/// Push for one axis of a blur pass: texel step, radius, and the Gaussian tap
+/// ratio (unused by the box shader).
+pub(super) fn blur_push(kind: BlurKind, texel_step: [f32; 2], radius: f32) -> [f32; 4] {
+    let ratio = match kind {
+        BlurKind::Box => 0.0,
+        BlurKind::Gaussian => gaussian_ratio(radius),
+    };
+    [texel_step[0], texel_step[1], radius, ratio]
+}
 
 /// Which scratch image currently holds a pass's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +116,7 @@ pub(super) struct FilterResources {
     pub curves: vk::Pipeline,
     pub invert: vk::Pipeline,
     pub box_blur: vk::Pipeline,
+    pub gaussian_blur: vk::Pipeline,
     pub sharpen: vk::Pipeline,
     pub mask_mix: vk::Pipeline,
 
@@ -182,6 +197,8 @@ impl FilterResources {
         let invert = create_pipeline(device, pipeline_layout, canvas_render_pass, INVERT_FRAG_SPV)?;
         let box_blur =
             create_pipeline(device, pipeline_layout, canvas_render_pass, BOX_BLUR_FRAG_SPV)?;
+        let gaussian_blur =
+            create_pipeline(device, pipeline_layout, canvas_render_pass, GAUSSIAN_BLUR_FRAG_SPV)?;
         let sharpen =
             create_pipeline(device, pipeline_layout, canvas_render_pass, SHARPEN_FRAG_SPV)?;
         let mask_mix =
@@ -251,6 +268,7 @@ impl FilterResources {
             curves,
             invert,
             box_blur,
+            gaussian_blur,
             sharpen,
             mask_mix,
             stroke_layout,
@@ -289,6 +307,13 @@ impl FilterResources {
         match which {
             Scratch::A => self.framebuffer_a,
             Scratch::B => self.framebuffer_b,
+        }
+    }
+
+    pub(super) const fn blur(&self, kind: BlurKind) -> vk::Pipeline {
+        match kind {
+            BlurKind::Box => self.box_blur,
+            BlurKind::Gaussian => self.gaussian_blur,
         }
     }
 
@@ -357,6 +382,7 @@ impl FilterResources {
             device.destroy_pipeline(self.curves, None);
             device.destroy_pipeline(self.invert, None);
             device.destroy_pipeline(self.box_blur, None);
+            device.destroy_pipeline(self.gaussian_blur, None);
             device.destroy_pipeline(self.sharpen, None);
             device.destroy_pipeline(self.mask_mix, None);
             device.destroy_pipeline(self.jfa_seed, None);

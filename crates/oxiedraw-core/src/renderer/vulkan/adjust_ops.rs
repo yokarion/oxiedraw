@@ -15,9 +15,9 @@ use super::{create_framebuffer_for_view, create_sampled_image_set, VulkanRendere
 use crate::renderer::resources::Image;
 use crate::document::CompositeStep;
 use crate::effects::{AdjustmentData, EffectKind};
-use crate::filters::FilterSpec;
+use crate::filters::{BlurKind, FilterSpec};
 use crate::renderer::PresentSource;
-use crate::renderer::filters::{INPUT_RING, Scratch};
+use crate::renderer::filters::{INPUT_RING, Scratch, blur_push};
 
 /// A canvas-sized sub-accumulator for one folder nesting level: an image to
 /// composite the folder's contents into, plus the descriptor set that samples
@@ -73,6 +73,17 @@ struct GroupSpan {
     exit: usize,
     /// Whether the stroke target layer composites inside this folder.
     contains_target: bool,
+}
+
+fn effect_margin(kind: EffectKind) -> u32 {
+    match kind {
+        EffectKind::HueSatBright { .. } | EffectKind::Curves { .. } | EffectKind::Invert => 0,
+        EffectKind::Blur {
+            radius_x, radius_y, ..
+        } => radius_x.max(radius_y).ceil().max(0.0) as u32,
+        EffectKind::Sharpen { .. } => FilterSpec::SHARPEN_BLUR_RADIUS.ceil() as u32,
+        EffectKind::Stroke { thickness, .. } => thickness.ceil().max(0.0) as u32 + 1,
+    }
 }
 
 /// Index each `EnterGroup` step to its [`GroupSpan`]. A folder "contains" the
@@ -790,10 +801,10 @@ impl VulkanRenderer {
         // the dab expanded by the effect margin, and the seed/input region
         // (outer) is expanded once more so the effect samples correct input.
         // For local effects margin = 0, so inner == outer == dab.
+        let margin = self.adjusted_effect_margin(&visible_indices, target_idx);
         let (inner, outer) = if incremental {
             self.take_preview_clip().map_or((None, None), |dab| {
-                let m = self.adjusted_effect_margin(&visible_indices, target_idx);
-                (Some(self.expand_clip(dab, m)), Some(self.expand_clip(dab, m * 2)))
+                (Some(self.expand_clip(dab, margin)), Some(self.expand_clip(dab, margin * 2)))
             })
         } else {
             (None, None)
@@ -810,6 +821,7 @@ impl VulkanRenderer {
                     present,
                     inner,
                     outer,
+                    margin,
                 );
                 Ok(())
             }
@@ -915,6 +927,7 @@ impl VulkanRenderer {
         present: bool,
         inner: Option<vk::Rect2D>,
         outer: Option<vk::Rect2D>,
+        margin: u32,
     ) {
         let acc = self.preview_accumulator();
         let below_cached = self.preview_cache_valid;
@@ -940,23 +953,24 @@ impl VulkanRenderer {
             }
             // 2. The target layer with the in-flight stroke merged in.
             this.preview_compose_stroked_target(target_idx, push, erase);
-            // The effect output + above layers + present only touch `inner` (the
-            // region that actually changed); effects still sample the accumulator
-            // freely, reading the correctly-seeded `outer` region.
-            this.clip = inner;
             // 3. Above the target: adjustments (effect chain) + plain layers.
+            // Each step writes `inner` grown by `reach`, the margin of the effects
+            // still to come, since those sample that far past `inner`.
             let mut cursor = 0usize;
+            let mut reach = margin;
             for &idx in &visible_indices {
                 if idx <= target_idx {
                     continue;
                 }
                 if this.layer_stack.slots[idx].adjustment.is_some() {
-                    this.cmd_apply_adjustment(acc, idx, &mut cursor);
+                    this.cmd_apply_adjustment(acc, idx, inner, &mut reach, &mut cursor);
                 } else {
+                    this.clip = inner.map(|r| this.expand_clip(r, reach));
                     this.cmd_compose_layer(acc, idx);
                 }
             }
             // 4. Fold the dmabuf present copy into this same submit.
+            this.clip = inner;
             if present {
                 this.record_present_copy(acc.image, acc.view);
             }
@@ -974,7 +988,14 @@ impl VulkanRenderer {
     /// Record (no submit) one adjustment's effect chain into the current buffer,
     /// advancing `cursor` through the input-set ring. Only Hsv / Blur effects
     /// reach here (stroke routes to the unbatched path).
-    fn cmd_apply_adjustment(&mut self, acc: Accumulator, idx: usize, cursor: &mut usize) {
+    fn cmd_apply_adjustment(
+        &mut self,
+        acc: Accumulator,
+        idx: usize,
+        inner: Option<vk::Rect2D>,
+        reach: &mut u32,
+        cursor: &mut usize,
+    ) {
         let Some(data) = self.layer_stack.slots[idx].adjustment.clone() else {
             return;
         };
@@ -990,6 +1011,8 @@ impl VulkanRenderer {
             if !effect.is_active() {
                 continue;
             }
+            *reach = reach.saturating_sub(effect_margin(effect.kind));
+            self.clip = inner.map(|r| self.expand_clip(r, *reach));
             let Some(spec) = effect.kind.as_filter_spec() else {
                 if let EffectKind::Stroke { .. } = effect.kind {
                     self.cmd_apply_stroke(acc, effect.kind, mask_view, mask_img, cursor);
@@ -1077,10 +1100,6 @@ impl VulkanRenderer {
     ) -> Scratch {
         let layout = self.filter_resources.pipeline_layout;
         let render_pass = self.canvas_target.render_pass;
-        #[allow(clippy::cast_precision_loss)]
-        let inv_w = 1.0 / self.canvas.extent.width as f32;
-        #[allow(clippy::cast_precision_loss)]
-        let inv_h = 1.0 / self.canvas.extent.height as f32;
 
         match spec {
             FilterSpec::Hsv {
@@ -1114,29 +1133,12 @@ impl VulkanRenderer {
                 );
                 Scratch::A
             }
-            FilterSpec::BoxBlur { radius_x, radius_y } => {
-                let pipeline = self.filter_resources.box_blur;
-                let fb_a = self.filter_resources.framebuffer(Scratch::A);
-                let set_h = self.filter_resources.input_set(*cursor);
-                *cursor += 1;
-                self.filter_resources
-                    .write_input(&self.device, set_h, src_view, src_view, src_view);
-                self.cmd_filter_pass3(
-                    set_h, layout, pipeline, render_pass, fb_a, src_img, src_img, src_img,
-                    [inv_w, 0.0, radius_x, 0.0],
-                );
-
-                let a_view = self.filter_resources.scratch_view(Scratch::A);
-                let a_img = self.filter_resources.scratch_handle(Scratch::A);
-                let fb_b = self.filter_resources.framebuffer(Scratch::B);
-                let set_v = self.filter_resources.input_set(*cursor);
-                *cursor += 1;
-                self.filter_resources
-                    .write_input(&self.device, set_v, a_view, a_view, a_view);
-                self.cmd_filter_pass3(
-                    set_v, layout, pipeline, render_pass, fb_b, a_img, a_img, a_img,
-                    [0.0, inv_h, radius_y, 0.0],
-                );
+            FilterSpec::Blur {
+                kind,
+                radius_x,
+                radius_y,
+            } => {
+                self.cmd_blur_passes(src_view, src_img, kind, radius_x, radius_y, cursor);
                 Scratch::B
             }
             FilterSpec::Invert => {
@@ -1154,30 +1156,10 @@ impl VulkanRenderer {
             FilterSpec::Sharpen { amount } => {
                 // Blur the source (H then V) into B, then unsharp = src vs blurred.
                 let r = FilterSpec::SHARPEN_BLUR_RADIUS;
-                let blur = self.filter_resources.box_blur;
-                let fb_a = self.filter_resources.framebuffer(Scratch::A);
-                let set_h = self.filter_resources.input_set(*cursor);
-                *cursor += 1;
-                self.filter_resources
-                    .write_input(&self.device, set_h, src_view, src_view, src_view);
-                self.cmd_filter_pass3(
-                    set_h, layout, blur, render_pass, fb_a, src_img, src_img, src_img,
-                    [inv_w, 0.0, r, 0.0],
-                );
-
-                let a_view = self.filter_resources.scratch_view(Scratch::A);
-                let a_img = self.filter_resources.scratch_handle(Scratch::A);
-                let fb_b = self.filter_resources.framebuffer(Scratch::B);
-                let set_v = self.filter_resources.input_set(*cursor);
-                *cursor += 1;
-                self.filter_resources
-                    .write_input(&self.device, set_v, a_view, a_view, a_view);
-                self.cmd_filter_pass3(
-                    set_v, layout, blur, render_pass, fb_b, a_img, a_img, a_img,
-                    [0.0, inv_h, r, 0.0],
-                );
+                self.cmd_blur_passes(src_view, src_img, BlurKind::Box, r, r, cursor);
 
                 // Sharpen reads the source (binding 0) + blurred-in-B (binding 1).
+                let fb_a = self.filter_resources.framebuffer(Scratch::A);
                 let b_view = self.filter_resources.scratch_view(Scratch::B);
                 let b_img = self.filter_resources.scratch_handle(Scratch::B);
                 let sharpen = self.filter_resources.sharpen;
@@ -1192,6 +1174,50 @@ impl VulkanRenderer {
                 Scratch::A
             }
         }
+    }
+
+    /// Record (no submit) the horizontal then vertical blur of `src` into scratch
+    /// B. The vertical pass reads `radius_y` rows past the clip, so the
+    /// horizontal pass writes that much further.
+    fn cmd_blur_passes(
+        &mut self,
+        src_view: vk::ImageView,
+        src_img: vk::Image,
+        kind: BlurKind,
+        radius_x: f32,
+        radius_y: f32,
+        cursor: &mut usize,
+    ) {
+        let layout = self.filter_resources.pipeline_layout;
+        let render_pass = self.canvas_target.render_pass;
+        let pipeline = self.filter_resources.blur(kind);
+        let inv_w = 1.0 / self.canvas.extent.width as f32;
+        let inv_h = 1.0 / self.canvas.extent.height as f32;
+        let out_clip = self.clip;
+
+        self.clip = out_clip.map(|r| self.expand_clip(r, radius_y.ceil().max(0.0) as u32));
+        let fb_a = self.filter_resources.framebuffer(Scratch::A);
+        let set_h = self.filter_resources.input_set(*cursor);
+        *cursor += 1;
+        self.filter_resources
+            .write_input(&self.device, set_h, src_view, src_view, src_view);
+        self.cmd_filter_pass3(
+            set_h, layout, pipeline, render_pass, fb_a, src_img, src_img, src_img,
+            blur_push(kind, [inv_w, 0.0], radius_x),
+        );
+        self.clip = out_clip;
+
+        let a_view = self.filter_resources.scratch_view(Scratch::A);
+        let a_img = self.filter_resources.scratch_handle(Scratch::A);
+        let fb_b = self.filter_resources.framebuffer(Scratch::B);
+        let set_v = self.filter_resources.input_set(*cursor);
+        *cursor += 1;
+        self.filter_resources
+            .write_input(&self.device, set_v, a_view, a_view, a_view);
+        self.cmd_filter_pass3(
+            set_v, layout, pipeline, render_pass, fb_b, a_img, a_img, a_img,
+            blur_push(kind, [0.0, inv_h], radius_y),
+        );
     }
 
     /// Show an adjustment layer's grayscale mask on the canvas (its slot is the
@@ -1280,21 +1306,9 @@ impl VulkanRenderer {
                 continue;
             }
             for effect in &data.effects {
-                if !effect.is_active() {
-                    continue;
+                if effect.is_active() {
+                    margin += effect_margin(effect.kind);
                 }
-                #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                let r = match effect.kind {
-                    EffectKind::HueSatBright { .. }
-                    | EffectKind::Curves { .. }
-                    | EffectKind::Invert => 0,
-                    EffectKind::Blur { radius_x, radius_y } => {
-                        radius_x.max(radius_y).ceil().max(0.0) as u32
-                    }
-                    EffectKind::Sharpen { .. } => FilterSpec::SHARPEN_BLUR_RADIUS.ceil() as u32,
-                    EffectKind::Stroke { thickness, .. } => thickness.ceil().max(0.0) as u32 + 1,
-                };
-                margin += r;
             }
         }
         margin

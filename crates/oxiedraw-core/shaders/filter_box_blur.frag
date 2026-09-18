@@ -18,7 +18,7 @@ layout(push_constant) uniform Push {
 } push;
 
 void main() {
-    int radius = int(push.params.z + 0.5);
+    int radius = max(int(push.params.z + 0.5), 0);
     vec2 step = push.params.xy;
 
     vec4 sum = vec4(0.0);

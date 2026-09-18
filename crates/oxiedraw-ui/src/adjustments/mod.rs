@@ -25,6 +25,7 @@ use oxiedraw_core::color::Color;
 use oxiedraw_core::curves::Histogram;
 use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind, StrokeSoftness};
 use oxiedraw_core::enum_meta::EnumMeta;
+use oxiedraw_core::filters::BlurKind;
 use oxiedraw_core::history::{HistoryAction, HistoryStack};
 use relm4::gtk;
 
@@ -579,13 +580,29 @@ fn build_curves_panel(
 }
 
 fn build_blur_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live: &Rc<dyn Fn()>) {
-    let EffectKind::Blur { radius_x, radius_y } = working.borrow().blur.kind else {
+    let EffectKind::Blur {
+        kind,
+        radius_x,
+        radius_y,
+    } = working.borrow().blur.kind
+    else {
         return;
     };
 
     let list = boxed_list::list();
 
-    let type_combo = gtk::DropDown::from_strings(&["Box Blur"]);
+    let type_combo = gtk::DropDown::from_strings(&BlurKind::labels());
+    type_combo.set_selected(kind.to_index());
+    type_combo.connect_selected_notify({
+        let working = Rc::clone(working);
+        let apply_live = Rc::clone(apply_live);
+        move |combo| {
+            if let EffectKind::Blur { kind, .. } = &mut working.borrow_mut().blur.kind {
+                *kind = BlurKind::from_index(combo.selected());
+            }
+            apply_live();
+        }
+    });
     list.append(&boxed_list::row("Type", &type_combo, &[]));
 
     // Lock links the two radii so they move together (default on when equal).
@@ -647,7 +664,10 @@ fn build_blur_panel(page: &gtk::Box, working: &Rc<RefCell<Working>>, apply_live:
 
 /// Mutate the blur radii through a `(radius_x, radius_y)` view.
 fn set_blur(working: &Rc<RefCell<Working>>, f: impl FnOnce(&mut (f32, f32))) {
-    if let EffectKind::Blur { radius_x, radius_y } = &mut working.borrow_mut().blur.kind {
+    if let EffectKind::Blur {
+        radius_x, radius_y, ..
+    } = &mut working.borrow_mut().blur.kind
+    {
         let mut pair = (*radius_x, *radius_y);
         f(&mut pair);
         *radius_x = pair.0;

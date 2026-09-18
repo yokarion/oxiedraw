@@ -10,6 +10,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::Color;
 use oxiedraw_core::curves::{Curve, CurveChannel, CurvePoint, CurveSet};
 use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind, StrokeSoftness};
+use oxiedraw_core::filters::BlurKind;
 use oxiedraw_utils::geometry::Size;
 
 /// Fill a full-canvas BGRA8 buffer with one opaque color (B, G, R).
@@ -174,6 +175,103 @@ fn incremental_stroke_preview_matches_full() {
         .filter(|(a, b)| (i32::from(**a) - i32::from(**b)).abs() > 2)
         .count();
     assert_eq!(diff, 0, "incremental stroke diverged from full in {diff} bytes");
+}
+
+// Frame 2 redraws only the dabs (rows 42..54, x up to ~56 with the stabiliser
+// lag) grown by the effect margin; pixels past that are stale by design.
+fn incremental_and_full_line(canvas: &mut Canvas, target: usize) -> (Vec<u8>, Vec<u8>) {
+    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
+    use oxiedraw_utils::geometry::Point;
+
+    let sample = |x: f32, t: u64| InputSample {
+        position: Point::new(x, 48.0),
+        pressure: 1.0,
+        tilt_x: 0.0,
+        tilt_y: 0.0,
+        rotation: 0.0,
+        time_ms: t,
+    };
+    canvas.layers().set_active(Some(target));
+    let brush = BrushEngine::new();
+    brush.size.set(6.0);
+    brush.opacity.set(1.0);
+    let white = Color::new(255, 255, 255);
+    canvas.begin_stroke(white, 1.0, false).unwrap();
+    canvas.stamp(|t| brush.begin_stroke(sample(10.0, 0), white, t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(sample(14.0, 10), t)).unwrap();
+    let _ = canvas.read_incremental_preview().unwrap();
+
+    canvas.stamp(|t| brush.push_sample(sample(50.0, 20), t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(sample(80.0, 30), t)).unwrap();
+    let incremental = canvas.read_incremental_preview().unwrap();
+    canvas.force_full_preview();
+    (incremental, canvas.read_incremental_preview().unwrap())
+}
+
+fn adjust_with(canvas: &mut Canvas, effects: &[EffectKind]) {
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    let data = AdjustmentData {
+        effects: effects.iter().copied().map(Effect::new).collect(),
+    };
+    canvas.set_layer_effects(adj, data).unwrap();
+}
+
+#[test]
+fn incremental_blur_preview_matches_full() {
+    let size = Size::new(96, 96);
+    let stripes: Vec<u8> = (0..size.height)
+        .flat_map(|y| {
+            let v = if y / 2 % 2 == 0 { 100 } else { 150 };
+            [v, v, v, 255].repeat(size.width as usize)
+        })
+        .collect();
+    let blur = |kind| EffectKind::Blur {
+        kind,
+        radius_x: 4.0,
+        radius_y: 4.0,
+    };
+    let cases = [
+        (vec![blur(BlurKind::Box)], 4),
+        (vec![blur(BlurKind::Gaussian)], 4),
+        (vec![EffectKind::sharpen_default()], 4),
+        (vec![blur(BlurKind::Gaussian), EffectKind::sharpen_default()], 8),
+    ];
+    for (effects, margin) in cases {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let base = canvas.add_layer_with_pixels("base", &stripes).unwrap();
+        adjust_with(&mut canvas, &effects);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base);
+
+        let differing = (43 - margin..53 + margin)
+            .flat_map(|y| (20..50).map(move |x| (y * 96 + x) * 4))
+            .filter(|&i| (i..i + 4).any(|c| !near(incremental[c], full[c], 2)))
+            .count();
+        assert_eq!(differing, 0, "{effects:?}");
+    }
+}
+
+#[test]
+fn incremental_blur_preview_includes_layers_between() {
+    let size = Size::new(96, 96);
+    let blur = EffectKind::Blur {
+        kind: BlurKind::Gaussian,
+        radius_x: 4.0,
+        radius_y: 4.0,
+    };
+    for effects in [vec![blur], vec![blur, EffectKind::sharpen_default()]] {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let base = canvas
+            .add_layer_with_pixels("base", &solid(size, 0, 0, 255))
+            .unwrap();
+        canvas
+            .add_layer_with_pixels("between", &solid(size, 255, 0, 0))
+            .unwrap();
+        adjust_with(&mut canvas, &effects);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base);
+
+        let differing = incremental.iter().zip(&full).filter(|(a, b)| !near(**a, **b, 2)).count();
+        assert_eq!(differing, 0, "{effects:?}");
+    }
 }
 
 /// A red backdrop with a brightness-0 adjustment on top should composite to
@@ -1518,6 +1616,35 @@ fn cropping_keeps_adjustment_layers_working() {
             "pixel {i} lost the adjustment across the crop: {px:?}"
         );
     }
+}
+
+#[test]
+fn gaussian_blur_adjustment_matches_the_filter() {
+    let size = Size::new(32, 32);
+    let effect = |kind| EffectKind::Blur {
+        kind,
+        radius_x: 6.0,
+        radius_y: 6.0,
+    };
+    let adjusted_with = |kind| {
+        let mut canvas = Canvas::headless(size).unwrap();
+        canvas.add_layer_with_pixels("base", &left_half_red(size)).unwrap();
+        let adj = canvas.add_adjustment_layer("adj").unwrap();
+        canvas.set_layer_effects(adj, one_effect(effect(kind))).unwrap();
+        canvas.read_pixels().unwrap()
+    };
+    let adjusted = adjusted_with(BlurKind::Gaussian);
+
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("base", &left_half_red(size)).unwrap();
+    let spec = effect(BlurKind::Gaussian).as_filter_spec().unwrap();
+    canvas.apply_filter(&[idx], spec).unwrap();
+    let filtered = canvas.read_pixels().unwrap();
+
+    let mismatches = adjusted.iter().zip(&filtered).filter(|(a, b)| !near(**a, **b, 2)).count();
+    assert_eq!(mismatches, 0);
+    let boxed = adjusted_with(BlurKind::Box);
+    assert!(adjusted.iter().zip(&boxed).any(|(a, b)| !near(*a, *b, 8)));
 }
 
 fn curves_effect(channel: CurveChannel, level: u8) -> EffectKind {

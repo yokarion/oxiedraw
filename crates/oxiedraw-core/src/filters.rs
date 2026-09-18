@@ -1,5 +1,5 @@
-//! Layer filters: hue/saturation/value, curves, invert, box blur, and unsharp
-//! sharpen.
+//! Layer filters: hue/saturation/value, curves, invert, box and Gaussian blur,
+//! and unsharp sharpen.
 //!
 //! [`FilterSpec`] is the single source of truth for filter parameters,
 //! shared by the UI (popups) and the renderer (which turns each spec into
@@ -12,7 +12,27 @@
 //! with no padding - the same layout [`crate::canvas::Canvas::read_layer`]
 //! returns.
 
+use serde::{Deserialize, Serialize};
+
 use crate::curves::{CurveSet, LUT_SIZE, sample_baked};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum BlurKind {
+    #[default]
+    Box,
+    Gaussian,
+}
+
+impl crate::enum_meta::EnumMeta for BlurKind {
+    const ALL: &'static [Self] = &[Self::Box, Self::Gaussian];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Box => "Box Blur",
+            Self::Gaussian => "Gaussian Blur",
+        }
+    }
+}
 
 /// A destructive filter and its parameters. Copyable so the live-preview path
 /// can stash the latest value behind a `Cell` without allocation.
@@ -33,8 +53,12 @@ pub enum FilterSpec {
     Curves { curves: CurveSet },
     /// Invert colors. No parameters.
     Invert,
-    /// Box blur with independent horizontal / vertical radii in pixels.
-    BoxBlur { radius_x: f32, radius_y: f32 },
+    /// Separable blur with independent horizontal / vertical radii in pixels.
+    Blur {
+        kind: BlurKind,
+        radius_x: f32,
+        radius_y: f32,
+    },
     /// Unsharp-mask sharpen. `amount` of 0 leaves the image unchanged.
     Sharpen { amount: f32 },
 }
@@ -57,7 +81,14 @@ impl FilterSpec {
             Self::Hsv { .. } => "Hue/Saturation/Value",
             Self::Curves { .. } => "Curves",
             Self::Invert => "Invert",
-            Self::BoxBlur { .. } => "Blur",
+            Self::Blur {
+                kind: BlurKind::Box,
+                ..
+            } => "Blur",
+            Self::Blur {
+                kind: BlurKind::Gaussian,
+                ..
+            } => "Gaussian Blur",
             Self::Sharpen { .. } => "Sharpen",
         }
     }
@@ -103,12 +134,21 @@ pub fn apply_cpu(
             point_filter(src, |bgra| curves_pixel(bgra, &lut))
         }
         FilterSpec::Invert => point_filter(src, invert_pixel),
-        FilterSpec::BoxBlur { radius_x, radius_y } => {
-            box_blur(src, w, h, radius_x.round() as i32, radius_y.round() as i32)
+        FilterSpec::Blur {
+            kind,
+            radius_x,
+            radius_y,
+        } => {
+            let kernel = match kind {
+                BlurKind::Box => box_weights,
+                BlurKind::Gaussian => gaussian_weights,
+            };
+            let (kernel_x, kernel_y) = (kernel(radius_x.round() as i32), kernel(radius_y.round() as i32));
+            separable_blur(src, w, h, &kernel_x, &kernel_y)
         }
         FilterSpec::Sharpen { amount } => {
-            let r = FilterSpec::SHARPEN_BLUR_RADIUS.round() as i32;
-            let blurred = box_blur(src, w, h, r, r);
+            let kernel = box_weights(FilterSpec::SHARPEN_BLUR_RADIUS.round() as i32);
+            let blurred = separable_blur(src, w, h, &kernel, &kernel);
             sharpen(src, &blurred, amount)
         }
     };
@@ -234,21 +274,42 @@ fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (f32, f32, f32) {
     }
 }
 
-fn box_blur(src: &[u8], w: usize, h: usize, radius_x: i32, radius_y: i32) -> Vec<u8> {
-    let horizontal = blur_axis(src, w, h, radius_x.max(0), true);
-    blur_axis(&horizontal, w, h, radius_y.max(0), false)
+fn separable_blur(src: &[u8], w: usize, h: usize, kernel_x: &[f32], kernel_y: &[f32]) -> Vec<u8> {
+    let horizontal = blur_axis(src, w, h, kernel_x, true);
+    blur_axis(&horizontal, w, h, kernel_y, false)
 }
 
-fn blur_axis(src: &[u8], w: usize, h: usize, radius: i32, horizontal: bool) -> Vec<u8> {
+fn box_weights(radius: i32) -> Vec<f32> {
+    let taps = 2 * radius.max(0) + 1;
+    vec![1.0 / taps as f32; taps as usize]
+}
+
+/// Ratio between neighbouring Gaussian taps (tap `i` weighs `ratio^(i*i)`),
+/// which is what the GPU shader receives. Sigma ~= radius / 3 and the kernel
+/// stops at the radius, so small radii are cut off before fully fading.
+pub(crate) fn gaussian_ratio(radius: f32) -> f32 {
+    let sigma = 0.3 * radius.round().max(0.0) + 0.3;
+    (-0.5 / (sigma * sigma)).exp()
+}
+
+fn gaussian_weights(radius: i32) -> Vec<f32> {
+    let radius = radius.max(0);
+    let ratio = gaussian_ratio(radius as f32);
+    let weights: Vec<f32> = (-radius..=radius).map(|i| ratio.powi(i * i)).collect();
+    let total: f32 = weights.iter().sum();
+    weights.iter().map(|weight| weight / total).collect()
+}
+
+fn blur_axis(src: &[u8], w: usize, h: usize, weights: &[f32], horizontal: bool) -> Vec<u8> {
+    let radius = (weights.len() / 2) as i32;
     if radius == 0 {
         return src.to_vec();
     }
     let mut out = vec![0u8; src.len()];
-    let count = f32::from(u16::try_from(2 * radius + 1).unwrap_or(u16::MAX));
     for y in 0..h {
         for x in 0..w {
             let mut sum = [0.0f32; 4];
-            for k in -radius..=radius {
+            for (k, weight) in (-radius..=radius).zip(weights) {
                 let (sx, sy) = if horizontal {
                     ((x as i32 + k).clamp(0, w as i32 - 1) as usize, y)
                 } else {
@@ -256,12 +317,12 @@ fn blur_axis(src: &[u8], w: usize, h: usize, radius: i32, horizontal: bool) -> V
                 };
                 let i = (sy * w + sx) * 4;
                 for c in 0..4 {
-                    sum[c] += f32::from(src[i + c]);
+                    sum[c] += f32::from(src[i + c]) * weight;
                 }
             }
             let o = (y * w + x) * 4;
             for c in 0..4 {
-                out[o + c] = (sum[c] / count).round().clamp(0.0, 255.0) as u8;
+                out[o + c] = sum[c].round().clamp(0.0, 255.0) as u8;
             }
         }
     }
@@ -306,6 +367,7 @@ fn mask_mix(original: &[u8], filtered: &[u8], mask: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::enum_meta::EnumMeta;
 
     // A 2x2 premultiplied BGRA8 swatch with assorted opaque/translucent
     // colors. Opaque so premultiplied == straight for the simple channels.
@@ -385,60 +447,68 @@ mod tests {
         }
     }
 
+    const fn blur(kind: BlurKind, radius: f32) -> FilterSpec {
+        FilterSpec::Blur {
+            kind,
+            radius_x: radius,
+            radius_y: radius,
+        }
+    }
+
+    fn spike(size: usize) -> (Vec<u8>, usize) {
+        let mut src = vec![0u8; size * size * 4];
+        let center = (size / 2 * size + size / 2) * 4;
+        src[center] = 255;
+        src[center + 3] = 255;
+        (src, center)
+    }
+
     #[test]
     fn blur_of_constant_is_constant() {
         let src = [40u8, 80, 120, 255].repeat(16); // 4x4 solid
-        let out = apply_cpu(
-            FilterSpec::BoxBlur {
-                radius_x: 2.0,
-                radius_y: 2.0,
-            },
-            &src,
-            4,
-            4,
-            None,
-        );
-        assert_eq!(out, src, "blurring a flat color must not change it");
+        for &kind in BlurKind::ALL {
+            let out = apply_cpu(blur(kind, 2.0), &src, 4, 4, None);
+            assert_eq!(out, src, "{kind:?} blur changed a flat color");
+        }
     }
 
     #[test]
     fn blur_zero_radius_is_identity() {
         let src = swatch();
-        let out = apply_cpu(
-            FilterSpec::BoxBlur {
-                radius_x: 0.0,
-                radius_y: 0.0,
-            },
-            &src,
-            2,
-            2,
-            None,
-        );
-        assert_eq!(out, src);
+        for &kind in BlurKind::ALL {
+            assert_eq!(apply_cpu(blur(kind, 0.0), &src, 2, 2, None), src);
+        }
     }
 
     #[test]
     fn blur_averages_a_spike() {
-        // Single bright pixel in a 3x3 black field; a radius-1 box blur
-        // should spread it and lower the center.
-        let mut src = vec![0u8; 3 * 3 * 4];
-        // Spelled out as (row * width + col) * 4 to show which pixel this is.
-        #[allow(clippy::identity_op)]
-        let center = (1 * 3 + 1) * 4;
-        src[center] = 255;
-        src[center + 3] = 255; // alpha
-        let out = apply_cpu(
-            FilterSpec::BoxBlur {
-                radius_x: 1.0,
-                radius_y: 1.0,
-            },
-            &src,
-            3,
-            3,
-            None,
-        );
+        let (src, center) = spike(3);
+        let out = apply_cpu(blur(BlurKind::Box, 1.0), &src, 3, 3, None);
         assert!(out[center] < 255, "center should be reduced by blur");
         assert!(out[0] > 0, "corner should pick up some energy");
+    }
+
+    #[test]
+    fn gaussian_blur_keeps_more_of_a_spike_than_box() {
+        let (src, center) = spike(9);
+        let gaussian = apply_cpu(blur(BlurKind::Gaussian, 3.0), &src, 9, 9, None);
+        let boxed = apply_cpu(blur(BlurKind::Box, 3.0), &src, 9, 9, None);
+        assert!(gaussian[center] > boxed[center]);
+        assert!(gaussian[center + 4] > 0 && gaussian[center + 4] < gaussian[center]);
+        let alpha_sum = |px: &[u8]| px.chunks_exact(4).map(|p| u32::from(p[3])).sum::<u32>();
+        assert!(alpha_sum(&gaussian).abs_diff(255) <= 40, "{}", alpha_sum(&gaussian));
+    }
+
+    #[test]
+    fn gaussian_weights_are_normalized_and_peak_at_center() {
+        for radius in [2, 4, 100] {
+            let weights = gaussian_weights(radius);
+            assert_eq!(weights.len(), 2 * radius as usize + 1);
+            assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-4);
+            let center = weights[radius as usize];
+            assert!(weights.iter().all(|&w| w <= center));
+            assert!(weights[0] < center * 0.1, "radius {radius} edge {}", weights[0]);
+        }
     }
 
     #[test]

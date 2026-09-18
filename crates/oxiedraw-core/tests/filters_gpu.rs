@@ -5,7 +5,8 @@
 
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::curves::{Curve, CurveChannel, CurvePoint, CurveSet};
-use oxiedraw_core::filters::FilterSpec;
+use oxiedraw_core::enum_meta::EnumMeta;
+use oxiedraw_core::filters::{BlurKind, FilterSpec, apply_cpu};
 use oxiedraw_core::selection::{RectShape, SelectionShape};
 use oxiedraw_core::tools::SelectionMode;
 use oxiedraw_utils::geometry::Size;
@@ -78,30 +79,52 @@ fn hsv_value_zero_blackens() {
     assert_eq!(out[3], 255, "alpha preserved");
 }
 
+const fn blur(kind: BlurKind, radius: f32) -> FilterSpec {
+    FilterSpec::Blur {
+        kind,
+        radius_x: radius,
+        radius_y: radius,
+    }
+}
+
+fn white_spike(size: Size) -> (Vec<u8>, usize) {
+    let mut px = vec![0u8; (size.width * size.height) as usize * 4];
+    let center = ((size.height / 2 * size.width + size.width / 2) * 4) as usize;
+    px[center..center + 4].copy_from_slice(&[255, 255, 255, 255]);
+    (px, center)
+}
+
 #[test]
 fn blur_spreads_a_spike() {
     let size = Size::new(8, 8);
+    let (px, center) = white_spike(size);
+    for &kind in BlurKind::ALL {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let idx = canvas.add_layer_with_pixels("t", &px).unwrap();
+        canvas.apply_filter(&[idx], blur(kind, 2.0)).unwrap();
+        let out = canvas.read_layer(idx).unwrap();
+
+        assert!(out[center + 3] < 255, "{kind:?}: center alpha should drop");
+        assert!(out[center + 4 + 3] > 0, "{kind:?}: neighbor should gain coverage");
+    }
+}
+
+#[test]
+fn gaussian_blur_alpha_matches_cpu_reference() {
+    let size = Size::new(24, 24);
+    let (px, center) = white_spike(size);
+    let spec = blur(BlurKind::Gaussian, 5.0);
     let mut canvas = Canvas::headless(size).unwrap();
-    let mut px = vec![0u8; (size.width * size.height) as usize * 4];
-    let center = (4 * 8 + 4) * 4;
-    px[center..center + 4].copy_from_slice(&[255, 255, 255, 255]);
     let idx = canvas.add_layer_with_pixels("t", &px).unwrap();
+    canvas.apply_filter(&[idx], spec).unwrap();
+    let gpu = canvas.read_layer(idx).unwrap();
+    let cpu = apply_cpu(spec, &px, size.width, size.height, None);
 
-    canvas
-        .apply_filter(
-            &[idx],
-            FilterSpec::BoxBlur {
-                radius_x: 2.0,
-                radius_y: 2.0,
-            },
-        )
-        .unwrap();
-    let out = canvas.read_layer(idx).unwrap();
-
-    assert!(out[center + 3] < 255, "center alpha should drop after blur");
-    // A neighbor within the blur radius should pick up some energy.
-    let neighbor = (4 * 8 + 5) * 4;
-    assert!(out[neighbor + 3] > 0, "neighbor should gain coverage");
+    for (i, (g, c)) in gpu.chunks_exact(4).zip(cpu.chunks_exact(4)).enumerate() {
+        assert!(near(g[3], c[3], 1), "alpha at {i}: gpu {} cpu {}", g[3], c[3]);
+    }
+    let boxed = apply_cpu(blur(BlurKind::Box, 5.0), &px, size.width, size.height, None);
+    assert!(gpu[center + 3] > boxed[center + 3] + 2);
 }
 
 #[test]
