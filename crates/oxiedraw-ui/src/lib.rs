@@ -20,6 +20,7 @@ mod panels;
 mod perf_graph;
 mod preferences_window;
 mod project_io;
+mod recording;
 mod session;
 mod settings;
 mod splash;

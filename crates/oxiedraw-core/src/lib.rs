@@ -35,6 +35,7 @@ pub mod history;
 pub mod liquify;
 pub mod patterns;
 pub mod project;
+pub mod recording;
 pub mod renderer;
 pub mod selection;
 pub mod serde_defaults;

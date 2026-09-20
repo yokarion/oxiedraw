@@ -29,6 +29,14 @@ use relm4::gtk::subclass::prelude::ObjectSubclassIsExt;
 const CHECKER_TILE: u32 = 128;
 
 const BACKDROP_BLUE: f32 = 0.14;
+const BACKDROP_RED_GREEN: f32 = 0.12;
+
+/// The off-canvas backdrop as sRGB bytes, for exports that frame the artwork.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub(crate) fn backdrop_rgb8() -> [u8; 3] {
+    let byte = |v: f32| (v * 255.0).round() as u8;
+    [byte(BACKDROP_RED_GREEN), byte(BACKDROP_RED_GREEN), byte(BACKDROP_BLUE)]
+}
 /// One cell inside a tile, in canvas pixels. `TILE = 2 * CELL`.
 const CHECKER_CELL: u32 = 64;
 
@@ -2401,13 +2409,14 @@ mod imp {
             } else {
                 BACKDROP_BLUE
             };
-            snapshot.append_color(&gdk::RGBA::new(0.12, 0.12, blue, 1.0), &widget_rect);
+            let rg = super::BACKDROP_RED_GREEN;
+            snapshot.append_color(&gdk::RGBA::new(rg, rg, blue, 1.0), &widget_rect);
 
             // 1b. One backdrop-coloured pixel under everything else, so the
             // pump's frame is never an empty one - see `request_damage`.
             if self.force_damage.replace(false) {
                 snapshot.append_color(
-                    &gdk::RGBA::new(0.12, 0.12, self.jittered_backdrop_blue(), 1.0),
+                    &gdk::RGBA::new(rg, rg, self.jittered_backdrop_blue(), 1.0),
                     &graphene::Rect::new(0.0, 0.0, 1.0, 1.0),
                 );
             }

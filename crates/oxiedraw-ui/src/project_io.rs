@@ -14,6 +14,7 @@ use gtk::gio;
 use gtk::glib;
 
 use oxiedraw_core::project::{self, format::OxieProject};
+use oxiedraw_core::recording::RecordingManifest;
 use oxiedraw_utils::frame_profile;
 
 use crate::session::DocumentSession;
@@ -138,6 +139,8 @@ fn write_project(
     // without this the saved file has none of the pattern on screen.
     session.pattern_edit.commit();
 
+    let (recording, recording_ticket) = session.recording.prepare_save();
+
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();
@@ -166,7 +169,7 @@ fn write_project(
             view_rotation,
             guide,
         ) {
-            Ok(s) => s,
+            Ok(s) => s.with_recording(Some(recording)),
             Err(e) => {
                 if kind == SaveKind::Manual {
                     show_error(window, "Save Failed", &e.to_string());
@@ -189,7 +192,7 @@ fn write_project(
         .then(|| session.global.toaster.pending("Saving project..."));
 
     // Phase 2 (worker thread): PNG-encode + write the TAR archive.
-    let (tx, rx) = mpsc::channel::<Result<(), String>>();
+    let (tx, rx) = mpsc::channel::<Result<Option<RecordingManifest>, String>>();
     let path_for_worker = path.clone();
     std::thread::spawn(move || {
         let result = project::save::write_snapshot(&snapshot, &path_for_worker, backup_count)
@@ -215,12 +218,13 @@ fn write_project(
             t.dismiss();
         }
         match (outcome, kind) {
-            (Ok(()), SaveKind::Manual) => {
+            (Ok(recording), SaveKind::Manual) => {
                 tracing::info!(path = %path.display(), "project saved");
                 *session.file_path.borrow_mut() = Some(path.clone());
                 if let Some(stem) = path.file_stem() {
                     *session.title.borrow_mut() = stem.to_string_lossy().into_owned();
                 }
+                session.recording.saved_to(&path, recording, &recording_ticket);
                 session.mark_saved();
                 session.refresh_tab_title();
                 // The document now lives in a real file; drop any recovery copy.
@@ -228,12 +232,13 @@ fn write_project(
 
                 session.global.toaster.info("Project saved!");
             }
-            (Ok(()), SaveKind::Autosave) => {
+            (Ok(recording), SaveKind::Autosave) => {
                 tracing::debug!(path = %path.display(), "autosaved project");
+                session.recording.saved_to(&path, recording, &recording_ticket);
                 session.mark_saved();
                 session.refresh_tab_title();
             }
-            (Ok(()), SaveKind::Recovery) => {
+            (Ok(_), SaveKind::Recovery) => {
                 tracing::debug!(path = %path.display(), "wrote recovery autosave");
             }
             (Err(e), SaveKind::Manual) => show_error(&window, "Save Failed", &e),

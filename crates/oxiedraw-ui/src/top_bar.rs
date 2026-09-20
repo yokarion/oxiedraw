@@ -17,7 +17,10 @@ pub(crate) fn style_control(widget: &impl IsA<gtk::Widget>) {
     widget.set_height_request(CONTROL_HEIGHT);
 }
 
-pub(crate) fn build(layout_control: &gtk::Widget) -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
+pub(crate) fn build(
+    layout_control: &gtk::Widget,
+    record_control: &gtk::Widget,
+) -> (gtk::WindowHandle, impl Fn(bool) + 'static) {
     load_css();
     let handle = gtk::WindowHandle::new();
 
@@ -58,6 +61,7 @@ pub(crate) fn build(layout_control: &gtk::Widget) -> (gtk::WindowHandle, impl Fn
     bar.append(&spacer);
 
     bar.append(layout_control);
+    bar.append(record_control);
     bar.append(&build_guide_control());
 
     let primary_btn = gtk::MenuButton::builder()

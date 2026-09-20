@@ -20,6 +20,7 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
     let mut document_bytes: Option<Vec<u8>> = None;
     let mut components_bytes: Option<Vec<u8>> = None;
     let mut fonts_bytes: Option<Vec<u8>> = None;
+    let mut recording_bytes: Option<Vec<u8>> = None;
     // Layer PNGs kept in archive order, which is the layer z-order the writer
     // emits. We pair them to layer entries positionally rather than by id, so a
     // file with duplicate layer ids (a known pre-fix corruption) keeps every
@@ -30,13 +31,19 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
     // Embedded font files keyed by content hash.
     let mut font_files: HashMap<String, Vec<u8>> = HashMap::new();
 
-    for entry_result in archive.entries()? {
+    // Seekable, so the recording segments below are stepped over, not read.
+    for entry_result in archive.entries_with_seek()? {
         let mut entry = entry_result?;
         let entry_path = entry.path()?.to_string_lossy().into_owned();
+        if entry_path.starts_with(crate::recording::SEGMENT_DIR) {
+            continue;
+        }
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes)?;
 
-        if entry_path == "manifest.json" {
+        if entry_path == crate::recording::MANIFEST_ENTRY {
+            recording_bytes = Some(bytes);
+        } else if entry_path == "manifest.json" {
             manifest_bytes = Some(bytes);
         } else if entry_path == "document.json" {
             document_bytes = Some(bytes);
@@ -150,6 +157,13 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
         None => Vec::new(),
     };
 
+    // An unreadable index costs the recording, not the artwork.
+    let recording = recording_bytes.and_then(|bytes| {
+        serde_json::from_slice(&bytes)
+            .inspect_err(|e| tracing::warn!(err = %e, "recording.json unreadable, recording ignored"))
+            .ok()
+    });
+
     Ok(OxieProject {
         manifest,
         document,
@@ -158,6 +172,7 @@ pub fn load(path: &Path) -> Result<OxieProject, ProjectError> {
         component_pixels,
         fonts,
         font_bytes: font_files,
+        recording,
     })
 }
 
@@ -335,6 +350,7 @@ mod tests {
             component_pixels: HashMap::from([("c1/l1".to_string(), pixels.clone())]),
             fonts: Vec::new(),
             font_bytes: HashMap::new(),
+            recording: None,
         };
 
         let lib = build_components(&project);

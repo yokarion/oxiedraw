@@ -7,6 +7,8 @@ use tar::{Builder, Header};
 use crate::canvas::Canvas;
 use crate::components::ComponentLibrary;
 use crate::document::DocumentProperties;
+use crate::recording::RecordingManifest;
+use crate::recording::segments::{RecordingPayload, write_to_archive};
 use crate::text::fonts::{FontMeta, FontRegistry};
 
 use super::ProjectError;
@@ -34,6 +36,15 @@ pub struct ProjectSnapshot {
     fonts: Vec<FontMeta>,
     /// `(hash, font-file bytes)` for each embedded font.
     font_bytes: Vec<(String, Vec<u8>)>,
+    recording: Option<RecordingPayload>,
+}
+
+impl ProjectSnapshot {
+    #[must_use]
+    pub fn with_recording(mut self, recording: Option<RecordingPayload>) -> Self {
+        self.recording = recording;
+        self
+    }
 }
 
 /// Collect a [`ProjectSnapshot`] from the canvas. Reads each layer back from the
@@ -132,6 +143,7 @@ pub fn snapshot(
         component_layers,
         fonts: font_meta,
         font_bytes,
+        recording: None,
     })
 }
 
@@ -139,28 +151,31 @@ pub fn snapshot(
 /// call off the main thread. Builds into a temp sibling and atomically renames
 /// over `path`, so a failed write never truncates the old file. `backup_count`
 /// > 0 first rotates the previous file into `<path>-1`..`-N` (`-N` newest); 0
-/// overwrites without backups.
+/// overwrites without backups. Returns the recording index that was written.
 pub fn write_snapshot(
     snapshot: &ProjectSnapshot,
     path: &Path,
     backup_count: usize,
-) -> Result<(), ProjectError> {
+) -> Result<Option<RecordingManifest>, ProjectError> {
     let tmp_path = temp_path_for(path);
 
     // Fsync the temp file before it is renamed into place.
-    let build = (|| -> Result<(), ProjectError> {
+    let build = (|| -> Result<Option<RecordingManifest>, ProjectError> {
         let file = std::fs::File::create(&tmp_path)?;
         let mut archive = Builder::new(file);
-        build_archive(&mut archive, snapshot)?;
+        let recording = build_archive(&mut archive, snapshot)?;
         archive.finish()?;
         archive.into_inner()?.sync_all()?;
-        Ok(())
+        Ok(recording)
     })();
 
-    if let Err(e) = build {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    let recording = match build {
+        Ok(recording) => recording,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
 
     // A rotation hiccup must not abort the save, so log rather than propagate.
     if backup_count > 0
@@ -174,7 +189,7 @@ pub fn write_snapshot(
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e.into());
     }
-    Ok(())
+    Ok(recording)
 }
 
 /// The path of numbered backup `slot` for `main` (e.g. `foo.oxiedrawproj-2`).
@@ -204,12 +219,12 @@ fn rotate_backups(main: &Path, count: usize) -> std::io::Result<()> {
     std::fs::rename(main, backup_path(main, count))
 }
 
-/// Write every archive entry (manifest, document, layers, components, fonts)
-/// into `archive`. The first failing entry aborts the whole build.
+/// Write every archive entry (manifest, document, layers, components, fonts,
+/// recording) into `archive`. The first failing entry aborts the whole build.
 fn build_archive<W: Write>(
     archive: &mut Builder<W>,
     snapshot: &ProjectSnapshot,
-) -> Result<(), ProjectError> {
+) -> Result<Option<RecordingManifest>, ProjectError> {
     let manifest = Manifest {
         schema_version: SCHEMA_VERSION,
         app_version: APP_VERSION.to_string(),
@@ -242,7 +257,10 @@ fn build_archive<W: Write>(
         }
     }
 
-    Ok(())
+    match &snapshot.recording {
+        Some(payload) => Ok(write_to_archive(archive, payload)?),
+        None => Ok(None),
+    }
 }
 
 /// Sibling temp path next to `path` (same filesystem, so the rename is atomic).
@@ -265,7 +283,7 @@ pub fn save(
     path: &Path,
 ) -> Result<(), ProjectError> {
     let snap = snapshot(canvas, props, components, fonts, gradient, view_rotation, guide)?;
-    write_snapshot(&snap, path, 0)
+    write_snapshot(&snap, path, 0).map(|_| ())
 }
 
 fn append_json<W, T>(archive: &mut Builder<W>, name: &str, value: &T) -> Result<(), ProjectError>
@@ -315,14 +333,16 @@ fn utc_timestamp_now() -> String {
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
+    let [year, month, day, hour, min, sec] = utc_fields(secs);
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+/// `[year, month, day, hour, minute, second]` in UTC for a Unix time.
+pub(crate) const fn utc_fields(secs: u64) -> [u64; 6] {
     let secs_per_day = 86_400_u64;
     let day_secs = secs % secs_per_day;
-    let days = secs / secs_per_day;
-    let hour = day_secs / 3600;
-    let min = (day_secs % 3600) / 60;
-    let sec = day_secs % 60;
-    let (year, month, day) = unix_days_to_ymd(days);
-    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{min:02}:{sec:02}Z")
+    let (year, month, day) = unix_days_to_ymd(secs / secs_per_day);
+    [year, month, day, day_secs / 3600, (day_secs % 3600) / 60, day_secs % 60]
 }
 
 #[allow(clippy::manual_div_ceil)]
@@ -385,6 +405,7 @@ mod tests {
             component_layers: Vec::new(),
             fonts: Vec::new(),
             font_bytes: Vec::new(),
+            recording: None,
         }
     }
 
@@ -433,6 +454,7 @@ mod tests {
             component_layers: Vec::new(),
             fonts: Vec::new(),
             font_bytes: Vec::new(),
+            recording: None,
         }
     }
 
@@ -618,6 +640,70 @@ mod tests {
         assert!(main.exists());
         assert!(!backup_path(&main, 1).exists(), "count 0 makes no backups");
         load::load(&main).expect("main still valid");
+        cleanup(&main);
+    }
+
+    fn recorded_frames(tag: &str, values: &[u8]) -> crate::recording::segments::FreshFrames {
+        use crate::recording::codec::{Encoded, Frame, FrameEncoder};
+        let mut encoder = FrameEncoder::default();
+        let mut bytes = Vec::new();
+        for (i, &v) in values.iter().enumerate() {
+            let frame = Frame { width: 4, height: 4, pixels: vec![v; 64] };
+            if let Ok(Encoded::Record(r)) = encoder.encode(frame, 0, i as u64 + 1) {
+                bytes.extend_from_slice(&r);
+            }
+        }
+        let path = unique_main(tag).with_extension("spool");
+        std::fs::write(&path, &bytes).expect("test io");
+        crate::recording::segments::FreshFrames {
+            source: crate::recording::segments::SegmentSource::new(
+                std::fs::File::open(&path).expect("test io"),
+                0,
+                bytes.len() as u64,
+            ),
+            frames: values.len() as u64,
+        }
+    }
+
+    // The loader indexes the recording without reading its frames, and the next
+    // save copies the saved segment across before adding the new one.
+    #[test]
+    fn recording_survives_save_load_and_resave() {
+        use crate::recording::RecordingSettings;
+        use crate::recording::segments::{FrameReader, RecordingPayload, entry_path, find_in_archive};
+
+        let main = unique_main("recording");
+        let first = RecordingPayload {
+            settings: RecordingSettings { auto_start: true, ..RecordingSettings::default() },
+            source: None,
+            saved: Vec::new(),
+            fresh: Some(recorded_frames("rec1", &[1, 2, 3])),
+        };
+        let written = write_snapshot(&valid_snapshot(2, 2, &["a"]).with_recording(Some(first)), &main, 0)
+            .expect("write")
+            .expect("recording written");
+        let loaded = load::load(&main).expect("load").recording.expect("index loaded");
+        assert_eq!(loaded, written);
+        assert!(loaded.settings.auto_start);
+
+        let second = RecordingPayload {
+            settings: loaded.settings,
+            source: Some(main.clone()),
+            saved: loaded.segments.clone(),
+            fresh: Some(recorded_frames("rec2", &[4, 5])),
+        };
+        let resaved = write_snapshot(&valid_snapshot(2, 2, &["a"]).with_recording(Some(second)), &main, 0)
+            .expect("second write")
+            .expect("recording written");
+        assert_eq!(resaved.segments.len(), 2);
+        let entries: Vec<String> = resaved.segments.iter().map(|s| entry_path(&s.name)).collect();
+        let mut reader = FrameReader::new(find_in_archive(&main, &entries).expect("segments"));
+        let mut frames = 0;
+        while let Some(h) = reader.next_header().expect("header") {
+            reader.skip_payload(&h).expect("skip");
+            frames += 1;
+        }
+        assert_eq!(frames, 5);
         cleanup(&main);
     }
 

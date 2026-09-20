@@ -1045,6 +1045,46 @@ impl Canvas {
             .render_preview_layered_into(&visibilities, ctx.layer_idx, linear, ctx.opacity, out)
     }
 
+    /// Start a non-blocking readback of what the canvas shows, for the
+    /// recorder. False when there is nothing to capture yet.
+    pub fn begin_frame_capture(&mut self, halvings: u32) -> Result<bool, RendererError> {
+        // The stroke preview is only worth reading once a present has built it
+        // for this version; before that it still holds the previous frame.
+        let from_preview = self.current_stroke.is_some();
+        if from_preview && self.display_version != self.pixels_version {
+            return Ok(false);
+        }
+        if !from_preview {
+            self.sync_canvas_for_liquify()?;
+        }
+        self.renderer.begin_capture(from_preview, halvings)
+    }
+
+    /// False once a started capture was taken, or lost with a renderer rebuilt
+    /// for a new canvas size.
+    #[must_use]
+    pub fn frame_capture_pending(&self) -> bool {
+        self.renderer.capture_pending()
+    }
+
+    /// Take a finished capture into `out`, returning its size. `wait` blocks
+    /// until the GPU is done instead of returning `None`.
+    pub fn take_frame_capture(
+        &mut self,
+        out: &mut Vec<u8>,
+        wait: bool,
+    ) -> Result<Option<(u32, u32)>, RendererError> {
+        self.renderer.poll_capture(out, wait)
+    }
+
+    /// True while the canvas shows something other than the document: a
+    /// transform preview (built without the layers above the target), or an
+    /// adjustment mask toggled into view.
+    #[must_use]
+    pub fn capture_blocked(&self) -> bool {
+        self.renderer.transform_preview_active() || self.mask_view_id.is_some()
+    }
+
     /// Like [`Self::read_layer`] but fills a caller-owned buffer.
     pub fn read_layer_into(&mut self, idx: usize, out: &mut Vec<u8>) -> Result<(), RendererError> {
         self.renderer.read_layer_into(idx, out)

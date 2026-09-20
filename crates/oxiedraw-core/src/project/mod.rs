@@ -4,9 +4,11 @@
 //! first, then `document.json`, then `layers/<layer-id>.png`:
 //!
 //! ```text
-//! manifest.json     schema_version, app_version, created_at
-//! document.json     canvas size/dpi, active layer, ordered layer list
-//! layers/<id>.png   RGBA8 sRGB; R/B swapped against the BGRA Vulkan layers
+//! manifest.json            schema_version, app_version, created_at
+//! document.json            canvas size/dpi, active layer, ordered layer list
+//! layers/<id>.png          RGBA8 sRGB; R/B swapped against the BGRA Vulkan layers
+//! recording.json           timelapse settings + segment index (optional)
+//! recording/seg-NNNNN.bin  timelapse frames, never read on load
 //! ```
 //!
 //! Schema or canvas-size mismatches are rejected (`UnsupportedSchema`,
@@ -45,6 +47,8 @@ pub enum ProjectError {
     Renderer(#[from] RendererError),
     #[error("project contains no layers")]
     NoLayers,
+    #[error("recording: {0}")]
+    Recording(#[from] crate::recording::RecordingError),
 }
 
 #[cfg(test)]

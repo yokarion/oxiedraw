@@ -111,8 +111,11 @@ impl SimpleComponent for AppModel {
         let dock_widget = dock.widget();
         let layouts = crate::dock::manager::LayoutManager::new(&dock, settings.layout.clone());
 
-        let (top_bar_widget, apply_decorations) =
-            top_bar::build(&crate::dock::selector::build(&layouts, &root));
+        let record_button = crate::recording::RecordButton::new();
+        let (top_bar_widget, apply_decorations) = top_bar::build(
+            &crate::dock::selector::build(&layouts, &root),
+            &record_button.widget(),
+        );
         let apply_decorations: Rc<dyn Fn(bool)> = Rc::new(apply_decorations);
 
         let widgets = view_output!();
@@ -132,6 +135,7 @@ impl SimpleComponent for AppModel {
             history_capacity,
             untitled_counter: Cell::new(0),
             last_autosave: Cell::new(std::time::Instant::now()),
+            record_button,
         });
 
         {

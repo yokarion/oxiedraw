@@ -32,8 +32,10 @@ use crate::text::fonts::FontMeta;
 /// Absent in pre-v12 files (both off).
 /// v13 adds the Curves adjustment effect and the Blur effect's `kind`, so older
 /// builds refuse the file cleanly.
-pub const SCHEMA_VERSION: u32 = 13;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+/// v14 adds the timelapse recording (`recording.json` + `recording/seg-*.bin`),
+/// so an older build can't open the file and drop the recording on its next save.
+pub const SCHEMA_VERSION: u32 = 14;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -136,4 +138,6 @@ pub struct OxieProject {
     pub fonts: Vec<FontMeta>,
     /// Embedded font file bytes keyed by content hash (from `fonts/<hash>`).
     pub font_bytes: HashMap<String, Vec<u8>>,
+    /// Recording index (pre-v14: none). The frames stay on disk until needed.
+    pub recording: Option<crate::recording::RecordingManifest>,
 }

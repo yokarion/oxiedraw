@@ -178,6 +178,7 @@ pub(crate) struct DocumentSession {
     pub(crate) tab_page: Rc<RefCell<Option<adw::TabPage>>>,
     pub(crate) recovery_file: RefCell<Option<PathBuf>>,
     pub(crate) last_autosave_len: Cell<Option<usize>>,
+    pub(crate) recording: Rc<crate::recording::Recorder>,
     _alive: Rc<()>,
 }
 
@@ -1088,19 +1089,30 @@ impl DocumentSession {
         let tab_page: Rc<RefCell<Option<adw::TabPage>>> = Rc::new(RefCell::new(None));
         let alive = Rc::new(());
 
+        let recording = {
+            let edit_mode = Rc::clone(&edit_mode);
+            let transform = transform.clone();
+            let blocked: Rc<dyn Fn() -> bool> = Rc::new(move || {
+                edit_mode.borrow().is_some() || transform.has_targets() || transform.rect.get().is_some()
+            });
+            crate::recording::Recorder::new(viewport.clone(), blocked)
+        };
+
         {
             let weak = Rc::downgrade(&alive);
             let history = Rc::clone(&history);
             let saved = Rc::clone(&saved_marker);
             let title = Rc::clone(&title);
             let tab_page = Rc::clone(&tab_page);
+            let recording = Rc::downgrade(&recording);
             let last_dirty = Cell::new(false);
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 let _span = frame_profile::span(frame_profile::Stage::Timers);
                 if weak.upgrade().is_none() {
                     return glib::ControlFlow::Break;
                 }
-                let dirty = history.borrow().undo_len() != saved.get();
+                let dirty = history.borrow().undo_len() != saved.get()
+                    || recording.upgrade().is_some_and(|r| r.is_dirty());
                 if dirty != last_dirty.get() {
                     last_dirty.set(dirty);
                     if let Some(page) = tab_page.borrow().as_ref() {
@@ -1163,12 +1175,13 @@ impl DocumentSession {
             tab_page,
             recovery_file: RefCell::new(None),
             last_autosave_len: Cell::new(None),
+            recording,
             _alive: alive,
         })
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
-        self.history.borrow().undo_len() != self.saved_marker.get()
+        self.history.borrow().undo_len() != self.saved_marker.get() || self.recording.is_dirty()
     }
 
     pub(crate) fn mark_saved(&self) {

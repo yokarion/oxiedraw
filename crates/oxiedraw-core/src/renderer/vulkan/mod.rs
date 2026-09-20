@@ -11,6 +11,7 @@
 //! - `transform_ops` - GPU affine transform applied to a single layer
 
 mod adjust_ops;
+mod capture_ops;
 mod curves_ops;
 mod fill_ops;
 mod filter_ops;
@@ -372,6 +373,9 @@ pub struct VulkanRenderer {
     /// Liquify tool has a layer open.
     pub(super) liquify: Option<LiquifySession>,
 
+    /// Recorder readback resources, allocated on the first capture.
+    pub(super) capture: Option<capture_ops::FrameCapture>,
+
     /// Display-side dmabuf image. Per-frame `present_to_display` copies
     /// the chosen source (canvas or preview) into here.
     /// Rotating pool of display dmabuf images (see [`DISPLAY_BUFFERS`]). Each
@@ -724,6 +728,7 @@ impl VulkanRenderer {
             smudge_before: None,
             liquify_pipelines: None,
             liquify: None,
+            capture: None,
             display,
             present_convert: ManuallyDrop::new(present_convert),
             display_framebuffers,
@@ -1396,6 +1401,9 @@ impl Drop for VulkanRenderer {
             let _ = self.device.device_wait_idle();
             if let Some(pipelines) = self.liquify_pipelines.take() {
                 pipelines.destroy(&self.device);
+            }
+            if let Some(capture) = self.capture.take() {
+                capture.destroy(&self.device, &mut self.allocator, self.command_pool);
             }
             self.device.destroy_query_pool(self.timestamp_pool, None);
             for &f in &self.ring_fences {

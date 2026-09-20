@@ -32,6 +32,7 @@ pub(crate) struct TabManager {
     pub(crate) history_capacity: usize,
     pub(crate) untitled_counter: Cell<u32>,
     pub(crate) last_autosave: Cell<Instant>,
+    pub(crate) record_button: crate::recording::RecordButton,
 }
 
 impl TabManager {
@@ -104,6 +105,11 @@ impl TabManager {
         }
     }
 
+    pub(crate) fn sync_record_button(&self) {
+        let on = self.active().is_some_and(|s| s.recording.is_recording());
+        self.record_button.set_recording(on);
+    }
+
     fn next_untitled_title(&self) -> String {
         let n = self.untitled_counter.get() + 1;
         self.untitled_counter.set(n);
@@ -151,6 +157,18 @@ impl TabManager {
                 }
             }));
         }
+        {
+            let manager = Rc::downgrade(self);
+            let owner = Rc::downgrade(session);
+            session.recording.connect_changed(Rc::new(move || {
+                let (Some(manager), Some(owner)) = (manager.upgrade(), owner.upgrade()) else {
+                    return;
+                };
+                if manager.active().is_some_and(|a| Rc::ptr_eq(&a, &owner)) {
+                    manager.sync_record_button();
+                }
+            }));
+        }
 
         let page = self.tab_view.add_page(&session.canvas_root, None);
         page.set_title(&session.display_title());
@@ -193,6 +211,7 @@ impl TabManager {
         (session.set_tool_options)(t);
         (session.set_tool_window)(t);
         self.sync_guide_toggle();
+        self.sync_record_button();
         session.viewport.paintable().set_crop_active(t == Tool::Crop);
         session.viewport.paintable().set_transform_active(t == Tool::Transform);
         session.viewport.paintable().set_guide_editing(t == Tool::DrawingGuide);
@@ -291,6 +310,7 @@ impl TabManager {
     pub(crate) fn on_page_detached(self: &Rc<Self>, page: &adw::TabPage) {
         if let Some(session) = self.session_for_page(page) {
             session.clear_recovery();
+            session.recording.shutdown();
         }
         self.sessions
             .borrow_mut()
@@ -371,6 +391,7 @@ impl TabManager {
 
         *session.components.borrow_mut() = project::load::build_components(&project);
         (session.refresh_components)();
+        session.recording.adopt(project.recording, &path);
         *session.file_path.borrow_mut() = Some(path);
         session.mark_saved();
         (session.refresh_layers)();
@@ -378,6 +399,7 @@ impl TabManager {
         session.viewport.redraw_handle().request();
 
         self.add_session(&session);
+        crate::recording::auto_start(self, &session.recording);
     }
 
     pub(crate) fn connect_tab_signals(self: &Rc<Self>) {
@@ -399,6 +421,7 @@ impl TabManager {
     }
 
     pub(crate) fn register_actions(self: &Rc<Self>, app: &gtk::Application) {
+        crate::recording::register_actions(self, app);
         {
             let manager = Rc::clone(self);
             let action = gio::SimpleAction::new("new", None);

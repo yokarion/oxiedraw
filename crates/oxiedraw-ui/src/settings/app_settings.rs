@@ -19,6 +19,8 @@ pub(crate) struct AppSettings {
     #[serde(default, deserialize_with = "forgiving")]
     pub(crate) export: ExportSettings,
     #[serde(default, deserialize_with = "forgiving")]
+    pub(crate) recording_export: oxiedraw_core::recording::export::ExportOptions,
+    #[serde(default, deserialize_with = "forgiving")]
     pub(crate) pixel_view: PixelViewSettings,
     #[serde(default, deserialize_with = "forgiving")]
     pub(crate) history: HistorySettings,
@@ -192,6 +194,7 @@ impl Default for AppSettings {
             appearance: AppearanceSettings::default(),
             shape_correction: ShapeCorrectionSettings::default(),
             export: ExportSettings::default(),
+            recording_export: oxiedraw_core::recording::export::ExportOptions::default(),
             pixel_view: PixelViewSettings::default(),
             history: HistorySettings::default(),
             save: SaveSettings::default(),
@@ -244,6 +247,26 @@ pub(crate) fn data_dir() -> PathBuf {
 
 pub(crate) fn recovery_dir() -> PathBuf {
     data_dir().join("recovery")
+}
+
+pub(crate) fn cache_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    let base = std::env::var("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."));
+
+    #[cfg(not(target_os = "windows"))]
+    let base = std::env::var("XDG_CACHE_HOME").map_or_else(
+        |_| std::env::var("HOME").map_or_else(|_| PathBuf::from("."), |h| PathBuf::from(h).join(".cache")),
+        PathBuf::from,
+    );
+
+    base.join("oxiedraw")
+}
+
+/// Frames recorded since the last save, one spool file per recording document.
+pub(crate) fn recording_spool_dir() -> PathBuf {
+    cache_dir().join("recordings")
 }
 
 impl AppSettings {
