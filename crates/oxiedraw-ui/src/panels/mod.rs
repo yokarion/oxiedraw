@@ -5,6 +5,7 @@
 pub(crate) mod canvas_info;
 pub(crate) mod color_picker;
 pub(crate) mod layers;
+pub(crate) mod palette;
 pub(crate) mod tool_bar;
 pub(crate) mod tool_options;
 pub(crate) mod tool_windows;

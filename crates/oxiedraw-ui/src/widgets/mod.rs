@@ -2,9 +2,12 @@
 //! the panels.
 
 pub(crate) mod boxed_list;
+pub(crate) mod color_strip;
 pub(crate) mod curve_editor;
 pub(crate) mod curves_panel;
 pub(crate) mod gradient_bar;
 pub(crate) mod gradient_slider;
+pub(crate) mod shapes;
 pub(crate) mod slider;
+pub(crate) mod swatch_grid;
 pub(crate) mod tool_chip;

@@ -32,8 +32,14 @@ pub struct ColorState {
     pub primary: Rc<Cell<Color>>,
     pub secondary: Rc<Cell<Color>>,
     pub selected: Rc<Cell<ColorSlot>>,
-    changed: Rc<RefCell<Vec<Box<dyn Fn()>>>>,
+    changed: Rc<RefCell<Vec<(ObserverId, Box<dyn Fn()>)>>>,
+    used: Rc<RefCell<Vec<Box<dyn Fn(Color)>>>>,
+    next_observer: Rc<Cell<ObserverId>>,
 }
+
+/// Handle from [`ColorState::connect_changed`], so a window that closes can
+/// take its observer back out.
+pub type ObserverId = u64;
 
 impl std::fmt::Debug for ColorState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -52,6 +58,8 @@ impl ColorState {
             secondary: Rc::new(Cell::new(Color::WHITE)),
             selected: Rc::new(Cell::new(ColorSlot::Primary)),
             changed: Rc::new(RefCell::new(Vec::new())),
+            used: Rc::new(RefCell::new(Vec::new())),
+            next_observer: Rc::new(Cell::new(0)),
         }
     }
 
@@ -74,14 +82,36 @@ impl ColorState {
     /// Run all registered change callbacks. Call after mutating a slot
     /// from outside the picker widget so the picker redraws.
     pub fn notify_changed(&self) {
-        for cb in self.changed.borrow().iter() {
+        for (_, cb) in self.changed.borrow().iter() {
             cb();
         }
     }
 
     /// Register a callback fired by [`Self::notify_changed`].
-    pub fn connect_changed(&self, cb: Box<dyn Fn()>) {
-        self.changed.borrow_mut().push(cb);
+    pub fn connect_changed(&self, cb: Box<dyn Fn()>) -> ObserverId {
+        let id = self.next_observer.get();
+        self.next_observer.set(id + 1);
+        self.changed.borrow_mut().push((id, cb));
+        id
+    }
+
+    /// Drop a callback again - windows that come and go must, or their
+    /// observers pile up for the rest of the session.
+    pub fn disconnect_changed(&self, id: ObserverId) {
+        self.changed.borrow_mut().retain(|(existing, _)| *existing != id);
+    }
+
+    /// Announce that `color` was painted with - a stroke, fill or shape. What
+    /// the palette's Recent list is built from; merely choosing one is not.
+    pub fn notify_used(&self, color: Color) {
+        for cb in self.used.borrow().iter() {
+            cb(color);
+        }
+    }
+
+    /// Register a callback fired by [`Self::notify_used`].
+    pub fn connect_used(&self, cb: Box<dyn Fn(Color)>) {
+        self.used.borrow_mut().push(cb);
     }
 }
 
@@ -126,11 +156,10 @@ impl Color {
     /// painting an adjustment-layer mask, which must stay black-gray-white.
     #[must_use]
     pub fn to_grayscale(self) -> Self {
-        let luma = 0.2126 * f32::from(self.r)
-            + 0.7152 * f32::from(self.g)
-            + 0.0722 * f32::from(self.b);
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let v = luma.round().clamp(0.0, 255.0) as u8;
+        let v = color_math::luma(self.r, self.g, self.b)
+            .round()
+            .clamp(0.0, 255.0) as u8;
         Self { r: v, g: v, b: v }
     }
 

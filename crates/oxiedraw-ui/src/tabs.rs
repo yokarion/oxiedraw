@@ -295,6 +295,7 @@ impl TabManager {
 
     pub(crate) fn on_window_close_request(self: &Rc<Self>) -> glib::Propagation {
         self.layouts.flush();
+        (self.global.flush_palettes)();
         let any_dirty = self.sessions.borrow().iter().any(|s| s.is_dirty());
         if !any_dirty {
             return glib::Propagation::Proceed;

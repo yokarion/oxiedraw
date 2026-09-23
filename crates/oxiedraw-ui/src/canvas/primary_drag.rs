@@ -113,6 +113,10 @@ pub(super) struct PrimaryDragHandler {
     // -- brush -----------------------------------------------------------
     brush_engine: BrushEngine,
     colors: ColorState,
+    /// Colour a stroke, fill or shape started painting with. Handed to the
+    /// palette's Recent list at pen-up rather than pen-down: updating a panel
+    /// mid-stroke risks the relayout that cancels a stylus grab.
+    used_color: Cell<Option<Color>>,
     stroke_points: Rc<RefCell<Vec<InputSample>>>,
     pending_color: Rc<Cell<Color>>,
     pending_opacity: Rc<Cell<f32>>,
@@ -361,6 +365,10 @@ impl PrimaryDragHandler {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
+        // Cleared per gesture: a stroke or fill that ends by some path other
+        // than its own pen-up would otherwise leave its colour here for a
+        // later, unrelated gesture to hand to Recent.
+        self.used_color.set(None);
         match self.tools.active.get() {
             Tool::Brush => self.brush_begin(gesture, x, y),
             Tool::Crop => self.crop_begin(x, y),
@@ -854,6 +862,11 @@ impl PrimaryDragHandler {
             tracing::error!(error = %e, "canvas.begin_stroke failed");
             return;
         }
+        // Erasing paints no colour, a mask stroke paints a grey stand-in, and
+        // smudge pushes the pixels already on the layer around.
+        if !erase && !on_adjustment && !smudge {
+            self.used_color.set(Some(color));
+        }
         // Build-up accumulates coverage in the stroke buffer (OVER-blend) so
         // overlapping dabs darken, capped at the stroke opacity by the single
         // commit composite. The render pump presents the live buffer.
@@ -924,6 +937,11 @@ impl PrimaryDragHandler {
     }
 
     fn brush_end(&self) {
+        self.commit_brush_stroke();
+        self.hand_over_used_color();
+    }
+
+    fn commit_brush_stroke(&self) {
         // User lifted the pen - cancel any pending shape-correction idle timer.
         if let Some(src) = self.pending_timer.borrow_mut().take() {
             src.remove();
@@ -1013,6 +1031,12 @@ impl PrimaryDragHandler {
     fn finalize_pending_brush(&self) {
         if self.pending_correction.borrow().is_some() || self.brush_engine.is_drawing() {
             self.brush_end();
+        }
+    }
+
+    fn hand_over_used_color(&self) {
+        if let Some(color) = self.used_color.take() {
+            self.colors.notify_used(color);
         }
     }
 
@@ -1861,6 +1885,7 @@ impl PrimaryDragHandler {
             released: false,
             animate: true,
         });
+        self.used_color.set(Some(primary));
         fill_request(&self.fill_ctx());
     }
 
@@ -1952,6 +1977,7 @@ impl PrimaryDragHandler {
         if done {
             fill_finish(&self.fill_ctx());
         }
+        self.hand_over_used_color();
     }
 
     /// The pieces the fill's async plumbing needs, bundled so the poll
@@ -1972,7 +1998,13 @@ impl PrimaryDragHandler {
     /// Record whatever a fill gesture has already put on the layer.
     /// No-op when no fill is in progress.
     fn finalize_pending_fill(&self) {
+        let pending = self.fill_session.borrow().is_some();
         fill_finish(&self.fill_ctx());
+        // Undo mid-fill lands here rather than in `fill_end`; the pixels went
+        // down, so the colour still counts as used.
+        if pending {
+            self.hand_over_used_color();
+        }
     }
 
     /// Cut any running fill reveal short, leaving the committed pixels
@@ -2124,6 +2156,8 @@ impl PrimaryDragHandler {
         }
 
         present_into_paintable(&mut self.canvas.borrow_mut(), &self.paintable, &self.area);
+        // Already pen-up here, so the shape hands its colour straight over.
+        self.colors.notify_used(self.colors.current());
     }
 
     // -- gradient ----------------------------------------------------------
@@ -3149,6 +3183,7 @@ pub(super) fn install_primary_drag(
         toaster: toaster.clone(),
         brush_engine: brush_engine.clone(),
         colors: colors.clone(),
+        used_color: Cell::new(None),
         stroke_points: Rc::new(RefCell::new(Vec::new())),
         pending_color: Rc::new(Cell::new(Color::new(0, 0, 0))),
         pending_opacity: Rc::new(Cell::new(1.0)),

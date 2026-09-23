@@ -10,17 +10,25 @@ pub(crate) const DEFAULT_LAYOUT_NAME: &str = "Default Layout";
 const TOOL_OPTIONS_H: i32 = 40;
 const SIDEBAR_W: i32 = 300;
 const COLOR_PICKER_H: i32 = 372;
+const PALETTE_H: i32 = 170;
 const CANVAS_INFO_H: i32 = 24;
 
 // The arrangement the app opened with before layouts were customisable, so a
 // fresh install and a Reset both land somewhere familiar.
 pub(crate) fn default_layout() -> Layout {
+    let palette_over_layers = LayoutNode::Split {
+        axis: Axis::Vertical,
+        fixed: DockSide::Top.child(),
+        size: PALETTE_H,
+        first: Box::new(LayoutNode::Panel(PanelId::Palette)),
+        second: Box::new(LayoutNode::Panel(PanelId::Layers)),
+    };
     let sidebar = LayoutNode::Split {
         axis: Axis::Vertical,
         fixed: DockSide::Top.child(),
         size: COLOR_PICKER_H,
         first: Box::new(LayoutNode::Panel(PanelId::ColorPicker)),
-        second: Box::new(LayoutNode::Panel(PanelId::Layers)),
+        second: Box::new(palette_over_layers),
     };
     let document = LayoutNode::dock_sized(
         PanelId::CanvasInfo,
@@ -88,6 +96,7 @@ mod tests {
         assert_eq!(layout.root.side_of(PanelId::ToolOptions), Some(DockSide::Top));
         assert_eq!(layout.root.side_of(PanelId::ToolBar), Some(DockSide::Left));
         assert_eq!(layout.root.side_of(PanelId::ColorPicker), Some(DockSide::Right));
+        assert_eq!(layout.root.side_of(PanelId::Palette), Some(DockSide::Right));
         assert_eq!(layout.root.side_of(PanelId::Layers), Some(DockSide::Right));
         assert_eq!(
             layout.root.side_of(PanelId::CanvasInfo),

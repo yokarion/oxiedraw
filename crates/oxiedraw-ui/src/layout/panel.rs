@@ -66,6 +66,7 @@ pub(crate) enum PanelId {
     ToolBar,
     ToolOptions,
     ColorPicker,
+    Palette,
     Layers,
     CanvasInfo,
 }
@@ -107,7 +108,7 @@ impl PanelSpec {
 
 pub(crate) const TOOL_ICON_CELL: i32 = 40;
 
-pub(crate) static SPECS: [PanelSpec; 5] = [
+pub(crate) static SPECS: [PanelSpec; 6] = [
     PanelSpec {
         id: PanelId::ToolBar,
         display_name: "Tools",
@@ -144,6 +145,19 @@ pub(crate) static SPECS: [PanelSpec; 5] = [
         snap_step: None,
         min_size: crate::panels::color_picker::MIN_SIZE,
         default_size: 300,
+        default_side: DockSide::Right,
+        removable: true,
+    },
+    PanelSpec {
+        id: PanelId::Palette,
+        display_name: "Palette",
+        description: "Recently picked colors, your saved swatches and the preset palettes.",
+        sides: DockSide::ANY,
+        splittable: true,
+        resizable: true,
+        snap_step: None,
+        min_size: crate::panels::palette::MIN_SIZE,
+        default_size: 170,
         default_side: DockSide::Right,
         removable: true,
     },
@@ -189,6 +203,7 @@ impl EnumMeta for PanelId {
         Self::ToolBar,
         Self::ToolOptions,
         Self::ColorPicker,
+        Self::Palette,
         Self::Layers,
         Self::CanvasInfo,
     ];

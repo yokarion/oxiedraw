@@ -41,14 +41,7 @@ pub(crate) fn build_list_row(
 
     // Star: grayed-out outline when not default, yellow filled when default.
     let star_btn = on_set_default.map(|cb| {
-        let star = gtk::Button::builder()
-            .has_frame(false)
-            .valign(gtk::Align::Center)
-            .tooltip_text("Default Brush")
-            .build();
-        update_star_icon(&star, is_default);
-        star.add_css_class("brush-star-btn");
-        ensure_star_css();
+        let star = star_button(is_default, "Default Brush");
         star.connect_clicked(move |_| cb());
         h.append(&star);
         star
@@ -125,6 +118,20 @@ fn build_scaling_icon(preset: &BrushPreset) -> gtk::Image {
     image.set_overflow(gtk::Overflow::Hidden);
     apply_icon_to_image(&image, preset, super::FALLBACK_ICON);
     image
+}
+
+/// The list-row star: gray outline, yellow when set. Shared with the Manage
+/// Palettes list so the two managers mark favourites the same way.
+pub(crate) fn star_button(starred: bool, tooltip: &str) -> gtk::Button {
+    let star = gtk::Button::builder()
+        .has_frame(false)
+        .valign(gtk::Align::Center)
+        .tooltip_text(tooltip)
+        .build();
+    update_star_icon(&star, starred);
+    star.add_css_class("brush-star-btn");
+    ensure_star_css();
+    star
 }
 
 /// Set the star icon on the button based on whether the brush is default.

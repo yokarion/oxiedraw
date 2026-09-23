@@ -94,6 +94,14 @@ impl SimpleComponent for AppModel {
         let (tool_bar_widget, set_left_bar) = tool_bar::build(&global.tools, &on_change_for_lb);
         let set_left_bar: Rc<dyn Fn(Tool)> = Rc::new(set_left_bar);
 
+        // Palettes are shared across tabs, so this panel is built once here
+        // rather than per document like the layer stack.
+        let palette_widget = crate::panels::palette::build(
+            &global.colors,
+            &global.palettes,
+            &global.toaster,
+        );
+
         let tab_view = adw::TabView::builder().hexpand(true).vexpand(true).build();
         let tab_bar = adw::TabBar::builder().view(&tab_view).build();
         let canvas_area = gtk::Box::builder()
@@ -147,8 +155,10 @@ impl SimpleComponent for AppModel {
         {
             let manager = Rc::downgrade(&manager);
             let tool_bar_widget = tool_bar_widget.upcast::<gtk::Widget>();
+            let palette_widget = palette_widget.upcast::<gtk::Widget>();
             let refill: Rc<dyn Fn(&crate::dock::DockHost)> = Rc::new(move |host| {
                 host.fill(crate::layout::PanelId::ToolBar, &tool_bar_widget);
+                host.fill(crate::layout::PanelId::Palette, &palette_widget);
                 if let Some(manager) = manager.upgrade() {
                     manager.fill_document_panels();
                 }
@@ -440,6 +450,39 @@ fn register_window_actions(
         let action = gio::SimpleAction::new("brush-manager", None);
         action.connect_activate(move |_, _| {
             crate::brush_manager::show(&win, &brush_engine, default_brush_name.clone());
+        });
+        app.add_action(&action);
+    }
+
+    {
+        let win = root.clone();
+        let palettes = global.palettes.clone();
+        let colors = global.colors.clone();
+        let toaster = global.toaster.clone();
+        let action = gio::SimpleAction::new("palette-manager", None);
+        action.connect_activate(move |_, _| {
+            crate::palette_manager::show(&win, &palettes, &colors, &toaster);
+        });
+        app.add_action(&action);
+    }
+
+    {
+        let manager = Rc::clone(manager);
+        let win = root.clone();
+        let palettes = global.palettes.clone();
+        let toaster = global.toaster.clone();
+        let action = gio::SimpleAction::new("palette-extract", None);
+        action.connect_activate(move |_, _| {
+            let Some(session) = manager.active() else { return };
+            // The extractor reads the composite, so any in-flight liquify has
+            // to be baked in first.
+            (session.liquify_flush)();
+            crate::palette_manager::extract::show(
+                &win,
+                &palettes,
+                &session.viewport.canvas(),
+                &toaster,
+            );
         });
         app.add_action(&action);
     }

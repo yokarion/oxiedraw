@@ -16,6 +16,7 @@ mod filters;
 mod font_previews;
 mod layout;
 mod pacing_trace;
+mod palette_manager;
 mod panels;
 mod perf_graph;
 mod preferences_window;

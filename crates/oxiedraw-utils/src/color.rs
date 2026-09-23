@@ -85,11 +85,20 @@ pub fn rgb_to_hsv(r: u8, g: u8, b: u8) -> (f32, f32, f32) {
     (h, s, max)
 }
 
+/// Rec. 709 luma of an sRGB colour, in `[0, 255]`.
+#[inline]
+#[must_use]
+pub fn luma(r: u8, g: u8, b: u8) -> f32 {
+    0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
+}
+
 /// Parse a `#rrggbb` (or `rrggbb`) hex string into RGB channels.
 #[must_use]
 pub fn parse_hex_rgb(text: &str) -> Option<[u8; 3]> {
     let hex = text.trim().trim_start_matches('#');
-    if hex.len() != 6 {
+    // Byte-indexed below, so a multi-byte character of the right byte length
+    // would slice mid-character and panic.
+    if hex.len() != 6 || !hex.is_ascii() {
         return None;
     }
     let r = u8::from_str_radix(&hex[0..2], 16).ok()?;

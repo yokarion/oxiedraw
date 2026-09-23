@@ -12,6 +12,7 @@ use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::color::ColorState;
 use oxiedraw_core::components::{ComponentLayer, ComponentLibrary};
 use oxiedraw_core::liquify::LiquifyState;
+use oxiedraw_core::palettes::PaletteState;
 use oxiedraw_core::document::{
     ComponentInstance, Document, DocumentProperties, LayerKind, Placement,
 };
@@ -47,6 +48,9 @@ pub(crate) use oxiedraw_core::history::LayerExtension;
 pub(crate) struct GlobalState {
     pub(crate) brush_engine: BrushEngine,
     pub(crate) colors: ColorState,
+    pub(crate) palettes: PaletteState,
+    /// Writes a pending palette save out now; called as the window closes.
+    pub(crate) flush_palettes: Rc<dyn Fn()>,
     pub(crate) tools: ToolState,
     pub(crate) clipboard: Rc<RefCell<Option<crate::clipboard::LayerClipboard>>>,
     pub(crate) toaster: crate::toaster::Toaster,
@@ -66,9 +70,18 @@ pub(crate) struct AutosaveConfig {
 impl GlobalState {
     pub(crate) fn new() -> Self {
         let settings = crate::settings::AppSettings::load();
+        let palettes = PaletteState::new(crate::settings::palettes::load());
+        let flush_palettes = crate::settings::palettes::install_autosave(&palettes);
+        let colors = ColorState::new();
+        {
+            let palettes = palettes.clone();
+            colors.connect_used(Box::new(move |color| palettes.push_recent(color)));
+        }
         Self {
             brush_engine: BrushEngine::new(),
-            colors: ColorState::new(),
+            colors,
+            palettes,
+            flush_palettes,
             tools: ToolState::new(),
             clipboard: Rc::new(RefCell::new(None)),
             toaster: crate::toaster::Toaster::new(),

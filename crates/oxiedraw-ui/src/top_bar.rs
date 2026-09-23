@@ -208,6 +208,7 @@ fn build_primary_menu() -> gio::Menu {
     let menu = gio::Menu::new();
     let s1 = gio::Menu::new();
     s1.append_item(&item("Manage Brushes...", "app.brush-manager", None));
+    s1.append_item(&item("Manage Palettes...", "app.palette-manager", None));
     menu.append_section(None, &s1);
     let s2 = gio::Menu::new();
     s2.append_item(&item("Preferences", "app.preferences", None));

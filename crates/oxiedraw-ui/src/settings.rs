@@ -13,6 +13,7 @@
 
 mod app_settings;
 pub(crate) mod keybinds;
+pub(crate) mod palettes;
 
 pub(crate) use app_settings::{
     APP_VERSION, AppSettings, PixelViewSettings, ShapeCorrectionSettings, recording_spool_dir,

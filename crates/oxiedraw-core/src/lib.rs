@@ -33,6 +33,7 @@ pub mod filters;
 pub mod guides;
 pub mod history;
 pub mod liquify;
+pub mod palettes;
 pub mod patterns;
 pub mod project;
 pub mod recording;
