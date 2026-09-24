@@ -92,6 +92,36 @@ pub fn luma(r: u8, g: u8, b: u8) -> f32 {
     0.2126 * f32::from(r) + 0.7152 * f32::from(g) + 0.0722 * f32::from(b)
 }
 
+/// Convert sRGB to OKLab `[L, a, b]`, where euclidean distance tracks how
+/// different two colours look. `L` runs 0..1; `a` and `b` stay inside +/-0.35
+/// for anything in the sRGB gamut.
+#[must_use]
+pub fn rgb_to_oklab(r: u8, g: u8, b: u8) -> [f32; 3] {
+    linear_rgb_to_oklab([srgb_to_linear(r), srgb_to_linear(g), srgb_to_linear(b)])
+}
+
+/// [`rgb_to_oklab`] from channels that are already linear. Hot loops tabulate
+/// the transfer function and come in here, so the matrix lives in one place.
+#[must_use]
+pub fn linear_rgb_to_oklab([r, g, b]: [f32; 3]) -> [f32; 3] {
+    let l = (0.412_221_5 * r + 0.536_332_55 * g + 0.051_445_995 * b).cbrt();
+    let m = (0.211_903_5 * r + 0.680_699_5 * g + 0.107_396_96 * b).cbrt();
+    let s = (0.088_302_46 * r + 0.281_718_85 * g + 0.629_978_7 * b).cbrt();
+    [
+        0.210_454_26 * l + 0.793_617_8 * m - 0.004_072_047 * s,
+        1.977_998_5 * l - 2.428_592_2 * m + 0.450_593_7 * s,
+        0.025_904_037 * l + 0.782_771_77 * m - 0.808_675_77 * s,
+    ]
+}
+
+/// Euclidean OKLab distance: 0 is identical, and roughly 1 spans black to white.
+#[inline]
+#[must_use]
+pub fn oklab_distance(a: [f32; 3], b: [f32; 3]) -> f32 {
+    let (dl, da, db) = (a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+    dl.mul_add(dl, da.mul_add(da, db * db)).sqrt()
+}
+
 /// Parse a `#rrggbb` (or `rrggbb`) hex string into RGB channels.
 #[must_use]
 pub fn parse_hex_rgb(text: &str) -> Option<[u8; 3]> {
@@ -114,8 +144,50 @@ pub fn rgb_to_hex(r: u8, g: u8, b: u8) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)]
 mod tests {
-    use super::{linear_to_srgb, srgb_to_linear};
+    use super::{linear_to_srgb, oklab_distance, rgb_to_oklab, srgb_to_linear};
+
+    #[test]
+    fn oklab_anchors_black_white_and_neutrals() {
+        let black = rgb_to_oklab(0, 0, 0);
+        let white = rgb_to_oklab(255, 255, 255);
+        assert!(black[0].abs() < 1e-4, "black L is {}", black[0]);
+        assert!((white[0] - 1.0).abs() < 1e-3, "white L is {}", white[0]);
+        for level in [0u8, 64, 128, 200, 255] {
+            let grey = rgb_to_oklab(level, level, level);
+            assert!(grey[1].abs() < 1e-3 && grey[2].abs() < 1e-3, "grey {level}: {grey:?}");
+        }
+    }
+
+    #[test]
+    fn oklab_lightness_rises_and_chroma_stays_in_range() {
+        let mut previous = -1.0_f32;
+        for level in 0u8..=255 {
+            let lab = rgb_to_oklab(level, level, level);
+            assert!(lab[0] >= previous, "L fell at {level}");
+            previous = lab[0];
+        }
+        for r in (0u8..=255).step_by(17) {
+            for g in (0u8..=255).step_by(17) {
+                for b in (0u8..=255).step_by(17) {
+                    let lab = rgb_to_oklab(r, g, b);
+                    assert!((0.0..=1.001).contains(&lab[0]), "L out of range: {lab:?}");
+                    assert!(lab[1].abs() <= 0.35 && lab[2].abs() <= 0.35, "ab out of range: {lab:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn oklab_distance_is_zero_only_for_the_same_color() {
+        let red = rgb_to_oklab(220, 40, 40);
+        assert_eq!(oklab_distance(red, red), 0.0);
+        let near = rgb_to_oklab(222, 42, 42);
+        let far = rgb_to_oklab(40, 60, 220);
+        assert!(oklab_distance(red, near) < oklab_distance(red, far));
+        assert!(oklab_distance(rgb_to_oklab(0, 0, 0), rgb_to_oklab(255, 255, 255)) > 0.9);
+    }
 
     #[test]
     fn srgb_round_trips_through_linear_for_every_byte() {

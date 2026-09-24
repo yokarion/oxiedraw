@@ -13,8 +13,8 @@ mod extract;
 
 pub use builtins::{DEFAULT_PRESET, builtin_palettes};
 pub use extract::{
-    ExtractOptions, ExtractOrder, ExtractedColor, MAX_EXTRACTED_COLORS, MIN_EXTRACTED_COLORS,
-    extract_palette,
+    BackgroundMode, ExtractOptions, ExtractOrder, ExtractedColor, MAX_EXTRACTED_COLORS,
+    MIN_EXTRACTED_COLORS, PaletteSource, extract_palette,
 };
 
 use std::cell::{Cell, Ref, RefCell};

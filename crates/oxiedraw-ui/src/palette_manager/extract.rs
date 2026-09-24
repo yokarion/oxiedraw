@@ -1,8 +1,8 @@
 //! Extract Palette window: pull the colours out of the drawing and save them
 //! as a preset.
 //!
-//! The pixels are read once per source and kept, so dragging a slider only
-//! re-runs [`extract_palette`] over the cached buffer and repaints the preview.
+//! Each source is analysed once into a [`PaletteSource`], so dragging a slider
+//! only re-runs the selection over the cached peaks and repaints the preview.
 //! Nothing is written until Add.
 
 use std::cell::{Cell, RefCell};
@@ -12,8 +12,7 @@ use adw::prelude::*;
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::palettes::{
-    ExtractOptions, ExtractOrder, ExtractedColor, MAX_EXTRACTED_COLORS, MIN_EXTRACTED_COLORS,
-    PaletteState, extract_palette,
+    BackgroundMode, ExtractOptions, ExtractOrder, ExtractedColor, PaletteSource, PaletteState,
 };
 use relm4::gtk;
 
@@ -55,21 +54,12 @@ impl Source {
     }
 }
 
-/// Premultiplied BGRA8 straight from the canvas, plus its selection mask. Kept
-/// as-is: the extractor un-premultiplies only the pixels it samples.
-struct Pixels {
-    source: Source,
-    bgra: Vec<u8>,
-    width: u32,
-    mask: Option<Vec<u8>>,
-}
-
 #[derive(Clone)]
 struct Extractor {
     canvas: Rc<RefCell<Canvas>>,
     options: Rc<RefCell<ExtractOptions>>,
     source: Rc<Cell<Source>>,
-    pixels: Rc<RefCell<Option<Pixels>>>,
+    analysis: Rc<RefCell<Option<(Source, PaletteSource)>>>,
     result: Rc<RefCell<Vec<ExtractedColor>>>,
     grid: Rc<SwatchGrid>,
     colors_group: adw::PreferencesGroup,
@@ -78,18 +68,20 @@ struct Extractor {
 }
 
 impl Extractor {
-    /// Re-extract and repaint. Re-reads the canvas only when the source
-    /// changed; a slider move works off the buffer already in hand.
+    /// Re-select and repaint. Re-reads the canvas only when the source changed;
+    /// a slider move works off the peaks already in hand.
     fn refresh(&self) {
         let wanted = self.source.get();
-        if self.pixels.borrow().as_ref().is_none_or(|p| p.source != wanted) {
-            let read = read_pixels(&self.canvas, wanted);
-            *self.pixels.borrow_mut() = read;
+        if self.analysis.borrow().as_ref().is_none_or(|(s, _)| *s != wanted) {
+            let read = analyze(&self.canvas, wanted).map(|source| (wanted, source));
+            *self.analysis.borrow_mut() = read;
         }
 
-        let extracted = self.pixels.borrow().as_ref().map_or_else(Vec::new, |p| {
-            extract_palette(&p.bgra, p.width, p.mask.as_deref(), &self.options.borrow())
-        });
+        let extracted = self
+            .analysis
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |(_, source)| source.select(&self.options.borrow()));
 
         self.count.set_text(&match extracted.len() {
             1 => "1 color".to_string(),
@@ -142,7 +134,7 @@ pub(crate) fn show(
         canvas: Rc::clone(canvas),
         options: Rc::new(RefCell::new(ExtractOptions::default())),
         source: Rc::new(Cell::new(Source::Canvas)),
-        pixels: Rc::new(RefCell::new(None)),
+        analysis: Rc::new(RefCell::new(None)),
         result: Rc::new(RefCell::new(Vec::new())),
         colors_group: shared::colors_group(&grid, Some(count.upcast_ref())),
         grid,
@@ -263,48 +255,33 @@ fn build_settings(
     group.add(&source_row);
 
     let defaults = *extractor.options.borrow();
-    group.add(&slider_row(
-        "Colors",
-        (MIN_EXTRACTED_COLORS as f64, MAX_EXTRACTED_COLORS as f64),
-        defaults.max_colors as f64,
-        |value| format!("{value:.0}"),
-        extractor,
-        refresh,
-        |options, value| options.max_colors = value as usize,
-    ));
-    group.add(&slider_row(
-        "Merge similar",
-        (0.0, 100.0),
-        f64::from(defaults.merge_similar) * 100.0,
-        |value| format!("{value:.0}%"),
-        extractor,
-        refresh,
-        |options, value| options.merge_similar = (value / 100.0) as f32,
-    ));
-    group.add(&slider_row(
-        "Min saturation",
-        (0.0, 100.0),
-        f64::from(defaults.min_saturation) * 100.0,
-        |value| format!("{value:.0}%"),
-        extractor,
-        refresh,
-        |options, value| options.min_saturation = (value / 100.0) as f32,
-    ));
-    group.add(&order_row(defaults.order, extractor, refresh));
 
-    let skip_row = adw::SwitchRow::builder()
-        .title("Skip near-black and near-white")
-        .active(defaults.skip_extremes)
+    let background_row = adw::ComboRow::builder()
+        .title("Background")
+        .subtitle("What to do with the backdrop behind the drawing")
+        .model(&gtk::StringList::new(&BackgroundMode::labels()))
+        .selected(defaults.background.to_index())
         .build();
     {
         let options = Rc::clone(&extractor.options);
         let refresh = Rc::clone(refresh);
-        skip_row.connect_active_notify(move |row| {
-            options.borrow_mut().skip_extremes = row.is_active();
+        background_row.connect_selected_notify(move |row| {
+            options.borrow_mut().background = BackgroundMode::from_index(row.selected());
             refresh();
         });
     }
-    group.add(&skip_row);
+    group.add(&background_row);
+
+    group.add(&slider_row(
+        "Detail",
+        (0.0, 100.0),
+        f64::from(defaults.detail) * 100.0,
+        |value| format!("{value:.0}%"),
+        extractor,
+        refresh,
+        |options, value| options.detail = (value / 100.0) as f32,
+    ));
+    group.add(&order_row(defaults.order, extractor, refresh));
 
     group
 }
@@ -365,9 +342,9 @@ fn order_row(initial: ExtractOrder, extractor: &Extractor, refresh: &Rc<dyn Fn()
     row
 }
 
-/// Read the chosen source. `None` when there is nothing to sample - no active
-/// layer, or no selection.
-fn read_pixels(canvas: &Rc<RefCell<Canvas>>, source: Source) -> Option<Pixels> {
+/// Read the chosen source and analyse it. `None` when there is nothing to
+/// sample - no active layer, or no selection.
+fn analyze(canvas: &Rc<RefCell<Canvas>>, source: Source) -> Option<PaletteSource> {
     let mut canvas = canvas.borrow_mut();
     let (bgra, mask) = match source {
         Source::Canvas => (canvas.read_pixels().ok()?, None),
@@ -379,14 +356,13 @@ fn read_pixels(canvas: &Rc<RefCell<Canvas>>, source: Source) -> Option<Pixels> {
             if !canvas.selection_active() {
                 return None;
             }
-            let pixels = canvas.read_pixels().ok()?;
-            (pixels, canvas.read_selection_mask().ok())
+            // Not `.ok()`: a dropped mask would quietly extract from the whole
+            // canvas, and turn background detection on, while the UI says
+            // Selection. Better to report nothing to sample.
+            (canvas.read_pixels().ok()?, Some(canvas.read_selection_mask().ok()?))
         }
     };
-    Some(Pixels {
-        source,
-        bgra,
-        width: canvas.size().width,
-        mask,
-    })
+    let width = canvas.size().width;
+    drop(canvas);
+    Some(PaletteSource::analyze(&bgra, width, mask.as_deref()))
 }
