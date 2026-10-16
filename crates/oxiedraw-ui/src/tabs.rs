@@ -438,7 +438,7 @@ impl TabManager {
                 let m = Rc::clone(&manager);
                 let on_loaded: Rc<dyn Fn(OxieProject, PathBuf)> =
                     Rc::new(move |project, path| m.open_loaded(project, path));
-                crate::project_io::open_dialog(&manager.root, on_loaded);
+                crate::project_io::open_dialog(&manager.root, &manager.global.toaster, on_loaded);
             });
             app.add_action(&action);
         }

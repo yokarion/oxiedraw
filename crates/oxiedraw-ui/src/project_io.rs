@@ -18,6 +18,7 @@ use oxiedraw_core::recording::RecordingManifest;
 use oxiedraw_utils::frame_profile;
 
 use crate::session::DocumentSession;
+use crate::toaster::Toaster;
 
 /// Save `session`. When it already has a path and `force_dialog` is false, write
 /// straight to that path; otherwise prompt for a location ("Save As").
@@ -341,8 +342,10 @@ fn process_autosave_queue(
 /// the parsed project and its path so the caller can open it in a new tab.
 pub(crate) fn open_dialog(
     window: &adw::ApplicationWindow,
+    toaster: &Toaster,
     on_loaded: Rc<dyn Fn(OxieProject, PathBuf)>,
 ) {
+    let toaster = toaster.clone();
     let filters = project_file_filters();
     let dialog = gtk::FileDialog::new();
     dialog.set_title("Open Project");
@@ -356,22 +359,43 @@ pub(crate) fn open_dialog(
         // Timed in two halves: parsing the archive off disk, then handing it to
         // the caller, which uploads every layer to the GPU and builds the tab.
         let started = Instant::now();
-        match project::load::load(&path) {
-            Ok(p) => {
-                let parse_ms = started.elapsed().as_millis();
-                let layers = p.layer_pixels.len();
-                on_loaded(p, path.clone());
-                tracing::info!(
-                    target: "oxiedraw::doc",
-                    path = %path.display(),
-                    layers,
-                    parse_ms,
-                    total_ms = started.elapsed().as_millis(),
-                    "document opened"
-                );
-            }
-            Err(e) => show_error(&window_cb, "Open Failed", &e.to_string()),
+        let pending = toaster.pending("Opening project...");
+        let (tx, rx) = mpsc::channel();
+        {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(project::load::load(&path).map_err(|e| e.to_string()));
+            });
         }
+        let window_cb = window_cb.clone();
+        let on_loaded = Rc::clone(&on_loaded);
+        glib::timeout_add_local(Duration::from_millis(16), move || {
+            let result = match rx.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err("the loader terminated unexpectedly".to_string())
+                }
+            };
+            pending.dismiss();
+            match result {
+                Ok(p) => {
+                    let parse_ms = started.elapsed().as_millis();
+                    let layers = p.layer_pixels.len();
+                    on_loaded(p, path.clone());
+                    tracing::info!(
+                        target: "oxiedraw::doc",
+                        path = %path.display(),
+                        layers,
+                        parse_ms,
+                        total_ms = started.elapsed().as_millis(),
+                        "document opened"
+                    );
+                }
+                Err(e) => show_error(&window_cb, "Open Failed", &e),
+            }
+            glib::ControlFlow::Break
+        });
     });
 }
 

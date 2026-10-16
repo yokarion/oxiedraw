@@ -23,7 +23,7 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::canvas::RedrawHandle;
-use crate::clipboard::LayerClipboard;
+use crate::clipboard::{LayerClipboard, PasteJob};
 use crate::settings::AppSettings;
 use crate::settings::keybinds::accel_parts_for;
 use crate::toaster::Toaster;
@@ -1324,6 +1324,7 @@ pub(crate) fn build(
     Rc<dyn Fn(Option<String>)>,
     Rc<dyn Fn()>,
     Rc<dyn Fn() -> Option<usize>>,
+    Rc<dyn Fn(Vec<PasteJob>)>,
 ) {
     let panel = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1354,6 +1355,7 @@ pub(crate) fn build(
         reinstall_actions,
         layer_begin_rename,
         create_adjustment,
+        paste,
     ) = build_layers_page(
             layers,
             canvas,
@@ -1422,6 +1424,7 @@ pub(crate) fn build(
         set_editing,
         begin_rename,
         create_adjustment,
+        paste,
     )
 }
 
@@ -1514,6 +1517,7 @@ fn build_layers_page(
     Rc<dyn Fn()>,
     Rc<dyn Fn()>,
     Rc<dyn Fn() -> Option<usize>>,
+    Rc<dyn Fn(Vec<PasteJob>)>,
 ) {
     let page = gtk::Box::builder()
         .orientation(gtk::Orientation::Vertical)
@@ -1544,7 +1548,7 @@ fn build_layers_page(
         history,
         prepare_reorder,
     );
-    actions::install_context_menu(&area, &ui, layer_clipboard);
+    actions::install_context_menu(&area, &ui);
 
     let reinstall_actions: Rc<dyn Fn()> = {
         let area = area.clone();
@@ -1691,7 +1695,10 @@ fn build_layers_page(
         }) as Rc<dyn Fn() -> Option<usize>>
     };
 
-    (page, refresh, selected_ids, reinstall_actions, begin_rename, create_adjustment)
+    let paste =
+        actions::paste_handle(&area, &ui, canvas, redraw, toaster, history, layer_extensions);
+
+    (page, refresh, selected_ids, reinstall_actions, begin_rename, create_adjustment, paste)
 }
 
 fn tooltip_with_accel(label: &str, action_id: &str) -> String {

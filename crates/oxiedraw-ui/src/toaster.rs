@@ -17,6 +17,13 @@ const OUT_MS: f32 = 200.0;
 /// multi-second hold in between schedules a single one-shot, so an idle toast
 /// costs no per-frame work.
 const TICK_MS: u64 = 16;
+/// Quick operations finish before their pending toast would appear.
+const PENDING_DELAY_MS: u64 = 300;
+const BUSY_TICK_MS: u64 = 33;
+const BUSY_FLOOR: f32 = 0.10;
+const BUSY_CEIL: f32 = 0.95;
+/// Seconds until the busy bar is halfway between floor and ceiling.
+const BUSY_HALF_SECS: f32 = 3.0;
 
 /// Cheaply clonable handle for posting toast notifications.
 ///
@@ -44,6 +51,8 @@ struct Inner {
     tick: Option<glib::SourceId>,
     /// One-shot timer for the on-screen hold between fade-in and fade-out.
     hold: Option<glib::SourceId>,
+    /// Drives the busy bar while a pending toast is up.
+    busy_tick: Option<glib::SourceId>,
     /// True once the fade-in finished (pill fully on screen).
     visible: bool,
     /// True from the moment a toast is posted until its fade-out finishes.
@@ -66,15 +75,31 @@ struct Inner {
 /// is called or another message replaces it.
 pub(crate) struct PendingToast {
     toaster: Toaster,
-    generation: u64,
+    state: Rc<RefCell<PendingState>>,
+}
+
+enum PendingState {
+    Delayed(glib::SourceId),
+    Shown(u64),
+    Dismissed,
 }
 
 impl PendingToast {
-    /// Fade the toast out, unless a newer message has already taken the pill.
-    /// Safe to call more than once.
+    /// Fade the toast out (or never show it), unless a newer message has
+    /// already taken the pill. Safe to call more than once.
     pub(crate) fn dismiss(&self) {
-        self.toaster.dismiss_generation(self.generation);
+        match std::mem::replace(&mut *self.state.borrow_mut(), PendingState::Dismissed) {
+            PendingState::Delayed(id) => id.remove(),
+            PendingState::Shown(generation) => self.toaster.dismiss_generation(generation),
+            PendingState::Dismissed => {}
+        }
     }
+}
+
+// Fake progress for work of unknown length: starts at the floor, always still
+// moving, and only passes the ceiling when the work actually finishes
+fn busy_fill(elapsed_secs: f32) -> f32 {
+    BUSY_FLOOR + (BUSY_CEIL - BUSY_FLOOR) * elapsed_secs / (elapsed_secs + BUSY_HALF_SECS)
 }
 
 impl Toaster {
@@ -86,6 +111,7 @@ impl Toaster {
             target: None,
             tick: None,
             hold: None,
+            busy_tick: None,
             visible: false,
             active: false,
             alpha: 0.0,
@@ -103,10 +129,12 @@ impl Toaster {
     /// any in-flight toast on the previous canvas so it doesn't linger there.
     pub(crate) fn set_target(&self, paintable: CanvasPaintable) {
         self.cancel_timers();
+        self.stop_busy();
         let mut inner = self.0.borrow_mut();
         if let Some(old) = inner.target.take() {
             old.set_toast_message(None);
             old.set_toast_anim(0.0, 0.0);
+            old.set_toast_progress(None);
         }
         inner.visible = false;
         inner.active = false;
@@ -124,14 +152,25 @@ impl Toaster {
         self.show(msg, Some(5));
     }
 
-    /// Show a toast that stays up until the returned handle is dismissed. For
-    /// long operations (saving, decoding a pasted image) where the end time
-    /// isn't known up front.
+    /// Show a toast with a busy bar that stays up until the returned handle is
+    /// dismissed. For long operations (saving, opening, decoding a pasted
+    /// image) where the end time isn't known up front.
     pub(crate) fn pending(&self, msg: &str) -> PendingToast {
-        self.show(msg, None);
+        let state = Rc::new(RefCell::new(PendingState::Dismissed));
+        let id = {
+            let this = self.clone();
+            let state = Rc::clone(&state);
+            let msg = msg.to_string();
+            glib::timeout_add_local_once(Duration::from_millis(PENDING_DELAY_MS), move || {
+                this.show(&msg, None);
+                this.start_busy();
+                *state.borrow_mut() = PendingState::Shown(this.0.borrow().generation);
+            })
+        };
+        *state.borrow_mut() = PendingState::Delayed(id);
         PendingToast {
             toaster: self.clone(),
-            generation: self.0.borrow().generation,
+            state,
         }
     }
 
@@ -168,6 +207,8 @@ impl Toaster {
             self.fallback(msg, hold_secs);
             return;
         };
+        self.stop_busy();
+        target.set_toast_progress(None);
         target.set_toast_message(Some(msg));
         // Stop any running fade so a re-show (including one arriving mid fade-out)
         // doesn't fight the ticker. `visible` stays true through the fade-out, so
@@ -262,6 +303,7 @@ impl Toaster {
                 }
                 target.set_toast_message(None);
                 target.set_toast_anim(0.0, 0.0);
+                target.set_toast_progress(None);
                 glib::ControlFlow::Break
             } else {
                 glib::ControlFlow::Continue
@@ -280,7 +322,31 @@ impl Toaster {
             }
         }
         self.cancel_timers();
+        // Show the work as finished while the pill fades out
+        if self.stop_busy()
+            && let Some(target) = self.0.borrow().target.as_ref()
+        {
+            target.set_toast_progress(Some(1.0));
+        }
         self.start_fade_out();
+    }
+
+    fn start_busy(&self) {
+        self.stop_busy();
+        let Some(target) = self.0.borrow().target.clone() else { return };
+        let start = Instant::now();
+        target.set_toast_progress(Some(busy_fill(0.0)));
+        let id = glib::timeout_add_local(Duration::from_millis(BUSY_TICK_MS), move || {
+            target.set_toast_progress(Some(busy_fill(start.elapsed().as_secs_f32())));
+            glib::ControlFlow::Continue
+        });
+        self.0.borrow_mut().busy_tick = Some(id);
+    }
+
+    /// Returns whether a busy bar was running.
+    fn stop_busy(&self) -> bool {
+        let tick = self.0.borrow_mut().busy_tick.take();
+        tick.map(glib::SourceId::remove).is_some()
     }
 
     fn cancel_tick(&self) {
@@ -311,6 +377,24 @@ impl Toaster {
             #[allow(clippy::cast_possible_truncation)]
             t.set_timeout(hold_secs.unwrap_or(10) as u32);
             overlay.add_toast(t);
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn busy_fill_stays_between_floor_and_ceiling_and_keeps_rising() {
+        assert!((busy_fill(0.0) - BUSY_FLOOR).abs() < 1e-6);
+        let mut previous = busy_fill(0.0);
+        for step in 1..=600 {
+            let fill = busy_fill(step as f32 * 0.5);
+            assert!(fill > previous, "stalled at {fill}");
+            assert!(fill < BUSY_CEIL);
+            previous = fill;
         }
     }
 }

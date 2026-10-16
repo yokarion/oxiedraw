@@ -1,5 +1,5 @@
 
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::time::Duration;
@@ -16,8 +16,12 @@ use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
 use crate::canvas::RedrawHandle;
-use crate::clipboard::LayerClipboard;
-use crate::toaster::{PendingToast, Toaster};
+use crate::clipboard::{
+    FileSource, LayerClipboard, PasteJob, file_jobs, layer_content, next_layer_token,
+    offers_files, offers_image_data, read_file_uris, read_layer_token,
+};
+use crate::toaster::Toaster;
+use oxiedraw_utils::frame_profile;
 
 use super::{
     GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
@@ -789,13 +793,7 @@ pub(super) fn layer_copy(
         .get(idx)
         .map_or_else(|| "Layer".to_string(), |l| l.name.clone());
 
-    *layer_clipboard.borrow_mut() = Some(LayerClipboard {
-        name,
-        pixels: pixels.clone(),
-        canvas_width: w,
-        canvas_height: h,
-    });
-
+    let token = next_layer_token();
     if let Some(display) = gdk::Display::default() {
         let stride = (w * 4) as usize;
         let bytes = glib::Bytes::from(&pixels);
@@ -807,8 +805,17 @@ pub(super) fn layer_copy(
             &bytes,
             stride,
         );
-        display.clipboard().set_texture(&texture);
+        if let Err(e) = display.clipboard().set_content(Some(&layer_content(texture.upcast_ref(), &token))) {
+            tracing::warn!(error = %e, "copy: publishing the layer to the clipboard failed");
+        }
     }
+    *layer_clipboard.borrow_mut() = Some(LayerClipboard {
+        name,
+        pixels,
+        canvas_width: w,
+        canvas_height: h,
+        token,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -822,138 +829,106 @@ pub(super) fn layer_paste(
     history: &Rc<RefCell<HistoryStack>>,
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
 ) {
-    let canvas_size = canvas.borrow().size();
-
-    if let Some(internal) = layer_clipboard.borrow().as_ref()
-        && internal.canvas_width == canvas_size.width
-        && internal.canvas_height == canvas_size.height
-    {
-        let name = format!("{} copy", internal.name);
-        let pixels = internal.pixels.clone();
-        let result = canvas.borrow_mut().add_layer_with_pixels(name, &pixels);
-        match result {
-            Ok(new_idx) => {
-                if let Some((id, name, visible, kind, blend, opacity, px)) =
-                    capture_layer(&mut canvas.borrow_mut(), new_idx)
-                {
-                    history.borrow_mut().record(HistoryAction::LayerAdd {
-                        idx: new_idx,
-                        id,
-                        name,
-                        visible,
-                        layer_kind: kind,
-                        blend,
-                        opacity,
-                        pixels: px,
-                    });
-                }
-                sync_height(area, ui);
-                commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
-                area.queue_draw();
-                redraw.request();
-                toaster.info("Layer pasted!");
-            }
-            Err(RendererError::LayerLimit) => toaster.layer_limit_reached(),
-            Err(e) => toaster.error(&format!("Failed to paste layer: {e}")),
-        }
-        return;
-    }
-
     let Some(display) = gdk::Display::default() else {
         tracing::warn!("paste: no display");
         return;
     };
-    let toaster = toaster.clone();
-    let area = area.clone();
-    let ui = ui.clone();
-    let canvas = Rc::clone(canvas);
-    let redraw = redraw.clone();
-    let history = Rc::clone(history);
-    let layer_extensions = Rc::clone(layer_extensions);
-
-    display
-        .clipboard()
-        .read_texture_async(gio::Cancellable::NONE, move |result| {
-            let texture = match result {
-                Ok(Some(t)) => t,
-                Ok(None) => {
-                    tracing::info!("paste: system clipboard has no image");
-                    return;
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "paste: read_texture_async failed");
-                    return;
-                }
-            };
-
-            let done = Rc::new(Cell::new(false));
-            let pending_toast: Rc<RefCell<Option<PendingToast>>> = Rc::new(RefCell::new(None));
+    let clipboard = display.clipboard();
+    let target = PasteTarget {
+        area: area.clone(),
+        ui: ui.clone(),
+        canvas: Rc::clone(canvas),
+        redraw: redraw.clone(),
+        toaster: toaster.clone(),
+        history: Rc::clone(history),
+        layer_extensions: Rc::clone(layer_extensions),
+    };
+    let layer_clipboard = Rc::clone(layer_clipboard);
+    let clipboard_c = clipboard.clone();
+    read_layer_token(&clipboard, move |token| {
+        let internal = layer_clipboard.borrow().clone();
+        let size = target.canvas.borrow().size();
+        match internal {
+            Some(internal)
+                if token.as_deref() == Some(internal.token.as_str())
+                    && internal.canvas_width == size.width
+                    && internal.canvas_height == size.height =>
             {
-                let done_c = Rc::clone(&done);
-                let toaster_c = toaster.clone();
-                let pending_c = Rc::clone(&pending_toast);
-                glib::timeout_add_local_once(Duration::from_millis(500), move || {
-                    if done_c.get() {
-                        return;
-                    }
-                    *pending_c.borrow_mut() = Some(toaster_c.pending("Pasting image..."));
-                });
+                paste_internal(&target, internal);
             }
-
-            let (tx, rx) = std::sync::mpsc::channel::<Result<(Vec<u8>, u32, u32), String>>();
-            std::thread::spawn(move || {
-                let png_bytes = texture.save_to_png_bytes();
-                match oxiedraw_core::export::decode_png_bytes(&png_bytes) {
-                    Some((pixels, src_w, src_h)) => {
-                        let _ = tx.send(Ok((pixels, src_w, src_h)));
-                    }
-                    None => {
-                        let _ = tx.send(Err("Could not decode clipboard image".into()));
-                    }
-                }
-            });
-
-            glib::idle_add_local(move || {
-                let result = match rx.try_recv() {
-                    Ok(r) => r,
-                    Err(std::sync::mpsc::TryRecvError::Empty) => {
-                        return glib::ControlFlow::Continue;
-                    }
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                        Err("Worker thread disconnected".into())
-                    }
-                };
-
-                done.set(true);
-                if let Some(t) = pending_toast.borrow_mut().take() {
-                    t.dismiss();
-                }
-
-                match result {
-                    Ok((pixels, src_w, src_h)) => {
-                        paste_as_new_layer(
-                            &area,
-                            &ui,
-                            &canvas,
-                            &redraw,
-                            &toaster,
-                            &history,
-                            &layer_extensions,
-                            &pixels,
-                            src_w,
-                            src_h,
-                        );
-                    }
-                    Err(e) => toaster.error(&format!("Paste failed: {e}")),
-                }
-
-                glib::ControlFlow::Break
-            });
-        });
+            _ => paste_from_system(&target, clipboard_c),
+        }
+    });
 }
 
-#[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
-fn paste_as_new_layer(
+fn paste_internal(target: &PasteTarget, internal: LayerClipboard) {
+    let PasteTarget { area, ui, canvas, redraw, toaster, history, .. } = target;
+    let name = format!("{} copy", internal.name);
+    let result = canvas.borrow_mut().add_layer_with_pixels(name, &internal.pixels);
+    match result {
+        Ok(new_idx) => {
+            if let Some((id, name, visible, kind, blend, opacity, px)) =
+                capture_layer(&mut canvas.borrow_mut(), new_idx)
+            {
+                history.borrow_mut().record(HistoryAction::LayerAdd {
+                    idx: new_idx,
+                    id,
+                    name,
+                    visible,
+                    layer_kind: kind,
+                    blend,
+                    opacity,
+                    pixels: px,
+                });
+            }
+            sync_height(area, ui);
+            commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+            area.queue_draw();
+            redraw.request();
+            toaster.info("Layer pasted!");
+        }
+        Err(RendererError::LayerLimit) => toaster.layer_limit_reached(),
+        Err(e) => toaster.error(&format!("Failed to paste layer: {e}")),
+    }
+}
+
+fn paste_from_system(target: &PasteTarget, clipboard: gdk::Clipboard) {
+    let target = target.clone();
+    let formats = clipboard.formats();
+    tracing::debug!(formats = %formats.to_str(), "paste: system clipboard");
+    let has_image = offers_image_data(&formats) || formats.contains_type(gdk::Texture::static_type());
+
+    // A file copied in a file manager arrives as a uri list, not as image data
+    if !has_image && offers_files(&formats) {
+        read_file_uris(&FileSource::Clipboard(clipboard), move |result| match result {
+            Ok(uris) => paste_image_files(&target, uris),
+            Err(e) => {
+                tracing::warn!(error = %e, "paste: reading clipboard files failed");
+                target.toaster.error(&format!("Paste failed: {e}"));
+            }
+        });
+        return;
+    }
+    if !has_image {
+        target.toaster.info("Nothing to paste - the clipboard has no image");
+        return;
+    }
+
+    clipboard.read_texture_async(gio::Cancellable::NONE, move |result| match result {
+        Ok(Some(texture)) => {
+            let name = "Pasted clipboard image".to_string();
+            paste_jobs(&target, vec![PasteJob::Texture { texture, name }]);
+        }
+        Ok(None) => target.toaster.info("Nothing to paste - the clipboard has no image"),
+        Err(e) => {
+            tracing::warn!(error = %e, "paste: read_texture_async failed");
+            target.toaster.error(&format!("Paste failed: {e}"));
+        }
+    });
+}
+
+/// Hands dropped images and files to this document's layer stack.
+pub(super) fn paste_handle(
     area: &gtk::DrawingArea,
     ui: &Ui,
     canvas: &Rc<RefCell<Canvas>>,
@@ -961,16 +936,146 @@ fn paste_as_new_layer(
     toaster: &Toaster,
     history: &Rc<RefCell<HistoryStack>>,
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-) {
+) -> Rc<dyn Fn(Vec<PasteJob>)> {
+    let target = PasteTarget {
+        area: area.clone(),
+        ui: ui.clone(),
+        canvas: Rc::clone(canvas),
+        redraw: redraw.clone(),
+        toaster: toaster.clone(),
+        history: Rc::clone(history),
+        layer_extensions: Rc::clone(layer_extensions),
+    };
+    Rc::new(move |jobs| paste_jobs(&target, jobs))
+}
+
+#[derive(Clone)]
+struct PasteTarget {
+    area: gtk::DrawingArea,
+    ui: Ui,
+    canvas: Rc<RefCell<Canvas>>,
+    redraw: RedrawHandle,
+    toaster: Toaster,
+    history: Rc<RefCell<HistoryStack>>,
+    layer_extensions: Rc<RefCell<HashMap<String, LayerExtension>>>,
+}
+
+struct PastedImage {
+    name: String,
+    pixels: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
+type DecodedImage = Result<PastedImage, String>;
+
+#[allow(clippy::cast_sign_loss)]
+fn texture_to_image(texture: &gdk::Texture, name: String) -> PastedImage {
+    let mut downloader = gdk::TextureDownloader::new(texture);
+    downloader.set_format(gdk::MemoryFormat::B8g8r8a8Premultiplied);
+    let (bytes, stride) = downloader.download_bytes();
+    let (width, height) = (texture.width() as u32, texture.height() as u32);
+    let row = width as usize * 4;
+    let pixels = if stride == row {
+        bytes.to_vec()
+    } else {
+        bytes.chunks(stride).flat_map(|line| &line[..row]).copied().collect()
+    };
+    PastedImage { name, pixels, width, height }
+}
+
+fn decode_job(job: PasteJob) -> DecodedImage {
+    match job {
+        PasteJob::Texture { texture, name } => Ok(texture_to_image(&texture, name)),
+        PasteJob::Encoded { bytes, name } => gdk::Texture::from_bytes(&bytes)
+            .map(|t| texture_to_image(&t, name.clone()))
+            .map_err(|e| format!("{name}: {e}")),
+        PasteJob::File { uri } => {
+            let file = gio::File::for_uri(&uri);
+            let name = file.basename().map_or(uri, |p| p.display().to_string());
+            gdk::Texture::from_file(&file)
+                .map(|t| texture_to_image(&t, name.clone()))
+                .map_err(|e| format!("{name}: {e}"))
+        }
+    }
+}
+
+fn paste_image_files(target: &PasteTarget, uris: Vec<String>) {
+    tracing::debug!(?uris, "paste: image files");
+    let jobs = file_jobs(uris);
+    if jobs.is_empty() {
+        target.toaster.info("Only image files on this computer can be pasted");
+        return;
+    }
+    paste_jobs(target, jobs);
+}
+
+// Decodes one image at a time and adds each as it lands, so only about two
+// decoded images are ever held and a layer-limit stop skips the rest
+fn paste_jobs(target: &PasteTarget, jobs: Vec<PasteJob>) {
+    if jobs.is_empty() {
+        return;
+    }
+    let target = target.clone();
+    let pending = target.toaster.pending(if jobs.len() == 1 {
+        "Pasting image..."
+    } else {
+        "Pasting images..."
+    });
+    let (tx, rx) = std::sync::mpsc::sync_channel::<DecodedImage>(1);
+    std::thread::spawn(move || {
+        for job in jobs {
+            if tx.send(decode_job(job)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut pasted = 0_usize;
+    let mut errors: Vec<String> = Vec::new();
+    glib::timeout_add_local(Duration::from_millis(16), move || {
+        let _span = frame_profile::span(frame_profile::Stage::Timers);
+        match rx.try_recv() {
+            Ok(Ok(image)) => {
+                if paste_as_new_layer(&target, image) {
+                    pasted += 1;
+                    return glib::ControlFlow::Continue;
+                }
+                pending.dismiss();
+                return glib::ControlFlow::Break;
+            }
+            Ok(Err(e)) => {
+                errors.push(e);
+                return glib::ControlFlow::Continue;
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => return glib::ControlFlow::Continue,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+        }
+        pending.dismiss();
+        if let Some(first) = errors.first() {
+            let more = match errors.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            };
+            target.toaster.error(&format!("Paste failed: {first}{more}"));
+        } else if pasted == 1 {
+            target.toaster.info("Image pasted!");
+        } else if pasted > 1 {
+            target.toaster.info(&format!("{pasted} images pasted!"));
+        }
+        glib::ControlFlow::Break
+    });
+}
+
+/// Returns false when the layer limit stops further pastes.
+#[allow(clippy::cast_possible_wrap)]
+fn paste_as_new_layer(target: &PasteTarget, image: PastedImage) -> bool {
+    let PasteTarget { area, ui, canvas, redraw, toaster, history, layer_extensions } = target;
+    let PastedImage { name, pixels: src, width: src_w, height: src_h } = image;
     let size = canvas.borrow().size();
     let off_x = (size.width as i32 - src_w as i32) / 2;
     let off_y = (size.height as i32 - src_h as i32) / 2;
-    let pixels = composite_centered(src, src_w, src_h, size.width, size.height);
-    let next_n = canvas.borrow().layers().len() + 1;
-    let name = format!("Layer {next_n}");
+    let pixels = composite_centered(&src, src_w, src_h, size.width, size.height);
     let result = canvas.borrow_mut().add_layer_with_pixels(name, &pixels);
     match result {
         Ok(new_idx) => {
@@ -978,7 +1083,7 @@ fn paste_as_new_layer(
                 canvas,
                 layer_extensions,
                 new_idx,
-                src,
+                &src,
                 src_w,
                 src_h,
                 off_x,
@@ -1002,10 +1107,16 @@ fn paste_as_new_layer(
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             area.queue_draw();
             redraw.request();
-            toaster.info("External image pasted!");
+            true
         }
-        Err(RendererError::LayerLimit) => toaster.layer_limit_reached(),
-        Err(e) => toaster.error(&format!("Failed to paste layer: {e}")),
+        Err(RendererError::LayerLimit) => {
+            toaster.layer_limit_reached();
+            false
+        }
+        Err(e) => {
+            toaster.error(&format!("Failed to paste layer: {e}"));
+            false
+        }
     }
 }
 
@@ -1103,11 +1214,7 @@ pub(super) fn refresh_action_sensitivity(ui: &Ui) {
 }
 
 
-pub(super) fn install_context_menu(
-    area: &gtk::DrawingArea,
-    ui: &Ui,
-    layer_clipboard: &Rc<RefCell<Option<LayerClipboard>>>,
-) {
+pub(super) fn install_context_menu(area: &gtk::DrawingArea, ui: &Ui) {
     let build_layer_menu = |clipped: bool, locked: bool| {
         let menu = gio::Menu::new();
         menu.append(
@@ -1163,7 +1270,6 @@ pub(super) fn install_context_menu(
         let ui = ui.clone();
         let area_w = area.clone();
         let popover = Rc::clone(&popover);
-        let layer_clipboard = Rc::clone(layer_clipboard);
         let group_menu = group_menu.clone();
         click.connect_pressed(move |gesture, _, x, y| {
             gesture.set_state(gtk::EventSequenceState::Claimed);
@@ -1193,22 +1299,6 @@ pub(super) fn install_context_menu(
             }
             refresh_action_sensitivity(&ui);
             area_w.queue_draw();
-
-            let has_internal = layer_clipboard.borrow().is_some();
-            let has_system_image = gdk::Display::default().is_some_and(|d| {
-                d.clipboard().formats().contain_mime_type("image/png")
-                    || d.clipboard().formats().contain_mime_type("image/jpeg")
-                    || d.clipboard().formats().contain_mime_type("image/webp")
-                    || d.clipboard().formats().contain_mime_type("image/bmp")
-            });
-            if let Some(gio_app) = gio::Application::default()
-                && let Ok(app) = gio_app.downcast::<gtk::Application>() {
-                    let enabled = has_internal || has_system_image;
-                    if let Some(a) = app.lookup_action("paste")
-                        && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
-                            sa.set_enabled(enabled);
-                        }
-                }
 
             #[allow(clippy::cast_possible_truncation)]
             let rect = gdk::Rectangle::new(x as i32, y as i32, 1, 1);

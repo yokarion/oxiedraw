@@ -344,6 +344,12 @@ impl CanvasPaintable {
         gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
+    /// Busy bar under the toast pill, `fill` in `0.0..=1.0`; `None` hides it.
+    pub(crate) fn set_toast_progress(&self, fill: Option<f32>) {
+        self.imp().toast_progress.set(fill);
+        gdk::prelude::PaintableExt::invalidate_contents(self);
+    }
+
     /// Update the text-editing overlay. `box_rect`, `caret` and `selection`
     /// rects are all in canvas coordinates. Pass `active = false` to clear.
     pub(crate) fn set_text_edit(
@@ -1558,6 +1564,24 @@ fn render_edit_label_texture(label: &str) -> Option<(gdk::MemoryTexture, f32, f3
     render_pill_texture(label, 13.0, 8.0, 4.0, (0.08, 0.08, 0.10, 0.7), (1.0, 1.0, 1.0, 0.55))
 }
 
+fn append_busy_bar(snapshot: &gtk::Snapshot, pill: &graphene::Rect, fill: f32) {
+    use gtk::prelude::SnapshotExt;
+    const HEIGHT: f32 = 4.0;
+    const GAP: f32 = 6.0;
+    const INSET: f32 = 12.0;
+    let track = graphene::Rect::new(
+        pill.x() + INSET,
+        pill.y() + pill.height() + GAP,
+        (pill.width() - INSET * 2.0).max(HEIGHT),
+        HEIGHT,
+    );
+    let filled = graphene::Rect::new(track.x(), track.y(), track.width() * fill.clamp(0.0, 1.0), HEIGHT);
+    snapshot.push_rounded_clip(&gsk::RoundedRect::from_rect(track, HEIGHT / 2.0));
+    snapshot.append_color(&gdk::RGBA::new(0.10, 0.10, 0.12, 0.92), &track);
+    snapshot.append_color(&gdk::RGBA::new(1.0, 1.0, 1.0, 0.9), &filled);
+    snapshot.pop();
+}
+
 /// Transient toast pill: a notification - larger padding/font, near-opaque
 /// dark fill and bright text.
 fn render_toast_texture(msg: &str) -> Option<(gdk::MemoryTexture, f32, f32)> {
@@ -2126,6 +2150,7 @@ mod imp {
         pub(super) toast_cache: RefCell<Option<(gdk::MemoryTexture, f32, f32)>>,
         pub(super) toast_alpha: Cell<f32>,
         pub(super) toast_offset: Cell<f32>,
+        pub(super) toast_progress: Cell<Option<f32>>,
         // text editing overlay (box outline + caret + selection, canvas coords)
         pub(super) text_edit_active: Cell<bool>,
         pub(super) text_edit_box: Cell<Option<TransformRect>>,
@@ -2225,6 +2250,7 @@ mod imp {
                 toast_cache: RefCell::new(None),
                 toast_alpha: Cell::new(0.0),
                 toast_offset: Cell::new(0.0),
+                toast_progress: Cell::new(None),
                 text_edit_active: Cell::new(false),
                 text_edit_box: Cell::new(None),
                 text_caret: Cell::new(None),
@@ -2936,6 +2962,9 @@ mod imp {
                 let rect = graphene::Rect::new(x, y, *pill_w, *pill_h);
                 gtk_snap.push_opacity(f64::from(self.toast_alpha.get()));
                 gtk_snap.append_texture(texture, &rect);
+                if let Some(fill) = self.toast_progress.get() {
+                    super::append_busy_bar(gtk_snap, &rect, fill);
+                }
                 gtk_snap.pop();
             }
 

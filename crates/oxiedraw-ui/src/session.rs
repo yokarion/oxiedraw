@@ -813,6 +813,7 @@ impl DocumentSession {
             set_component_edit,
             begin_rename,
             create_adjustment_layer,
+            paste_into_layers,
         ) = crate::panels::layers::build(
             &document.layers,
             &viewport.canvas(),
@@ -1031,31 +1032,112 @@ impl DocumentSession {
         };
 
         {
-            let drop = gtk::DropTarget::new(glib::types::Type::STRING, gtk::gdk::DragAction::COPY);
-            let viewport_c = viewport.clone();
-            let components_c = Rc::clone(&components);
-            let history_c = Rc::clone(&history);
-            let edit_mode_c = Rc::clone(&edit_mode);
-            let refresh_layers_c = Rc::clone(&refresh_layers);
-            let toaster_c = global.toaster.clone();
-            drop.connect_drop(move |_, value, x, y| {
-                let Ok(id) = value.get::<String>() else {
-                    return false;
-                };
-                do_place_component(
-                    id,
-                    x,
-                    y,
-                    &viewport_c,
-                    &components_c,
-                    &history_c,
-                    &edit_mode_c,
-                    &refresh_layers_c,
-                    &toaster_c,
+            use crate::clipboard::{
+                FileSource, PasteJob, drop_formats, file_jobs, offers_files, offers_image_data,
+                read_dropped_image, read_file_uris,
+            };
+            use gtk::gdk::DragAction;
+
+            // Returns false for text that is not a component id (a plain text drag)
+            let place_component: Rc<dyn Fn(String, f64, f64) -> bool> = {
+                let viewport = viewport.clone();
+                let components = Rc::clone(&components);
+                let history = Rc::clone(&history);
+                let edit_mode = Rc::clone(&edit_mode);
+                let refresh_layers = Rc::clone(&refresh_layers);
+                let toaster = global.toaster.clone();
+                Rc::new(move |id, x, y| {
+                    if components.borrow().get(&id).is_none() {
+                        return false;
+                    }
+                    do_place_component(
+                        id,
+                        x,
+                        y,
+                        &viewport,
+                        &components,
+                        &history,
+                        &edit_mode,
+                        &refresh_layers,
+                        &toaster,
+                    );
+                    true
+                })
+            };
+            let drop_target = gtk::DropTargetAsync::new(Some(drop_formats()), DragAction::COPY);
+            // Before we answer, Wayland reports only the source's preferred action
+            // (MOVE for Nautilus), so accept on format and request COPY instead.
+            // Never MOVE: the file manager would delete the original.
+            drop_target.connect_accept(|target, drop| {
+                let accepted = target.formats().is_some_and(|f| f.match_(&drop.formats()));
+                tracing::debug!(
+                    formats = %drop.formats().to_str(),
+                    actions = ?drop.actions(),
+                    accepted,
+                    "canvas drag entered"
+                );
+                accepted
+            });
+            drop_target.connect_drag_enter(|_, _, _, _| DragAction::COPY);
+            drop_target.connect_drag_motion(|_, _, _, _| DragAction::COPY);
+            let toaster = global.toaster.clone();
+            drop_target.connect_drop(move |_, drop, x, y| {
+                let offered = drop.formats();
+                tracing::debug!(formats = %offered.to_str(), "canvas drop");
+                let drop_c = drop.clone();
+                let toaster = toaster.clone();
+                let paste = Rc::clone(&paste_into_layers);
+                if offers_image_data(&offered) {
+                    read_dropped_image(drop, move |result| match result {
+                        Ok(bytes) => {
+                            drop_c.finish(DragAction::COPY);
+                            let name = "Dropped image".to_string();
+                            paste(vec![PasteJob::Encoded { bytes, name }]);
+                        }
+                        Err(e) => {
+                            drop_c.finish(DragAction::empty());
+                            tracing::warn!(error = %e, "canvas drop: reading image failed");
+                            toaster.error(&format!("Drop failed: {e}"));
+                        }
+                    });
+                    return true;
+                }
+                if offers_files(&offered) {
+                    read_file_uris(&FileSource::Drop(drop.clone()), move |result| match result {
+                        Ok(uris) => {
+                            let jobs = file_jobs(uris);
+                            if jobs.is_empty() {
+                                drop_c.finish(DragAction::empty());
+                                toaster.info("Only image files on this computer can be dropped");
+                                return;
+                            }
+                            drop_c.finish(DragAction::COPY);
+                            paste(jobs);
+                        }
+                        Err(e) => {
+                            drop_c.finish(DragAction::empty());
+                            tracing::warn!(error = %e, "canvas drop: reading files failed");
+                            toaster.error(&format!("Drop failed: {e}"));
+                        }
+                    });
+                    return true;
+                }
+                let place_component = Rc::clone(&place_component);
+                drop.read_value_async(
+                    glib::types::Type::STRING,
+                    glib::Priority::DEFAULT,
+                    gtk::gio::Cancellable::NONE,
+                    move |result| {
+                        let placed = result
+                            .ok()
+                            .and_then(|v| v.get::<String>().ok())
+                            .is_some_and(|id| place_component(id, x, y));
+                        drop_c.finish(if placed { DragAction::COPY } else { DragAction::empty() });
+                    },
                 );
                 true
             });
-            picture.add_controller(drop);
+            picture.add_controller(drop_target);
         }
 
         {
