@@ -153,6 +153,38 @@ pub(crate) fn build(colors: ColorState) -> gtk::Box {
     panel
 }
 
+// Just the ring and triangle, for embedding outside the panel.
+pub(crate) fn build_wheel(colors: ColorState, size: i32) -> gtk::DrawingArea {
+    let state = PickerState::new(colors);
+    let wheel = build_wheel_widget();
+    wheel.set_content_width(size);
+    wheel.set_content_height(size);
+    // Weak so the wheel can be finalized, which is what disconnects the observer.
+    let redraw: Rc<dyn Fn()> = {
+        let wheel = wheel.downgrade();
+        Rc::new(move || {
+            if let Some(wheel) = wheel.upgrade() {
+                wheel.queue_draw();
+            }
+        })
+    };
+    install_wheel_draw(&wheel, &state);
+    install_wheel_input(&wheel, &state, &redraw);
+    let observer = {
+        let state = state.clone();
+        state.colors.clone().connect_changed(Box::new(move || {
+            if state.syncing.get() {
+                return;
+            }
+            state.load_hsv_from_current();
+            redraw();
+        }))
+    };
+    let colors = state.colors.clone();
+    wheel.connect_destroy(move |_| colors.disconnect_changed(observer));
+    wheel
+}
+
 fn build_inputs(
     state: &PickerState,
     wheel: &gtk::DrawingArea,

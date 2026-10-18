@@ -123,7 +123,7 @@ impl GlobalState {
                     .or_else(|| brushes.first());
                 if let Some(preset) = target {
                     brush_engine.set_active(preset.id);
-                    brush_engine.size.set(preset.default_size);
+                    brush_engine.set_size(preset.default_size);
                     brush_engine.opacity.set(preset.default_opacity);
                 }
             }
@@ -920,7 +920,7 @@ impl DocumentSession {
             })
         };
 
-        let apply_tool: Rc<dyn Fn(Tool)> = build_apply_tool(
+        let mut apply_tool: Rc<dyn Fn(Tool)> = build_apply_tool(
             &viewport,
             &crop,
             &transform,
@@ -1028,6 +1028,20 @@ impl DocumentSession {
         let canvas_root = {
             let overlay = gtk::Overlay::builder().child(&picture).build();
             tool_windows.attach(&overlay);
+            let close_brush_popup = crate::brush_popup::attach(
+                &overlay,
+                &picture,
+                &global.tools,
+                &global.colors,
+                &global.brush_engine,
+            );
+            let inner = apply_tool;
+            apply_tool = Rc::new(move |t: Tool| {
+                if t != Tool::Brush {
+                    close_brush_popup();
+                }
+                inner(t);
+            });
             overlay.upcast::<gtk::Widget>()
         };
 

@@ -186,7 +186,7 @@ fn build_selection_page(
         .sensitive(selection.edit.get().paints())
         .build();
     brush_controls.append(&gtk::Label::new(Some("Size")));
-    brush_controls.append(&build_size_slider(brush_engine));
+    brush_controls.append(&build_size_slider(brush_engine, SIZE_SLIDER_WIDTH));
     brush_controls.append(&gtk::Label::new(Some("Strength")));
     brush_controls.append(&build_strength_slider(selection));
 
@@ -317,7 +317,7 @@ fn build_brush_page(
     row.append(&brush_picker::build(brush_engine, default_brush_name, toaster));
     row.append(&build_eraser_toggle());
     row.append(&gtk::Label::new(Some("Size")));
-    row.append(&build_size_slider(brush_engine));
+    row.append(&build_size_slider(brush_engine, SIZE_SLIDER_WIDTH));
     row.append(&gtk::Label::new(Some("Opacity")));
     row.append(&build_opacity_slider(brush_engine));
 
@@ -346,12 +346,11 @@ fn apply_eraser_style(btn: &gtk::ToggleButton, active: bool) {
     }
 }
 
-fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
-    let size = brush_engine.size.clone();
+pub(crate) fn build_size_slider(brush_engine: &BrushEngine, width: i32) -> gtk::Scale {
     let programmatic = Rc::new(Cell::new(false));
     let scale = slider::build_mapped(
         f64::from(brush_engine.size.get()),
-        SIZE_SLIDER_WIDTH,
+        width,
         size_pos_to_value,
         size_value_to_pos,
         |value| {
@@ -361,23 +360,44 @@ fn build_size_slider(brush_engine: &BrushEngine) -> gtk::Scale {
         },
         {
             let programmatic = Rc::clone(&programmatic);
+            let brush_engine = brush_engine.clone();
             move |value| {
                 if programmatic.get() {
                     return;
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                size.set(value as f32);
+                brush_engine.set_size(value as f32);
             }
         },
     );
-    {
+    // Skipped when the thumb already maps to the size, so the slider being
+    // dragged doesn't snap its own thumb under the pointer.
+    let sync: Rc<dyn Fn(&gtk::Scale)> = {
         let size = brush_engine.size.clone();
-        scale.connect_map(move |s| {
+        Rc::new(move |s| {
+            let current = f64::from(size.get());
+            if (size_pos_to_value(s.value()) - current).abs() < f64::EPSILON {
+                return;
+            }
             programmatic.set(true);
-            s.set_value(size_value_to_pos(f64::from(size.get())));
+            s.set_value(size_value_to_pos(current));
             programmatic.set(false);
-        });
+        })
+    };
+    {
+        let sync = Rc::clone(&sync);
+        scale.connect_map(move |s| sync(s));
     }
+    let listener = {
+        let weak = scale.downgrade();
+        brush_engine.connect_size_changed(Rc::new(move || {
+            if let Some(s) = weak.upgrade() {
+                sync(&s);
+            }
+        }))
+    };
+    let brush_engine = brush_engine.clone();
+    scale.connect_destroy(move |_| brush_engine.disconnect_size_changed(listener));
     scale
 }
 

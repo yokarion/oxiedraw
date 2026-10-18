@@ -6,6 +6,7 @@ mod actions;
 mod adjustments;
 mod app;
 mod brush_manager;
+mod brush_popup;
 mod brush_picker;
 mod canvas;
 mod canvas_paintable;

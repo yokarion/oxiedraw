@@ -48,12 +48,16 @@ pub(super) fn install_wheel_input(
 
     let mode: Rc<Cell<DragMode>> = Rc::new(Cell::new(DragMode::None));
 
+    // The area comes from the gesture: capturing it would be a reference cycle
+    // through its own controller, and it would never be freed.
     {
-        let area_w = area.clone();
         let state = state.clone();
         let mode = Rc::clone(&mode);
         let refresh = Rc::clone(refresh);
-        drag.connect_drag_begin(move |_, x, y| {
+        drag.connect_drag_begin(move |gesture, x, y| {
+            let Some(area_w) = gesture.widget() else {
+                return;
+            };
             let geom = WheelGeom::for_area(area_w.width(), area_w.height());
             let new_mode = classify_pointer(&geom, x, y, f64::from(state.hue.get()));
             mode.set(new_mode);
@@ -62,12 +66,11 @@ pub(super) fn install_wheel_input(
         });
     }
     {
-        let area_w = area.clone();
         let state = state.clone();
         let mode = Rc::clone(&mode);
         let refresh = Rc::clone(refresh);
         drag.connect_drag_update(move |gesture, dx, dy| {
-            let Some((sx, sy)) = gesture.start_point() else {
+            let (Some((sx, sy)), Some(area_w)) = (gesture.start_point(), gesture.widget()) else {
                 return;
             };
             let geom = WheelGeom::for_area(area_w.width(), area_w.height());

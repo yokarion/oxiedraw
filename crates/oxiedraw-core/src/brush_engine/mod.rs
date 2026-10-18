@@ -55,7 +55,11 @@ pub struct BrushEngine {
     /// of `clear -> add -> add -> ...` flicker.
     suppress_notify_depth: Rc<Cell<u32>>,
     notify_pending: Rc<Cell<bool>>,
+    size_listeners: Rc<RefCell<Vec<(SizeListenerId, Rc<dyn Fn()>)>>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizeListenerId(u32);
 
 /// Opaque handle returned by `connect_brushes_changed` so the caller
 /// can detach the listener via `disconnect_brushes_changed`.
@@ -89,6 +93,7 @@ impl BrushEngine {
             next_listener_id: Rc::new(Cell::new(0)),
             suppress_notify_depth: Rc::new(Cell::new(0)),
             notify_pending: Rc::new(Cell::new(false)),
+            size_listeners: Rc::new(RefCell::new(Vec::new())),
         };
         // Built-in factories; `add_brush` reassigns the id from the counter
         // so the literal `BrushPresetId(0)` passed here is just a placeholder.
@@ -111,6 +116,32 @@ impl BrushEngine {
             .map_or(12.0, |p| p.default_size);
         engine.size.set(default_preset_size);
         engine
+    }
+
+    // Writers go through here so every size slider follows the change.
+    pub fn set_size(&self, size: f32) {
+        self.size.set(size);
+        let snapshot: Vec<Rc<dyn Fn()>> = self
+            .size_listeners
+            .borrow()
+            .iter()
+            .map(|(_, cb)| Rc::clone(cb))
+            .collect();
+        for cb in snapshot {
+            cb();
+        }
+    }
+
+    pub fn connect_size_changed(&self, listener: Rc<dyn Fn()>) -> SizeListenerId {
+        let id = SizeListenerId(self.next_listener_id.get());
+        self.next_listener_id
+            .set(self.next_listener_id.get().wrapping_add(1));
+        self.size_listeners.borrow_mut().push((id, listener));
+        id
+    }
+
+    pub fn disconnect_size_changed(&self, id: SizeListenerId) {
+        self.size_listeners.borrow_mut().retain(|(i, _)| *i != id);
     }
 
     /// Append a preset to the registry, assigning it a fresh id.
