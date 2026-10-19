@@ -80,6 +80,16 @@ pub(crate) fn attach(
                     on_motion(&state, &overlay, event);
                     glib::Propagation::Proceed
                 }
+                // Touch pans the canvas, so a finger outside closes it like a press.
+                gdk::EventType::TouchBegin => {
+                    if state.is_open.get()
+                        && let Some((x, y)) = event_position_in(&overlay, event)
+                        && !state.contains(&overlay, x, y)
+                    {
+                        state.close(false);
+                    }
+                    glib::Propagation::Proceed
+                }
                 _ => glib::Propagation::Proceed,
             }
         });
@@ -351,13 +361,16 @@ fn place_centered(popup: &gtk::Box, overlay: &gtk::Overlay, x: f64, y: f64) {
     popup.set_margin_top(clamp(y - half, height, overlay.height()));
 }
 
-// Legacy events carry surface coordinates; map them into the overlay.
-fn event_position_in(overlay: &gtk::Overlay, event: &gdk::Event) -> Option<(f64, f64)> {
+// Legacy events carry surface coordinates; map them into the widget.
+pub(crate) fn event_position_in(
+    widget: &impl IsA<gtk::Widget>,
+    event: &gdk::Event,
+) -> Option<(f64, f64)> {
     let (surface_x, surface_y) = event.position()?;
-    let native = overlay.native()?;
+    let native = widget.native()?;
     let (offset_x, offset_y) = native.surface_transform();
     #[allow(clippy::cast_possible_truncation)]
     let point = gtk::graphene::Point::new((surface_x - offset_x) as f32, (surface_y - offset_y) as f32);
-    let mapped = native.upcast_ref::<gtk::Widget>().compute_point(overlay, &point)?;
+    let mapped = native.upcast_ref::<gtk::Widget>().compute_point(widget, &point)?;
     Some((f64::from(mapped.x()), f64::from(mapped.y())))
 }

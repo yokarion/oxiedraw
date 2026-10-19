@@ -38,7 +38,7 @@ use crate::settings::{AppSettings, ShapeCorrectionSettings};
 use super::stroke_tip::{DeferredDabs, stamp_runs};
 use super::{RenderPump, Viewport};
 use super::{
-    BUTTON_PRIMARY, crop_geom, present_into_paintable, pressure_from, sample_from,
+    BUTTON_PRIMARY, crop_geom, is_eraser_end, present_into_paintable, pressure_from, sample_from,
     transform_geometry, widget_to_canvas,
 };
 
@@ -121,6 +121,9 @@ pub(super) struct PrimaryDragHandler {
     pending_color: Rc<Cell<Color>>,
     pending_opacity: Rc<Cell<f32>>,
     pending_erase: Rc<Cell<bool>>,
+    /// The pen's eraser end started this gesture: it erases with the brush
+    /// whatever tool is active.
+    pen_eraser: Cell<bool>,
     pending_timer: Rc<RefCell<Option<glib::SourceId>>>,
     /// Set once a shape-correction animation is armed; lets pen-up and
     /// undo/redo finalize the corrected shape. `None` for a plain freehand
@@ -340,7 +343,25 @@ impl PrimaryDragHandler {
             .is_some_and(|k| matches!(k, LayerKind::Text(_)))
     }
 
+    fn tool_session_open(&self) -> bool {
+        match self.tools.active.get() {
+            Tool::Liquify => self.canvas.borrow().liquify_active(),
+            Tool::Transform => self.transform.rect.get().is_some(),
+            _ => false,
+        }
+    }
+
+    fn gesture_tool(&self) -> Tool {
+        if self.pen_eraser.get() {
+            Tool::Brush
+        } else {
+            self.tools.active.get()
+        }
+    }
+
     fn on_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
+        self.pen_eraser
+            .set(is_eraser_end(gesture.current_event().as_ref()));
         // A fill gesture ends on the button coming up, which normally
         // arrives as a motion event - but a release outside the window
         // never delivers one, leaving the fill committed and unrecorded.
@@ -350,7 +371,7 @@ impl PrimaryDragHandler {
         // Raster tools are rejected on component layers - those are pre-rendered
         // and only editable by opening the component.
         let raster_tool = matches!(
-            self.tools.active.get(),
+            self.gesture_tool(),
             Tool::Brush | Tool::Fill(_) | Tool::Shapes(_) | Tool::Liquify
         );
         if raster_tool && self.active_is_component() {
@@ -365,11 +386,20 @@ impl PrimaryDragHandler {
             gesture.set_state(gtk::EventSequenceState::Denied);
             return;
         }
+        // Erasing under an open liquify or transform would desync the layer
+        // from the session's pristine copy, and settling it here would apply
+        // the user's work behind their back.
+        if self.pen_eraser.get() && self.tool_session_open() {
+            self.toaster
+                .info("Apply or cancel the current Liquify or Transform before erasing.");
+            gesture.set_state(gtk::EventSequenceState::Denied);
+            return;
+        }
         // Cleared per gesture: a stroke or fill that ends by some path other
         // than its own pen-up would otherwise leave its colour here for a
         // later, unrelated gesture to hand to Recent.
         self.used_color.set(None);
-        match self.tools.active.get() {
+        match self.gesture_tool() {
             Tool::Brush => self.brush_begin(gesture, x, y),
             Tool::Crop => self.crop_begin(x, y),
             Tool::Transform => self.transform_begin(x, y),
@@ -395,7 +425,7 @@ impl PrimaryDragHandler {
     }
 
     fn on_update(&self, gesture: &gtk::GestureDrag, dx: f64, dy: f64) {
-        match self.tools.active.get() {
+        match self.gesture_tool() {
             Tool::Brush => self.brush_update(gesture, dx, dy),
             Tool::Crop => self.crop_update(gesture, dx, dy),
             Tool::Transform => self.transform_update(gesture, dx, dy),
@@ -413,7 +443,7 @@ impl PrimaryDragHandler {
     }
 
     fn on_end(&self, gesture: &gtk::GestureDrag) {
-        match self.tools.active.get() {
+        match self.gesture_tool() {
             Tool::Brush => self.brush_end(),
             Tool::Crop => self.crop_end(),
             Tool::Selection(s) => self.selection_end(s),
@@ -811,7 +841,7 @@ impl PrimaryDragHandler {
         } else {
             self.colors.current()
         };
-        let erase = !on_adjustment && self.tools.eraser.get();
+        let erase = !on_adjustment && (self.tools.eraser.get() || self.pen_eraser.get());
 
         // Capture context so the idle timer can re-draw with the same settings.
         self.pending_color.set(color);
@@ -3170,7 +3200,7 @@ pub(super) fn install_primary_drag(
     toaster: &crate::toaster::Toaster,
     text_edit: &crate::text_edit::TextEdit,
     cursor_activates_transform: Rc<dyn Fn()>,
-) {
+) -> gtk::GestureDrag {
     let handler = Rc::new(PrimaryDragHandler {
         canvas: Rc::clone(&viewport.canvas),
         paintable: viewport.paintable.clone(),
@@ -3188,6 +3218,7 @@ pub(super) fn install_primary_drag(
         pending_color: Rc::new(Cell::new(Color::new(0, 0, 0))),
         pending_opacity: Rc::new(Cell::new(1.0)),
         pending_erase: Rc::new(Cell::new(false)),
+        pen_eraser: Cell::new(false),
         pending_timer: Rc::new(RefCell::new(None)),
         pending_correction: Rc::new(RefCell::new(None)),
         stroke_shape_correction: RefCell::new(ShapeCorrectionSettings::default()),
@@ -3322,5 +3353,6 @@ pub(super) fn install_primary_drag(
         }));
     }
 
-    area.add_controller(drag);
+    area.add_controller(drag.clone());
+    drag
 }

@@ -8,6 +8,7 @@ mod crop_geom;
 pub(crate) mod primary_drag;
 mod resample;
 mod stroke_tip;
+mod touch;
 mod transform_geometry;
 
 use std::cell::{Cell, RefCell};
@@ -789,7 +790,7 @@ pub(crate) fn wire(
     install_pan(picture, viewport);
     install_scroll(picture, viewport);
     install_pinch_zoom(picture, viewport);
-    primary_drag::install_primary_drag(
+    let primary_drag = primary_drag::install_primary_drag(
         picture,
         viewport,
         brush_engine,
@@ -811,6 +812,7 @@ pub(crate) fn wire(
         text_edit,
         cursor_activates_transform,
     );
+    touch::install_touch_nav(picture, viewport, &primary_drag);
     install_centering_and_present(picture, viewport);
 }
 
@@ -900,12 +902,19 @@ fn install_motion(
         hover_pump.poke();
         frame_profile::note_input();
 
+        // The eraser end always erases with the brush, so it hovers as one.
+        let tool = if is_eraser_end(ctrl.current_event().as_ref()) {
+            Tool::Brush
+        } else {
+            tools_c.active.get()
+        };
+
         // Only the Gradient tool draws the ramp cursor; clear it otherwise.
-        if !matches!(tools_c.active.get(), Tool::Fill(FillTool::Gradient)) {
+        if !matches!(tool, Tool::Fill(FillTool::Gradient)) {
             paintable.set_gradient_cursor(None);
         }
 
-        match tools_c.active.get() {
+        match tool {
             Tool::Crop => {
                 let p = pan.get();
                 let z = zoom.get();
@@ -1158,6 +1167,12 @@ fn device_axes(ctrl: &gtk::EventControllerMotion) -> (f32, f32, f32, f32) {
     // engine wants radians.
     let rotation_rad = read(gdk::AxisUse::Rotation, 0.0) * std::f32::consts::TAU;
     (pressure, tilt_x, tilt_y, rotation_rad)
+}
+
+pub(super) fn is_eraser_end(event: Option<&gdk::Event>) -> bool {
+    event
+        .and_then(gdk::Event::device_tool)
+        .is_some_and(|tool| tool.tool_type() == gdk::DeviceToolType::Eraser)
 }
 
 /// Deterministic-but-position-dependent unit value used for scatter /
