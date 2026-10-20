@@ -1,4 +1,4 @@
-use std::ffi::{CStr, c_void};
+use std::ffi::{CStr, c_char, c_void};
 
 use ash::ext::debug_utils;
 use ash::{Entry, Instance, vk};
@@ -36,8 +36,8 @@ pub(super) fn create() -> Result<InstanceBundle, RendererError> {
         .engine_version(vk::make_api_version(0, 0, 1, 0))
         .api_version(vk::API_VERSION_1_3);
 
-    let mut layer_ptrs: Vec<*const i8> = Vec::new();
-    let mut ext_ptrs: Vec<*const i8> = Vec::new();
+    let mut layer_ptrs: Vec<*const c_char> = Vec::new();
+    let mut ext_ptrs: Vec<*const c_char> = Vec::new();
 
     let validation = want_validation && validation_layer_available(&entry)?;
     if want_validation && !validation {

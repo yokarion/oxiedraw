@@ -54,11 +54,16 @@ jobs:
   build:
     needs: [lint, test]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/yokarion/rust-toolchain-container:latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -68,8 +73,8 @@ jobs:
             /usr/local/cargo/registry
             /usr/local/cargo/git
             target
-          key: cargo-build-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-build-
+          key: cargo-build-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-build-${{ matrix.arch }}-
 
       - name: Resolve version
         id: ver
@@ -98,7 +103,7 @@ jobs:
         run: |
           set -eu
           version="${{ steps.ver.outputs.version }}"
-          stage="stage/oxiedraw-${version}-x86_64-linux"
+          stage="stage/oxiedraw-${version}-${{ matrix.arch }}-linux"
           mkdir -p "${stage}" dist
           install -Dm755 target/release/oxiedraw "${stage}/oxiedraw"
           strip "${stage}/oxiedraw"
@@ -107,8 +112,8 @@ jobs:
           install -Dm644 data/com.yokarion.oxiedraw.desktop "${stage}/com.yokarion.oxiedraw.desktop"
           install -Dm644 data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg \
             "${stage}/com.yokarion.oxiedraw.svg"
-          tar -C stage -caf "dist/oxiedraw-${version}-x86_64-linux.tar.zst" \
-            "oxiedraw-${version}-x86_64-linux"
+          tar -C stage -caf "dist/oxiedraw-${{ matrix.arch }}-linux.tar.zst" \
+            "oxiedraw-${version}-${{ matrix.arch }}-linux"
 
       # linuxdeploy only bundles what is installed here. Without these the
       # AppImage ships broken icons, no Cantarell, and no desktop schemas.
@@ -129,13 +134,14 @@ jobs:
         run: |
           set -eu
           version="${{ steps.ver.outputs.version }}"
-          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          linuxdeploy="linuxdeploy-${{ matrix.arch }}.AppImage"
+          wget -q "https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/${linuxdeploy}"
           wget -q https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
-          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-gtk.sh
+          chmod +x "${linuxdeploy}" linuxdeploy-plugin-gtk.sh
           export PATH="${PWD}:${PATH}"
 
           # Deploy only; packaging waits until the plugin's hook is patched.
-          VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
+          VERSION="${version}" "./${linuxdeploy}" \
             --appdir AppDir \
             --executable target/release/oxiedraw \
             --desktop-file data/com.yokarion.oxiedraw.desktop \
@@ -151,10 +157,46 @@ jobs:
           ! grep -qE 'GDK_BACKEND=x11|export GTK_THEME=' "${hook}"
 
           # No --plugin here, or the hook is rewritten and the patch undone.
-          VERSION="${version}" ./linuxdeploy-x86_64.AppImage \
+          VERSION="${version}" "./${linuxdeploy}" \
             --appdir AppDir \
             --output appimage
-          mv OxieDraw-*-x86_64.AppImage "dist/OxieDraw-${version}-x86_64.AppImage"
+          mv OxieDraw-*-${{ matrix.arch }}.AppImage "dist/OxieDraw-${{ matrix.arch }}.AppImage"
+
+      # ARM 16K pages test
+      - name: Check 16K page alignment
+        if: matrix.arch == 'aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bad=0
+          while IFS= read -r -d '' file; do
+            readelf -h "${file}" > /dev/null 2>&1 || continue
+            for align in $(readelf -lW "${file}" | awk '$1 == "LOAD" { print $NF }'); do
+              if (( align < 0x4000 )); then
+                echo "${file}: LOAD alignment ${align}"
+                bad=1
+              fi
+            done
+          done < <(find stage AppDir -type f -print0)
+          exit "${bad}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
       - name: Checksums
         run: |

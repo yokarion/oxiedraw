@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, c_char};
 
 use ash::ext::image_drm_format_modifier;
 use ash::khr::external_memory_fd;
@@ -78,7 +78,7 @@ pub(super) fn create(instance: &Instance) -> Result<DeviceBundle, RendererError>
     let queue_infos = [vk::DeviceQueueCreateInfo::default()
         .queue_family_index(queue_family)
         .queue_priorities(&priorities)];
-    let ext_ptrs: Vec<*const i8> = REQUIRED_DEVICE_EXTENSIONS
+    let ext_ptrs: Vec<*const c_char> = REQUIRED_DEVICE_EXTENSIONS
         .iter()
         .map(|n| n.as_ptr())
         .collect();
