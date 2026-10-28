@@ -5,7 +5,7 @@
 use ash::vk;
 
 use super::super::RendererError;
-use super::{CANVAS_FORMAT, VulkanRenderer, full_image_barrier};
+use super::{CANVAS_FORMAT, CommitRebuild, VulkanRenderer, full_image_barrier};
 
 impl VulkanRenderer {
     /// Monotonic content version of layer `idx`, bumped on every write to its
@@ -109,14 +109,17 @@ impl VulkanRenderer {
 
     /// Commit the in-flight stroke in a single submit: composite the
     /// stroke buffer into the target layer, clear the stroke buffer, and
-    /// rebuild the canvas from the visible layer stack. Replaces three
-    /// separate submits (one fence-wait instead of three).
+    /// refresh the canvas per `rebuild`. Without adjustment layers the
+    /// whole-canvas rebuild shares the submit; with them the adjusted rebuild
+    /// follows as its own submit, confined to the stroke's dirty rect when
+    /// `rebuild` is incremental and the canvas was complete.
     pub fn commit_stroke_into_layer(
         &mut self,
         layer_idx: usize,
         color_linear: [f32; 3],
         opacity: f32,
         visibilities: &[bool],
+        rebuild: CommitRebuild,
     ) -> Result<(), RendererError> {
         if layer_idx >= self.layer_stack.slots.len() {
             return Err(RendererError::LayerIndexOutOfRange);
@@ -130,11 +133,8 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let visible_indices = self.visible_layer_indices(visibilities);
-        // Adjustment layers run a multi-submit effect chain, so their canvas
-        // rebuild can't share this single submit. Without an adjustment the
-        // canvas rebuild stays folded into the stroke-commit submit (the fast,
-        // common path).
         let has_adjustments = self.has_adjustment_layers();
+        let flat_rebuild = rebuild != CommitRebuild::Skip && !has_adjustments;
         self.record_and_submit(|this| {
             // 1. Stroke buffer -> target layer.
             this.cmd_composite_pass(framebuffer, push);
@@ -145,19 +145,31 @@ impl VulkanRenderer {
             // 3. Reset the stroke buffer for the next stroke / stamp.
             this.cmd_clear_image(this.stroke.handle, [0.0, 0.0, 0.0, 0.0]);
             // 4. Rebuild the canvas from the layer stack (no-adjustment path).
-            if !has_adjustments {
+            if flat_rebuild {
                 this.cmd_composite_layers_to_canvas(&visible_indices);
             }
             Ok(())
         })?;
         self.layer_stack.touch(layer_idx);
-        // 4b. With adjustment layers present, rebuild the canvas through the
-        //     per-layer-submit path so each effect's chain applies to the
-        //     accumulator instead of the slot being drawn as its raw mask.
-        if has_adjustments {
-            self.composite_layers_to_canvas_adjusted(&visible_indices)?;
+        if flat_rebuild {
+            self.canvas_complete = true;
         }
-        Ok(())
+        if !has_adjustments {
+            return Ok(());
+        }
+        match rebuild {
+            CommitRebuild::Skip => Ok(()),
+            CommitRebuild::Incremental if self.canvas_complete => {
+                // Nothing stamped leaves the layer, and so the canvas, as it was.
+                let Some(rect) = self.stroke_dirty_rect() else {
+                    return Ok(());
+                };
+                self.composite_adjusted_region(&visible_indices, Some((layer_idx, rect)))
+            }
+            CommitRebuild::Full | CommitRebuild::Incremental => {
+                self.composite_layers_to_canvas_adjusted(&visible_indices)
+            }
+        }
     }
 
     /// Composite only the visible layers strictly above `target_idx` into
@@ -223,15 +235,15 @@ impl VulkanRenderer {
         visibilities: &[bool],
     ) -> Result<(), RendererError> {
         let visible_indices = self.visible_layer_indices(visibilities);
-        // Adjustment layers run multi-pass effect chains that can't share a
-        // single command submission, so fall back to the per-layer path.
         if self.has_adjustment_layers() {
             return self.composite_layers_to_canvas_adjusted(&visible_indices);
         }
         self.record_and_submit(|this| {
             this.cmd_composite_layers_to_canvas(&visible_indices);
             Ok(())
-        })
+        })?;
+        self.canvas_complete = true;
+        Ok(())
     }
 
     /// Rebuild the canvas image from only the visible layers up to and
@@ -249,6 +261,7 @@ impl VulkanRenderer {
             .into_iter()
             .filter(|&i| i <= target_idx)
             .collect();
+        self.canvas_complete = false;
         self.record_and_submit(|this| {
             this.cmd_composite_layers_to_canvas(&visible_indices);
             Ok(())

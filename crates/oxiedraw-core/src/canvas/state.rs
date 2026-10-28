@@ -356,13 +356,30 @@ impl Canvas {
             self.bump_version();
             return Ok(());
         }
+        use crate::renderer::CommitRebuild;
         let linear = ctx.color.to_linear_rgb();
         let visibilities = self.visibilities();
-        self.renderer
-            .commit_stroke_into_layer(ctx.layer_idx, linear, ctx.opacity, &visibilities)?;
-        // commit_stroke_into_layer composites flat; redo it folder-scoped if any
-        // folder bounds an adjustment, so the committed result clips correctly.
-        self.rescope_composite()?;
+        let scoped = self.scoped_steps(&self.layers.snapshot());
+        // A folder-scoped document is rebuilt below. Otherwise the canvas is
+        // patched in place, unless a batched edit or a liquify session left it
+        // out of date (the full rebuild settles that).
+        let rebuild = if scoped.is_some() {
+            CommitRebuild::Skip
+        } else if self.defer_recomposite || self.liquify_composite_stale {
+            CommitRebuild::Full
+        } else {
+            CommitRebuild::Incremental
+        };
+        self.renderer.commit_stroke_into_layer(
+            ctx.layer_idx,
+            linear,
+            ctx.opacity,
+            &visibilities,
+            rebuild,
+        )?;
+        if let Some(steps) = scoped {
+            self.renderer.composite_layers_scoped(&steps)?;
+        }
         // Clear erase / lock mode now the stroke is done so a later composite
         // that does not start with `begin_stroke` cannot inherit either.
         self.renderer.set_stroke_erase(false);
@@ -1007,7 +1024,14 @@ impl Canvas {
         };
         let linear = ctx.color.to_linear_rgb();
         let visibilities = self.visibilities();
-        if self.effective_adjustment_above(ctx.layer_idx) {
+        if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
+            self.renderer.render_mask_edit_preview_adjusted_incremental_and_read(
+                &visibilities,
+                ctx.layer_idx,
+                linear,
+                ctx.opacity,
+            )
+        } else if self.effective_adjustment_above(ctx.layer_idx) {
             self.renderer.render_preview_adjusted_incremental_and_read(
                 &visibilities,
                 ctx.layer_idx,
@@ -1025,9 +1049,11 @@ impl Canvas {
     }
 
     /// Test/diagnostic: force the next preview frame to rebuild the whole canvas
-    /// (drops the incremental dab-region state).
+    /// (drops the incremental dab-region state) and mark the display dirty so
+    /// the next `present` draws it.
     pub fn force_full_preview(&mut self) {
         self.renderer.invalidate_preview_cache();
+        self.bump_version();
     }
 
     /// Like [`Self::read_pixels`] but fills a caller-owned buffer instead
@@ -1280,14 +1306,22 @@ impl Canvas {
                         // mask view OFF: preview the effect gated by the live
                         // (committed + in-flight) mask, never the mask itself.
                         if self.painting_hidden_adjustment_mask(ctx.layer_idx) {
-                            let snapshot = self.layers.snapshot();
-                            let steps = self.preview_steps(&snapshot);
-                            self.renderer.render_mask_edit_preview_and_present(
-                                &steps,
-                                ctx.layer_idx,
-                                linear,
-                                ctx.opacity,
-                            )?;
+                            // A flat document takes the incremental single-submit
+                            // frame; folder scope and clipping need the walk.
+                            match self.scoped_steps(&self.layers.snapshot()) {
+                                Some(steps) => self.renderer.render_mask_edit_preview_and_present(
+                                    &steps,
+                                    ctx.layer_idx,
+                                    linear,
+                                    ctx.opacity,
+                                )?,
+                                None => self.renderer.render_mask_edit_preview_adjusted_and_present(
+                                    &visibilities,
+                                    ctx.layer_idx,
+                                    linear,
+                                    ctx.opacity,
+                                )?,
+                            }
                         }
                         // Folder-bounded adjustment: the flat fast path can't clip
                         // the effect to its folder (it would bleed onto every layer

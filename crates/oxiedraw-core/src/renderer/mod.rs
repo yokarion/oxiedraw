@@ -146,6 +146,6 @@ pub use error::RendererError;
 pub use layers::MAX_LAYERS;
 pub use selection::SelectionBlendMode;
 pub use vulkan::{
-    CANVAS_FORMAT, EdgesBuffer, GradientKind, MaskBrushMode, PresentSource, STROKE_FORMAT,
-    ShapeKind, SmudgeDab, VulkanRenderer,
+    CANVAS_FORMAT, CommitRebuild, EdgesBuffer, GradientKind, MaskBrushMode, PresentSource,
+    STROKE_FORMAT, ShapeKind, SmudgeDab, VulkanRenderer,
 };

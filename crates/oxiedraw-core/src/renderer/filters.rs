@@ -43,8 +43,9 @@ const MASK_MIX_FRAG_SPV: &[u8] =
 pub(super) const FILTER_PUSH_BYTES: u32 = 16;
 /// Size of the input-set ring. Caps how many filter passes the batched
 /// adjustment preview can record into a single submit before falling back to
-/// the per-submit path.
-pub(super) const INPUT_RING: usize = 16;
+/// the per-submit path. One adjustment with every effect at max thickness
+/// needs 22 sets, so this covers five stacked adjustments.
+pub(super) const INPUT_RING: usize = 128;
 /// Stroke resolve push: 3x vec4 (color, params, texel). See `jfa_resolve.frag`.
 pub(super) const STROKE_PUSH_BYTES: u32 = 48;
 

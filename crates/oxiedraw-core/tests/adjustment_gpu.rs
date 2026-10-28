@@ -177,35 +177,290 @@ fn incremental_stroke_preview_matches_full() {
     assert_eq!(diff, 0, "incremental stroke diverged from full in {diff} bytes");
 }
 
-// Frame 2 redraws only the dabs (rows 42..54, x up to ~56 with the stabiliser
-// lag) grown by the effect margin; pixels past that are stale by design.
-fn incremental_and_full_line(canvas: &mut Canvas, target: usize) -> (Vec<u8>, Vec<u8>) {
-    use oxiedraw_core::brush_engine::{BrushEngine, InputSample};
-    use oxiedraw_utils::geometry::Point;
-
-    let sample = |x: f32, t: u64| InputSample {
-        position: Point::new(x, 48.0),
+fn line_sample(x: f32, y: f32, t: u64) -> oxiedraw_core::brush_engine::InputSample {
+    oxiedraw_core::brush_engine::InputSample {
+        position: oxiedraw_utils::geometry::Point::new(x, y),
         pressure: 1.0,
         tilt_x: 0.0,
         tilt_y: 0.0,
         rotation: 0.0,
         time_ms: t,
-    };
+    }
+}
+
+// Drives the live path (stamp + present) along a line at y = 48 and reads the
+// display back twice: after an incremental second frame, and after a forced
+// full frame. The display keeps every pixel the incremental frame did not
+// present, so the two must agree everywhere.
+fn incremental_and_full_line(canvas: &mut Canvas, target: usize, color: Color) -> (Vec<u8>, Vec<u8>) {
+    use oxiedraw_core::brush_engine::BrushEngine;
+
     canvas.layers().set_active(Some(target));
     let brush = BrushEngine::new();
     brush.size.set(6.0);
     brush.opacity.set(1.0);
-    let white = Color::new(255, 255, 255);
-    canvas.begin_stroke(white, 1.0, false).unwrap();
-    canvas.stamp(|t| brush.begin_stroke(sample(10.0, 0), white, t)).unwrap();
-    canvas.stamp(|t| brush.push_sample(sample(14.0, 10), t)).unwrap();
-    let _ = canvas.read_incremental_preview().unwrap();
+    canvas.begin_stroke(color, 1.0, false).unwrap();
+    canvas.stamp(|t| brush.begin_stroke(line_sample(10.0, 48.0, 0), color, t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(line_sample(14.0, 48.0, 10), t)).unwrap();
+    canvas.present().unwrap();
 
-    canvas.stamp(|t| brush.push_sample(sample(50.0, 20), t)).unwrap();
-    canvas.stamp(|t| brush.push_sample(sample(80.0, 30), t)).unwrap();
-    let incremental = canvas.read_incremental_preview().unwrap();
+    canvas.stamp(|t| brush.push_sample(line_sample(50.0, 48.0, 20), t)).unwrap();
+    canvas.stamp(|t| brush.push_sample(line_sample(80.0, 48.0, 30), t)).unwrap();
+    canvas.present().unwrap();
+    let incremental = canvas.read_display().unwrap();
     canvas.force_full_preview();
-    (incremental, canvas.read_incremental_preview().unwrap())
+    canvas.present().unwrap();
+    (incremental, canvas.read_display().unwrap())
+}
+
+// Stripes on the top half over a transparent bottom half: an alpha edge along
+// y = 48 for the stroke effect to trace, under the line the helpers paint.
+fn half_stripes(size: Size) -> Vec<u8> {
+    (0..size.height)
+        .flat_map(|y| {
+            let v = if y / 2 % 2 == 0 { 100 } else { 150 };
+            let px = if y < size.height / 2 { [v, v, v, 255] } else { [0; 4] };
+            px.repeat(size.width as usize)
+        })
+        .collect()
+}
+
+fn every_effect() -> Vec<EffectKind> {
+    vec![
+        EffectKind::HueSatBright {
+            hue_degrees: 20.0,
+            saturation: 1.2,
+            brightness: 0.9,
+        },
+        EffectKind::Curves {
+            curves: CurveSet::default(),
+        },
+        EffectKind::Blur {
+            kind: BlurKind::Gaussian,
+            radius_x: 3.0,
+            radius_y: 3.0,
+        },
+        EffectKind::sharpen_default(),
+        EffectKind::Stroke {
+            color: Color { r: 255, g: 0, b: 0 },
+            opacity: 1.0,
+            thickness: 6.0,
+            offset: 1.0,
+            softness: StrokeSoftness::Bilinear,
+        },
+    ]
+}
+
+fn count_differing(a: &[u8], b: &[u8], tolerance: i32) -> usize {
+    assert_eq!(a.len(), b.len());
+    a.iter().zip(b).filter(|(x, y)| !near(**x, **y, tolerance)).count()
+}
+
+/// Bounding box `(x0, y0, x1, y1)` of the pixels where `a` and `b` differ.
+fn diff_bbox(a: &[u8], b: &[u8], width: u32, tolerance: i32) -> Option<(u32, u32, u32, u32)> {
+    let mut bbox: Option<(u32, u32, u32, u32)> = None;
+    for (i, (pa, pb)) in a.chunks_exact(4).zip(b.chunks_exact(4)).enumerate() {
+        if pa.iter().zip(pb).all(|(x, y)| near(*x, *y, tolerance)) {
+            continue;
+        }
+        let (x, y) = (i as u32 % width, i as u32 / width);
+        bbox = Some(bbox.map_or((x, y, x, y), |(x0, y0, x1, y1)| {
+            (x0.min(x), y0.min(y), x1.max(x), y1.max(y))
+        }));
+    }
+    bbox
+}
+
+/// Whole-image check of the incremental preview under a blur on content that
+/// varies, so a pass reading past the seeded region shows up.
+#[test]
+fn incremental_blur_preview_matches_full_on_stripes() {
+    let size = Size::new(256, 96);
+    let cases = [
+        EffectKind::Blur {
+            kind: BlurKind::Gaussian,
+            radius_x: 4.0,
+            radius_y: 4.0,
+        },
+        EffectKind::Blur {
+            kind: BlurKind::Box,
+            radius_x: 6.0,
+            radius_y: 2.0,
+        },
+        EffectKind::sharpen_default(),
+    ];
+    for effect in cases {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let base = canvas.add_layer_with_pixels("base", &half_stripes(size)).unwrap();
+        adjust_with(&mut canvas, &[effect]);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base, Color::WHITE);
+        let bbox = diff_bbox(&incremental, &full, size.width, 2);
+        assert_eq!(count_differing(&incremental, &full, 2), 0, "{effect:?} differs within {bbox:?}");
+    }
+}
+
+/// Painting an adjustment's mask (mask view off) previews the effect through
+/// the incremental frame; it must match both a full frame and the scoped walk
+/// folder-bounded documents still use.
+#[test]
+fn incremental_mask_paint_preview_matches_full() {
+    let size = Size::new(256, 96);
+    let backdrop = half_stripes(size);
+    let cases = [
+        vec![EffectKind::HueSatBright {
+            hue_degrees: 0.0,
+            saturation: 1.0,
+            brightness: 0.4,
+        }],
+        vec![EffectKind::Blur {
+            kind: BlurKind::Gaussian,
+            radius_x: 4.0,
+            radius_y: 4.0,
+        }],
+        vec![EffectKind::Stroke {
+            color: Color { r: 0, g: 0, b: 255 },
+            opacity: 1.0,
+            thickness: 8.0,
+            offset: 0.0,
+            softness: StrokeSoftness::Pixelated,
+        }],
+        every_effect(),
+    ];
+    for effects in cases {
+        let mut canvas = Canvas::headless(size).unwrap();
+        canvas.add_layer_with_pixels("base", &backdrop).unwrap();
+        let adj = canvas.add_adjustment_layer("adj").unwrap();
+        let data = AdjustmentData {
+            effects: effects.iter().copied().map(Effect::new).collect(),
+        };
+        canvas.set_layer_effects(adj, data).unwrap();
+        // Black on the white mask switches the effect off under the line.
+        let (incremental, full) = incremental_and_full_line(&mut canvas, adj, Color::BLACK);
+        let bbox = diff_bbox(&incremental, &full, size.width, 2);
+        assert_eq!(count_differing(&incremental, &full, 2), 0, "{effects:?} differs within {bbox:?}");
+
+        // The same full frame, read in linear space from the batched path and
+        // from the scoped walk that folder-bounded documents still take.
+        canvas.force_full_preview();
+        let batched = canvas.read_incremental_preview().unwrap();
+        let walked = canvas.read_pixels().unwrap();
+        assert_eq!(count_differing(&batched, &walked, 2), 0, "{effects:?} vs scoped walk");
+        // The stroke changed something, or the comparison proves nothing.
+        canvas.discard_stroke().unwrap();
+        let untouched = canvas.read_pixels().unwrap();
+        assert_ne!(count_differing(&batched, &untouched, 2), 0, "{effects:?} had no effect");
+    }
+}
+
+/// Every stroke commit patches the canvas in place (the dirty rect grown by the
+/// effects above the layer); the result must equal a full rebuild.
+#[test]
+fn incremental_commit_matches_full_rebuild() {
+    use oxiedraw_core::brush_engine::BrushEngine;
+
+    let size = Size::new(256, 96);
+    let backdrop = half_stripes(size);
+    let transparent = vec![0u8; (size.width * size.height) as usize * 4];
+    let mut semi_red = transparent.clone();
+    for px in semi_red.chunks_exact_mut(4) {
+        px.copy_from_slice(&[0, 0, 128, 128]);
+    }
+    let cases = [
+        vec![EffectKind::Blur {
+            kind: BlurKind::Box,
+            radius_x: 5.0,
+            radius_y: 2.0,
+        }],
+        vec![EffectKind::Stroke {
+            color: Color { r: 255, g: 0, b: 0 },
+            opacity: 0.8,
+            thickness: 10.0,
+            offset: -0.5,
+            softness: StrokeSoftness::Bilinear,
+        }],
+        every_effect(),
+    ];
+    for effects in cases {
+        let mut canvas = Canvas::headless(size).unwrap();
+        canvas.add_layer_with_pixels("base", &backdrop).unwrap();
+        adjust_with(&mut canvas, &[EffectKind::Blur {
+            kind: BlurKind::Gaussian,
+            radius_x: 2.0,
+            radius_y: 2.0,
+        }]);
+        let target = canvas.add_layer_with_pixels("paint", &transparent).unwrap();
+        canvas.add_layer_with_pixels("between", &semi_red).unwrap();
+        adjust_with(&mut canvas, &effects);
+        canvas.layers().set_active(Some(target));
+
+        let brush = BrushEngine::new();
+        brush.size.set(8.0);
+        brush.opacity.set(1.0);
+        let white = Color::new(255, 255, 255);
+        for (x0, x1, y) in [(10.0, 80.0, 48.0), (60.0, 200.0, 30.0), (120.0, 130.0, 70.0)] {
+            canvas.begin_stroke(white, 1.0, false).unwrap();
+            canvas.stamp(|t| brush.begin_stroke(line_sample(x0, y, 0), white, t)).unwrap();
+            canvas.stamp(|t| brush.push_sample(line_sample(x1, y, 10), t)).unwrap();
+            canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+            canvas.commit_stroke().unwrap();
+        }
+        let patched = canvas.read_pixels().unwrap();
+        canvas.recomposite().unwrap();
+        let full = canvas.read_pixels().unwrap();
+        let bbox = diff_bbox(&patched, &full, size.width, 0);
+        assert_eq!(count_differing(&patched, &full, 0), 0, "{effects:?} differs within {bbox:?}");
+    }
+}
+
+/// Per-event cost of the adjusted paths on a large canvas with every effect
+/// on, for `--nocapture`: the preview below the adjustment, the mask preview,
+/// the stroke commit, against a full rebuild.
+#[test]
+#[allow(clippy::print_stderr, clippy::cast_precision_loss)]
+fn adjusted_stroke_costs() {
+    use std::time::Instant;
+
+    use oxiedraw_core::brush_engine::BrushEngine;
+
+    let size = Size::new(2048, 2048);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let base = canvas.add_layer_with_pixels("base", &half_stripes(size)).unwrap();
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    let data = AdjustmentData {
+        effects: every_effect().into_iter().map(Effect::new).collect(),
+    };
+    canvas.set_layer_effects(adj, data).unwrap();
+    let brush = BrushEngine::new();
+    brush.size.set(24.0);
+    brush.opacity.set(1.0);
+
+    let mut stroke = |target: usize, color: Color| {
+        canvas.layers().set_active(Some(target));
+        canvas.begin_stroke(color, 1.0, false).unwrap();
+        canvas.stamp(|t| brush.begin_stroke(line_sample(100.0, 1000.0, 0), color, t)).unwrap();
+        canvas.present().unwrap();
+        let events = 60;
+        let started = Instant::now();
+        for i in 1..=events {
+            let x = 100.0 + i as f32 * 12.0;
+            canvas.stamp(|t| brush.push_sample(line_sample(x, 1000.0, i * 8), t)).unwrap();
+            canvas.present().unwrap();
+        }
+        let per_event = started.elapsed() / events as u32;
+        canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+        let started = Instant::now();
+        canvas.commit_stroke().unwrap();
+        (per_event, started.elapsed())
+    };
+    let (below_event, below_commit) = stroke(base, Color::new(255, 255, 255));
+    let (mask_event, mask_commit) = stroke(adj, Color::BLACK);
+    let started = Instant::now();
+    canvas.recomposite().unwrap();
+    let full = started.elapsed();
+
+    eprintln!("2048^2, every effect: paint below {below_event:?}/event, commit {below_commit:?}");
+    eprintln!("2048^2, every effect: paint mask {mask_event:?}/event, commit {mask_commit:?}");
+    eprintln!("2048^2, every effect: full rebuild {full:?}");
 }
 
 fn adjust_with(canvas: &mut Canvas, effects: &[EffectKind]) {
@@ -231,22 +486,19 @@ fn incremental_blur_preview_matches_full() {
         radius_y: 4.0,
     };
     let cases = [
-        (vec![blur(BlurKind::Box)], 4),
-        (vec![blur(BlurKind::Gaussian)], 4),
-        (vec![EffectKind::sharpen_default()], 4),
-        (vec![blur(BlurKind::Gaussian), EffectKind::sharpen_default()], 8),
+        vec![blur(BlurKind::Box)],
+        vec![blur(BlurKind::Gaussian)],
+        vec![EffectKind::sharpen_default()],
+        vec![blur(BlurKind::Gaussian), EffectKind::sharpen_default()],
     ];
-    for (effects, margin) in cases {
+    for effects in cases {
         let mut canvas = Canvas::headless(size).unwrap();
         let base = canvas.add_layer_with_pixels("base", &stripes).unwrap();
         adjust_with(&mut canvas, &effects);
-        let (incremental, full) = incremental_and_full_line(&mut canvas, base);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base, Color::WHITE);
 
-        let differing = (43 - margin..53 + margin)
-            .flat_map(|y| (20..50).map(move |x| (y * 96 + x) * 4))
-            .filter(|&i| (i..i + 4).any(|c| !near(incremental[c], full[c], 2)))
-            .count();
-        assert_eq!(differing, 0, "{effects:?}");
+        let bbox = diff_bbox(&incremental, &full, size.width, 2);
+        assert_eq!(count_differing(&incremental, &full, 2), 0, "{effects:?} differs within {bbox:?}");
     }
 }
 
@@ -267,7 +519,35 @@ fn incremental_blur_preview_includes_layers_between() {
             .add_layer_with_pixels("between", &solid(size, 255, 0, 0))
             .unwrap();
         adjust_with(&mut canvas, &effects);
-        let (incremental, full) = incremental_and_full_line(&mut canvas, base);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base, Color::WHITE);
+
+        let differing = incremental.iter().zip(&full).filter(|(a, b)| !near(**a, **b, 2)).count();
+        assert_eq!(differing, 0, "{effects:?}");
+    }
+}
+
+#[test]
+fn incremental_blur_stroke_preview_matches_full() {
+    let size = Size::new(256, 96);
+    let blur = EffectKind::Blur {
+        kind: BlurKind::Gaussian,
+        radius_x: 3.0,
+        radius_y: 3.0,
+    };
+    let stroke = |thickness| EffectKind::Stroke {
+        color: Color { r: 255, g: 0, b: 0 },
+        opacity: 1.0,
+        thickness,
+        offset: 1.0,
+        softness: StrokeSoftness::Bilinear,
+    };
+    for effects in [vec![stroke(4.0)], vec![blur, stroke(4.0)], vec![blur, stroke(12.0)], every_effect()] {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let base = canvas
+            .add_layer_with_pixels("base", &vec![0u8; (size.width * size.height) as usize * 4])
+            .unwrap();
+        adjust_with(&mut canvas, &effects);
+        let (incremental, full) = incremental_and_full_line(&mut canvas, base, Color::WHITE);
 
         let differing = incremental.iter().zip(&full).filter(|(a, b)| !near(**a, **b, 2)).count();
         assert_eq!(differing, 0, "{effects:?}");
@@ -774,6 +1054,133 @@ fn adjustment_is_clipped_to_its_folder() {
         rb2 <= 6 && rg2 <= 6 && rr2 <= 6,
         "without a folder the adjustment should reach A, got B{rb2} G{rg2} R{rr2}"
     );
+}
+
+/// Dragging the bottom layer out of a folder that holds an adjustment keeps the
+/// flat order, so only the tree changes; the canvas must still pick up that the
+/// layer left the adjustment's scope.
+#[test]
+fn moving_a_layer_out_of_an_adjusted_folder_recomposites() {
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+
+    let size = Size::new(64, 64);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let bottom = canvas
+        .add_layer_with_pixels("Layer 3", &solid(size, 255, 0, 0))
+        .unwrap();
+    let background = canvas
+        .add_layer_with_pixels("Background", &left_half_red(size))
+        .unwrap();
+    let adj = canvas.add_adjustment_layer("Adjustment").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            one_effect(EffectKind::HueSatBright {
+                hue_degrees: 0.0,
+                saturation: 1.0,
+                brightness: 0.0,
+            }),
+        )
+        .unwrap();
+    canvas.layers().set_active(Some(adj));
+    let snap = canvas.layers().snapshot();
+    let ids = [snap[bottom].id.clone(), snap[background].id.clone(), snap[adj].id.clone()];
+    let group = |children: Vec<LayerTreeNode>| {
+        LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Group".to_string(),
+            expanded: true,
+            children,
+        })
+    };
+    let at = |out: &[u8], x: u32, y: u32| {
+        let i = ((y * size.width + x) * 4) as usize;
+        (out[i], out[i + 1], out[i + 2])
+    };
+
+    // Everything grouped: the adjustment blackens both layers.
+    let all = ids.iter().cloned().map(LayerTreeNode::layer).collect();
+    canvas.set_layer_tree(vec![group(all)]).unwrap();
+    let (b, g, r) = at(&canvas.read_pixels().unwrap(), 48, 32);
+    assert!(b <= 6 && g <= 6 && r <= 6, "grouped: expected black, got B{b} G{g} R{r}");
+
+    // The bottom layer leaves the folder; the flat order is unchanged.
+    canvas.layers().set_active(Some(background));
+    let rest = ids[1..].iter().cloned().map(LayerTreeNode::layer).collect();
+    canvas
+        .set_layer_tree(vec![LayerTreeNode::layer(ids[0].clone()), group(rest)])
+        .unwrap();
+    let out = canvas.read_pixels().unwrap();
+    let (b, g, r) = at(&out, 48, 32);
+    assert!(b > 200 && g <= 12 && r <= 12, "moved out: expected blue, got B{b} G{g} R{r}");
+    let display = canvas.present().map(|_| canvas.read_display().unwrap()).unwrap();
+    let (b, g, r) = at(&display, 48, 32);
+    assert!(b > 200 && g <= 12 && r <= 12, "display: expected blue, got B{b} G{g} R{r}");
+}
+
+/// The same drag with every effect on, after a mask stroke painted through the
+/// live path while everything was grouped: the display must match a document
+/// that painted the same stroke straight in the final layout.
+#[test]
+fn moving_a_layer_out_of_an_adjusted_folder_matches_a_fresh_document() {
+    use oxiedraw_core::brush_engine::BrushEngine;
+    use oxiedraw_core::document::{LayerGroup, LayerTreeNode};
+
+    let size = Size::new(256, 96);
+    let build = |grouped_first: bool| -> Vec<u8> {
+        let mut canvas = Canvas::headless(size).unwrap();
+        let bottom = canvas
+            .add_layer_with_pixels("Layer 3", &half_stripes(size))
+            .unwrap();
+        let background = canvas
+            .add_layer_with_pixels("Background", &left_half_red(size))
+            .unwrap();
+        let adj = canvas.add_adjustment_layer("Adjustment").unwrap();
+        let data = AdjustmentData {
+            effects: every_effect().into_iter().map(Effect::new).collect(),
+        };
+        canvas.set_layer_effects(adj, data).unwrap();
+        let snap = canvas.layers().snapshot();
+        let ids = [snap[bottom].id.clone(), snap[background].id.clone(), snap[adj].id.clone()];
+        let group = |children: Vec<LayerTreeNode>| {
+            LayerTreeNode::Group(LayerGroup {
+                id: "g1".to_string(),
+                name: "Group".to_string(),
+                expanded: true,
+                children,
+            })
+        };
+        let all = ids.iter().cloned().map(LayerTreeNode::layer).collect();
+        let rest = ids[1..].iter().cloned().map(LayerTreeNode::layer).collect();
+        let moved_out = vec![LayerTreeNode::layer(ids[0].clone()), group(rest)];
+        if grouped_first {
+            canvas.set_layer_tree(vec![group(all)]).unwrap();
+        } else {
+            canvas.set_layer_tree(moved_out.clone()).unwrap();
+        }
+        // Paint the mask through the live path, then commit.
+        canvas.layers().set_active(Some(adj));
+        let brush = BrushEngine::new();
+        brush.size.set(10.0);
+        canvas.begin_stroke(Color::BLACK, 1.0, false).unwrap();
+        canvas.stamp(|t| brush.begin_stroke(line_sample(20.0, 40.0, 0), Color::BLACK, t)).unwrap();
+        canvas.present().unwrap();
+        canvas.stamp(|t| brush.push_sample(line_sample(90.0, 40.0, 10), t)).unwrap();
+        canvas.present().unwrap();
+        canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+        canvas.commit_stroke().unwrap();
+        canvas.present().unwrap();
+        if grouped_first {
+            canvas.set_layer_tree(moved_out).unwrap();
+        }
+        canvas.layers().set_active(Some(background));
+        canvas.present().unwrap();
+        canvas.read_display().unwrap()
+    };
+    let moved = build(true);
+    let fresh = build(false);
+    let bbox = diff_bbox(&moved, &fresh, size.width, 2);
+    assert_eq!(count_differing(&moved, &fresh, 2), 0, "moved-out layout differs within {bbox:?}");
 }
 
 /// The stroke-commit path (not just recompose) must respect folder scoping:

@@ -158,6 +158,18 @@ pub(super) const RING_FRAMES: usize = 3;
 /// Raising this disables the clipped present in `record_present_copy`.
 pub(super) const DISPLAY_BUFFERS: usize = 1;
 
+/// How `commit_stroke_into_layer` refreshes the canvas after the stroke lands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitRebuild {
+    /// Rebuild the whole canvas.
+    Full,
+    /// Rebuild only where the stroke can show, through the effects above it.
+    /// Falls back to `Full` unless the canvas was complete before the stroke.
+    Incremental,
+    /// Leave the canvas alone; the caller rebuilds it (folder-scoped).
+    Skip,
+}
+
 /// What source the dmabuf display image should mirror.
 #[derive(Debug, Clone, Copy)]
 pub enum PresentSource {
@@ -217,6 +229,11 @@ pub struct VulkanRenderer {
     /// Forces the next preview frame to rebuild the whole canvas (stroke start
     /// or any layer mutation), after which incremental updates take over.
     pub(super) preview_needs_full: bool,
+    /// True while the canvas image is a whole-canvas composite of the layer
+    /// stack: set by every full rebuild, cleared by the paths that draw only
+    /// part of the stack into it. An incremental stroke commit may only patch
+    /// the canvas in place while this holds.
+    pub(super) canvas_complete: bool,
     /// Region the last present rewrote, or `None` for a full-canvas one.
     /// Handed to GTK as the dmabuf update region.
     pub(super) last_present_area: Option<vk::Rect2D>,
@@ -669,6 +686,7 @@ impl VulkanRenderer {
             preview_pending_dirty: None,
             last_present_area: None,
             preview_needs_full: true,
+            canvas_complete: false,
             clip: None,
             staging: ManuallyDrop::new(staging),
             canvas_target: ManuallyDrop::new(canvas_target),
@@ -944,6 +962,42 @@ impl VulkanRenderer {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::GENERAL,
         );
+    }
+
+    /// Clear `image` to transparent inside the active clip (a clear-attachments
+    /// pass over `framebuffer`), or the whole image when no clip is set.
+    pub(super) fn cmd_clear_clip(&self, image: vk::Image, framebuffer: vk::Framebuffer) {
+        let Some(rect) = self.clip else {
+            self.cmd_clear_image(image, [0.0, 0.0, 0.0, 0.0]);
+            return;
+        };
+        let begin = vk::RenderPassBeginInfo::default()
+            .render_pass(self.canvas_target.render_pass)
+            .framebuffer(framebuffer)
+            .render_area(rect);
+        let attachment = vk::ClearAttachment {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            color_attachment: 0,
+            clear_value: vk::ClearValue {
+                color: vk::ClearColorValue { float32: [0.0; 4] },
+            },
+        };
+        let clear_rect = vk::ClearRect {
+            rect,
+            base_array_layer: 0,
+            layer_count: 1,
+        };
+        unsafe {
+            self.device.cmd_begin_render_pass(
+                self.command_buffer,
+                &begin,
+                vk::SubpassContents::INLINE,
+            );
+            self.device
+                .cmd_clear_attachments(self.command_buffer, &[attachment], &[clear_rect]);
+            self.device.cmd_end_render_pass(self.command_buffer);
+        }
+        self.barrier(image, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
     }
 
     /// Mark the cached `preview_below` stale so the next in-flight stroke

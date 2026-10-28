@@ -460,9 +460,12 @@ impl VulkanRenderer {
     /// past those used), so the chain can share a submission with other passes.
     /// `push` is the 48-byte resolve push (color, params, texel); `thickness`
     /// drives how many flood passes the band radius needs. The caller
-    /// OVER-composites `Scratch::A` onto the accumulator.
+    /// OVER-composites `Scratch::A` onto the accumulator. With `clip` set, each
+    /// pass writes the clip grown by the steps still to come, which keeps the
+    /// band inside the clip identical to a full-canvas flood.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn cmd_stroke_band(
-        &self,
+        &mut self,
         backdrop_view: vk::ImageView,
         backdrop_img: vk::Image,
         mask_view: vk::ImageView,
@@ -474,6 +477,10 @@ impl VulkanRenderer {
         let texel = [push[8], push[9]];
         let jfa_rp = self.filter_resources.jfa_render_pass;
         let layout16 = self.filter_resources.pipeline_layout;
+        let out_clip = self.clip;
+        let steps = jfa_step_sizes(thickness);
+        let mut remaining: u32 = steps.iter().sum();
+        self.clip = out_clip.map(|r| self.expand_clip(r, remaining));
 
         // Seed: classify the backdrop silhouette into coord A.
         let seed_set = self.filter_resources.input_set(*cursor);
@@ -489,7 +496,9 @@ impl VulkanRenderer {
 
         // Flood: halving steps, ping-ponging the coord buffers.
         let mut src = JfaSlot::A;
-        for step in jfa_step_sizes(thickness) {
+        for step in steps {
+            remaining -= step;
+            self.clip = out_clip.map(|r| self.expand_clip(r, remaining));
             let dst = src.other();
             let set = self.filter_resources.input_set(*cursor);
             *cursor += 1;
@@ -509,6 +518,7 @@ impl VulkanRenderer {
         }
 
         // Resolve: color the band from the converged field into Scratch::A.
+        self.clip = out_clip;
         let resolve_set = self.filter_resources.input_set(*cursor);
         *cursor += 1;
         let coord_view = self.filter_resources.coord_view(src);
@@ -617,7 +627,7 @@ const fn color_layers() -> vk::ImageSubresourceLayers {
 /// of two covering the band radius, halving down to 1, plus one extra step-1
 /// pass (JFA+1) to clean up the rare propagation error. The number of passes is
 /// `O(log thickness)`, where the old disc scan was `O(thickness^2)` per pixel.
-fn jfa_step_sizes(thickness: f32) -> Vec<u32> {
+pub(super) fn jfa_step_sizes(thickness: f32) -> Vec<u32> {
     // Seeds must reach the band's far edge (~thickness) plus an AA pixel.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let radius = (thickness.ceil() as u32).saturating_add(2).clamp(1, 64);
@@ -636,4 +646,9 @@ fn jfa_step_sizes(thickness: f32) -> Vec<u32> {
     }
     steps.push(1);
     steps
+}
+
+// How far past its output the band reads: each flood pass samples one step out.
+pub(super) fn jfa_reach(thickness: f32) -> u32 {
+    jfa_step_sizes(thickness).iter().sum()
 }

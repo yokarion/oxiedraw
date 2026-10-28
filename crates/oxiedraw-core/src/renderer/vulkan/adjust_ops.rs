@@ -1,16 +1,18 @@
 //! Adjustment-layer compositing: non-destructive effects applied to the
 //! canvas accumulator (everything below the layer) at composite time.
 //!
-//! When any slot is an adjustment layer the canvas can no longer be built in a
-//! single command submission, because each effect runs its own multi-pass
-//! filter chain (each pass is a separate submit with barriers). This module
-//! provides the per-layer-submit composite loop that the renderer falls back
-//! to in that case; the fast single-submit path stays for the common case of
-//! no adjustment layers.
+//! An adjustment's effect chain is several fullscreen passes, each reading the
+//! previous one through its own input descriptor set. The flat composite
+//! records the whole stack into one submit, taking those sets from a ring
+//! (`INPUT_RING`), and clips every pass to the region a change can reach: the
+//! live stroke preview and the stroke commit redraw only the dab region grown
+//! by the spread of the effects above it. Chains too long for the ring, and the
+//! folder-scoped walk, fall back to one fence-waited submit per pass.
 
 use ash::vk;
 
 use super::super::RendererError;
+use super::filter_ops::{jfa_reach, jfa_step_sizes};
 use super::{create_framebuffer_for_view, create_sampled_image_set, VulkanRenderer, CANVAS_FORMAT};
 use crate::renderer::resources::Image;
 use crate::document::CompositeStep;
@@ -82,7 +84,7 @@ fn effect_margin(kind: EffectKind) -> u32 {
             radius_x, radius_y, ..
         } => radius_x.max(radius_y).ceil().max(0.0) as u32,
         EffectKind::Sharpen { .. } => FilterSpec::SHARPEN_BLUR_RADIUS.ceil() as u32,
-        EffectKind::Stroke { thickness, .. } => thickness.ceil().max(0.0) as u32 + 1,
+        EffectKind::Stroke { thickness, .. } => jfa_reach(thickness),
     }
 }
 
@@ -141,6 +143,18 @@ pub(super) enum PreviewTarget {
     Filtered { spec: FilterSpec },
 }
 
+/// What one adjusted preview frame does with the in-flight stroke.
+#[derive(Clone, Copy)]
+struct AdjustedFrame {
+    /// Fold the dmabuf present copy into the frame's submit.
+    present: bool,
+    /// Redraw only the pending dab region instead of the whole canvas.
+    incremental: bool,
+    /// The target is an adjustment whose mask the stroke paints: its effects
+    /// run gated by the committed mask merged with the stroke.
+    paint_mask: bool,
+}
+
 /// The in-flight mask stroke for a live mask-edit preview: which adjustment slot
 /// is being painted and the brush push (linear color + opacity) / erase flag the
 /// stroke is merged with.
@@ -167,10 +181,72 @@ impl VulkanRenderer {
     }
 
     /// Rebuild the canvas image bottom-up, applying each adjustment layer's
-    /// effect chain to the accumulator as it is reached. Mirrors
-    /// `cmd_composite_layers_to_canvas` but submits per layer so the effect
-    /// passes can run.
+    /// effect chain to the accumulator as it is reached.
     pub(super) fn composite_layers_to_canvas_adjusted(
+        &mut self,
+        visible_indices: &[usize],
+    ) -> Result<(), RendererError> {
+        self.composite_adjusted_region(visible_indices, None)
+    }
+
+    /// Adjusted canvas rebuild in one submit. With `changed` = (layer, rect),
+    /// only the canvas region that change can reach is recomputed: the rect
+    /// grown by the spread of the effects above the layer. The stack is still
+    /// rebuilt there from the bottom, each step grown by the spread of the
+    /// effects still to come so every pass reads correct input; the rest of
+    /// the canvas keeps what it had.
+    pub(super) fn composite_adjusted_region(
+        &mut self,
+        visible_indices: &[usize],
+        changed: Option<(usize, vk::Rect2D)>,
+    ) -> Result<(), RendererError> {
+        let all = visible_indices.iter().copied();
+        if self.chain_input_pass_count(all.clone()) > INPUT_RING {
+            return self.composite_layers_to_canvas_adjusted_per_pass(visible_indices);
+        }
+        let curve_sets = self.adjustment_curve_sets(all.clone());
+        self.prepare_curve_rows(&curve_sets)?;
+        let (inner, mut reach) = match changed {
+            Some((layer, rect)) => {
+                let above = self.chain_margin(all.clone().filter(|&i| i > layer));
+                (Some(self.expand_clip(rect, above)), self.chain_margin(all))
+            }
+            None => (None, 0),
+        };
+        // A clipped rebuild leaves intermediate chain results in the ring the
+        // earlier passes wrote past `inner`, so it runs in the preview image and
+        // only the finished `inner` lands in the canvas.
+        let acc = if inner.is_some() {
+            self.preview_accumulator()
+        } else {
+            self.canvas_accumulator()
+        };
+        let canvas = self.canvas.handle;
+        let indices = visible_indices.to_vec();
+        let result = self.record_and_submit(|this| {
+            this.clip = inner.map(|r| this.expand_clip(r, reach));
+            this.cmd_clear_clip(acc.image, acc.framebuffer);
+            let mut cursor = 0usize;
+            this.cmd_compose_stack(acc, &indices, inner, &mut reach, &mut cursor, None);
+            if inner.is_some() {
+                this.clip = inner;
+                this.cmd_copy_image_full(acc.image, canvas);
+            }
+            Ok(())
+        });
+        self.clip = None;
+        result?;
+        if inner.is_some() {
+            self.invalidate_preview_cache();
+        } else {
+            self.canvas_complete = true;
+        }
+        Ok(())
+    }
+
+    /// Full-canvas fallback for a chain the input ring can't hold: one
+    /// fence-waited submit per layer / effect pass.
+    fn composite_layers_to_canvas_adjusted_per_pass(
         &mut self,
         visible_indices: &[usize],
     ) -> Result<(), RendererError> {
@@ -186,6 +262,7 @@ impl VulkanRenderer {
                 self.compose_layer_into(acc, idx)?;
             }
         }
+        self.canvas_complete = true;
         Ok(())
     }
 
@@ -198,8 +275,11 @@ impl VulkanRenderer {
         &mut self,
         steps: &[CompositeStep],
     ) -> Result<(), RendererError> {
+        self.clip = None;
         let root = self.canvas_accumulator();
-        self.composite_steps_into(steps, root)
+        self.composite_steps_into(steps, root)?;
+        self.canvas_complete = true;
+        Ok(())
     }
 
     /// Draws into the preview image, so it invalidates the preview cache.
@@ -737,7 +817,12 @@ impl VulkanRenderer {
         color_linear: [f32; 3],
         opacity: f32,
     ) -> Result<(), RendererError> {
-        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, true, true)
+        let frame = AdjustedFrame {
+            present: true,
+            incremental: true,
+            paint_mask: false,
+        };
+        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, frame)
     }
 
     /// Same build as the live present path, but read the preview back to host
@@ -750,10 +835,13 @@ impl VulkanRenderer {
         color_linear: [f32; 3],
         opacity: f32,
     ) -> Result<Vec<u8>, RendererError> {
-        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, false, false)?;
-        let extent = self.canvas.extent;
-        self.read_image_to_staging(self.preview.handle, extent)?;
-        self.copy_staging_bytes()
+        let frame = AdjustedFrame {
+            present: false,
+            incremental: false,
+            paint_mask: false,
+        };
+        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, frame)?;
+        self.read_preview()
     }
 
     /// Test/diagnostic: drive the *incremental* adjusted preview (dab-region
@@ -766,10 +854,51 @@ impl VulkanRenderer {
         color_linear: [f32; 3],
         opacity: f32,
     ) -> Result<Vec<u8>, RendererError> {
-        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, false, true)?;
-        let extent = self.canvas.extent;
-        self.read_image_to_staging(self.preview.handle, extent)?;
-        self.copy_staging_bytes()
+        let frame = AdjustedFrame {
+            present: false,
+            incremental: true,
+            paint_mask: false,
+        };
+        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, frame)?;
+        self.read_preview()
+    }
+
+    /// Live preview while painting an adjustment layer's mask with the mask view
+    /// off: the effect runs gated by the committed mask merged with the stroke,
+    /// so the canvas shows the effect updating instead of the mask. Same
+    /// incremental single-submit frame as the stroke-below-adjustment preview;
+    /// [`Self::render_mask_edit_preview_and_present`] remains for documents
+    /// that need the folder-scoped walk.
+    pub fn render_mask_edit_preview_adjusted_and_present(
+        &mut self,
+        visibilities: &[bool],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<(), RendererError> {
+        let frame = AdjustedFrame {
+            present: true,
+            incremental: true,
+            paint_mask: true,
+        };
+        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, frame)
+    }
+
+    /// Test/diagnostic: the incremental mask-edit preview, read back.
+    pub fn render_mask_edit_preview_adjusted_incremental_and_read(
+        &mut self,
+        visibilities: &[bool],
+        target_idx: usize,
+        color_linear: [f32; 3],
+        opacity: f32,
+    ) -> Result<Vec<u8>, RendererError> {
+        let frame = AdjustedFrame {
+            present: false,
+            incremental: true,
+            paint_mask: true,
+        };
+        self.build_preview_adjusted(visibilities, target_idx, color_linear, opacity, frame)?;
+        self.read_preview()
     }
 
     fn build_preview_adjusted(
@@ -778,8 +907,7 @@ impl VulkanRenderer {
         target_idx: usize,
         color_linear: [f32; 3],
         opacity: f32,
-        present: bool,
-        incremental: bool,
+        frame: AdjustedFrame,
     ) -> Result<(), RendererError> {
         let visible_indices = self.visible_layer_indices(visibilities);
         // Always build the below-target stack so the per-frame seed is a clipped
@@ -792,119 +920,98 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let erase = self.stroke_erase;
+        // The chain this frame runs over the stroked target: everything above
+        // it, plus the target itself when the stroke paints its mask.
+        let first = if frame.paint_mask { target_idx } else { target_idx + 1 };
+        let chain: Vec<usize> = visible_indices.iter().copied().filter(|&i| i >= first).collect();
         // Before recording: the batched frame is a single submit.
-        let above = visible_indices.iter().copied().filter(|&i| i > target_idx);
-        let curve_sets = self.adjustment_curve_sets(above);
+        let curve_sets = self.adjustment_curve_sets(chain.iter().copied());
         self.prepare_curve_rows(&curve_sets)?;
-        // Incremental dirty-rect: recompute only the dab region. Non-local
-        // effects (Blur/Stroke) spread, so the effect output region (inner) is
-        // the dab expanded by the effect margin, and the seed/input region
-        // (outer) is expanded once more so the effect samples correct input.
-        // For local effects margin = 0, so inner == outer == dab.
-        let margin = self.adjusted_effect_margin(&visible_indices, target_idx);
-        let (inner, outer) = if incremental {
-            self.take_preview_clip().map_or((None, None), |dab| {
-                (Some(self.expand_clip(dab, margin)), Some(self.expand_clip(dab, margin * 2)))
-            })
+        // Incremental dirty-rect: the effect output region (inner) is the dab
+        // grown by the chain's spread; the seed is grown by it once more so the
+        // first effect samples correct input. Local effects spread 0.
+        let margin = self.chain_margin(chain.iter().copied());
+        let inner = if frame.incremental {
+            self.take_preview_clip().map(|dab| self.expand_clip(dab, margin))
         } else {
-            (None, None)
+            None
         };
-        // Fast path: record the whole frame in ONE submit when the above-target
-        // effect chain fits the input-set ring. The present copy is folded in.
-        let result = match self.batched_input_pass_count(&visible_indices, target_idx) {
-            Some(n) if n <= INPUT_RING => {
-                self.build_preview_adjusted_batched(
-                    &visible_indices,
-                    target_idx,
-                    push,
-                    erase,
-                    present,
-                    inner,
-                    outer,
-                    margin,
-                );
-                Ok(())
+        let visible = visible_indices.contains(&target_idx);
+        let result = if self.chain_input_pass_count(chain.iter().copied()) <= INPUT_RING {
+            self.build_preview_adjusted_batched(&chain, target_idx, visible, push, erase, frame, inner, margin)
+        } else {
+            // Ring overflow: full-canvas per-submit fallback.
+            self.clip = None;
+            let r = self.build_preview_adjusted_unbatched(&chain, target_idx, visible, push, erase, frame.paint_mask);
+            if frame.present && r.is_ok() {
+                self.present_to_display(PresentSource::Preview)?;
             }
-            _ => {
-                // Ring overflow: full-canvas per-submit fallback.
-                self.clip = None;
-                let r =
-                    self.build_preview_adjusted_unbatched(&visible_indices, target_idx, push, erase);
-                if present && r.is_ok() {
-                    self.present_to_display(PresentSource::Preview)?;
-                }
-                r
-            }
+            r
         };
         self.clip = None;
         result
     }
 
-    /// Number of input-set passes the above-target effect chain needs, or `None`
-    /// if it contains a stroke effect (recorded by the per-submit fallback).
-    fn batched_input_pass_count(&self, visible_indices: &[usize], target_idx: usize) -> Option<usize> {
-        let mut n = 0usize;
-        for &idx in visible_indices {
-            if idx <= target_idx {
-                continue;
-            }
-            let Some(data) = self.layer_stack.slots[idx].adjustment.as_ref() else {
-                continue;
-            };
-            if data.is_noop() {
-                continue;
-            }
-            for effect in &data.effects {
-                if !effect.is_active() {
-                    continue;
-                }
-                match effect.kind {
-                    // filter + mask-mix
-                    EffectKind::HueSatBright { .. }
-                    | EffectKind::Curves { .. }
-                    | EffectKind::Invert => n += 2,
-                    EffectKind::Blur { .. } => n += 3, // H + V + mask-mix
-                    EffectKind::Sharpen { .. } => n += 4, // blur H + V + sharpen + mask-mix
-                    // The jump-flood band must flood full-canvas (no dab clip),
-                    // so a stroke drops the chain to the per-submit path.
-                    EffectKind::Stroke { .. } => return None,
-                }
-            }
-        }
-        Some(n)
+    /// The enabled effects of the effective adjustments among `indices`, in
+    /// composite order.
+    fn active_effects<'a>(
+        &'a self,
+        indices: impl Iterator<Item = usize> + 'a,
+    ) -> impl Iterator<Item = EffectKind> + 'a {
+        indices
+            .filter_map(move |idx| self.layer_stack.slots.get(idx)?.adjustment.as_ref())
+            .filter(|data| !data.is_noop())
+            .flat_map(|data| data.effects.iter())
+            .filter(|effect| effect.is_active())
+            .map(|effect| effect.kind)
+    }
+
+    /// Input-ring sets the adjustments among `indices` take in one submit.
+    fn chain_input_pass_count(&self, indices: impl Iterator<Item = usize>) -> usize {
+        self.active_effects(indices)
+            .map(|kind| match kind {
+                // filter + mask-mix
+                EffectKind::HueSatBright { .. } | EffectKind::Curves { .. } | EffectKind::Invert => 2,
+                EffectKind::Blur { .. } => 3, // H + V + mask-mix
+                EffectKind::Sharpen { .. } => 4, // blur H + V + sharpen + mask-mix
+                // seed + flood steps + resolve
+                EffectKind::Stroke { thickness, .. } => jfa_step_sizes(thickness).len() + 2,
+            })
+            .sum()
+    }
+
+    /// Canvas pixels a change in the input of the adjustments among `indices`
+    /// can spread through them: each effect can spread the previous one's.
+    fn chain_margin(&self, indices: impl Iterator<Item = usize>) -> u32 {
+        self.active_effects(indices).map(effect_margin).sum()
     }
 
     /// Per-submit fallback: each layer / effect pass is its own fence-waited
-    /// submission. Used when the effect chain exceeds the ring or uses a stroke.
+    /// submission. Used when the effect chain exceeds the ring.
     fn build_preview_adjusted_unbatched(
         &mut self,
-        visible_indices: &[usize],
+        chain: &[usize],
         target_idx: usize,
+        visible: bool,
         push: [f32; 4],
         erase: bool,
+        paint_mask: bool,
     ) -> Result<(), RendererError> {
         let acc = self.preview_accumulator();
-        if self.preview_cache_valid {
+        self.record_and_submit(|this| {
+            this.cmd_copy_image_full(this.preview_below.handle, acc.image);
+            Ok(())
+        })?;
+        if visible && !paint_mask {
             self.record_and_submit(|this| {
-                this.cmd_copy_image_full(this.preview_below.handle, acc.image);
-                Ok(())
-            })?;
-        } else {
-            self.record_and_submit(|this| {
-                this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                this.preview_compose_stroked_target(target_idx, push, erase);
                 Ok(())
             })?;
         }
-        for &idx in visible_indices {
+        for &idx in chain {
             if idx == target_idx {
-                self.record_and_submit(|this| {
-                    this.preview_compose_stroked_target(target_idx, push, erase);
-                    Ok(())
-                })?;
-            } else if idx < target_idx {
-                if !self.preview_cache_valid {
-                    self.compose_layer_into(acc, idx)?;
-                }
+                let (mask_view, mask_img) = self.stroked_mask(idx, push, erase)?;
+                self.apply_adjustment_with_mask(acc, idx, mask_view, mask_img)?;
             } else if self.layer_stack.slots[idx].adjustment.is_some() {
                 self.apply_adjustment_to(acc, idx)?;
             } else {
@@ -915,67 +1022,74 @@ impl VulkanRenderer {
     }
 
     /// Record the entire adjusted preview frame into one command buffer (one
-    /// fence wait): below-stack (cached), stroked target, then the above-target
-    /// effect chain using a fresh ring input-set per pass.
+    /// fence wait): below-stack (cached), stroked target, then the effect chain
+    /// using a fresh ring input-set per pass.
     #[allow(clippy::too_many_arguments)]
     fn build_preview_adjusted_batched(
         &mut self,
-        visible_indices: &[usize],
+        chain: &[usize],
         target_idx: usize,
+        visible: bool,
         push: [f32; 4],
         erase: bool,
-        present: bool,
+        frame: AdjustedFrame,
         inner: Option<vk::Rect2D>,
-        outer: Option<vk::Rect2D>,
         margin: u32,
-    ) {
+    ) -> Result<(), RendererError> {
         let acc = self.preview_accumulator();
-        let below_cached = self.preview_cache_valid;
-        let visible_indices = visible_indices.to_vec();
+        let chain = chain.to_vec();
         // Blocking: the per-frame effect chain rewrites the shared input-set
         // ring, so this frame's passes must finish before the next frame reuses
         // those sets. The work is one cheap (dirty-rect) submit.
-        let _ = self.record_and_submit(|this| {
-            // The seed + stroked target use the wider `outer` region so the
-            // effect samples correct (raw) input where it reaches past `inner`.
-            this.clip = outer;
-            // 1. Seed the accumulator with the below-target stack.
-            if below_cached {
-                this.cmd_copy_image_full(this.preview_below.handle, acc.image);
-            } else {
-                this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
-                for &idx in &visible_indices {
-                    if idx >= target_idx {
-                        break;
-                    }
-                    this.cmd_compose_layer(acc, idx);
-                }
-            }
-            // 2. The target layer with the in-flight stroke merged in.
-            this.preview_compose_stroked_target(target_idx, push, erase);
-            // 3. Above the target: adjustments (effect chain) + plain layers.
-            // Each step writes `inner` grown by `reach`, the margin of the effects
-            // still to come, since those sample that far past `inner`.
-            let mut cursor = 0usize;
+        self.record_and_submit(|this| {
+            // The seed and the stroked target cover `inner` grown by the whole
+            // chain's spread, so every effect samples correct input.
             let mut reach = margin;
-            for &idx in &visible_indices {
-                if idx <= target_idx {
-                    continue;
+            this.clip = inner.map(|r| this.expand_clip(r, reach));
+            this.cmd_copy_image_full(this.preview_below.handle, acc.image);
+            let gate = if frame.paint_mask {
+                let (mask_view, mask_img) = this.cmd_stroked_mask(target_idx, push, erase);
+                Some((target_idx, mask_view, mask_img))
+            } else {
+                if visible {
+                    this.preview_compose_stroked_target(target_idx, push, erase);
                 }
-                if this.layer_stack.slots[idx].adjustment.is_some() {
-                    this.cmd_apply_adjustment(acc, idx, inner, &mut reach, &mut cursor);
-                } else {
-                    this.clip = inner.map(|r| this.expand_clip(r, reach));
-                    this.cmd_compose_layer(acc, idx);
-                }
-            }
-            // 4. Fold the dmabuf present copy into this same submit.
+                None
+            };
+            let mut cursor = 0usize;
+            this.cmd_compose_stack(acc, &chain, inner, &mut reach, &mut cursor, gate);
+            // Fold the dmabuf present copy into this same submit.
             this.clip = inner;
-            if present {
+            if frame.present {
                 this.record_present_copy(acc.image, acc.view);
             }
             Ok(())
-        });
+        })
+    }
+
+    /// Record (no submit) layers `indices` bottom-up into `acc`: plain layers
+    /// composite, adjustments run their effect chain in place. Each step writes
+    /// `inner` grown by `reach`, the spread of the effects still to come, so the
+    /// result inside `inner` matches a full rebuild. `gate` replaces one
+    /// adjustment's mask (the stroked mask while it is being painted).
+    fn cmd_compose_stack(
+        &mut self,
+        acc: Accumulator,
+        indices: &[usize],
+        inner: Option<vk::Rect2D>,
+        reach: &mut u32,
+        cursor: &mut usize,
+        gate: Option<(usize, vk::ImageView, vk::Image)>,
+    ) {
+        for &idx in indices {
+            if self.layer_stack.slots[idx].adjustment.is_some() {
+                let mask = gate.filter(|g| g.0 == idx).map(|g| (g.1, g.2));
+                self.cmd_apply_adjustment(acc, idx, inner, reach, cursor, mask);
+            } else {
+                self.clip = inner.map(|r| self.expand_clip(r, *reach));
+                self.cmd_compose_layer(acc, idx);
+            }
+        }
     }
 
     /// Record (no submit) a plain layer composite into `acc`.
@@ -986,8 +1100,8 @@ impl VulkanRenderer {
     }
 
     /// Record (no submit) one adjustment's effect chain into the current buffer,
-    /// advancing `cursor` through the input-set ring. Only Hsv / Blur effects
-    /// reach here (stroke routes to the unbatched path).
+    /// advancing `cursor` through the input-set ring. `mask` overrides the
+    /// slot's own mask as the gate.
     fn cmd_apply_adjustment(
         &mut self,
         acc: Accumulator,
@@ -995,6 +1109,7 @@ impl VulkanRenderer {
         inner: Option<vk::Rect2D>,
         reach: &mut u32,
         cursor: &mut usize,
+        mask: Option<(vk::ImageView, vk::Image)>,
     ) {
         let Some(data) = self.layer_stack.slots[idx].adjustment.clone() else {
             return;
@@ -1002,8 +1117,10 @@ impl VulkanRenderer {
         if data.is_noop() {
             return;
         }
-        let mask_view = self.layer_stack.slots[idx].image.view;
-        let mask_img = self.layer_stack.slots[idx].image.handle;
+        let (mask_view, mask_img) = mask.unwrap_or_else(|| {
+            let slot = &self.layer_stack.slots[idx];
+            (slot.image.view, slot.image.handle)
+        });
         let layout = self.filter_resources.pipeline_layout;
         let render_pass = self.canvas_target.render_pass;
 
@@ -1043,7 +1160,7 @@ impl VulkanRenderer {
     /// Record (no submit) a Stroke effect: render the band into scratch A then
     /// OVER-composite it onto `acc`, advancing `cursor`.
     fn cmd_apply_stroke(
-        &self,
+        &mut self,
         acc: Accumulator,
         kind: EffectKind,
         mask_view: ash::vk::ImageView,
@@ -1178,7 +1295,9 @@ impl VulkanRenderer {
 
     /// Record (no submit) the horizontal then vertical blur of `src` into scratch
     /// B. The vertical pass reads `radius_y` rows past the clip, so the
-    /// horizontal pass writes that much further.
+    /// horizontal pass writes that many rows further - only rows, so its own
+    /// `radius_x` reach stays inside the `max(radius_x, radius_y)` margin the
+    /// caller seeded.
     fn cmd_blur_passes(
         &mut self,
         src_view: vk::ImageView,
@@ -1195,7 +1314,7 @@ impl VulkanRenderer {
         let inv_h = 1.0 / self.canvas.extent.height as f32;
         let out_clip = self.clip;
 
-        self.clip = out_clip.map(|r| self.expand_clip(r, radius_y.ceil().max(0.0) as u32));
+        self.clip = out_clip.map(|r| self.expand_clip_xy(r, 0, radius_y.ceil().max(0.0) as u32));
         let fb_a = self.filter_resources.framebuffer(Scratch::A);
         let set_h = self.filter_resources.input_set(*cursor);
         *cursor += 1;
@@ -1261,7 +1380,7 @@ impl VulkanRenderer {
     /// Build the below-target stack into `preview_below` (adjustment-aware) if
     /// the cache is stale. Always builds, so the adjusted preview can seed the
     /// accumulator with a clipped copy rather than a full clear (needed for the
-    /// incremental dirty-rect path).
+    /// incremental dirty-rect path). One submit when the chain fits the ring.
     fn ensure_below_cache(
         &mut self,
         visible_indices: &[usize],
@@ -1270,61 +1389,53 @@ impl VulkanRenderer {
         if self.preview_cache_valid {
             return Ok(());
         }
+        let below: Vec<usize> = visible_indices.iter().copied().filter(|&i| i < target_idx).collect();
         let acc = self.preview_below_accumulator();
-        self.record_and_submit(|this| {
-            this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
-            Ok(())
-        })?;
-        for &idx in visible_indices {
-            if idx >= target_idx {
-                break;
-            }
-            if self.layer_stack.slots[idx].adjustment.is_some() {
-                self.apply_adjustment_to(acc, idx)?;
-            } else {
-                self.compose_layer_into(acc, idx)?;
+        if self.chain_input_pass_count(below.iter().copied()) <= INPUT_RING {
+            let curve_sets = self.adjustment_curve_sets(below.iter().copied());
+            self.prepare_curve_rows(&curve_sets)?;
+            self.clip = None;
+            self.record_and_submit(|this| {
+                this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                let (mut reach, mut cursor) = (0u32, 0usize);
+                this.cmd_compose_stack(acc, &below, None, &mut reach, &mut cursor, None);
+                Ok(())
+            })?;
+        } else {
+            self.record_and_submit(|this| {
+                this.cmd_clear_image(acc.image, [0.0, 0.0, 0.0, 0.0]);
+                Ok(())
+            })?;
+            for &idx in &below {
+                if self.layer_stack.slots[idx].adjustment.is_some() {
+                    self.apply_adjustment_to(acc, idx)?;
+                } else {
+                    self.compose_layer_into(acc, idx)?;
+                }
             }
         }
         self.preview_cache_valid = true;
         Ok(())
     }
 
-    /// Spatial radius (canvas pixels) the above-target effect chain reaches:
-    /// a change in the input affects output within this distance. Local effects
-    /// (Hue/Sat/Bright) contribute 0; Blur its radius; Stroke its thickness.
-    /// Summed across the chain (each effect can spread the previous one).
-    fn adjusted_effect_margin(&self, visible_indices: &[usize], target_idx: usize) -> u32 {
-        let mut margin = 0u32;
-        for &idx in visible_indices {
-            if idx <= target_idx {
-                continue;
-            }
-            let Some(data) = self.layer_stack.slots[idx].adjustment.as_ref() else {
-                continue;
-            };
-            if data.is_noop() {
-                continue;
-            }
-            for effect in &data.effects {
-                if effect.is_active() {
-                    margin += effect_margin(effect.kind);
-                }
-            }
-        }
-        margin
+    /// Expand `r` by `margin` canvas pixels, clamped to the canvas bounds.
+    pub(super) fn expand_clip(&self, r: vk::Rect2D, margin: u32) -> vk::Rect2D {
+        self.expand_clip_xy(r, margin, margin)
     }
 
-    /// Expand `r` by `margin` canvas pixels, clamped to the canvas bounds.
-    fn expand_clip(&self, r: vk::Rect2D, margin: u32) -> vk::Rect2D {
-        let m = margin as i32;
+    /// Expand `r` by `mx` pixels sideways and `my` vertically, clamped to the
+    /// canvas bounds.
+    pub(super) fn expand_clip_xy(&self, r: vk::Rect2D, mx: u32, my: u32) -> vk::Rect2D {
+        #[allow(clippy::cast_possible_wrap)]
+        let (mx, my) = (mx as i32, my as i32);
         #[allow(clippy::cast_possible_wrap)]
         let (cw, ch) = (self.canvas.extent.width as i32, self.canvas.extent.height as i32);
-        let x0 = (r.offset.x - m).max(0);
-        let y0 = (r.offset.y - m).max(0);
+        let x0 = (r.offset.x - mx).max(0);
+        let y0 = (r.offset.y - my).max(0);
         #[allow(clippy::cast_possible_wrap)]
-        let x1 = (r.offset.x + r.extent.width as i32 + m).min(cw);
+        let x1 = (r.offset.x + r.extent.width as i32 + mx).min(cw);
         #[allow(clippy::cast_possible_wrap)]
-        let y1 = (r.offset.y + r.extent.height as i32 + m).min(ch);
+        let y1 = (r.offset.y + r.extent.height as i32 + my).min(ch);
         #[allow(clippy::cast_sign_loss)]
         vk::Rect2D {
             offset: vk::Offset2D { x: x0, y: y0 },
@@ -1518,16 +1629,22 @@ impl VulkanRenderer {
         push: [f32; 4],
         erase: bool,
     ) -> Result<(vk::ImageView, vk::Image), RendererError> {
+        self.record_and_submit(|this| {
+            this.cmd_stroked_mask(idx, push, erase);
+            Ok(())
+        })?;
+        Ok((self.erase_preview.scratch.view, self.erase_preview.scratch.handle))
+    }
+
+    /// Record (no submit) the body of [`Self::stroked_mask`]; honors the clip.
+    fn cmd_stroked_mask(&self, idx: usize, push: [f32; 4], erase: bool) -> (vk::ImageView, vk::Image) {
         let mask_image = self.layer_stack.slots[idx].image.handle;
         let scratch = self.erase_preview.scratch.handle;
         let scratch_fb = self.erase_preview.framebuffer;
-        self.record_and_submit(|this| {
-            this.cmd_copy_image_full(mask_image, scratch);
-            this.cmd_composite_stroke(scratch_fb, push, erase);
-            this.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
-            Ok(())
-        })?;
-        Ok((self.erase_preview.scratch.view, scratch))
+        self.cmd_copy_image_full(mask_image, scratch);
+        self.cmd_composite_stroke(scratch_fb, push, erase);
+        self.barrier(scratch, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        (self.erase_preview.scratch.view, scratch)
     }
 
     /// As [`Self::apply_adjustment_to`] but with the gating mask supplied
@@ -1634,10 +1751,7 @@ impl VulkanRenderer {
         ];
 
         // Build the jump-flood band into Scratch::A and OVER-blend it onto the
-        // accumulator, all in one submit. The scoped/unbatched preview paths run
-        // this with `clip` unset, so the flood is full-canvas (correct distance
-        // propagation); a Stroke effect forces those paths via
-        // `batched_input_pass_count`.
+        // accumulator, all in one submit.
         let set = self.filter_resources.composite_set(Scratch::A);
         let stroke_img = self.filter_resources.scratch_handle(Scratch::A);
         self.record_and_submit(|this| {

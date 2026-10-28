@@ -26,6 +26,7 @@ impl VulkanRenderer {
         let layout = pipe.layout;
         let render_pass = self.canvas_target.render_pass;
         let framebuffer = self.canvas_target.framebuffer;
+        self.canvas_complete = false;
         self.record_dab_pass(family, pipeline, layout, render_pass, framebuffer, n)
     }
 
@@ -154,7 +155,21 @@ impl VulkanRenderer {
             opacity.clamp(0.0, 1.0),
         ];
         let framebuffer = self.canvas_target.framebuffer;
+        self.canvas_complete = false;
         self.record_composite_pass(framebuffer, push)
+    }
+
+    /// [`Self::stroke_dirty_bounds`] as a Vulkan rect.
+    pub(super) fn stroke_dirty_rect(&self) -> Option<vk::Rect2D> {
+        let (x, y, width, height) = self.stroke_dirty_bounds()?;
+        #[allow(clippy::cast_possible_wrap)]
+        Some(vk::Rect2D {
+            offset: vk::Offset2D {
+                x: x as i32,
+                y: y as i32,
+            },
+            extent: vk::Extent2D { width, height },
+        })
     }
 
     pub(super) fn record_dab_pass(
