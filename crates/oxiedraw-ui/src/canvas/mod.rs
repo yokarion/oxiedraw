@@ -742,6 +742,42 @@ impl Viewport {
     }
 }
 
+// Re-read on scheme switches from idle, once libadwaita has swapped stylesheets.
+fn install_theme_backdrop(picture: &gtk::Picture, paintable: &CanvasPaintable) {
+    let sync: Rc<dyn Fn()> = {
+        let picture = picture.downgrade();
+        let paintable = paintable.downgrade();
+        Rc::new(move || {
+            let (Some(picture), Some(paintable)) = (picture.upgrade(), paintable.upgrade()) else {
+                return;
+            };
+            let (r, g, b) = crate::theme::canvas_backdrop(&picture);
+            paintable.set_backdrop((r as f32, g as f32, b as f32));
+        })
+    };
+    if picture.is_realized() {
+        sync();
+    }
+    let on_realize = Rc::clone(&sync);
+    picture.connect_realize(move |_| on_realize());
+
+    let style = adw::StyleManager::default();
+    let deferred = move || {
+        let sync = Rc::clone(&sync);
+        glib::idle_add_local_once(move || sync());
+    };
+    let on_dark = deferred.clone();
+    let handlers = RefCell::new(vec![
+        style.connect_dark_notify(move |_| on_dark()),
+        style.connect_high_contrast_notify(move |_| deferred()),
+    ]);
+    picture.connect_destroy(move |_| {
+        for id in handlers.take() {
+            style.disconnect(id);
+        }
+    });
+}
+
 pub(crate) fn wire(
     picture: &gtk::Picture,
     viewport: &Viewport,
@@ -766,6 +802,7 @@ pub(crate) fn wire(
 ) {
     *viewport.picture.borrow_mut() = Some(picture.clone());
     picture.set_paintable(Some(viewport.paintable()));
+    install_theme_backdrop(picture, &viewport.paintable);
 
     // Populate the redraw handle now that we have a real widget. Any
     // code that mutates the canvas (brush handlers below, the layers

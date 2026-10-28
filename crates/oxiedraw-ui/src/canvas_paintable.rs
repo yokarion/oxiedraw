@@ -28,15 +28,8 @@ use relm4::gtk::subclass::prelude::ObjectSubclassIsExt;
 /// One checker tile side, in canvas pixels. Matches the cairo path.
 const CHECKER_TILE: u32 = 128;
 
-const BACKDROP_BLUE: f32 = 0.14;
-const BACKDROP_RED_GREEN: f32 = 0.12;
-
-/// The off-canvas backdrop as sRGB bytes, for exports that frame the artwork.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-pub(crate) fn backdrop_rgb8() -> [u8; 3] {
-    let byte = |v: f32| (v * 255.0).round() as u8;
-    [byte(BACKDROP_RED_GREEN), byte(BACKDROP_RED_GREEN), byte(BACKDROP_BLUE)]
-}
+/// Off-canvas backdrop until the theme's color is read.
+const DEFAULT_BACKDROP: (f32, f32, f32) = (0.12, 0.12, 0.14);
 /// One cell inside a tile, in canvas pixels. `TILE = 2 * CELL`.
 const CHECKER_CELL: u32 = 64;
 
@@ -146,6 +139,12 @@ impl CanvasPaintable {
     /// Set the accent color used for the guide nodes (straight RGB).
     pub(crate) fn set_guide_accent(&self, accent: (f32, f32, f32)) {
         self.imp().guide_accent.set(accent);
+    }
+
+    /// Set the off-canvas backdrop color (straight RGB).
+    pub(crate) fn set_backdrop(&self, rgb: (f32, f32, f32)) {
+        self.imp().backdrop.set(rgb);
+        gdk::prelude::PaintableExt::invalidate_contents(self);
     }
 
     /// Update the transform overlay rect. Pass `None` to hide.
@@ -2078,7 +2077,7 @@ fn draw_gradient_cursor_cairo(cr: &gtk::cairo::Context, overlay: &GradientCursor
 
 mod imp {
     use super::{
-        BACKDROP_BLUE, BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect,
+        BrushCursor, CHECKER_TILE, Cell, ColorPickerOverlay, CropOverlay, CropRect, DEFAULT_BACKDROP,
         GradientCursorOverlay, GuideCacheEntry, GuideCacheKey, PendingMarquee, Point, RefCell,
         TransformRect,
         append_brush_cursor, apply_view_rotation, draw_color_picker_cairo,
@@ -2201,6 +2200,7 @@ mod imp {
         /// quantisation step, so GSK's node diff always damages the whole widget.
         /// See the backdrop in `snapshot`.
         pub(super) repaint_jitter: Cell<u8>,
+        pub(super) backdrop: Cell<(f32, f32, f32)>,
         /// See `request_damage`.
         pub(super) force_damage: Cell<bool>,
         /// Performance overlay (toggle with F3). Records one sample per snapshot
@@ -2273,6 +2273,7 @@ mod imp {
                 guide_do_rerender: Cell::new(false),
                 guide_zoom_gen: Cell::new(0),
                 repaint_jitter: Cell::new(0),
+                backdrop: Cell::new(DEFAULT_BACKDROP),
                 force_damage: Cell::new(false),
                 perf: RefCell::new(super::PerfGraph::default()),
             }
@@ -2296,7 +2297,7 @@ mod imp {
         fn jittered_backdrop_blue(&self) -> f32 {
             let jitter = self.repaint_jitter.get().wrapping_add(1);
             self.repaint_jitter.set(jitter);
-            f32::from(jitter % 251).mul_add(1e-7, BACKDROP_BLUE)
+            f32::from(jitter % 251).mul_add(1e-7, self.backdrop.get().2)
         }
 
         /// Schedule a debounced crisp re-render of the guide overlay once pan /
@@ -2430,19 +2431,19 @@ mod imp {
             // (selection ants, crop, transform) still force their own.
             #[allow(clippy::cast_possible_truncation)]
             let widget_rect = graphene::Rect::new(0.0, 0.0, width as f32, height as f32);
+            let (red, green, backdrop_blue) = self.backdrop.get();
             let blue = if self.brush_cursor.borrow().is_some() {
                 self.jittered_backdrop_blue()
             } else {
-                BACKDROP_BLUE
+                backdrop_blue
             };
-            let rg = super::BACKDROP_RED_GREEN;
-            snapshot.append_color(&gdk::RGBA::new(rg, rg, blue, 1.0), &widget_rect);
+            snapshot.append_color(&gdk::RGBA::new(red, green, blue, 1.0), &widget_rect);
 
             // 1b. One backdrop-coloured pixel under everything else, so the
             // pump's frame is never an empty one - see `request_damage`.
             if self.force_damage.replace(false) {
                 snapshot.append_color(
-                    &gdk::RGBA::new(rg, rg, self.jittered_backdrop_blue(), 1.0),
+                    &gdk::RGBA::new(red, green, self.jittered_backdrop_blue(), 1.0),
                     &graphene::Rect::new(0.0, 0.0, 1.0, 1.0),
                 );
             }

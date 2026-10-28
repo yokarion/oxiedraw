@@ -310,7 +310,7 @@ fn start(ui: &Rc<Ui>, recorder: &Rc<Recorder>, title: &str, options: ExportOptio
 
     let job_title = title.to_string();
     let software = format!("OxieDraw {}", crate::settings::APP_VERSION);
-    let margin_rgb = crate::canvas_paintable::backdrop_rgb8();
+    let margin_rgb = crate::theme::to_rgb8(crate::theme::canvas_backdrop(&ui.win));
     let (tx, rx) = mpsc::channel::<Result<u64, RecordingError>>();
     let worker_progress = Arc::clone(&progress);
     std::thread::spawn(move || {
