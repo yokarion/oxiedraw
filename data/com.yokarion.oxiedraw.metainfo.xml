@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.yokarion.oxiedraw</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <name>OxieDraw</name>
+  <summary>Sketch, paint and illustrate</summary>
+  <developer id="com.yokarion">
+    <name>Yokarion</name>
+  </developer>
+
+  <description>
+    <p>
+      OxieDraw is a fast, clean drawing app built for low-latency painting with
+      a stylus, mouse or touchscreen. It keeps the interface simple without
+      giving up the features artists rely on.
+    </p>
+    <ul>
+      <li>Layers, groups, blend modes and opacity</li>
+      <li>Non-destructive adjustment layers with painted masks</li>
+      <li>Parameter-driven brushes with textured grain and realistic paint</li>
+      <li>Text tool with per-range styling and embedded fonts</li>
+      <li>Selections, gradients, smart fill, liquify and transform</li>
+      <li>Symmetry and perspective drawing guides</li>
+      <li>Timelapse recording with video export</li>
+    </ul>
+    <p>
+      OxieDraw needs a GPU with Vulkan support.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.yokarion.oxiedraw.desktop</launchable>
+  <provides>
+    <binary>oxiedraw</binary>
+  </provides>
+
+  <url type="homepage">https://oxiedraw.yokarion.com</url>
+  <url type="help">https://oxiedraw.yokarion.com/user-guide/tools/brush</url>
+  <url type="bugtracker">https://github.com/yokarion/oxiedraw/issues</url>
+  <url type="vcs-browser">https://github.com/yokarion/oxiedraw</url>
+  <url type="contribute">https://oxiedraw.yokarion.com/development/overview</url>
+
+  <screenshots>
+    <screenshot type="default">
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/1-main-screen-light.png</image>
+      <caption>Painting with textured brushes and layers</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/2-main-screen-dark.png</image>
+      <caption>Light and dark style</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/3-adjustment-layers.png</image>
+      <caption>Non-destructive adjustment layers</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/4-text-editor.png</image>
+      <caption>Editing text right on the canvas</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/5-procedural-patterns.png</image>
+      <caption>Procedural patterns along a drawn curve</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/6-pallete-generator.png</image>
+      <caption>Extracting a palette from the canvas</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/7-advanced-exporter.png</image>
+      <caption>Exporting to PNG, JPEG, WebP or AVIF</caption>
+    </screenshot>
+    <screenshot>
+      <image>https://raw.githubusercontent.com/yokarion/oxiedraw/v0.1.12/data/screenshots/8-8k-canvas-demo.png</image>
+      <caption>Large canvases stay smooth</caption>
+    </screenshot>
+  </screenshots>
+
+  <branding>
+    <color type="primary" scheme_preference="light">#2c9cc4</color>
+    <color type="primary" scheme_preference="dark">#0f4a63</color>
+  </branding>
+
+  <content_rating type="oars-1.1" />
+
+  <requires>
+    <display_length compare="ge">768</display_length>
+  </requires>
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+  </recommends>
+  <supports>
+    <control>tablet</control>
+    <control>touch</control>
+  </supports>
+</component>

@@ -1,0 +1,35 @@
+id: com.yokarion.oxiedraw
+runtime: org.gnome.Platform
+runtime-version: "51"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: oxiedraw
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=home
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+
+modules:
+  - name: oxiedraw
+    buildsystem: simple
+    build-options:
+      env:
+        CARGO_HOME: /run/build/oxiedraw/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/oxiedraw -t /app/bin/
+      - install -Dm644 data/com.yokarion.oxiedraw.desktop -t /app/share/applications/
+      - sh flatpak/changelog-to-metainfo.sh docs/4.development/3.changelog.md data/com.yokarion.oxiedraw.metainfo.xml /app/share/metainfo/com.yokarion.oxiedraw.metainfo.xml
+      - install -Dm644 data/icons/hicolor/scalable/apps/com.yokarion.oxiedraw.svg -t /app/share/icons/hicolor/scalable/apps/
+    sources:
+      - type: dir
+        path: ../target/flatpak/source
+      - cargo-sources.json

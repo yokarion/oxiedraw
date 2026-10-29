@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+
+cd "$(git rev-parse --show-toplevel)"
+
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+./flatpak/changelog-to-metainfo.sh
+if command -v appstreamcli >/dev/null; then
+  appstreamcli validate --no-net target/flatpak/com.yokarion.oxiedraw.metainfo.xml
+fi
