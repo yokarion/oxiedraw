@@ -38,7 +38,7 @@ use crate::settings::{AppSettings, ShapeCorrectionSettings};
 use super::stroke_tip::{DeferredDabs, stamp_runs};
 use super::{RenderPump, Viewport};
 use super::{
-    BUTTON_PRIMARY, crop_geom, is_eraser_end, present_into_paintable, pressure_from, sample_from,
+    crop_geom, present_into_paintable, pressure_from, sample_from,
     transform_geometry, widget_to_canvas,
 };
 
@@ -239,6 +239,7 @@ pub(super) struct PrimaryDragHandler {
     /// Captured at brush_begin so brush_end can build a LayerPatch bounded
     /// to the stroke's dirty region.
     pending_capture: Rc<RefCell<Option<PendingStroke>>>,
+    abandon_stroke: Rc<Cell<bool>>,
 }
 
 /// Whether the mode a drag would use pushes by its drag vector (and so is
@@ -361,7 +362,7 @@ impl PrimaryDragHandler {
 
     fn on_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
         self.pen_eraser
-            .set(is_eraser_end(gesture.current_event().as_ref()));
+            .set(gesture.current_event().as_ref().is_some_and(crate::input::is_eraser));
         // A fill gesture ends on the button coming up, which normally
         // arrives as a motion event - but a release outside the window
         // never delivers one, leaving the fill committed and unrecorded.
@@ -453,9 +454,7 @@ impl PrimaryDragHandler {
                 // glass. Ending the fill here would cut the threshold
                 // drag off mid-gesture, so leave it to the button: the
                 // motion controller closes it out when that comes up.
-                let held = gesture
-                    .current_event_state()
-                    .contains(gtk::gdk::ModifierType::BUTTON1_MASK);
+                let held = crate::input::paint_button_held(gesture.current_event().as_ref(), gesture.current_event_state());
                 tracing::debug!(
                     held,
                     live = self.fill_session.borrow().is_some(),
@@ -967,8 +966,33 @@ impl PrimaryDragHandler {
     }
 
     fn brush_end(&self) {
+        if self.abandon_stroke.take() && self.discard_brush_stroke() {
+            return;
+        }
         self.commit_brush_stroke();
         self.hand_over_used_color();
+    }
+
+    fn discard_brush_stroke(&self) -> bool {
+        let mut canvas = self.canvas.borrow_mut();
+        if canvas.is_smudge_stroke() {
+            return false;
+        }
+        if let Some(src) = self.pending_timer.borrow_mut().take() {
+            src.remove();
+        }
+        self.pending_correction.borrow_mut().take();
+        let _ = self.deferred_dabs.borrow_mut().take_all();
+        if let Err(e) = canvas.stamp(|target| self.brush_engine.end_stroke(target)) {
+            tracing::error!(error = %e, "stamp end_stroke failed");
+        }
+        if let Err(e) = canvas.discard_stroke() {
+            tracing::error!(error = %e, "discard_stroke failed");
+        }
+        self.pending_capture.borrow_mut().take();
+        self.used_color.set(None);
+        present_into_paintable(&mut canvas, &self.paintable, &self.area);
+        true
     }
 
     fn commit_brush_stroke(&self) {
@@ -3268,24 +3292,64 @@ pub(super) fn install_primary_drag(
         cursor_activates_transform,
         history: Rc::clone(history),
         pending_capture: Rc::new(RefCell::new(None)),
+        abandon_stroke: Rc::clone(&viewport.abandon_stroke),
     });
 
     let drag = gtk::GestureDrag::new();
-    drag.set_button(BUTTON_PRIMARY);
+    drag.set_button(super::input_router::button_filters().0);
+    let ignored = Rc::new(Cell::new(false));
+    // Fix: non-brush tools wait for a touch to move or linger, so a two-finger tap does not act.
+    let held_touch = Rc::new(Cell::new(None::<(Point, Instant)>));
 
     // Keep the frame clock at steady vsync for the whole drag, so a jittery
     // stylus event stream still renders smoothly. See `RenderPump`.
     {
         let h = Rc::clone(&handler);
         let pump = viewport.render_pump();
+        let ignored = Rc::clone(&ignored);
+        let held_touch = Rc::clone(&held_touch);
         drag.connect_drag_begin(move |g, x, y| {
+            let event = g.current_event();
+            let paints = event
+                .as_ref()
+                .and_then(crate::input::resolve_event)
+                .is_some_and(crate::input::PointerAction::paints);
+            ignored.set(!paints);
+            held_touch.set(None);
+            if !paints {
+                g.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             pump.arm();
+            let touch = event.is_some_and(|e| e.event_type() == gtk::gdk::EventType::TouchBegin);
+            if touch && h.tools.active.get() != Tool::Brush {
+                #[allow(clippy::cast_possible_truncation)]
+                held_touch.set(Some((Point::new(x as f32, y as f32), Instant::now())));
+                return;
+            }
             h.on_begin(g, x, y);
         });
     }
     {
         let h = Rc::clone(&handler);
+        let ignored = Rc::clone(&ignored);
+        let held_touch = Rc::clone(&held_touch);
         drag.connect_drag_update(move |g, dx, dy| {
+            if ignored.get() {
+                return;
+            }
+            if let Some((start, landed)) = held_touch.get() {
+                #[allow(clippy::cast_possible_truncation)]
+                let pos = Point::new(start.x + dx as f32, start.y + dy as f32);
+                if super::touch::is_stray_dab(landed.elapsed(), start, pos) {
+                    return;
+                }
+                held_touch.set(None);
+                h.on_begin(g, f64::from(start.x), f64::from(start.y));
+                if !g.is_active() {
+                    return;
+                }
+            }
             frame_profile::note_input();
             let _span = frame_profile::span(frame_profile::Stage::Input);
             h.on_update(g, dx, dy);
@@ -3295,7 +3359,19 @@ pub(super) fn install_primary_drag(
         let h = Rc::clone(&handler);
         let pump = viewport.render_pump();
         drag.connect_drag_end(move |g, _, _| {
+            if ignored.replace(false) {
+                h.abandon_stroke.set(false);
+                return;
+            }
+            if let Some((start, _)) = held_touch.take() {
+                if h.abandon_stroke.take() {
+                    pump.disarm();
+                    return;
+                }
+                h.on_begin(g, f64::from(start.x), f64::from(start.y));
+            }
             h.on_end(g);
+            h.abandon_stroke.set(false);
             pump.disarm();
         });
     }

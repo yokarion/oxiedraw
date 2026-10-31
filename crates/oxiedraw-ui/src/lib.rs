@@ -15,6 +15,7 @@ mod dock;
 mod export_window;
 mod filters;
 mod font_previews;
+mod input;
 mod layout;
 mod pacing_trace;
 mod palette_manager;

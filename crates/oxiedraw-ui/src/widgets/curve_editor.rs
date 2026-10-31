@@ -9,6 +9,8 @@ use relm4::gtk;
 use relm4::gtk::prelude::*;
 use relm4::gtk::{cairo, gdk, glib};
 
+use super::shapes::rounded_rect;
+
 pub(crate) type Rgb = (f64, f64, f64);
 
 const PAD: f64 = 6.0;
@@ -24,6 +26,7 @@ const SHIFT_STEP: u8 = 10;
 
 const BACKGROUND: Rgb = (0.22, 0.22, 0.22);
 const HISTOGRAM: Rgb = (0.45, 0.45, 0.45);
+const AREA_ALPHA: f64 = 0.3;
 
 #[derive(Clone, Copy)]
 pub(crate) struct Ramp {
@@ -56,6 +59,8 @@ struct State {
     overlays: Vec<(Curve, Rgb)>,
     input_ramp: Option<Ramp>,
     output_ramp: Option<Ramp>,
+    marker: Option<f32>,
+    frame: Frame,
 }
 
 impl State {
@@ -76,8 +81,11 @@ impl State {
         Layout::new(
             f64::from(area.width()),
             f64::from(area.height()),
-            self.input_ramp.is_some(),
-            self.output_ramp.is_some(),
+            Frame {
+                input_bar: self.input_ramp.is_some(),
+                output_bar: self.output_ramp.is_some(),
+                ..self.frame
+            },
         )
     }
 
@@ -86,54 +94,71 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct Frame {
+    input_bar: bool,
+    output_bar: bool,
+    meters: bool,
+    fill: bool,
+}
+
 #[derive(Clone, Copy)]
 struct Layout {
     x: f64,
     y: f64,
-    side: f64,
+    width: f64,
+    height: f64,
+    input_bar: bool,
 }
 
 impl Layout {
-    fn new(width: f64, height: f64, input_bar: bool, output_bar: bool) -> Self {
+    fn new(width: f64, height: f64, frame: Frame) -> Self {
         let bar_room = BAR_GAP + BAR + HANDLE;
-        let left = PAD + if output_bar { bar_room } else { 0.0 };
-        let bottom = PAD + if input_bar { bar_room } else { 0.0 };
-        let side = (width - left - PAD).min(height - PAD - bottom).max(1.0);
-        let spare = (width - left - PAD - side).max(0.0);
+        let meter_room = BAR_GAP + BAR;
+        let left = PAD + if frame.output_bar { bar_room } else { 0.0 };
+        let right = PAD + if frame.meters { meter_room } else { 0.0 };
+        let bottom = PAD
+            + if frame.input_bar { bar_room } else { 0.0 }
+            + if frame.meters { meter_room } else { 0.0 };
+        let room_x = (width - left - right).max(1.0);
+        let room_y = (height - PAD - bottom).max(1.0);
+        let (plot_x, plot_y) = if frame.fill { (room_x, room_y) } else { (room_x.min(room_y), room_x.min(room_y)) };
         Self {
-            x: left + spare / 2.0,
+            x: left + (room_x - plot_x) / 2.0,
             y: PAD,
-            side,
+            width: plot_x,
+            height: plot_y,
+            input_bar: frame.input_bar,
         }
     }
 
     fn position(&self, point: CurvePoint) -> (f64, f64) {
         (
-            self.x + f64::from(point.x) / 255.0 * self.side,
-            self.y + (1.0 - f64::from(point.y) / 255.0) * self.side,
+            self.x + f64::from(point.x) / 255.0 * self.width,
+            self.y + (1.0 - f64::from(point.y) / 255.0) * self.height,
         )
     }
 
     fn level_at(&self, x: f64, y: f64) -> CurvePoint {
         let level = |t: f64| (t.clamp(0.0, 1.0) * 255.0).round() as u8;
         CurvePoint::new(
-            level((x - self.x) / self.side),
-            level(1.0 - (y - self.y) / self.side),
+            level((x - self.x) / self.width),
+            level(1.0 - (y - self.y) / self.height),
         )
     }
 
     fn contains(&self, x: f64, y: f64) -> bool {
-        (self.x..=self.x + self.side).contains(&x) && (self.y..=self.y + self.side).contains(&y)
+        (self.x..=self.x + self.width).contains(&x) && (self.y..=self.y + self.height).contains(&y)
     }
 
     fn distance_outside(&self, x: f64, y: f64) -> f64 {
-        let dx = (self.x - x).max(x - (self.x + self.side)).max(0.0);
-        let dy = (self.y - y).max(y - (self.y + self.side)).max(0.0);
+        let dx = (self.x - x).max(x - (self.x + self.width)).max(0.0);
+        let dy = (self.y - y).max(y - (self.y + self.height)).max(0.0);
         dx.max(dy)
     }
 
     fn input_bar_top(&self) -> f64 {
-        self.y + self.side + BAR_GAP
+        self.y + self.height + BAR_GAP
     }
 
     fn output_bar_left(&self) -> f64 {
@@ -142,7 +167,7 @@ impl Layout {
 
     fn input_handle(&self, x: u8) -> (f64, f64) {
         (
-            self.x + f64::from(x) / 255.0 * self.side,
+            self.x + f64::from(x) / 255.0 * self.width,
             self.input_bar_top() + BAR + HANDLE / 2.0,
         )
     }
@@ -150,8 +175,17 @@ impl Layout {
     fn output_handle(&self, y: u8) -> (f64, f64) {
         (
             self.output_bar_left() - HANDLE / 2.0,
-            self.y + (1.0 - f64::from(y) / 255.0) * self.side,
+            self.y + (1.0 - f64::from(y) / 255.0) * self.height,
         )
+    }
+
+    fn bottom_meter(&self) -> (f64, f64, f64, f64) {
+        let ramps = if self.input_bar { BAR_GAP + BAR + HANDLE } else { 0.0 };
+        (self.x, self.y + self.height + ramps + BAR_GAP, self.width, BAR)
+    }
+
+    fn right_meter(&self) -> (f64, f64, f64, f64) {
+        (self.x + self.width + BAR_GAP, self.y, BAR, self.height)
     }
 }
 
@@ -181,12 +215,15 @@ impl CurveEditor {
             overlays: Vec::new(),
             input_ramp: None,
             output_ramp: None,
+            marker: None,
+            frame: Frame::default(),
         }));
         {
             let state = Rc::clone(&state);
             widget.set_draw_func(move |area, cr, _, _| {
                 let st = state.borrow();
-                paint(cr, &st, &st.layout(area));
+                let accent = st.frame.meters.then(|| crate::theme::accent(area));
+                paint(cr, &st, &st.layout(area), accent);
             });
         }
         let handlers: Handlers = Rc::new(RefCell::new(Vec::new()));
@@ -235,6 +272,16 @@ impl CurveEditor {
             st.input_ramp = input;
             st.output_ramp = output;
         }
+        self.widget.queue_draw();
+    }
+
+    pub(crate) fn set_marker(&self, input: Option<f32>) {
+        self.state.borrow_mut().marker = input;
+        self.widget.queue_draw();
+    }
+
+    pub(crate) fn set_meter_style(&self) {
+        self.state.borrow_mut().frame = Frame { meters: true, fill: true, ..Frame::default() };
         self.widget.queue_draw();
     }
 
@@ -589,8 +636,8 @@ fn install_input(area: &gtk::DrawingArea, input: &Input) {
     area.add_controller(keys);
 }
 
-fn paint(cr: &cairo::Context, st: &State, l: &Layout) {
-    cr.rectangle(l.x, l.y, l.side, l.side);
+fn paint(cr: &cairo::Context, st: &State, l: &Layout, accent: Option<Rgb>) {
+    cr.rectangle(l.x, l.y, l.width, l.height);
     set_rgb(cr, BACKGROUND);
     let _ = cr.fill();
 
@@ -600,14 +647,24 @@ fn paint(cr: &cairo::Context, st: &State, l: &Layout) {
     paint_grid(cr, l);
 
     let curve = st.visible_curve();
+    let marker = st.marker.map(|input| (input, curve.evaluate(input)));
     let _ = cr.save();
-    cr.rectangle(l.x, l.y, l.side, l.side);
+    cr.rectangle(l.x, l.y, l.width, l.height);
     cr.clip();
     for (overlay, color) in &st.overlays {
         paint_curve(cr, l, overlay, *color, 0.7, 1.0);
     }
+    if let (Some(accent), Some((input, _))) = (accent, marker) {
+        paint_area_under(cr, l, &curve, input, accent);
+    }
     paint_curve(cr, l, &curve, st.color, 1.0, 1.75);
+    if let Some((input, output)) = marker {
+        paint_marker(cr, l, (input, output), st.color, st.frame.meters);
+    }
     let _ = cr.restore();
+    if let Some(accent) = accent.filter(|_| st.frame.meters) {
+        paint_meters(cr, l, marker, accent);
+    }
 
     // A point being dragged away shifts the indices, so highlight nothing.
     let removing = matches!(st.grab, Some(Grab { removing: true, .. }));
@@ -627,27 +684,27 @@ fn paint(cr: &cairo::Context, st: &State, l: &Layout) {
     let points = curve.points();
     let (first, last) = (points[0], points[points.len() - 1]);
     if let Some(ramp) = st.input_ramp {
-        paint_bar(cr, (l.x, l.input_bar_top(), l.side, BAR), ramp, true);
+        paint_bar(cr, (l.x, l.input_bar_top(), l.width, BAR), ramp, true);
         paint_handle(cr, l.input_handle(first.x), ramp.low, true);
         paint_handle(cr, l.input_handle(last.x), ramp.high, true);
     }
     if let Some(ramp) = st.output_ramp {
-        paint_bar(cr, (l.output_bar_left(), l.y, BAR, l.side), ramp, false);
+        paint_bar(cr, (l.output_bar_left(), l.y, BAR, l.height), ramp, false);
         paint_handle(cr, l.output_handle(first.y), ramp.low, false);
         paint_handle(cr, l.output_handle(last.y), ramp.high, false);
     }
 }
 
 fn paint_histogram(cr: &cairo::Context, l: &Layout, heights: &[f64]) {
-    let bottom = l.y + l.side;
-    let bin_width = l.side / LUT_SIZE as f64;
+    let bottom = l.y + l.height;
+    let bin_width = l.width / LUT_SIZE as f64;
     cr.move_to(l.x, bottom);
     for (i, h) in heights.iter().enumerate() {
-        let top = bottom - h * l.side;
+        let top = bottom - h * l.height;
         cr.line_to(l.x + i as f64 * bin_width, top);
         cr.line_to(l.x + (i + 1) as f64 * bin_width, top);
     }
-    cr.line_to(l.x + l.side, bottom);
+    cr.line_to(l.x + l.width, bottom);
     cr.close_path();
     set_rgb(cr, HISTOGRAM);
     let _ = cr.fill();
@@ -656,43 +713,97 @@ fn paint_histogram(cr: &cairo::Context, l: &Layout, heights: &[f64]) {
 fn paint_grid(cr: &cairo::Context, l: &Layout) {
     cr.set_line_width(1.0);
     for i in 1..GRID_DIVISIONS {
-        let t = (l.side * f64::from(i) / f64::from(GRID_DIVISIONS)).round() + 0.5;
-        cr.move_to(l.x + t, l.y);
-        cr.line_to(l.x + t, l.y + l.side);
-        cr.move_to(l.x, l.y + t);
-        cr.line_to(l.x + l.side, l.y + t);
+        let fraction = f64::from(i) / f64::from(GRID_DIVISIONS);
+        let tx = (l.width * fraction).round() + 0.5;
+        let ty = (l.height * fraction).round() + 0.5;
+        cr.move_to(l.x + tx, l.y);
+        cr.line_to(l.x + tx, l.y + l.height);
+        cr.move_to(l.x, l.y + ty);
+        cr.line_to(l.x + l.width, l.y + ty);
     }
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.12);
     let _ = cr.stroke();
 
-    cr.move_to(l.x, l.y + l.side);
-    cr.line_to(l.x + l.side, l.y);
+    cr.move_to(l.x, l.y + l.height);
+    cr.line_to(l.x + l.width, l.y);
     cr.set_source_rgba(1.0, 1.0, 1.0, 0.18);
     let _ = cr.stroke();
 
-    cr.rectangle(l.x + 0.5, l.y + 0.5, l.side - 1.0, l.side - 1.0);
+    cr.rectangle(l.x + 0.5, l.y + 0.5, l.width - 1.0, l.height - 1.0);
     cr.set_source_rgba(0.0, 0.0, 0.0, 0.5);
     let _ = cr.stroke();
 }
 
 fn paint_curve(cr: &cairo::Context, l: &Layout, curve: &Curve, color: Rgb, alpha: f64, width: f64) {
-    let steps = (l.side.ceil() as usize).max(2);
+    trace_curve(cr, l, curve);
+    cr.set_source_rgba(color.0, color.1, color.2, alpha);
+    cr.set_line_width(width);
+    cr.set_line_join(cairo::LineJoin::Round);
+    let _ = cr.stroke();
+}
+
+fn paint_area_under(cr: &cairo::Context, l: &Layout, curve: &Curve, input: f32, color: Rgb) {
+    let _ = cr.save();
+    cr.rectangle(l.x, l.y, f64::from(input.clamp(0.0, 1.0)) * l.width, l.height);
+    cr.clip();
+    trace_curve(cr, l, curve);
+    cr.line_to(l.x + l.width, l.y + l.height);
+    cr.line_to(l.x, l.y + l.height);
+    cr.close_path();
+    cr.set_source_rgba(color.0, color.1, color.2, AREA_ALPHA);
+    let _ = cr.fill();
+    let _ = cr.restore();
+}
+
+fn trace_curve(cr: &cairo::Context, l: &Layout, curve: &Curve) {
+    let steps = (l.width.ceil() as usize).max(2);
     let mut samples = vec![0.0_f32; steps];
     curve.sample_into(&mut samples);
     let last = (steps - 1) as f64;
     for (i, v) in samples.iter().enumerate() {
-        let x = l.x + i as f64 / last * l.side;
-        let y = l.y + (1.0 - f64::from(*v)) * l.side;
+        let x = l.x + i as f64 / last * l.width;
+        let y = l.y + (1.0 - f64::from(*v)) * l.height;
         if i == 0 {
             cr.move_to(x, y);
         } else {
             cr.line_to(x, y);
         }
     }
-    cr.set_source_rgba(color.0, color.1, color.2, alpha);
-    cr.set_line_width(width);
-    cr.set_line_join(cairo::LineJoin::Round);
+}
+
+fn paint_marker(cr: &cairo::Context, l: &Layout, (input, output): (f32, f32), color: Rgb, meters: bool) {
+    let x = l.x + f64::from(input.clamp(0.0, 1.0)) * l.width;
+    let y = l.y + (1.0 - f64::from(output.clamp(0.0, 1.0))) * l.height;
+    cr.set_dash(&[3.0, 3.0], 0.0);
+    cr.set_line_width(1.0);
+    cr.move_to(x, l.y + l.height);
+    cr.line_to(x, y);
+    cr.line_to(if meters { l.x + l.width } else { l.x }, y);
+    cr.set_source_rgba(color.0, color.1, color.2, 0.6);
     let _ = cr.stroke();
+    cr.set_dash(&[], 0.0);
+    cr.arc(x, y, POINT_HALF + 1.5, 0.0, std::f64::consts::TAU);
+    set_rgb(cr, color);
+    let _ = cr.fill();
+}
+
+fn paint_meters(cr: &cairo::Context, l: &Layout, marker: Option<(f32, f32)>, color: Rgb) {
+    let (input, output) = marker.map_or((0.0, 0.0), |(i, o)| (f64::from(i.clamp(0.0, 1.0)), f64::from(o.clamp(0.0, 1.0))));
+    let (bx, by, bw, bh) = l.bottom_meter();
+    let (rx, ry, rw, rh) = l.right_meter();
+    let pill = |(x, y, w, h): (f64, f64, f64, f64), fill: Rgb| {
+        rounded_rect(cr, x, y, w, h, BAR / 2.0);
+        set_rgb(cr, fill);
+        let _ = cr.fill();
+    };
+    pill((bx, by, bw, bh), BACKGROUND);
+    pill((rx, ry, rw, rh), BACKGROUND);
+    if input > 0.0 {
+        pill((bx, by, bw * input, bh), color);
+    }
+    if output > 0.0 {
+        pill((rx, ry + rh * (1.0 - output), rw, rh * output), color);
+    }
 }
 
 fn paint_point(cr: &cairo::Context, (x, y): (f64, f64), color: Rgb, filled: bool, hovered: bool) {
@@ -764,14 +875,35 @@ mod tests {
 
     #[test]
     fn layout_maps_levels_both_ways() {
-        let l = Layout::new(300.0, 300.0, true, true);
-        for level in [0u8, 1, 127, 128, 254, 255] {
-            let p = CurvePoint::new(level, 255 - level);
-            let (x, y) = l.position(p);
-            assert_eq!(l.level_at(x, y), p);
+        let ramps = Frame { input_bar: true, output_bar: true, ..Frame::default() };
+        let meters = Frame { meters: true, fill: true, ..Frame::default() };
+        for l in [Layout::new(300.0, 300.0, ramps), Layout::new(500.0, 300.0, meters)] {
+            for level in [0u8, 1, 127, 128, 254, 255] {
+                let p = CurvePoint::new(level, 255 - level);
+                let (x, y) = l.position(p);
+                assert_eq!(l.level_at(x, y), p);
+            }
+            assert!(l.contains(l.x + 1.0, l.y + 1.0));
+            assert!((l.distance_outside(l.x - 30.0, l.y + 5.0) - 30.0).abs() < 1e-9);
+            assert!(l.distance_outside(l.x + 5.0, l.y + 5.0).abs() < 1e-9);
         }
-        assert!(l.contains(l.x + 1.0, l.y + 1.0));
-        assert!((l.distance_outside(l.x - 30.0, l.y + 5.0) - 30.0).abs() < 1e-9);
-        assert!(l.distance_outside(l.x + 5.0, l.y + 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn square_plots_stay_square_and_filled_ones_take_the_room() {
+        let square = Layout::new(500.0, 300.0, Frame::default());
+        assert!((square.width - square.height).abs() < 1e-9);
+        assert!((square.x + square.width / 2.0 - 250.0).abs() < 1e-9);
+
+        let filled = Layout::new(500.0, 300.0, Frame { meters: true, fill: true, ..Frame::default() });
+        assert!(filled.width > filled.height);
+        let (bx, by, bw, _) = filled.bottom_meter();
+        let (rx, ry, _, rh) = filled.right_meter();
+        assert!((bx - filled.x).abs() < 1e-9 && (bw - filled.width).abs() < 1e-9);
+        assert!(by > filled.y + filled.height);
+        assert!(rx > filled.x + filled.width);
+        assert!((ry - filled.y).abs() < 1e-9 && (rh - filled.height).abs() < 1e-9);
+        assert!(rx + BAR <= 500.0 - PAD + 1e-9);
+        assert!(by + BAR <= 300.0 - PAD + 1e-9);
     }
 }

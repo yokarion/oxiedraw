@@ -5,6 +5,7 @@
 //! `gtk::Picture` once the realized widget exists.
 
 mod crop_geom;
+mod input_router;
 pub(crate) mod primary_drag;
 mod resample;
 mod stroke_tip;
@@ -41,8 +42,6 @@ use oxiedraw_core::color::Color;
 
 use crate::canvas_paintable::{CanvasPaintable, ColorPickerOverlay, GradientCursorOverlay};
 
-pub(super) const BUTTON_PRIMARY: u32 = 1;
-const BUTTON_MIDDLE: u32 = 2;
 const BUTTON_SECONDARY: u32 = 3;
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 32.0;
@@ -74,6 +73,7 @@ pub(crate) fn rotation_snap_rad() -> f32 {
 enum NavDrag {
     None,
     Pan,
+    PanToggle,
     Zoom,
     Rotate,
 }
@@ -167,8 +167,12 @@ pub(crate) struct Viewport {
     /// keeping the canvas and the undo stack in sync.
     flush_correction: Rc<RefCell<Option<Box<dyn Fn()>>>>,
     fill_drag: Rc<RefCell<Option<Box<dyn Fn(f64, bool)>>>>,
+    quick_menu: QuickMenuSlot,
+    abandon_stroke: Rc<Cell<bool>>,
     render_pump: RenderPump,
 }
+
+pub(crate) type QuickMenuSlot = Rc<RefCell<Option<Rc<dyn Fn(f64, f64)>>>>;
 
 /// Keeps GTK's frame clock continuously updating during an interactive drag, so
 /// the canvas renders at steady vsync regardless of input-event timing.
@@ -503,8 +507,14 @@ impl Viewport {
             picture,
             flush_correction: Rc::new(RefCell::new(None)),
             fill_drag: Rc::new(RefCell::new(None)),
+            quick_menu: Rc::new(RefCell::new(None)),
+            abandon_stroke: Rc::new(Cell::new(false)),
             render_pump,
         }
+    }
+
+    pub(crate) fn set_quick_menu(&self, open: Rc<dyn Fn(f64, f64)>) {
+        *self.quick_menu.borrow_mut() = Some(open);
     }
 
     /// Handle to the render pump - armed/disarmed around interactive drags to
@@ -824,7 +834,7 @@ pub(crate) fn wire(
         liquify, text_edit, pattern_edit,
     );
     install_pattern_secondary(picture, viewport, tools, pattern_edit);
-    install_pan(picture, viewport);
+    let pan_drag = install_pan(picture, viewport);
     install_scroll(picture, viewport);
     install_pinch_zoom(picture, viewport);
     let primary_drag = primary_drag::install_primary_drag(
@@ -850,6 +860,7 @@ pub(crate) fn wire(
         cursor_activates_transform,
     );
     touch::install_touch_nav(picture, viewport, &primary_drag);
+    input_router::install(picture, viewport, &primary_drag, &pan_drag);
     install_centering_and_present(picture, viewport);
 }
 
@@ -939,8 +950,7 @@ fn install_motion(
         hover_pump.poke();
         frame_profile::note_input();
 
-        // The eraser end always erases with the brush, so it hovers as one.
-        let tool = if is_eraser_end(ctrl.current_event().as_ref()) {
+        let tool = if crate::input::eraser_erases(ctrl.current_event().as_ref()) {
             Tool::Brush
         } else {
             tools_c.active.get()
@@ -1097,9 +1107,7 @@ fn install_motion(
                 // controller (where the brush reads pen pressure) keeps
                 // streaming the truth. The position is absolute, so an
                 // event the gesture also delivered is a no-op here.
-                let held = ctrl
-                    .current_event_state()
-                    .contains(gdk::ModifierType::BUTTON1_MASK);
+                let held = crate::input::paint_button_held(ctrl.current_event().as_ref(), ctrl.current_event_state());
                 if let Some(on_move) = fill_drag.borrow().as_ref() {
                     on_move(x, held);
                 }
@@ -1131,9 +1139,7 @@ fn install_motion(
             // Only once the button is genuinely up: a leave *during* a
             // drag (the pointer crossing out while held) must not cut
             // the gesture short.
-            let held = ctrl
-                .current_event_state()
-                .contains(gdk::ModifierType::BUTTON1_MASK);
+            let held = crate::input::paint_button_held(ctrl.current_event().as_ref(), ctrl.current_event_state());
             if held {
                 return;
             }
@@ -1197,19 +1203,13 @@ fn device_axes(ctrl: &gtk::EventControllerMotion) -> (f32, f32, f32, f32) {
             .and_then(|e| e.axis(axis))
             .map_or(default, |v| v as f32)
     };
-    let pressure = read(gdk::AxisUse::Pressure, 1.0);
+    let pressure = crate::input::map_pressure(event.as_ref(), read(gdk::AxisUse::Pressure, 1.0));
     let tilt_x = read(gdk::AxisUse::Xtilt, 0.0);
     let tilt_y = read(gdk::AxisUse::Ytilt, 0.0);
     // GDK reports rotation as a fraction of one revolution; the brush
     // engine wants radians.
     let rotation_rad = read(gdk::AxisUse::Rotation, 0.0) * std::f32::consts::TAU;
     (pressure, tilt_x, tilt_y, rotation_rad)
-}
-
-pub(super) fn is_eraser_end(event: Option<&gdk::Event>) -> bool {
-    event
-        .and_then(gdk::Event::device_tool)
-        .is_some_and(|tool| tool.tool_type() == gdk::DeviceToolType::Eraser)
 }
 
 /// Deterministic-but-position-dependent unit value used for scatter /
@@ -1226,7 +1226,7 @@ fn stable_random_for(pos: Point) -> f32 {
 
 /// Resolve a modifier-only keybind (e.g. "rotate-modifier") to its GDK mask, or
 /// `None` if the user has unbound it. Loaded from settings at drag-begin so
-/// changes in Preferences > Keybinds take effect on the next drag.
+/// changes in Preferences > Controls take effect on the next drag.
 fn drag_modifier_mask(id: &str) -> Option<gdk::ModifierType> {
     let settings = crate::settings::AppSettings::load();
     let parts = crate::settings::keybinds::accel_parts_for(id, &settings)?;
@@ -1244,8 +1244,8 @@ fn drag_modifier_mask(id: &str) -> Option<gdk::ModifierType> {
 /// centre (add the snap modifier for 45 deg steps).
 /// Right-click on a node of the Pattern tool's curve removes it.
 ///
-/// Its own controller rather than a branch of the primary drag: that one is
-/// bound to the left button, and a delete is a click, not a drag.
+/// Its own controller rather than a branch of the primary drag: that one
+/// follows the Draw binding, and a delete is a click, not a drag.
 fn install_pattern_secondary(
     area: &gtk::Picture,
     viewport: &Viewport,
@@ -1261,7 +1261,13 @@ fn install_pattern_secondary(
     let tools = tools.clone();
     let pattern_edit = pattern_edit.clone();
     click.connect_pressed(move |gesture, _, x, y| {
-        if tools.active.get() != Tool::Pattern {
+        // Fix: with Draw bound to this button, claiming it would cancel the drawing drag.
+        let draws = gesture
+            .current_event()
+            .as_ref()
+            .and_then(crate::input::resolve_event)
+            .is_some_and(crate::input::PointerAction::paints);
+        if draws || tools.active.get() != Tool::Pattern {
             return;
         }
         pattern_edit.delete_node(widget_to_canvas(x, y, &pan, &zoom, &rotation));
@@ -1270,12 +1276,14 @@ fn install_pattern_secondary(
     area.add_controller(click);
 }
 
-fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
+fn install_pan(area: &gtk::Picture, viewport: &Viewport) -> gtk::GestureDrag {
     let drag = gtk::GestureDrag::new();
-    drag.set_button(BUTTON_MIDDLE);
+    drag.set_button(input_router::button_filters().1);
     let resampler = Rc::new(RefCell::new(resample::PointerResampler::new()));
+    let engaged = Rc::new(Cell::new(false));
 
     {
+        let engaged = Rc::clone(&engaged);
         let last = Rc::clone(&viewport.pan_last_offset);
         let nav = Rc::clone(&viewport.nav);
         let nav_zoom_start = Rc::clone(&viewport.nav_zoom_start);
@@ -1291,6 +1299,13 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let area_c = area.clone();
         let resampler = Rc::clone(&resampler);
         drag.connect_drag_begin(move |gesture, start_x, start_y| {
+            let pans = gesture.current_event().as_ref().and_then(crate::input::resolve_event)
+                == Some(crate::input::PointerAction::Pan(crate::input::PanMode::Hold));
+            engaged.set(pans);
+            if !pans {
+                gesture.set_state(gtk::EventSequenceState::Denied);
+                return;
+            }
             pump.arm();
             last.set(Point::ZERO);
             // Any in-flight snap ease from a previous drag ends here.
@@ -1350,7 +1365,11 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let picture = Rc::clone(&viewport.picture);
         let area_c = area.clone();
         let resampler = Rc::clone(&resampler);
+        let engaged = Rc::clone(&engaged);
         drag.connect_drag_update(move |gesture, dx, dy| {
+            if !engaged.get() {
+                return;
+            }
             #[allow(clippy::cast_possible_truncation)]
             let offset = Point::new(dx as f32, dy as f32);
             if nav.get() == NavDrag::Rotate {
@@ -1426,6 +1445,9 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         let last = Rc::clone(&viewport.pan_last_offset);
         let sync = viewport.view_sync();
         drag.connect_drag_end(move |_, offset_x, offset_y| {
+            if !engaged.replace(false) {
+                return;
+            }
             // The gesture's own final offset, so the view ends where the
             // pointer did however the updates were delivered.
             if nav.get() == NavDrag::Pan {
@@ -1459,7 +1481,8 @@ fn install_pan(area: &gtk::Picture, viewport: &Viewport) {
         }));
     }
 
-    area.add_controller(drag);
+    area.add_controller(drag.clone());
+    drag
 }
 
 fn apply_pan_offset(pan: &Cell<Point>, last: &Cell<Point>, sync: &ViewSync, offset: Point) {
@@ -1805,11 +1828,13 @@ pub(super) fn widget_to_canvas_xf(x: f32, y: f32, pan: Point, zoom: f32, rotatio
 }
 
 fn pressure_from(gesture: &gtk::GestureDrag) -> f32 {
+    let event = gesture.current_event();
     #[allow(clippy::cast_possible_truncation)]
-    gesture
-        .current_event()
+    let raw = event
+        .as_ref()
         .and_then(|e| e.axis(gdk::AxisUse::Pressure))
-        .map_or(1.0, |p| p as f32)
+        .map_or(1.0, |p| p as f32);
+    crate::input::map_pressure(event.as_ref(), raw)
 }
 
 /// Read an arbitrary GDK device axis from the current event, falling

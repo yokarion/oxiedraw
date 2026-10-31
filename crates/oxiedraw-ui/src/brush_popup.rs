@@ -1,7 +1,4 @@
-//! Krita-style quick popup for the Brush tool: the secondary button (right
-//! click or the pen's barrel button) opens the colour wheel in a disc at the
-//! pointer, with a brush size slider below it. Any press outside those, or the
-//! secondary button again, closes it.
+//! Krita-style quick menu for the Brush tool: colour wheel and size slider at the pointer.
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -30,14 +27,18 @@ const BACKDROP_CSS: &str = "background-color: alpha(@window_bg_color, 0.5); \
      border: 1px solid alpha(@borders, 0.8); border-radius: 9999px;";
 
 
-// Returns a handle that closes the popup, for when the tool changes under it.
+pub(crate) struct QuickMenu {
+    pub(crate) close: Rc<dyn Fn()>,
+    pub(crate) open_at: Rc<dyn Fn(f64, f64)>,
+}
+
 pub(crate) fn attach(
     overlay: &gtk::Overlay,
     picture: &gtk::Picture,
     tools: &ToolState,
     colors: &ColorState,
     brush_engine: &BrushEngine,
-) -> Rc<dyn Fn()> {
+) -> QuickMenu {
     let size_slider = build_size_slider(brush_engine, SLIDER_WIDTH);
     size_slider.set_draw_value(false);
     size_slider.set_halign(gtk::Align::Center);
@@ -101,7 +102,29 @@ pub(crate) fn attach(
         overlay.connect_unmap(move |_| state.close(true));
     }
 
-    Rc::new(move || state.close(true))
+    let open_at: Rc<dyn Fn(f64, f64)> = {
+        let state = state.clone();
+        let tools = tools.clone();
+        let overlay = overlay.downgrade();
+        let picture = picture.downgrade();
+        Rc::new(move |x, y| {
+            let (Some(overlay), Some(picture)) = (overlay.upgrade(), picture.upgrade()) else {
+                return;
+            };
+            if state.is_open.get() || tools.active.get() != Tool::Brush {
+                return;
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let point = gtk::graphene::Point::new(x as f32, y as f32);
+            if let Some(at) = picture.compute_point(&overlay, &point) {
+                state.open(|popup| place_centered(popup, &overlay, f64::from(at.x()), f64::from(at.y())));
+            }
+        })
+    };
+    QuickMenu {
+        close: Rc::new(move || state.close(true)),
+        open_at,
+    }
 }
 
 // The secondary button opens or closes the popup and never reaches the canvas;
@@ -116,29 +139,29 @@ fn on_press(
     let Some((x, y)) = event_position_in(overlay, event) else {
         return glib::Propagation::Proceed;
     };
-    let is_secondary = event
-        .downcast_ref::<gdk::ButtonEvent>()
-        .is_some_and(|button| button.button() == gdk::BUTTON_SECONDARY);
+    let is_quick_menu =
+        crate::input::resolve_event(event) == Some(crate::input::PointerAction::QuickMenu);
 
     if state.is_open.get() {
-        if is_secondary {
+        // Fix: a primary press inside reaches the wheel even if it opens the menu.
+        let inside = state.contains(overlay, x, y);
+        let primary = event.downcast_ref::<gdk::ButtonEvent>().is_some_and(|b| b.button() == gdk::BUTTON_PRIMARY);
+        if is_quick_menu && !(inside && primary) {
             state.close(true);
             return glib::Propagation::Stop;
         }
-        if !state.contains(overlay, x, y) {
+        if !inside {
             state.close(false);
         }
         return glib::Propagation::Proceed;
     }
 
     // The pop-in scale would cancel a stroke already under way.
-    let stroke_running = event
-        .modifier_state()
-        .contains(gdk::ModifierType::BUTTON1_MASK);
+    let stroke_running = crate::input::paint_button_held(Some(event), event.modifier_state());
     let over_canvas = overlay
         .pick(x, y, gtk::PickFlags::DEFAULT)
         .is_some_and(|hit| hit == *picture.upcast_ref::<gtk::Widget>());
-    if !is_secondary || stroke_running || tools.active.get() != Tool::Brush || !over_canvas {
+    if !is_quick_menu || stroke_running || tools.active.get() != Tool::Brush || !over_canvas {
         return glib::Propagation::Proceed;
     }
     state.open(|popup| place_centered(popup, overlay, x, y));

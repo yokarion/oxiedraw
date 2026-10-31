@@ -19,14 +19,20 @@ pub(super) struct RowHandles {
 }
 
 pub(super) fn build_keybinds_page(
+    window: &adw::PreferencesWindow,
     settings: Rc<RefCell<AppSettings>>,
     recording_id: Rc<RefCell<Option<String>>>,
     row_handles: Rc<RefCell<HashMap<String, RowHandles>>>,
     modified_count: Rc<Cell<u32>>,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.set_title("Keybinds");
+    page.set_title("Controls");
     page.set_icon_name(Some("input-keyboard-symbolic"));
+
+    page.add(&super::devices::build_devices_group(window));
+    let separator = adw::PreferencesGroup::new();
+    separator.add(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    page.add(&separator);
 
     let total_actions: usize = ALL_ACTION_GROUPS.iter().map(|g| g.actions.len()).sum();
     let n_groups = ALL_ACTION_GROUPS.len();

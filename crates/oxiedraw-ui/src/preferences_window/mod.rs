@@ -1,8 +1,8 @@
-//! The preferences window: General, Canvas, Appearance and Keybinds pages.
-//! Changes are written to `settings.json` at once - no Apply/Cancel cycle.
+//! The preferences window. Changes are written to `settings.json` at once.
 
 mod appearance;
 mod canvas;
+mod devices;
 mod general;
 mod keybinds;
 mod project;
@@ -60,6 +60,7 @@ pub(crate) fn show(
     ));
     win.add(&build_project_page(Rc::clone(&settings), autosave));
     win.add(&build_keybinds_page(
+        &win,
         Rc::clone(&settings),
         Rc::clone(&recording_id),
         Rc::clone(&row_handles),

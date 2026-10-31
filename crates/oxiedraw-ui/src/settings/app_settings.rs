@@ -34,11 +34,13 @@ pub(crate) struct AppSettings {
     pub(crate) default_brush_name: Option<String>,
     #[serde(default)]
     pub(crate) brush_picker_grid_view: bool,
+    #[serde(default, deserialize_with = "forgiving")]
+    pub(crate) input: crate::input::InputSettings,
 }
 
 // Serde gives up on the whole document at the first bad value, which for one
 // mistyped panel name meant losing every other setting in the file.
-fn forgiving<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+pub(crate) fn forgiving<'de, D, T>(deserializer: D) -> Result<T, D::Error>
 where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
@@ -202,6 +204,7 @@ impl Default for AppSettings {
             rotation_snap_deg: default_rotation_snap_deg(),
             default_brush_name: Some("Ink Pen".to_string()),
             brush_picker_grid_view: false,
+            input: crate::input::InputSettings::default(),
         }
     }
 }
@@ -303,9 +306,12 @@ impl AppSettings {
     }
 
     // For anything holding settings open across edits: the dock rewrites the
-    // layout continuously, so a stale copy would put the old one back.
+    // layout continuously and `input::update` the input block, so a stale copy
+    // would put the old ones back.
     pub(crate) fn save_keeping_layout(&mut self) {
-        self.layout = Self::load().layout;
+        let disk = Self::load();
+        self.layout = disk.layout;
+        self.input = disk.input;
         self.save();
     }
 }

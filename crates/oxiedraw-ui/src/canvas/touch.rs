@@ -1,5 +1,4 @@
-//! Touchscreen navigation: one finger pans, two fingers pan, zoom and rotate
-//! together, and a quick two-finger tap undoes. Touches never draw.
+//! Touchscreen input: finger pan, pinch-zoom, rotate, taps and one-finger drawing.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -12,7 +11,8 @@ use relm4::gtk::gdk;
 use relm4::gtk::glib;
 use relm4::gtk::prelude::*;
 
-use super::{MAX_ZOOM, MIN_ZOOM, ViewSync, Viewport, widget_to_canvas_xf};
+use super::{MAX_ZOOM, MIN_ZOOM, QuickMenuSlot, ViewSync, Viewport, widget_to_canvas_xf};
+use crate::input::{self, Navigation, TouchAction, TouchPlan};
 
 const TAP_MAX_DURATION: Duration = Duration::from_millis(250);
 const TAP_SLOP_PX: f32 = 12.0;
@@ -77,10 +77,13 @@ struct Session {
     // Read from settings once rotation engages, keeping disk off the
     // touch-down path.
     snap: Option<Snap>,
+    plan: TouchPlan,
+    landed_sum: Point,
+    landed_count: usize,
 }
 
 impl Session {
-    fn new(rotation: f32) -> Self {
+    fn new(rotation: f32, plan: TouchPlan) -> Self {
         Self {
             began: Instant::now(),
             max_fingers: 0,
@@ -90,14 +93,28 @@ impl Session {
             rotating: false,
             free_rotation: rotation,
             snap: None,
+            plan,
+            landed_sum: Point::ZERO,
+            landed_count: 0,
         }
     }
 
-    fn is_two_finger_tap(&self) -> bool {
-        self.max_fingers == 2
-            && !self.moved
-            && !self.palm
-            && self.began.elapsed() <= TAP_MAX_DURATION
+    fn note_landing(&mut self, pos: Point) {
+        self.landed_sum = Point::new(self.landed_sum.x + pos.x, self.landed_sum.y + pos.y);
+        self.landed_count += 1;
+    }
+
+    fn tapped(&self) -> Option<TouchAction> {
+        if self.moved || self.palm || self.began.elapsed() > TAP_MAX_DURATION {
+            return None;
+        }
+        self.plan.tap(self.max_fingers)
+    }
+
+    fn tap_point(&self) -> Point {
+        #[allow(clippy::cast_precision_loss)]
+        let count = self.landed_count.max(1) as f32;
+        Point::new(self.landed_sum.x / count, self.landed_sum.y / count)
     }
 
     // Swallows the turn until it passes the start threshold; from the next
@@ -132,10 +149,26 @@ impl Session {
     }
 }
 
-#[derive(Default)]
+struct DrawingFinger {
+    finger: Finger,
+    landed: Instant,
+}
+
+impl DrawingFinger {
+    fn is_young(&self) -> bool {
+        is_stray_dab(self.landed.elapsed(), self.finger.start, self.finger.pos)
+    }
+}
+
+pub(super) fn is_stray_dab(age: Duration, start: Point, pos: Point) -> bool {
+    age <= TAP_MAX_DURATION && start.distance(pos) <= TAP_SLOP_PX
+}
+
 struct TouchState {
     fingers: Vec<Finger>,
     session: Option<Session>,
+    drawing: Option<DrawingFinger>,
+    plan: TouchPlan,
 }
 
 impl TouchState {
@@ -156,10 +189,26 @@ impl TouchState {
     // pump or steer later gestures.
     fn reset(&mut self, pump: &super::RenderPump) {
         self.fingers.clear();
+        self.drawing = None;
         if self.session.take().is_some() {
             pump.disarm();
         }
     }
+}
+
+enum Outcome {
+    Pass,
+    Consumed,
+    HandOver { abandon: bool },
+    Tap(TouchAction, Point),
+}
+
+struct Context<'a> {
+    sync: &'a ViewSync,
+    pump: &'a super::RenderPump,
+    pen_down: bool,
+    fresh: bool,
+    modifiers: gdk::ModifierType,
 }
 
 
@@ -169,10 +218,15 @@ pub(super) fn install_touch_nav(
     primary_drag: &gtk::GestureDrag,
 ) {
     let legacy = gtk::EventControllerLegacy::new();
-    // Capture phase, consuming every touch event, so a finger never reaches
-    // the drawing gesture on the same widget.
+    // Capture phase, consuming every touch event it navigates with, so those
+    // fingers never reach the drawing gesture on the same widget.
     legacy.set_propagation_phase(gtk::PropagationPhase::Capture);
-    let state = Rc::new(RefCell::new(TouchState::default()));
+    let state = Rc::new(RefCell::new(TouchState {
+        fingers: Vec::new(),
+        session: None,
+        drawing: None,
+        plan: input::read(|s| s.touchscreen.plan()),
+    }));
     {
         // A tab switch can unmap the canvas between a finger's press and its lift.
         let state = Rc::clone(&state);
@@ -182,6 +236,8 @@ pub(super) fn install_touch_nav(
     let sync = Rc::new(viewport.view_sync());
     let pump = viewport.render_pump();
     let animator = viewport.rotation_animator();
+    let quick_menu = Rc::clone(&viewport.quick_menu);
+    let abandon_stroke = Rc::clone(&viewport.abandon_stroke);
     // Weak: the picture owns both controllers.
     let primary_drag = primary_drag.downgrade();
     let area_c = area.clone();
@@ -196,15 +252,15 @@ pub(super) fn install_touch_nav(
         ) {
             return glib::Propagation::Proceed;
         }
-        let sequence = event.event_sequence();
         #[allow(clippy::cast_possible_truncation)]
         let pos = crate::brush_popup::event_position_in(&area_c, event)
             .map(|(x, y)| Point::new(x as f32, y as f32));
-        // GTK's own gesture state, so a denied or lost pen drag can't leave
-        // touch navigation switched off.
-        let pen_down = primary_drag.upgrade().is_some_and(|g| g.is_active());
-        let undo = {
+        let primary = primary_drag.upgrade();
+        let outcome = {
             let mut state = state.borrow_mut();
+            // GTK's own gesture state, so a denied or lost pen drag can't leave
+            // touch navigation switched off.
+            let pen_down = state.drawing.is_none() && primary.as_ref().is_some_and(GestureExt::is_active);
             // The first finger of a fresh contact emulates the pointer; any
             // fingers still tracked then are stale.
             let fresh = kind == gdk::EventType::TouchBegin
@@ -213,67 +269,122 @@ pub(super) fn install_touch_nav(
                     .is_some_and(gdk::TouchEvent::is_emulating_pointer);
             if fresh {
                 state.reset(&pump);
+                state.plan = input::read(|s| s.touchscreen.plan());
             }
-            if pen_down && let Some(session) = state.session.as_mut() {
-                session.palm = true;
+            if fresh && state.session.is_none() {
+                animator.cancel();
             }
-            match (kind, pos) {
-                (gdk::EventType::TouchBegin, Some(pos)) => {
-                    if state.session.is_none() {
-                        animator.cancel();
-                    }
-                    press(&mut state, sequence, pos, &sync, &pump);
-                    if let Some(session) = state.session.as_mut() {
-                        session.palm |= pen_down;
-                    }
-                    false
-                }
-                (gdk::EventType::TouchUpdate, Some(pos)) => {
-                    drag(&mut state, &sequence, pos, event.modifier_state(), &sync);
-                    false
-                }
-                (gdk::EventType::TouchEnd | gdk::EventType::TouchCancel, _) => release(
-                    &mut state,
-                    &sequence,
-                    kind == gdk::EventType::TouchCancel,
-                    &pump,
-                ),
-                _ => false,
-            }
+            let context = Context { sync: &sync, pump: &pump, pen_down, fresh, modifiers: event.modifier_state() };
+            handle(&mut state, kind, event.event_sequence(), pos, &context)
         };
-        if undo && let Err(e) = area_c.activate_action("app.undo", None) {
-            tracing::warn!(%e, "two-finger tap: undo action missing");
+        match outcome {
+            Outcome::Pass => return glib::Propagation::Proceed,
+            Outcome::Consumed => {}
+            Outcome::HandOver { abandon } => {
+                if let Some(drag) = primary {
+                    abandon_stroke.set(abandon);
+                    drag.set_state(gtk::EventSequenceState::Denied);
+                    abandon_stroke.set(false);
+                }
+            }
+            Outcome::Tap(action, at) => run_tap(&area_c, &quick_menu, action, at),
         }
         glib::Propagation::Stop
     });
     area.add_controller(legacy);
 }
 
-fn press(
+fn handle(
     state: &mut TouchState,
+    kind: gdk::EventType,
     sequence: gdk::EventSequence,
-    pos: Point,
-    sync: &ViewSync,
-    pump: &super::RenderPump,
-) {
+    pos: Option<Point>,
+    context: &Context,
+) -> Outcome {
+    if let Some(drawing) = state.drawing.as_mut().filter(|d| d.finger.sequence == sequence) {
+        match kind {
+            gdk::EventType::TouchUpdate => {
+                if let Some(pos) = pos {
+                    drawing.finger.pos = pos;
+                }
+            }
+            gdk::EventType::TouchEnd | gdk::EventType::TouchCancel => state.drawing = None,
+            _ => {}
+        }
+        return Outcome::Pass;
+    }
+    // Fix: any touch while the pen is down marks the session as palm, not just a new finger.
+    if context.pen_down && let Some(session) = state.session.as_mut() {
+        session.palm = true;
+    }
+    match (kind, pos) {
+        (gdk::EventType::TouchBegin, Some(pos)) => {
+            if context.fresh && state.plan.draw && !context.pen_down {
+                let finger = Finger { sequence, start: pos, pos };
+                state.drawing = Some(DrawingFinger { finger, landed: Instant::now() });
+                return Outcome::Pass;
+            }
+            let handed = state.drawing.take();
+            let young = handed.as_ref().is_some_and(DrawingFinger::is_young);
+            if let Some(drawing) = &handed {
+                let at = if young { drawing.finger.start } else { drawing.finger.pos };
+                press(state, drawing.finger.sequence.clone(), at, context);
+                if young && let Some(session) = state.session.as_mut() {
+                    session.began = drawing.landed;
+                }
+            }
+            press(state, sequence, pos, context);
+            if let Some(session) = state.session.as_mut() {
+                session.palm |= context.pen_down;
+                session.moved |= handed.is_some() && !young;
+            }
+            if handed.is_some() { Outcome::HandOver { abandon: young } } else { Outcome::Consumed }
+        }
+        (gdk::EventType::TouchUpdate, Some(pos)) => {
+            drag(state, &sequence, pos, context);
+            Outcome::Consumed
+        }
+        (gdk::EventType::TouchEnd | gdk::EventType::TouchCancel, _) => {
+            let cancelled = kind == gdk::EventType::TouchCancel;
+            release(state, &sequence, cancelled, context.pump)
+                .map_or(Outcome::Consumed, |(action, at)| Outcome::Tap(action, at))
+        }
+        _ => Outcome::Consumed,
+    }
+}
+
+fn run_tap(area: &gtk::Picture, quick_menu: &QuickMenuSlot, action: TouchAction, at: Point) {
+    let name = match action {
+        TouchAction::Undo => "app.undo",
+        TouchAction::Redo => "app.redo",
+        TouchAction::QuickMenu => {
+            let open = quick_menu.borrow().clone();
+            if let Some(open) = open {
+                open(f64::from(at.x), f64::from(at.y));
+            }
+            return;
+        }
+        TouchAction::Draw | TouchAction::Pan | TouchAction::Rotate => return,
+    };
+    if let Err(e) = area.activate_action(name, None) {
+        tracing::warn!(%e, name, "touch tap: action missing");
+    }
+}
+
+fn press(state: &mut TouchState, sequence: gdk::EventSequence, pos: Point, context: &Context) {
     if state.session.is_none() {
-        pump.arm();
-        state.session = Some(Session::new(sync.rotation.get()));
+        context.pump.arm();
+        state.session = Some(Session::new(context.sync.rotation.get(), state.plan));
     }
     state.fingers.push(Finger { sequence, start: pos, pos });
     let count = state.fingers.len();
     if let Some(session) = state.session.as_mut() {
         session.max_fingers = session.max_fingers.max(count);
+        session.note_landing(pos);
     }
 }
 
-fn drag(
-    state: &mut TouchState,
-    sequence: &gdk::EventSequence,
-    pos: Point,
-    modifiers: gdk::ModifierType,
-    sync: &ViewSync,
-) {
+fn drag(state: &mut TouchState, sequence: &gdk::EventSequence, pos: Point, context: &Context) {
     let engaged = state.session.as_ref().is_some_and(|s| s.moved);
     // Until a finger leaves the slop the view stays put, so a tap never nudges
     // it; the first real move then catches up from where the fingers landed.
@@ -289,6 +400,7 @@ fn drag(
     if !engaged && finger.start.distance(pos) <= TAP_SLOP_PX {
         return;
     }
+    let fingers = state.fingers.len();
     let (Some(before), Some(after)) = (before, state.steering_pair()) else {
         return;
     };
@@ -296,34 +408,34 @@ fn drag(
         return;
     };
     session.moved = true;
-    if session.palm || before == after {
+    let nav = session.plan.navigation(fingers);
+    if session.palm || before == after || !nav.any() {
         return;
     }
     let (scale, turn) = spread_change(before, after);
-    session.add_turn(turn);
-    let rotation = session.shown_rotation(modifiers);
-    navigate(View::read(sync), before, after, scale, rotation).write(sync);
+    if nav.rotate {
+        session.add_turn(turn);
+    }
+    let rotation = session.shown_rotation(context.modifiers);
+    step(View::read(context.sync), before, after, nav, scale, rotation).write(context.sync);
 }
 
-// Returns whether the session that just ended was a two-finger tap.
 fn release(
     state: &mut TouchState,
     sequence: &gdk::EventSequence,
     cancelled: bool,
     pump: &super::RenderPump,
-) -> bool {
+) -> Option<(TouchAction, Point)> {
     state.fingers.retain(|f| &f.sequence != sequence);
     if cancelled && let Some(session) = state.session.as_mut() {
         session.moved = true;
     }
     if !state.fingers.is_empty() {
-        return false;
+        return None;
     }
-    let Some(session) = state.session.take() else {
-        return false;
-    };
+    let session = state.session.take()?;
     pump.disarm();
-    session.is_two_finger_tap()
+    session.tapped().map(|action| (action, session.tap_point()))
 }
 
 // Zoom factor and turn (radians) from how the two fingers' spread changed.
@@ -340,6 +452,30 @@ fn spread_change(before: (Point, Point), after: (Point, Point)) -> (f32, f32) {
     } else {
         (1.0, 0.0)
     }
+}
+
+fn step(
+    view: View,
+    before: (Point, Point),
+    after: (Point, Point),
+    nav: Navigation,
+    scale: f32,
+    rotation: f32,
+) -> View {
+    let after = if nav.pan {
+        after
+    } else {
+        let mid_before = before.0.lerp(before.1, 0.5);
+        let mid_after = after.0.lerp(after.1, 0.5);
+        let shift = Point::new(mid_before.x - mid_after.x, mid_before.y - mid_after.y);
+        (
+            Point::new(after.0.x + shift.x, after.0.y + shift.y),
+            Point::new(after.1.x + shift.x, after.1.y + shift.y),
+        )
+    };
+    let scale = if nav.zoom { scale } else { 1.0 };
+    let rotation = if nav.rotate { rotation } else { view.rotation };
+    navigate(view, before, after, scale, rotation)
 }
 
 // Moves the view so the canvas point under the fingers' midpoint follows it,
@@ -375,7 +511,13 @@ mod tests {
 
     use relm4::gtk::gdk::ModifierType;
 
-    use super::{Point, Session, Snap, View, navigate, spread_change, widget_to_canvas_xf};
+    use std::time::Duration;
+
+    use super::{
+        Navigation, Point, Session, Snap, TAP_MAX_DURATION, TAP_SLOP_PX, View, is_stray_dab, navigate,
+        spread_change, step, widget_to_canvas_xf,
+    };
+    use crate::input::{InputSettings, TouchAction};
 
     fn session(rotation: f32) -> Session {
         Session {
@@ -387,6 +529,9 @@ mod tests {
             rotating: false,
             free_rotation: rotation,
             snap: Some(Snap { mask: Some(ModifierType::CONTROL_MASK), step: FRAC_PI_4 }),
+            plan: InputSettings::default().touchscreen.plan(),
+            landed_sum: Point::ZERO,
+            landed_count: 0,
         }
     }
 
@@ -411,6 +556,42 @@ mod tests {
         let free = FRAC_PI_4 - 0.25;
         assert!((s.shown_rotation(ModifierType::empty()) - free).abs() < 1e-6);
         assert!((s.shown_rotation(ModifierType::CONTROL_MASK) - FRAC_PI_4).abs() < 1e-6);
+    }
+
+    #[test]
+    fn taps_follow_the_bindings_and_land_between_the_fingers() {
+        let mut s = session(0.0);
+        s.moved = false;
+        s.note_landing(Point::new(100.0, 200.0));
+        s.note_landing(Point::new(200.0, 300.0));
+        assert_eq!(s.tapped(), Some(TouchAction::Undo));
+        assert_eq!(s.tap_point(), Point::new(150.0, 250.0));
+        s.max_fingers = 3;
+        s.note_landing(Point::new(0.0, 100.0));
+        assert_eq!(s.tapped(), Some(TouchAction::QuickMenu));
+        assert_eq!(s.tap_point(), Point::new(100.0, 200.0));
+        s.note_landing(Point::new(100.0, 200.0));
+        assert_eq!(s.tap_point(), Point::new(100.0, 200.0), "a finger landing twice still averages");
+        s.max_fingers = 4;
+        assert_eq!(s.tapped(), None);
+        s.max_fingers = 2;
+        s.palm = true;
+        assert_eq!(s.tapped(), None);
+        s.palm = false;
+        s.moved = true;
+        assert_eq!(s.tapped(), None);
+    }
+
+    #[test]
+    fn only_a_quick_still_first_finger_is_a_stray_dab() {
+        let start = Point::new(50.0, 50.0);
+        let near = Point::new(50.0 + TAP_SLOP_PX - 1.0, 50.0);
+        let far = Point::new(50.0 + TAP_SLOP_PX + 1.0, 50.0);
+        let late = TAP_MAX_DURATION + Duration::from_millis(1);
+        assert!(is_stray_dab(Duration::ZERO, start, start));
+        assert!(is_stray_dab(TAP_MAX_DURATION, start, near));
+        assert!(!is_stray_dab(Duration::ZERO, start, far));
+        assert!(!is_stray_dab(late, start, start));
     }
 
     fn canvas_under(view: View, p: Point) -> Point {
@@ -459,5 +640,25 @@ mod tests {
         let moved = navigate(view, before, after, 1.0, snapped);
         assert!((moved.rotation - snapped).abs() < 1e-6);
         assert_close(canvas_under(moved, after.0.lerp(after.1, 0.5)), middle);
+    }
+
+    #[test]
+    fn every_navigation_mix_moves_only_what_it_binds() {
+        let view = View { pan: Point::new(40.0, -10.0), zoom: 0.8, rotation: 0.1 };
+        let before = (Point::new(100.0, 100.0), Point::new(200.0, 100.0));
+        let after = (Point::new(140.0, 60.0), Point::new(260.0, 190.0));
+        let (scale, turn) = spread_change(before, after);
+        let middle_before = before.0.lerp(before.1, 0.5);
+        let canvas_middle = canvas_under(view, middle_before);
+        for bits in 0..8u8 {
+            let nav = Navigation { pan: bits & 1 != 0, zoom: bits & 2 != 0, rotate: bits & 4 != 0 };
+            let moved = step(view, before, after, nav, scale, view.rotation + turn);
+            let expected_zoom = if nav.zoom { view.zoom * scale } else { view.zoom };
+            let expected_rotation = if nav.rotate { view.rotation + turn } else { view.rotation };
+            assert!((moved.zoom - expected_zoom).abs() < 1e-5, "{nav:?}");
+            assert!((moved.rotation - expected_rotation).abs() < 1e-6, "{nav:?}");
+            let pinned_at = if nav.pan { after.0.lerp(after.1, 0.5) } else { middle_before };
+            assert_close(canvas_under(moved, pinned_at), canvas_middle);
+        }
     }
 }

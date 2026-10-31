@@ -1028,13 +1028,15 @@ impl DocumentSession {
         let canvas_root = {
             let overlay = gtk::Overlay::builder().child(&picture).build();
             tool_windows.attach(&overlay);
-            let close_brush_popup = crate::brush_popup::attach(
+            let quick_menu = crate::brush_popup::attach(
                 &overlay,
                 &picture,
                 &global.tools,
                 &global.colors,
                 &global.brush_engine,
             );
+            viewport.set_quick_menu(quick_menu.open_at);
+            let close_brush_popup = quick_menu.close;
             let inner = apply_tool;
             apply_tool = Rc::new(move |t: Tool| {
                 if t != Tool::Brush {
