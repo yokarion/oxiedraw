@@ -32,10 +32,20 @@ impl Default for HistoryConfig {
     }
 }
 
+/// Layers panel selection at the moment an entry was recorded, by id.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerSelection {
+    pub active_layer: Option<String>,
+    pub active_group: Option<String>,
+    pub selected: Vec<String>,
+}
+
 /// One recorded entry in the undo/redo timeline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub action: HistoryAction,
+    #[serde(default)]
+    pub layer_selection: Option<LayerSelection>,
 }
 
 #[derive(Debug)]
@@ -43,6 +53,7 @@ pub struct HistoryStack {
     undo: VecDeque<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     capacity: usize,
+    restored_selection: Option<LayerSelection>,
 }
 
 impl HistoryStack {
@@ -51,6 +62,7 @@ impl HistoryStack {
             undo: VecDeque::with_capacity(config.capacity.min(1024)),
             redo: Vec::new(),
             capacity: config.capacity.max(1),
+            restored_selection: None,
         }
     }
 
@@ -85,11 +97,26 @@ impl HistoryStack {
     /// Push a new action onto the undo stack. Clears the redo stack
     /// (standard "doing something new invalidates the redo branch").
     pub fn record(&mut self, action: HistoryAction) {
+        self.push_entry(HistoryEntry { action, layer_selection: None });
+    }
+
+    /// As [`Self::record`], remembering the layer selection so undo can put it back.
+    pub fn record_with_selection(&mut self, action: HistoryAction, selection: LayerSelection) {
+        self.push_entry(HistoryEntry { action, layer_selection: Some(selection) });
+    }
+
+    fn push_entry(&mut self, entry: HistoryEntry) {
         self.redo.clear();
+        self.restored_selection = None;
         if self.undo.len() == self.capacity {
             self.undo.pop_front();
         }
-        self.undo.push_back(HistoryEntry { action });
+        self.undo.push_back(entry);
+    }
+
+    /// The layer selection the last undo put back, handed out once.
+    pub const fn take_restored_selection(&mut self) -> Option<LayerSelection> {
+        self.restored_selection.take()
     }
 
     /// Pop the most recent undo entry, apply its inverse, and move it to the
@@ -104,6 +131,7 @@ impl HistoryStack {
         };
         let label = entry.action.label().to_string();
         apply_direction(canvas, components, &entry.action, Direction::Backward)?;
+        self.restored_selection.clone_from(&entry.layer_selection);
         self.redo.push(entry);
         Ok(Some(label))
     }
@@ -120,6 +148,7 @@ impl HistoryStack {
         };
         let label = entry.action.label().to_string();
         apply_direction(canvas, components, &entry.action, Direction::Forward)?;
+        self.restored_selection = None;
         if self.undo.len() == self.capacity {
             self.undo.pop_front();
         }
@@ -191,6 +220,7 @@ impl HistoryStack {
             undo,
             redo,
             capacity: capacity.max(1),
+            restored_selection: None,
         }
     }
 }

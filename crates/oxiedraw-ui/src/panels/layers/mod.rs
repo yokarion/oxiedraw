@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering as AOrdering};
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::document::{BlendMode, LayerGroup, LayerState, LayerTreeNode};
 use oxiedraw_core::enum_meta::EnumMeta;
-use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerExtension};
+use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerExtension, LayerSelection};
 use relm4::gtk;
 use relm4::gtk::cairo;
 use relm4::gtk::gdk;
@@ -408,6 +408,41 @@ impl Ui {
         let tree = self.tree.borrow();
         let group = find_group(&tree, &id)?;
         (!leaf_ids_top_first(&group.children).is_empty()).then_some(id)
+    }
+
+    pub(super) fn selection_snapshot(&self) -> LayerSelection {
+        let mut selected: Vec<String> = self.multi_selected.borrow().iter().cloned().collect();
+        selected.sort_unstable();
+        LayerSelection {
+            active_layer: self.active_id(),
+            active_group: self.active_group.borrow().clone(),
+            selected,
+        }
+    }
+
+    // Ids that no longer exist are skipped; with nothing left to make active,
+    // the current active layer stays.
+    pub(super) fn restore_selection(&self, selection: &LayerSelection) {
+        let snap = self.state.snapshot();
+        let tree = self.tree.borrow();
+        let is_layer = |id: &String| snap.iter().any(|l| &l.id == id);
+        let is_group = |id: &String| find_group(&tree, id).is_some();
+        *self.multi_selected.borrow_mut() = selection
+            .selected
+            .iter()
+            .filter(|id| is_layer(id) || is_group(id))
+            .cloned()
+            .collect();
+        let group = selection.active_group.clone().filter(is_group);
+        let active = selection
+            .active_layer
+            .as_ref()
+            .and_then(|id| snap.iter().position(|l| &l.id == id));
+        if group.is_some() || active.is_some() {
+            *self.active_group.borrow_mut() = group;
+            self.state.set_active(active);
+        }
+        self.invalidate_selection_sync();
     }
 }
 
@@ -1656,6 +1691,7 @@ fn build_layers_page(
         let ui = ui.clone();
         let area = area.clone();
         let canvas = Rc::clone(canvas);
+        let history = Rc::clone(history);
         Rc::new(move || {
             let c = canvas.borrow();
             {
@@ -1677,6 +1713,10 @@ fn build_layers_page(
             drop(c);
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
+            let restored = history.try_borrow_mut().ok().and_then(|mut h| h.take_restored_selection());
+            if let Some(selection) = restored {
+                ui.restore_selection(&selection);
+            }
             ui.sync_blend_controls();
             actions::refresh_action_sensitivity(&ui);
             area.queue_draw();

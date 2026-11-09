@@ -377,7 +377,7 @@ pub struct VulkanRenderer {
     /// smudge stroke (most sessions never use it). Samples `blend_scratch`
     /// (a per-dab copy of the target layer) + `smudge_before`, and deposits the
     /// dragged color lerped from the pre-stroke layer by opacity.
-    pub(super) smudge_pipeline: Option<(vk::PipelineLayout, vk::Pipeline)>,
+    pub(super) smudge_pipeline: Option<smudge_ops::SmudgePipeline>,
     /// Pre-stroke snapshot of the smudged layer `(image, pool, set)`, taken at
     /// stroke start; the dab shader lerps from it so opacity is a ceiling.
     /// Lazily allocated on first smudge stroke.
@@ -1478,9 +1478,8 @@ impl Drop for VulkanRenderer {
             if let Some(mut ga) = self.clip_mask_scratch.take() {
                 ga.destroy(&self.device, &mut self.allocator);
             }
-            if let Some((layout, pipeline)) = self.smudge_pipeline.take() {
-                self.device.destroy_pipeline(pipeline, None);
-                self.device.destroy_pipeline_layout(layout, None);
+            if let Some(smudge) = self.smudge_pipeline.take() {
+                smudge.destroy(&self.device);
             }
             if let Some(overlay) = self.pattern_overlay.take() {
                 overlay.destroy(&self.device, &mut self.allocator);

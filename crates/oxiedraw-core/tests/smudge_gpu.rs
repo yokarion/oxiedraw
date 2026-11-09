@@ -296,6 +296,66 @@ fn smudge_stroke_alpha_is_even() {
     assert!(min > 220, "smudge punched low-alpha beads into an opaque layer (min={min})");
 }
 
+/// A shallow diagonal smear over 1px horizontal stripes must drag them by
+/// subpixel amounts and soften them. Point sampling snapped every dab's drag
+/// to whole pixels, so the stripes survived untouched as streaks.
+#[test]
+fn subpixel_drag_softens_streaks() {
+    let size = Size::new(240, 60);
+    let w = size.width as usize;
+    let mut stripes = vec![0u8; w * size.height as usize * 4];
+    for (i, px) in stripes.chunks_exact_mut(4).enumerate() {
+        let row = i / w;
+        let value = if row.is_multiple_of(2) { 60 } else { 200 };
+        px.copy_from_slice(&[value, value, value, 255]);
+    }
+    let (mut canvas, idx) = canvas_with_layer(size, &stripes);
+
+    let brush = BrushEngine::new();
+    select_real_brush(&brush);
+    let active = brush.active.get();
+    if let Some(preset) = brush.brushes.borrow_mut().iter_mut().find(|p| p.id == active) {
+        preset.dynamics.color_rate = None;
+    }
+    brush.size.set(30.0);
+    brush.opacity.set(1.0);
+    let paint = Color::new(0, 0, 0);
+    canvas.begin_stroke(paint, 1.0, false).unwrap();
+    canvas.set_smudge_stroke(true).unwrap();
+    let steps = 60;
+    canvas.stamp(|tg| brush.begin_stroke(sample_p(30.0, 26.0, 0, 1.0), paint, tg)).unwrap();
+    for i in 1..=steps {
+        let t = i as f32 / steps as f32;
+        let sample = sample_p(30.0 + 180.0 * t, 26.0 + 8.0 * t, (i * 8) as u64, 1.0);
+        canvas.stamp_and_present(|tg| brush.push_sample(sample, tg)).unwrap();
+    }
+    canvas.stamp(|tg| brush.end_stroke(tg)).unwrap();
+    canvas.commit_stroke().unwrap();
+
+    let mut buf = Vec::new();
+    canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
+    let luma = |x: usize, y: usize| i32::from(buf[(y * w + x) * 4 + 1]);
+    let mut contrast = 0;
+    let mut count = 0;
+    for x in 90..150 {
+        let centre = 26 + (8 * (x - 30) / 180);
+        for y in centre - 4..centre + 4 {
+            contrast += (luma(x, y) - luma(x, y + 1)).abs();
+            count += 1;
+        }
+    }
+    let mean = contrast / count;
+    println!("stripe contrast under the smear: {mean} (untouched 140)");
+    assert!(mean < 100, "smear left the stripes as hard streaks (contrast {mean})");
+}
+
+fn canvas_with_layer(size: Size, pixels: &[u8]) -> (Canvas, usize) {
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer_with_pixels("base", pixels).unwrap();
+    canvas.layers().set_active(Some(idx));
+    (canvas, idx)
+}
+
 /// Low-pressure white smudge over transparent: the classic OVER-of-soft-dabs
 /// beading case. Report the centre-row alpha variance so we can see beads.
 #[test]

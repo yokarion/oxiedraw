@@ -23,7 +23,7 @@ pub use action::{
     CropLayer, Direction, FoldedLayer, HistoryAction, LayerExtension, SelectionSnapshot,
 };
 pub use snapshot::{LayerPatch, PatchBounds};
-pub use stack::{DEFAULT_CAPACITY, HistoryConfig, HistoryEntry, HistoryStack};
+pub use stack::{DEFAULT_CAPACITY, HistoryConfig, HistoryEntry, HistoryStack, LayerSelection};
 
 use crate::canvas::Canvas;
 
@@ -129,6 +129,7 @@ mod tests {
                 layer_id: "a".into(),
                 patch,
             },
+            layer_selection: None,
         };
         let stack = HistoryStack::from_parts(8, VecDeque::default(), vec![pattern]);
         assert!(stack.redo_puts_back_a_pattern());

@@ -47,16 +47,21 @@ fn selected_layer_targets(ui: &Ui) -> Vec<(String, usize)> {
         .collect()
 }
 
-fn record_one_step(history: &Rc<RefCell<HistoryStack>>, mut steps: Vec<HistoryAction>) {
-    let action = match steps.len() {
-        0 => return,
-        1 => steps.pop().expect("length checked"),
-        _ => HistoryAction::Batch {
+fn one_step(mut steps: Vec<HistoryAction>) -> Option<HistoryAction> {
+    match steps.len() {
+        0 => None,
+        1 => steps.pop(),
+        _ => Some(HistoryAction::Batch {
             label: steps[0].label().to_string(),
             actions: steps,
-        },
-    };
-    history.borrow_mut().record(action);
+        }),
+    }
+}
+
+fn record_one_step(history: &Rc<RefCell<HistoryStack>>, steps: Vec<HistoryAction>) {
+    if let Some(action) = one_step(steps) {
+        history.borrow_mut().record(action);
+    }
 }
 
 fn flattenable_layers(ui: &Ui) -> Vec<(String, usize, LayerKind)> {
@@ -189,6 +194,7 @@ fn start_group_merge(merge: &GroupMerge, gid: &str) {
 fn merge_group(merge: &GroupMerge, gid: &str, blend: MergeBlend, merged: &[u8]) {
     let GroupMerge { ui, area, canvas, redraw, history, .. } = merge;
     let Some(group) = find_group(&ui.tree.borrow(), gid).cloned() else { return };
+    let selection = ui.selection_snapshot();
     let snap = canvas.borrow().layers().snapshot();
     let orphan_clips = clipped_above_group(&ui.tree.borrow(), gid, &snap);
     let mut indices: Vec<usize> = super::leaf_ids_top_first(&group.children)
@@ -297,10 +303,13 @@ fn merge_group(merge: &GroupMerge, gid: &str, blend: MergeBlend, merged: &[u8]) 
         }
         actions.push(HistoryAction::LayerVisibility { id, old: true, new: false });
     }
-    history.borrow_mut().record(HistoryAction::Batch {
-        label: "Merge group".to_string(),
-        actions,
-    });
+    history.borrow_mut().record_with_selection(
+        HistoryAction::Batch {
+            label: "Merge group".to_string(),
+            actions,
+        },
+        selection,
+    );
     tracing::info!(
         target: "oxiedraw::layers",
         group = %group.name,
@@ -562,6 +571,7 @@ pub(super) fn install_layer_actions(
                 })
             };
             let tree_before = tree_to_core(&ui.tree.borrow());
+            let selection = ui.selection_snapshot();
             let result = canvas.borrow_mut().remove_layer(idx);
             match result {
                 Ok(()) => {
@@ -597,10 +607,10 @@ pub(super) fn install_layer_actions(
                         };
                         sync_height(&area, &ui);
                         let tree_after = tree_to_core(&ui.tree.borrow());
-                        if tree_after == tree_before {
-                            history.borrow_mut().record(removal);
+                        let action = if tree_after == tree_before {
+                            removal
                         } else {
-                            history.borrow_mut().record(HistoryAction::Batch {
+                            HistoryAction::Batch {
                                 label: "Delete layer".to_string(),
                                 actions: vec![
                                     removal,
@@ -609,8 +619,9 @@ pub(super) fn install_layer_actions(
                                         after: tree_after,
                                     },
                                 ],
-                            });
-                        }
+                            }
+                        };
+                        history.borrow_mut().record_with_selection(action, selection);
                     }
                     sync_height(&area, &ui);
                     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
@@ -687,7 +698,9 @@ pub(super) fn install_layer_actions(
                 }
             }
             tracing::info!(target: "oxiedraw::layers", layers = steps.len(), "layers flattened");
-            record_one_step(&history, steps);
+            if let Some(action) = one_step(steps) {
+                history.borrow_mut().record_with_selection(action, ui.selection_snapshot());
+            }
             area.queue_draw();
             redraw.request();
             refresh_action_sensitivity(&ui);
@@ -732,6 +745,8 @@ pub(super) fn install_layer_actions(
             }
             let removed_ids: Vec<String> =
                 sorted[1..].iter().map(|&i| snap[i].id.clone()).collect();
+            let tree_before = tree_to_core(&ui.tree.borrow());
+            let selection = ui.selection_snapshot();
 
             let (survivor_pre, folded) = {
                 let mut c = canvas.borrow_mut();
@@ -762,7 +777,7 @@ pub(super) fn install_layer_actions(
 
             let result = canvas.borrow_mut().merge_layers(&sorted);
             match result {
-                Ok(_) => {
+                Ok(merged_idx) => {
                     let survivor_post = canvas.borrow_mut()
                         .read_layer(sorted[0]).unwrap_or_default();
                     tracing::info!(
@@ -771,22 +786,44 @@ pub(super) fn install_layer_actions(
                         into_idx = sorted[0],
                         "layers merged"
                     );
-                    history.borrow_mut().record(HistoryAction::LayerMerge {
+                    let merge = HistoryAction::LayerMerge {
                         survivor_idx: sorted[0],
                         survivor_pre,
                         survivor_post,
                         survivor_blend,
                         survivor_opacity,
                         folded,
-                    });
+                    };
                     let mut tree = ui.tree.borrow_mut();
                     for rid in &removed_ids {
                         take_node(&mut tree, rid);
                     }
                     drop(tree);
                     ui.multi_selected.borrow_mut().clear();
+                    // Fix: the stale active index landed on the layer above the merged one.
+                    *ui.active_group.borrow_mut() = None;
+                    ui.state.set_active(Some(merged_idx));
+                    ui.invalidate_selection_sync();
                     sync_height(&area, &ui);
                     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+                    // Fix: undo restored the folded layers outside their group; record the tree too.
+                    let tree_after = tree_to_core(&ui.tree.borrow());
+                    let action = if tree_after == tree_before {
+                        merge
+                    } else {
+                        HistoryAction::Batch {
+                            label: merge.label().to_string(),
+                            actions: vec![
+                                merge,
+                                HistoryAction::LayerTreeEdit {
+                                    before: tree_before,
+                                    after: tree_after,
+                                },
+                            ],
+                        }
+                    };
+                    history.borrow_mut().record_with_selection(action, selection);
+                    ui.sync_blend_controls();
                     area.queue_draw();
                     redraw.request();
                     refresh_action_sensitivity(&ui);
@@ -829,6 +866,7 @@ pub(super) fn install_layer_actions(
         action.connect_activate(move |_, _| {
             let Some(gid) = ui.active_group.borrow().clone() else { return };
             let tree_before = tree_to_core(&ui.tree.borrow());
+            let selection = ui.selection_snapshot();
             // Highest index first, or earlier removals shift the rest.
             let leaves = group_leaf_ids(&ui.tree.borrow(), &gid);
             let snap = canvas.borrow().layers().snapshot();
@@ -875,10 +913,13 @@ pub(super) fn install_layer_actions(
                 });
             }
             if !actions.is_empty() {
-                history.borrow_mut().record(HistoryAction::Batch {
-                    label: "Delete group".to_string(),
-                    actions,
-                });
+                history.borrow_mut().record_with_selection(
+                    HistoryAction::Batch {
+                        label: "Delete group".to_string(),
+                        actions,
+                    },
+                    selection,
+                );
             }
             sync_height(&area, &ui);
             area.queue_draw();

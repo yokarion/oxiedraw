@@ -397,6 +397,97 @@ fn undoing_a_delete_restores_the_layer_inside_its_group() {
     assert!(restored.clipped, "undo dropped the clipping mask");
 }
 
+#[test]
+fn undo_hands_back_the_recorded_layer_selection_once() {
+    use crate::history::LayerSelection;
+
+    let mut c = canvas();
+    let id = layer_id(&c, 0);
+    c.set_layer_visible(0, false).expect("hide");
+    let selection = LayerSelection {
+        active_layer: Some(id.clone()),
+        active_group: None,
+        selected: vec![id.clone()],
+    };
+    let mut s = stack();
+    s.record_with_selection(
+        HistoryAction::LayerVisibility { id, old: true, new: false },
+        selection.clone(),
+    );
+    assert_eq!(s.take_restored_selection(), None, "nothing undone yet");
+
+    s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
+    assert_eq!(s.take_restored_selection(), Some(selection));
+    assert_eq!(s.take_restored_selection(), None, "handed out only once");
+
+    s.redo(&mut c, &mut ComponentLibrary::new()).expect("redo");
+    assert_eq!(s.take_restored_selection(), None, "redo keeps the current selection");
+}
+
+#[test]
+fn undoing_a_merge_restores_the_folded_layer_inside_its_group() {
+    use crate::document::{LayerGroup, LayerTreeNode};
+
+    let group = |children: Vec<LayerTreeNode>| {
+        LayerTreeNode::Group(LayerGroup {
+            id: "g".into(),
+            name: "Group".into(),
+            expanded: true,
+            children,
+        })
+    };
+    let mut c = canvas();
+    let lower = c.add_layer("Lower").expect("add");
+    let upper = c.add_layer("Upper").expect("add");
+    let (base_id, lower_id, upper_id) = (layer_id(&c, 0), layer_id(&c, lower), layer_id(&c, upper));
+    let tree_before = vec![
+        LayerTreeNode::layer(base_id.clone()),
+        group(vec![LayerTreeNode::layer(lower_id.clone()), LayerTreeNode::layer(upper_id.clone())]),
+    ];
+    c.set_layer_tree(tree_before.clone()).expect("set tree");
+
+    let survivor_pre = paint(&mut c, lower, [1.0, 0.0, 0.0, 1.0]);
+    let upper_pixels = paint(&mut c, upper, [0.0, 0.0, 1.0, 1.0]);
+    c.merge_layers(&[lower, upper]).expect("merge");
+    let survivor_post = c.read_layer(lower).expect("read");
+    let tree_after = vec![LayerTreeNode::layer(base_id), group(vec![LayerTreeNode::layer(lower_id)])];
+    c.set_layer_tree(tree_after.clone()).expect("set tree");
+
+    let mut s = stack();
+    s.record(HistoryAction::Batch {
+        label: "Merge layers".into(),
+        actions: vec![
+            HistoryAction::LayerMerge {
+                survivor_idx: lower,
+                survivor_pre,
+                survivor_post,
+                survivor_blend: crate::document::BlendMode::Normal,
+                survivor_opacity: 1.0,
+                folded: vec![FoldedLayer {
+                    idx: upper,
+                    id: upper_id.clone(),
+                    name: "Upper".into(),
+                    visible: true,
+                    blend: crate::document::BlendMode::Normal,
+                    opacity: 1.0,
+                    pixels: upper_pixels,
+                }],
+            },
+            HistoryAction::LayerTreeEdit {
+                before: tree_before.clone(),
+                after: tree_after.clone(),
+            },
+        ],
+    });
+
+    s.undo(&mut c, &mut ComponentLibrary::new()).expect("undo");
+    assert_eq!(c.layer_tree(), tree_before, "folded layer came back outside its group");
+    assert_eq!(layer_id(&c, upper), upper_id, "folded layer restored at its index");
+
+    s.redo(&mut c, &mut ComponentLibrary::new()).expect("redo");
+    assert_eq!(c.layer_tree(), tree_after);
+}
+
 /// Two layers: an opaque base covering the left half, and an opaque blue layer
 /// above it that is clipped to it. Anything on the right half of the composite
 /// means the clip was dropped.

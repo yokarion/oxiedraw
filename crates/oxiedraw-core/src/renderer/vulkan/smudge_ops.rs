@@ -12,7 +12,7 @@ use ash::vk;
 use std::mem::ManuallyDrop;
 
 use super::super::RendererError;
-use super::super::pass::{FullscreenPass, over_blend};
+use super::super::pass::{FullscreenPass, linear_clamp_sampler, over_blend};
 use super::super::resources::Image;
 use super::{CANVAS_FORMAT, VulkanRenderer, create_sampled_image_set};
 
@@ -60,13 +60,36 @@ impl SmudgePush {
     }
 }
 
+/// Lazily built smudge pass. `scratch_set` binds `blend_scratch` through a
+/// linear sampler so the drag lands at subpixel offsets.
+pub(in crate::renderer) struct SmudgePipeline {
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    sampler: vk::Sampler,
+    scratch_pool: vk::DescriptorPool,
+    scratch_set: vk::DescriptorSet,
+}
+
+impl SmudgePipeline {
+    /// # Safety
+    /// Caller must ensure no GPU work referencing this pipeline is in flight.
+    pub(super) unsafe fn destroy(self, device: &ash::Device) {
+        unsafe {
+            device.destroy_descriptor_pool(self.scratch_pool, None);
+            device.destroy_sampler(self.sampler, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+        }
+    }
+}
+
 impl VulkanRenderer {
     /// Build the smudge pipeline on first use (most sessions never smudge).
     /// Two descriptor sets, both the layer-composite single-sampler layout:
     /// set 0 = `blend_scratch` (per-dab layer copy), set 1 = `smudge_before`.
-    fn ensure_smudge_pipeline(&mut self) -> Result<(vk::PipelineLayout, vk::Pipeline), RendererError> {
-        if let Some(pair) = self.smudge_pipeline {
-            return Ok(pair);
+    fn ensure_smudge_pipeline(&mut self) -> Result<(), RendererError> {
+        if self.smudge_pipeline.is_some() {
+            return Ok(());
         }
         let set_layout = self.layer_composite_pipeline.descriptor_set_layout;
         let set_layouts = [set_layout, set_layout];
@@ -86,8 +109,18 @@ impl VulkanRenderer {
             blend: over_blend(),
         }
         .build(&self.device)?;
-        self.smudge_pipeline = Some((layout, pipeline));
-        Ok((layout, pipeline))
+        // Fix: linear pickup; the layers' nearest sampler snapped the drag to whole pixels (streaks).
+        let sampler = linear_clamp_sampler(&self.device)?;
+        let (scratch_pool, scratch_set) =
+            create_sampled_image_set(&self.device, set_layout, sampler, self.blend_scratch.view)?;
+        self.smudge_pipeline = Some(SmudgePipeline {
+            layout,
+            pipeline,
+            sampler,
+            scratch_pool,
+            scratch_set,
+        });
+        Ok(())
     }
 
     /// Ensure the pre-stroke snapshot image exists (lazy) and return its
@@ -250,12 +283,12 @@ impl VulkanRenderer {
         opacity: f32,
         dabs: &[SmudgeDab],
     ) {
-        let (layout, pipeline) = self.smudge_pipeline.expect("pipeline ensured");
+        let smudge = self.smudge_pipeline.as_ref().expect("pipeline ensured");
+        let (layout, pipeline, scratch_set) = (smudge.layout, smudge.pipeline, smudge.scratch_set);
         let before_set = self.smudge_before.as_ref().expect("before ensured").2;
         let layer_fb = self.layer_stack.slots[layer_idx].framebuffer;
         let layer_img = self.layer_stack.slots[layer_idx].image.handle;
         let scratch_img = self.blend_scratch.handle;
-        let scratch_set = self.blend_scratch_dst_set;
         let render_pass = self.canvas_target.render_pass;
         let size = self.canvas_size;
         #[allow(clippy::cast_precision_loss)]

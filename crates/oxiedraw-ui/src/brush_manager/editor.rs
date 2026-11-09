@@ -135,7 +135,7 @@ pub(super) fn build(
 
     let family_row = adw::ActionRow::builder().title("Family").build();
     let family_dropdown =
-        gtk::DropDown::from_strings(&["Soft round", "Pixel", "Textured"]);
+        gtk::DropDown::from_strings(&["Soft round", "Pixel", "Textured", "Smudge"]);
     family_dropdown.set_valign(gtk::Align::Center);
     family_row.add_suffix(&family_dropdown);
     props_group.add(&family_row);
@@ -233,6 +233,7 @@ pub(super) fn build(
             brush.family = match idx {
                 0 => BrushFamily::SoftRound,
                 1 => BrushFamily::Pixel,
+                3 => BrushFamily::Smudge,
                 _ => match &brush.family {
                     BrushFamily::Textured(rc) => BrushFamily::Textured(rc.clone()),
                     // First-time switch to Textured: seed with the
@@ -442,6 +443,38 @@ pub(super) fn build(
         &mark_dirty,
     );
     dyn_group.add(&spacing_dyn.row);
+    let smudge_rate_dyn = build_dynamics_row(
+        "Smudge rate",
+        "How much existing paint is dragged along, 1 = full",
+        DynamicsField::SmudgeRate,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+    );
+    dyn_group.add(&smudge_rate_dyn.row);
+    let color_rate_dyn = build_dynamics_row(
+        "Color rate",
+        "How much brush color mixes into the smear",
+        DynamicsField::ColorRate,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+    );
+    dyn_group.add(&color_rate_dyn.row);
+    // Smudge rows follow the family dropdown, including while a brush loads.
+    {
+        let smudge_rows = [smudge_rate_dyn.row.clone(), color_rate_dyn.row.clone()];
+        let sync = move |d: &gtk::DropDown| {
+            let smudge = d.selected() == family_to_dropdown_index(&BrushFamily::Smudge);
+            for row in &smudge_rows {
+                row.set_visible(smudge);
+            }
+        };
+        sync(&family_dropdown);
+        family_dropdown.connect_selected_notify(sync);
+    }
     body.append(&dyn_group);
 
     // -- Delete ----------------------------------------------------------
@@ -499,6 +532,8 @@ pub(super) fn build(
         let rotation_dyn = rotation_dyn.clone();
         let scatter_dyn = scatter_dyn.clone();
         let spacing_dyn = spacing_dyn.clone();
+        let smudge_rate_dyn = smudge_rate_dyn.clone();
+        let color_rate_dyn = color_rate_dyn.clone();
         Rc::new(move |maybe: Option<&BrushPreset>| {
             // Suppress widget callbacks while we populate.
             loading.set(true);
@@ -527,6 +562,8 @@ pub(super) fn build(
             rotation_dyn.row.set_sensitive(enabled);
             scatter_dyn.row.set_sensitive(enabled);
             spacing_dyn.row.set_sensitive(enabled);
+            smudge_rate_dyn.row.set_sensitive(enabled);
+            color_rate_dyn.row.set_sensitive(enabled);
 
             if let Some(p) = maybe {
                 name_entry.set_text(&p.name);
@@ -553,6 +590,8 @@ pub(super) fn build(
                 rotation_dyn.apply(p.dynamics.rotation.as_ref());
                 scatter_dyn.apply(p.dynamics.scatter.as_ref());
                 spacing_dyn.apply(p.dynamics.spacing.as_ref());
+                smudge_rate_dyn.apply(p.dynamics.smudge_rate.as_ref());
+                color_rate_dyn.apply(p.dynamics.color_rate.as_ref());
                 set_preview(Some(p));
             } else {
                 name_entry.set_text("");
@@ -576,6 +615,8 @@ pub(super) fn build(
                 rotation_dyn.apply(None);
                 scatter_dyn.apply(None);
                 spacing_dyn.apply(None);
+                smudge_rate_dyn.apply(None);
+                color_rate_dyn.apply(None);
                 set_preview(None);
             }
             loading.set(false);
@@ -642,6 +683,8 @@ pub(super) fn build(
         &rotation_dyn,
         &scatter_dyn,
         &spacing_dyn,
+        &smudge_rate_dyn,
+        &color_rate_dyn,
         &loading,
         &live_preview,
     );
@@ -778,13 +821,12 @@ fn ensure_discard_css() {
 
 fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
     match family {
-        // Smudge isn't a user-selectable family in the editor yet, so it shares
-        // the soft-round slot.
-        BrushFamily::SoftRound | BrushFamily::Smudge => 0,
+        BrushFamily::SoftRound => 0,
         BrushFamily::Pixel => 1,
         // Image-tip brushes (built-in chalk) share the "Textured" slot in the
         // editor dropdown; the tip itself isn't user-editable yet.
         BrushFamily::Textured(_) | BrushFamily::ImageTip { .. } => 2,
+        BrushFamily::Smudge => 3,
     }
 }
 
@@ -929,6 +971,8 @@ enum DynamicsField {
     Rotation,
     Scatter,
     Spacing,
+    SmudgeRate,
+    ColorRate,
 }
 
 impl DynamicsField {
@@ -939,6 +983,8 @@ impl DynamicsField {
             Self::Rotation => &mut dynamics.rotation,
             Self::Scatter => &mut dynamics.scatter,
             Self::Spacing => &mut dynamics.spacing,
+            Self::SmudgeRate => &mut dynamics.smudge_rate,
+            Self::ColorRate => &mut dynamics.color_rate,
         }
     }
 
@@ -971,6 +1017,18 @@ impl DynamicsField {
                 source: DynSource::Pressure,
                 curve: Curve::linear(),
                 range: (brush.spacing_ratio, brush.spacing_ratio),
+                invert: false,
+            },
+            Self::SmudgeRate => Mapping {
+                source: DynSource::Pressure,
+                curve: Curve::linear(),
+                range: (0.5, 1.0),
+                invert: false,
+            },
+            Self::ColorRate => Mapping {
+                source: DynSource::Pressure,
+                curve: Curve::linear(),
+                range: (0.0, 0.1),
                 invert: false,
             },
         }
@@ -1059,13 +1117,19 @@ fn build_dynamics_row(
             gtk::SpinButton::with_range(0.01, 1.0, 0.01),
             gtk::SpinButton::with_range(0.01, 1.0, 0.01),
         ),
+        DynamicsField::SmudgeRate | DynamicsField::ColorRate => (
+            gtk::SpinButton::with_range(0.0, 1.0, 0.005),
+            gtk::SpinButton::with_range(0.0, 1.0, 0.005),
+        ),
         _ => (
             gtk::SpinButton::with_range(0.0, 4.0, 0.05),
             gtk::SpinButton::with_range(0.0, 4.0, 0.05),
         ),
     };
-    min_spin.set_digits(2);
-    max_spin.set_digits(2);
+    // Rates sit near 0.01, so they need a third digit.
+    let digits = if matches!(field, DynamicsField::SmudgeRate | DynamicsField::ColorRate) { 3 } else { 2 };
+    min_spin.set_digits(digits);
+    max_spin.set_digits(digits);
     let min_row = adw::ActionRow::builder().title("Range min").build();
     min_row.add_suffix(&min_spin);
     row.add_row(&min_row);
@@ -1247,6 +1311,8 @@ fn install_live_preview(
     rotation_dyn: &DynamicsRowHandles,
     scatter_dyn: &DynamicsRowHandles,
     spacing_dyn: &DynamicsRowHandles,
+    smudge_rate_dyn: &DynamicsRowHandles,
+    color_rate_dyn: &DynamicsRowHandles,
     loading: &Rc<Cell<bool>>,
     live_preview: &Rc<dyn Fn()>,
 ) {
@@ -1268,7 +1334,15 @@ fn install_live_preview(
     attach_scale(pattern_size_scale);
     attach_scale(pattern_strength_scale);
 
-    for handles in [size_dyn, flow_dyn, rotation_dyn, scatter_dyn, spacing_dyn] {
+    for handles in [
+        size_dyn,
+        flow_dyn,
+        rotation_dyn,
+        scatter_dyn,
+        spacing_dyn,
+        smudge_rate_dyn,
+        color_rate_dyn,
+    ] {
         let l = loading.clone();
         let live = live_preview.clone();
         handles.row.connect_enable_expansion_notify(move |_| {
