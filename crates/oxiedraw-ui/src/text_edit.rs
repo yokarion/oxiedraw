@@ -14,6 +14,7 @@ use oxiedraw_core::document::LayerKind;
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch};
 use oxiedraw_core::text::editor::TextEditor;
 use oxiedraw_core::text::fonts::TextEngine;
+use oxiedraw_core::text::layer_name::layer_name_from_text;
 use oxiedraw_core::text::{FontId, HAlign, ResizeMode, TextBox, TextContent, TextStyle, VAlign};
 use oxiedraw_utils::geometry::{Point, Size};
 use relm4::gtk;
@@ -475,6 +476,9 @@ impl TextEdit {
         }
 
         if a.created {
+            if let Some(name) = layer_name_from_text(&content.plain_text()) {
+                self.canvas.borrow().layers().rename(idx, name);
+            }
             if let Some((lid, name, visible, kind, blend, opacity, px)) =
                 oxiedraw_core::history::capture_layer(&mut self.canvas.borrow_mut(), idx)
             {

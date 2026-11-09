@@ -14,6 +14,7 @@ use crate::color::Color;
 
 pub mod editor;
 pub mod fonts;
+pub mod layer_name;
 pub mod render;
 
 /// How a text box sizes itself relative to its content.

@@ -593,6 +593,44 @@ impl Canvas {
         Ok(target)
     }
 
+    /// Composites a folder's children on their own, which is what merging the
+    /// folder bakes. `normal_blends` draws every non-Normal layer as Normal.
+    pub fn read_folder_composite(
+        &mut self,
+        children: &[LayerTreeNode],
+        normal_blends: bool,
+    ) -> Result<Vec<u8>, RendererError> {
+        let snapshot = self.layers.snapshot();
+        let resolve = |id: &str| {
+            snapshot
+                .iter()
+                .position(|l| l.id == id)
+                .filter(|&i| snapshot[i].visible)
+        };
+        let clipped = |id: &str| snapshot.iter().find(|l| l.id == id).is_some_and(|l| l.clipped);
+        let steps = build_composite_steps(children, &resolve, &clipped, &[]);
+        let overridden: Vec<(usize, BlendMode, f32)> = if normal_blends {
+            steps
+                .iter()
+                .filter_map(|s| s.layer_index())
+                .map(|i| (i, snapshot[i].blend, snapshot[i].opacity))
+                .filter(|&(i, blend, _)| {
+                    blend != BlendMode::Normal && !snapshot[i].kind.is_adjustment()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for &(idx, _, opacity) in &overridden {
+            self.renderer.set_layer_blend(idx, BlendMode::Normal.to_gpu(), opacity);
+        }
+        let pixels = self.renderer.read_composite_steps(&steps);
+        for &(idx, blend, opacity) in &overridden {
+            self.renderer.set_layer_blend(idx, blend.to_gpu(), opacity);
+        }
+        pixels
+    }
+
     /// Duplicate the layer at `src_idx`. The copy is placed directly above
     /// `src_idx`, named `"<original> copy"`, and becomes the active layer.
     /// Returns the new layer's index.

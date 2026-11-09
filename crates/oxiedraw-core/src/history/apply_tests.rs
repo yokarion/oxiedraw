@@ -1336,3 +1336,34 @@ fn component_actions_round_trip() {
     s.redo(&mut c, &mut comps).expect("redo remove");
     assert!(comps.get(&a).is_none());
 }
+
+#[test]
+fn layer_kind_change_round_trip() {
+    use crate::document::{ComponentInstance, LayerKind, Placement};
+
+    let mut c = canvas();
+    let idx = c.add_layer("instance").expect("add_layer");
+    let pixels = paint(&mut c, idx, [0.0, 1.0, 0.0, 1.0]);
+    let instance = LayerKind::Component(ComponentInstance {
+        component_id: "comp".to_string(),
+        placement: Placement::new(8.0, 8.0, 16.0, 16.0, 0.0),
+    });
+    c.set_layer_kind(idx, instance.clone()).expect("set kind");
+    let id = layer_id(&c, idx);
+    let mut s = stack();
+    let mut comps = ComponentLibrary::new();
+
+    c.set_layer_kind(idx, LayerKind::Raster).expect("flatten");
+    s.record(HistoryAction::LayerKindChange {
+        layer_id: id,
+        before: instance.clone(),
+        after: LayerKind::Raster,
+    });
+
+    s.undo(&mut c, &mut comps).expect("undo");
+    assert_eq!(c.layers().kind(idx), Some(instance));
+    assert_eq!(c.read_layer(idx).expect("read"), pixels);
+    s.redo(&mut c, &mut comps).expect("redo");
+    assert_eq!(c.layers().kind(idx), Some(LayerKind::Raster));
+    assert_eq!(c.read_layer(idx).expect("read"), pixels);
+}

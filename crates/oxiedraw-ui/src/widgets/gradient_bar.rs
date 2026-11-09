@@ -11,6 +11,8 @@ use oxiedraw_core::tools::GradientState;
 use relm4::gtk;
 use relm4::gtk::prelude::*;
 
+use super::shapes::draw_checker;
+
 const WIDGET_HEIGHT: i32 = 56;
 const INSET: f64 = 9.0;
 const RAMP_H: f64 = 26.0;
@@ -81,7 +83,7 @@ fn paint(cr: &gtk::cairo::Context, width: i32, gradient: &GradientState, colors:
     let rw = ramp_width(width);
 
     // Checkerboard behind the ramp so transparent stops read.
-    draw_checker(cr, INSET, INSET, rw, RAMP_H);
+    draw_checker(cr, INSET, INSET, rw, RAMP_H, CHECKER);
 
     // Ramp: many vertical strips sampled from the settings.
     let strips = rw.ceil() as i32;
@@ -106,27 +108,6 @@ fn paint(cr: &gtk::cairo::Context, width: i32, gradient: &GradientState, colors:
     }
 }
 
-fn draw_checker(cr: &gtk::cairo::Context, x: f64, y: f64, w: f64, h: f64) {
-    cr.save().ok();
-    cr.rectangle(x, y, w, h);
-    cr.clip();
-    cr.rectangle(x, y, w, h);
-    cr.set_source_rgb(0.6, 0.6, 0.6);
-    cr.fill().ok();
-    let cols = (w / CHECKER).ceil() as i32;
-    let rows = (h / CHECKER).ceil() as i32;
-    cr.set_source_rgb(0.85, 0.85, 0.85);
-    for row in 0..rows {
-        for col in 0..cols {
-            if (row + col) % 2 == 0 {
-                cr.rectangle(x + f64::from(col) * CHECKER, y + f64::from(row) * CHECKER, CHECKER, CHECKER);
-                cr.fill().ok();
-            }
-        }
-    }
-    cr.restore().ok();
-}
-
 /// A pin handle pointing up into the ramp, its body filled with the stop
 /// color over a checkerboard so partial opacity shows.
 fn draw_handle(cr: &gtk::cairo::Context, cx: f64, color: Color, opacity: f32, selected: bool) {
@@ -145,7 +126,7 @@ fn draw_handle(cr: &gtk::cairo::Context, cx: f64, color: Color, opacity: f32, se
     };
 
     // Checkerboard body then the color at its alpha.
-    draw_checker(cr, cx - half, top_y, HANDLE_W, bottom_y - top_y);
+    draw_checker(cr, cx - half, top_y, HANDLE_W, bottom_y - top_y, CHECKER);
     trace(cr);
     set_rgba(cr, color, opacity);
     cr.fill().ok();

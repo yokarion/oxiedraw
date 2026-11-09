@@ -3,6 +3,7 @@
 
 mod actions;
 mod components;
+mod merge_dialog;
 mod thumbnail;
 
 use std::cell::{Cell, RefCell};
@@ -400,6 +401,13 @@ impl Ui {
         let mut ordered = Vec::new();
         collect_top_selected(&tree, &wanted, &mut ordered);
         ordered
+    }
+
+    pub(super) fn single_selected_group(&self) -> Option<String> {
+        let [id] = <[String; 1]>::try_from(self.selected_nodes_for_grouping()).ok()?;
+        let tree = self.tree.borrow();
+        let group = find_group(&tree, &id)?;
+        (!leaf_ids_top_first(&group.children).is_empty()).then_some(id)
     }
 }
 
@@ -1035,6 +1043,12 @@ fn insert_node_at_anchor(tree: &mut Vec<LayerNode>, node: LayerNode, anchor: &In
     }
 }
 
+pub(super) fn insert_above_layer(tree: &mut Vec<LayerNode>, node: LayerNode, layer_id: &str) {
+    let anchor = find_first_insertion_position(tree, &[layer_id.to_string()])
+        .map_or(InsertAnchor::Top, |(parent_id, idx)| InsertAnchor::Above { parent_id, idx });
+    insert_node_at_anchor(tree, node, &anchor);
+}
+
 fn capture_layer_add(canvas: &Rc<RefCell<Canvas>>, idx: usize) -> Option<HistoryAction> {
     let mut c = canvas.borrow_mut();
     let layer = c.layers().snapshot().get(idx)?.clone();
@@ -1314,6 +1328,7 @@ pub(crate) fn build(
     component_exit: &Rc<RefCell<Option<Rc<dyn Fn()>>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
+    prepare_flatten: &Rc<dyn Fn()>,
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Box,
@@ -1368,6 +1383,7 @@ pub(crate) fn build(
             layer_extensions,
             prepare_delete,
             prepare_reorder,
+            prepare_flatten,
             alpha_lock_observer,
         );
     let (components_page, refresh_components, component_begin_rename) = components::build(
@@ -1509,6 +1525,7 @@ fn build_layers_page(
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
     prepare_reorder: &Rc<dyn Fn()>,
+    prepare_flatten: &Rc<dyn Fn()>,
     alpha_lock_observer: &Rc<RefCell<Option<Rc<dyn Fn(bool)>>>>,
 ) -> (
     gtk::Box,
@@ -1560,6 +1577,7 @@ fn build_layers_page(
         let history = Rc::clone(history);
         let layer_extensions = Rc::clone(layer_extensions);
         let prepare_delete = Rc::clone(prepare_delete);
+        let prepare_flatten = Rc::clone(prepare_flatten);
         Rc::new(move || {
             actions::install_layer_actions(
                 &area,
@@ -1571,6 +1589,7 @@ fn build_layers_page(
                 &history,
                 &layer_extensions,
                 &prepare_delete,
+                &prepare_flatten,
             );
         })
     };
@@ -1659,6 +1678,7 @@ fn build_layers_page(
             commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
             sync_height(&area, &ui);
             ui.sync_blend_controls();
+            actions::refresh_action_sensitivity(&ui);
             area.queue_draw();
         }) as Rc<dyn Fn()>
     };
@@ -1796,22 +1816,36 @@ fn build_layers_footer() -> gtk::Box {
         .margin_top(4)
         .build();
 
-    let dup_btn = gtk::Button::builder()
-        .label("Duplicate")
-        .tooltip_text(tooltip_with_accel("Duplicate active layer", "layer-duplicate"))
+    let clone_btn = gtk::Button::builder()
+        .label("Clone")
+        .tooltip_text(tooltip_with_accel("Clone the selected layer or group", "layer-duplicate"))
         .css_classes(["suggested-action"])
         .action_name("app.layer-duplicate")
         .build();
 
     let merge_btn = gtk::Button::builder()
         .label("Merge")
-        .tooltip_text(tooltip_with_accel("Merge selected layers", "layers-merge"))
+        .tooltip_text(tooltip_with_accel(
+            "Merge selected layers, or a selected group into one layer",
+            "layers-merge",
+        ))
         .css_classes(["suggested-action"])
         .action_name("app.layers-merge")
         .build();
 
-    footer.append(&dup_btn);
+    let flatten_btn = gtk::Button::builder()
+        .label("Flatten")
+        .tooltip_text(tooltip_with_accel(
+            "Turn selected text and component layers into pixels",
+            "layers-flatten",
+        ))
+        .css_classes(["suggested-action"])
+        .action_name("app.layers-flatten")
+        .build();
+
+    footer.append(&clone_btn);
     footer.append(&merge_btn);
+    footer.append(&flatten_btn);
     footer
 }
 
@@ -5083,5 +5117,25 @@ mod tests {
         assert!(matches!(&inner.children[0], LayerNode::Layer(id) if id == "c"));
         assert!(matches!(&inner.children[1], LayerNode::Layer(id) if id == "d"));
         assert!(matches!(&outer.children[2], LayerNode::Layer(id) if id == "b"));
+    }
+
+    #[test]
+    fn a_clone_lands_directly_above_its_source_inside_the_group() {
+        let mut tree = vec![
+            LayerNode::Layer("top".into()),
+            ui_group("g", vec![LayerNode::Layer("a".into()), LayerNode::Layer("src".into())]),
+        ];
+        insert_above_layer(&mut tree, LayerNode::Layer("clone".into()), "src");
+        assert!(matches!(&tree[0], LayerNode::Layer(id) if id == "top"));
+        let LayerNode::Group(g) = &tree[1] else { panic!("group moved") };
+        let ids: Vec<&str> = g
+            .children
+            .iter()
+            .map(|n| match n {
+                LayerNode::Layer(id) => id.as_str(),
+                LayerNode::Group(g) => g.id.as_str(),
+            })
+            .collect();
+        assert_eq!(ids, ["a", "clone", "src"]);
     }
 }

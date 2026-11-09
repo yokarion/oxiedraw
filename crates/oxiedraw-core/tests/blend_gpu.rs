@@ -8,7 +8,7 @@
 #![allow(clippy::unwrap_used)]
 
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::document::BlendMode;
+use oxiedraw_core::document::{BlendMode, LayerTreeNode};
 use oxiedraw_utils::geometry::Size;
 
 const SIZE: Size = Size {
@@ -176,4 +176,83 @@ fn overlay_top_layer_changes_the_result() {
         "Overlay should land near 96 (gamma-space); ~66 means it was computed \
          on linear values and collapsed to the backdrop. Got {overlay:?}"
     );
+}
+
+fn centre(px: &[u8]) -> (u8, u8, u8, u8) {
+    let idx = ((SIZE.height / 2 * SIZE.width) + SIZE.width / 2) as usize * 4;
+    (px[idx], px[idx + 1], px[idx + 2], px[idx + 3])
+}
+
+fn folder_of(canvas: &Canvas, indices: &[usize]) -> Vec<LayerTreeNode> {
+    let snap = canvas.layers().snapshot();
+    indices
+        .iter()
+        .map(|&i| LayerTreeNode::layer(snap[i].id.clone()))
+        .collect()
+}
+
+#[test]
+fn folder_merge_bakes_blends_against_the_folder_only() {
+    let mut canvas = Canvas::headless(SIZE).unwrap();
+    canvas
+        .add_layer_with_pixels("outside", &filled(0, 255, 0, 255))
+        .unwrap();
+    let base = canvas
+        .add_layer_with_pixels("base", &filled(0, 0, 255, 255))
+        .unwrap();
+    let top = canvas
+        .add_layer_with_pixels("top", &filled(255, 0, 0, 255))
+        .unwrap();
+    canvas.set_layer_blend(top, BlendMode::Multiply, 1.0).unwrap();
+    let children = folder_of(&canvas, &[base, top]);
+
+    let (b, g, r, a) = centre(&canvas.read_folder_composite(&children, false).unwrap());
+    assert_eq!(a, 255);
+    assert!(b < 60 && g < 60 && r < 60, "blue x red multiplies to black, got {b} {g} {r}");
+
+    let (b, g, r, a) = centre(&canvas.read_folder_composite(&children, true).unwrap());
+    assert_eq!(a, 255);
+    assert!(b > 200 && g < 60 && r < 60, "as Normal the blue top wins, got {b} {g} {r}");
+
+    assert_eq!(
+        canvas.layers().blend(top).unwrap().0,
+        BlendMode::Multiply,
+        "the preview must not change the layer's blend"
+    );
+}
+
+#[test]
+fn folder_merge_skips_hidden_layers_and_applies_adjustments() {
+    use oxiedraw_core::effects::{AdjustmentData, Effect, EffectKind};
+
+    let mut canvas = Canvas::headless(SIZE).unwrap();
+    let base = canvas
+        .add_layer_with_pixels("base", &filled(0, 0, 255, 255))
+        .unwrap();
+    let hidden = canvas
+        .add_layer_with_pixels("hidden", &filled(255, 0, 0, 255))
+        .unwrap();
+    canvas.set_layer_visible(hidden, false).unwrap();
+
+    let children = folder_of(&canvas, &[base, hidden]);
+    let (b, _, r, _) = centre(&canvas.read_folder_composite(&children, false).unwrap());
+    assert!(r > 200 && b < 60, "hidden layer must not bake in, got b={b} r={r}");
+
+    let adj = canvas.add_adjustment_layer("adj").unwrap();
+    canvas
+        .set_layer_effects(
+            adj,
+            AdjustmentData {
+                effects: vec![Effect::new(EffectKind::HueSatBright {
+                    hue_degrees: 0.0,
+                    saturation: 1.0,
+                    brightness: 0.0,
+                })],
+            },
+        )
+        .unwrap();
+    let children = folder_of(&canvas, &[base, hidden, adj]);
+    let (b, g, r, a) = centre(&canvas.read_folder_composite(&children, false).unwrap());
+    assert_eq!(a, 255);
+    assert!(b < 8 && g < 8 && r < 8, "the folder's adjustment is baked in, got {b} {g} {r}");
 }

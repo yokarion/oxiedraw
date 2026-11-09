@@ -282,7 +282,7 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
             },
             ActionInfo {
                 id: "layer-duplicate",
-                label: "Duplicate Layer",
+                label: "Clone Layer",
                 default_accel: Some("<Primary>d"),
             },
             ActionInfo {
@@ -308,6 +308,11 @@ pub(crate) const ALL_ACTION_GROUPS: &[ActionGroup] = &[
             ActionInfo {
                 id: "layers-merge",
                 label: "Merge Selected Layers",
+                default_accel: None,
+            },
+            ActionInfo {
+                id: "layers-flatten",
+                label: "Flatten Selected Layers",
                 default_accel: None,
             },
         ],

@@ -215,6 +215,13 @@ pub enum HistoryAction {
         #[serde(default)]
         alpha_locked: bool,
     },
+    /// A layer's kind changed with its pixels untouched (flattening a text or
+    /// component layer into a raster one).
+    LayerKindChange {
+        layer_id: String,
+        before: LayerKind,
+        after: LayerKind,
+    },
     /// Several layers merged into one. `folded` describes each removed
     /// layer (in original z-order) so undo can re-create them.
     LayerMerge {
@@ -407,6 +414,7 @@ impl HistoryAction {
             Self::LayerBlend { .. } => "Change layer blend",
             Self::EffectEdit { .. } => "Edit adjustment effects",
             Self::LayerDuplicate { .. } => "Duplicate layer",
+            Self::LayerKindChange { .. } => "Flatten layer",
             Self::LayerMerge { .. } => "Merge layers",
             Self::SelectionChange { .. } => "Selection",
             Self::CropCanvas { .. } => "Crop canvas",

@@ -791,6 +791,19 @@ impl DocumentSession {
             })
         };
 
+        // Fix: an open text edit committed after Flatten turned the layer back into text.
+        let prepare_flatten: Rc<dyn Fn()> = {
+            let prepare_reorder = Rc::clone(&prepare_reorder);
+            let text_edit_slot = Rc::clone(&text_edit_slot);
+            Rc::new(move || {
+                prepare_reorder();
+                let text_edit = text_edit_slot.borrow().clone();
+                if let Some(text_edit) = text_edit {
+                    text_edit.commit();
+                }
+            })
+        };
+
         let cursor_activates_transform: Rc<dyn Fn()> = {
             let slot = Rc::clone(set_active_tool_late);
             let tools = global.tools.clone();
@@ -829,6 +842,7 @@ impl DocumentSession {
             &component_exit,
             &prepare_delete,
             &prepare_reorder,
+            &prepare_flatten,
             &alpha_lock_observer,
         );
 

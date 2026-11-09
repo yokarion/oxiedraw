@@ -5,6 +5,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use oxiedraw_core::canvas::Canvas;
+use oxiedraw_core::document::{BlendMode, Layer, LayerKind};
+use oxiedraw_core::enum_meta::EnumMeta;
 use oxiedraw_core::history::{
     FoldedLayer, HistoryAction, HistoryStack, LayerExtension, LayerPatch, capture_layer,
 };
@@ -23,9 +25,11 @@ use crate::clipboard::{
 use crate::toaster::Toaster;
 use oxiedraw_utils::frame_profile;
 
+use super::merge_dialog::{self, MergeBlend, MergePreviews};
 use super::{
     GroupData, LayerNode, RowKind, Ui, commit_groups, compute_visible_rows, find_group,
-    find_group_position, group_leaf_ids, group_nodes, insert_at_in_group, mirror_tree, RowLayout,
+    find_group_position, group_leaf_ids, group_nodes, insert_above_layer, insert_at_in_group,
+    mirror_tree, RowLayout,
     new_group_id, record_tree_edit, sync_canvas_order, sync_height, take_node, tree_to_core,
     ungroup_node,
 };
@@ -55,6 +59,266 @@ fn record_one_step(history: &Rc<RefCell<HistoryStack>>, mut steps: Vec<HistoryAc
     history.borrow_mut().record(action);
 }
 
+fn flattenable_layers(ui: &Ui) -> Vec<(String, usize, LayerKind)> {
+    let snapshot = ui.state.snapshot();
+    ui.selected_leaf_ids_all()
+        .into_iter()
+        .filter_map(|id| {
+            let idx = snapshot.iter().position(|l| l.id == id)?;
+            let kind = snapshot[idx].kind.clone();
+            matches!(kind, LayerKind::Text(_) | LayerKind::Component(_)).then_some((id, idx, kind))
+        })
+        .collect()
+}
+
+// The group Clone acts on: the selection is exactly one group, empty or not.
+fn selected_group_to_clone(ui: &Ui) -> Option<String> {
+    let [id] = <[String; 1]>::try_from(ui.selected_nodes_for_grouping()).ok()?;
+    find_group(&ui.tree.borrow(), &id).is_some().then_some(id)
+}
+
+#[derive(Clone)]
+struct GroupMerge {
+    ui: Ui,
+    area: gtk::DrawingArea,
+    canvas: Rc<RefCell<Canvas>>,
+    redraw: RedrawHandle,
+    toaster: Toaster,
+    history: Rc<RefCell<HistoryStack>>,
+}
+
+fn collect_blend_warnings(nodes: &[LayerNode], path: &str, snapshot: &[Layer], out: &mut Vec<String>) {
+    for node in nodes {
+        match node {
+            LayerNode::Layer(id) => {
+                let Some(layer) = snapshot.iter().find(|l| &l.id == id) else { continue };
+                if layer.visible && !layer.kind.is_adjustment() && layer.blend != BlendMode::Normal {
+                    let layer_path = gtk::glib::markup_escape_text(&format!("{path} -> {}", layer.name));
+                    out.push(format!(
+                        "Layer in <b>{layer_path}</b> has overlay type \"{}\".",
+                        layer.blend.label()
+                    ));
+                }
+            }
+            LayerNode::Group(g) => {
+                collect_blend_warnings(&g.children, &format!("{path} -> {}", g.name), snapshot, out);
+            }
+        }
+    }
+}
+
+fn clipped_above_group(tree: &[LayerNode], gid: &str, snapshot: &[Layer]) -> Vec<String> {
+    let Some((parent, pos)) = find_group_position(tree, gid) else { return Vec::new() };
+    let siblings = match &parent {
+        Some(pid) => match find_group(tree, pid) {
+            Some(g) => &g.children,
+            None => return Vec::new(),
+        },
+        None => tree,
+    };
+    siblings[..pos]
+        .iter()
+        .rev()
+        .map_while(|node| match node {
+            LayerNode::Layer(id) => snapshot.iter().find(|l| &l.id == id).filter(|l| l.clipped),
+            LayerNode::Group(_) => None,
+        })
+        .filter(|l| l.visible)
+        .map(|l| l.id.clone())
+        .collect()
+}
+
+fn start_group_merge(merge: &GroupMerge, gid: &str) {
+    let Some(group) = find_group(&merge.ui.tree.borrow(), gid).cloned() else { return };
+    if !group.visible {
+        merge.toaster.info("Show the group before merging it");
+        return;
+    }
+    let snapshot = merge.canvas.borrow().layers().snapshot();
+    let mut warnings = Vec::new();
+    collect_blend_warnings(&group.children, &group.name, &snapshot, &mut warnings);
+    let children = tree_to_core(&group.children);
+    let composite = |normal_blends: bool| {
+        merge
+            .canvas
+            .borrow_mut()
+            .read_folder_composite(&children, normal_blends)
+            .inspect_err(|e| tracing::error!(error = %e, "group merge composite failed"))
+            .ok()
+    };
+    if warnings.is_empty() {
+        if let Some(merged) = composite(false) {
+            merge_group(merge, gid, MergeBlend::ApplyOverlapping, &merged);
+        }
+        return;
+    }
+
+    let (Some(as_normal), Some(overlapping)) = (composite(true), composite(false)) else { return };
+    let (as_normal, overlapping) = (Rc::new(as_normal), Rc::new(overlapping));
+    let size = merge.canvas.borrow().size();
+    let message = warnings.join("\n");
+    let parent = merge.area.root().and_downcast::<gtk::Window>();
+    let on_choice: Rc<dyn Fn(MergeBlend)> = {
+        let merge = merge.clone();
+        let gid = gid.to_string();
+        let as_normal = Rc::clone(&as_normal);
+        let overlapping = Rc::clone(&overlapping);
+        Rc::new(move |choice| {
+            let merged = match choice {
+                MergeBlend::ChangeToNormal => &as_normal,
+                MergeBlend::ApplyOverlapping => &overlapping,
+            };
+            merge_group(&merge, &gid, choice, merged);
+        })
+    };
+    merge_dialog::show(
+        parent.as_ref(),
+        &message,
+        &MergePreviews {
+            as_normal: &as_normal,
+            overlapping: &overlapping,
+            width: size.width,
+            height: size.height,
+        },
+        on_choice,
+    );
+}
+
+// Bakes the folder into one raster layer in its place: hidden layers are
+// dropped, adjustments inside it are applied.
+fn merge_group(merge: &GroupMerge, gid: &str, blend: MergeBlend, merged: &[u8]) {
+    let GroupMerge { ui, area, canvas, redraw, history, .. } = merge;
+    let Some(group) = find_group(&ui.tree.borrow(), gid).cloned() else { return };
+    let snap = canvas.borrow().layers().snapshot();
+    let orphan_clips = clipped_above_group(&ui.tree.borrow(), gid, &snap);
+    let mut indices: Vec<usize> = super::leaf_ids_top_first(&group.children)
+        .iter()
+        .filter_map(|id| snap.iter().position(|l| &l.id == id))
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+    let Some(&insert_at) = indices.first() else { return };
+    let tree_before = tree_to_core(&ui.tree.borrow());
+
+    let mut actions: Vec<HistoryAction> = Vec::with_capacity(indices.len() + 2);
+    {
+        let mut c = canvas.borrow_mut();
+        c.defer_recomposite(true);
+        for &idx in indices.iter().rev() {
+            let captured = capture_layer(&mut c, idx);
+            if let Err(e) = c.remove_layer(idx) {
+                tracing::error!(error = %e, "group merge: remove_layer failed");
+                continue;
+            }
+            if let Some((id, name, visible, kind, blend, opacity, pixels)) = captured {
+                actions.push(HistoryAction::LayerRemove {
+                    idx,
+                    id,
+                    name,
+                    visible,
+                    layer_kind: kind,
+                    blend,
+                    opacity,
+                    pixels,
+                    clipped: snap[idx].clipped,
+                    alpha_locked: snap[idx].alpha_locked,
+                });
+            }
+        }
+        c.defer_recomposite(false);
+    }
+
+    let added = canvas.borrow_mut().add_layer_with_pixels(group.name.clone(), merged);
+    let new_id = match added {
+        Ok(top) => {
+            let mut c = canvas.borrow_mut();
+            let id = c.layers().snapshot().get(top).map(|l| l.id.clone());
+            if let Err(e) = c.reorder_layer(top, insert_at) {
+                tracing::error!(error = %e, "group merge: reorder failed");
+            }
+            id
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "group merge: adding the merged layer failed");
+            None
+        }
+    };
+    {
+        let mut tree = ui.tree.borrow_mut();
+        let position = find_group_position(&tree, gid);
+        take_node(&mut tree, gid);
+        if let Some(new_id) = &new_id {
+            let node = LayerNode::Layer(new_id.clone());
+            match position {
+                Some((Some(parent), pos)) => insert_at_in_group(&mut tree, node, &parent, pos),
+                Some((None, pos)) => {
+                    let pos = pos.min(tree.len());
+                    tree.insert(pos, node);
+                }
+                None => tree.insert(0, node),
+            }
+        }
+    }
+    sync_canvas_order(&ui.tree.borrow().clone(), &mut canvas.borrow_mut());
+    commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+
+    let final_idx = new_id.as_ref().and_then(|id| {
+        canvas.borrow().layers().snapshot().iter().position(|l| &l.id == id)
+    });
+    if let Some(idx) = final_idx
+        && let Some((id, name, visible, kind, blend, opacity, pixels)) =
+            capture_layer(&mut canvas.borrow_mut(), idx)
+    {
+        actions.push(HistoryAction::LayerAdd {
+            idx,
+            id,
+            name,
+            visible,
+            layer_kind: kind,
+            blend,
+            opacity,
+            pixels,
+        });
+    }
+    let tree_after = tree_to_core(&ui.tree.borrow());
+    if tree_before != tree_after {
+        actions.push(HistoryAction::LayerTreeEdit {
+            before: tree_before,
+            after: tree_after,
+        });
+    }
+    // Fix: layers clipped onto the folder never drew; the merged leaf would become their base.
+    for id in orphan_clips {
+        let idx = canvas.borrow().layers().snapshot().iter().position(|l| l.id == id);
+        let Some(idx) = idx else { continue };
+        if let Err(e) = canvas.borrow_mut().set_layer_visible(idx, false) {
+            tracing::error!(error = %e, "group merge: hiding a clipped layer failed");
+            continue;
+        }
+        actions.push(HistoryAction::LayerVisibility { id, old: true, new: false });
+    }
+    history.borrow_mut().record(HistoryAction::Batch {
+        label: "Merge group".to_string(),
+        actions,
+    });
+    tracing::info!(
+        target: "oxiedraw::layers",
+        group = %group.name,
+        layers = indices.len(),
+        normal_blends = blend == MergeBlend::ChangeToNormal,
+        "group merged"
+    );
+
+    ui.multi_selected.borrow_mut().clear();
+    *ui.active_group.borrow_mut() = None;
+    ui.state.set_active(final_idx);
+    sync_height(area, ui);
+    ui.sync_blend_controls();
+    area.queue_draw();
+    redraw.request();
+    refresh_action_sensitivity(ui);
+}
+
 pub(super) fn install_layer_actions(
     area: &gtk::DrawingArea,
     ui: &Ui,
@@ -65,6 +329,7 @@ pub(super) fn install_layer_actions(
     history: &Rc<RefCell<HistoryStack>>,
     layer_extensions: &Rc<RefCell<HashMap<String, LayerExtension>>>,
     prepare_delete: &Rc<dyn Fn() -> bool>,
+    prepare_flatten: &Rc<dyn Fn()>,
 ) {
     let Some(gio_app) = gio::Application::default() else {
         tracing::warn!("install_layer_actions: no default application");
@@ -82,12 +347,27 @@ pub(super) fn install_layer_actions(
         let redraw = redraw.clone();
         let toaster = toaster.clone();
         let history = Rc::clone(history);
+        let app_weak = app.downgrade();
         let action = gio::SimpleAction::new("layer-duplicate", None);
         action.connect_activate(move |_, _| {
+            // Fix: with a group selected, Clone cloned only the active layer inside it.
+            if selected_group_to_clone(&ui).is_some() {
+                if let Some(app) = app_weak.upgrade() {
+                    app.activate_action("group-duplicate", None);
+                }
+                return;
+            }
             let Some(idx) = ui.state.active() else { return };
+            let src_id = ui.state.snapshot().get(idx).map(|l| l.id.clone());
+            let tree_before = tree_to_core(&ui.tree.borrow());
             let result = canvas.borrow_mut().duplicate_layer(idx);
             match result {
                 Ok(new_idx) => {
+                    // Fix: the clone was adopted at the top of the tree instead of above its source.
+                    let clone_id = canvas.borrow().layers().snapshot().get(new_idx).map(|l| l.id.clone());
+                    if let (Some(src_id), Some(clone_id)) = (&src_id, clone_id) {
+                        insert_above_layer(&mut ui.tree.borrow_mut(), LayerNode::Layer(clone_id), src_id);
+                    }
                     let (
                         new_id,
                         new_name,
@@ -120,7 +400,7 @@ pub(super) fn install_layer_actions(
                         to_idx = new_idx,
                         "layer duplicated"
                     );
-                    history.borrow_mut().record(HistoryAction::LayerDuplicate {
+                    let duplicate = HistoryAction::LayerDuplicate {
                         src_idx: idx,
                         new_idx,
                         new_id,
@@ -131,9 +411,24 @@ pub(super) fn install_layer_actions(
                         pixels: new_pixels,
                         clipped: new_clipped,
                         alpha_locked: new_locked,
-                    });
+                    };
                     sync_height(&area, &ui);
                     commit_groups(&ui.tree.borrow(), &mut canvas.borrow_mut());
+                    let tree_after = tree_to_core(&ui.tree.borrow());
+                    if tree_after == tree_before {
+                        history.borrow_mut().record(duplicate);
+                    } else {
+                        history.borrow_mut().record(HistoryAction::Batch {
+                            label: duplicate.label().to_string(),
+                            actions: vec![
+                                duplicate,
+                                HistoryAction::LayerTreeEdit {
+                                    before: tree_before,
+                                    after: tree_after,
+                                },
+                            ],
+                        });
+                    }
                     area.queue_draw();
                     redraw.request();
                     refresh_action_sensitivity(&ui);
@@ -363,8 +658,64 @@ pub(super) fn install_layer_actions(
         let canvas = Rc::clone(canvas);
         let redraw = redraw.clone();
         let history = Rc::clone(history);
+        let prepare_flatten = Rc::clone(prepare_flatten);
+        let action = gio::SimpleAction::new("layers-flatten", None);
+        action.connect_activate(move |_, _| {
+            prepare_flatten();
+            let targets = flattenable_layers(&ui);
+            if targets.is_empty() {
+                return;
+            }
+            let mut steps = Vec::with_capacity(targets.len());
+            {
+                let mut c = canvas.borrow_mut();
+                c.defer_recomposite(true);
+                for (layer_id, idx, before) in targets {
+                    if let Err(e) = c.set_layer_kind(idx, LayerKind::Raster) {
+                        tracing::error!(error = %e, "layers-flatten failed");
+                        continue;
+                    }
+                    steps.push(HistoryAction::LayerKindChange {
+                        layer_id,
+                        before,
+                        after: LayerKind::Raster,
+                    });
+                }
+                c.defer_recomposite(false);
+                if let Err(e) = c.recomposite() {
+                    tracing::error!(error = %e, "layers-flatten: recomposite failed");
+                }
+            }
+            tracing::info!(target: "oxiedraw::layers", layers = steps.len(), "layers flattened");
+            record_one_step(&history, steps);
+            area.queue_draw();
+            redraw.request();
+            refresh_action_sensitivity(&ui);
+        });
+        app.add_action(&action);
+    }
+
+    {
+        let ui = ui.clone();
+        let area = area.clone();
+        let canvas = Rc::clone(canvas);
+        let redraw = redraw.clone();
+        let toaster = toaster.clone();
+        let history = Rc::clone(history);
+        let group_merge = GroupMerge {
+            ui: ui.clone(),
+            area: area.clone(),
+            canvas: Rc::clone(&canvas),
+            redraw: redraw.clone(),
+            toaster: toaster.clone(),
+            history: Rc::clone(&history),
+        };
         let action = gio::SimpleAction::new("layers-merge", None);
         action.connect_activate(move |_, _| {
+            if let Some(gid) = ui.single_selected_group() {
+                start_group_merge(&group_merge, &gid);
+                return;
+            }
             let selected: Vec<String> = ui.selected_layer_ids_in_order();
             if selected.len() < 2 {
                 return;
@@ -546,7 +897,8 @@ pub(super) fn install_layer_actions(
         let history = Rc::clone(history);
         let action = gio::SimpleAction::new("group-duplicate", None);
         action.connect_activate(move |_, _| {
-            let Some(gid) = ui.active_group.borrow().clone() else { return };
+            let target = selected_group_to_clone(&ui).or_else(|| ui.active_group.borrow().clone());
+            let Some(gid) = target else { return };
 
             let group_clone = {
                 let tree = ui.tree.borrow();
@@ -1191,7 +1543,12 @@ pub(super) fn refresh_action_sensitivity(ui: &Ui) {
     let has_active = ui.state.active().is_some();
     let has_active_group = ui.active_group.borrow().is_some();
     let selected_count = ui.selected_layer_ids_in_order().len();
-    for name in &["layer-duplicate", "layer-delete", "layer-clip", "layer-alpha-lock"] {
+    let group_to_clone = selected_group_to_clone(ui).is_some();
+    if let Some(a) = app.lookup_action("layer-duplicate")
+        && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
+            sa.set_enabled(has_active || group_to_clone);
+        }
+    for name in &["layer-delete", "layer-clip", "layer-alpha-lock"] {
         if let Some(a) = app.lookup_action(name)
             && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
                 sa.set_enabled(has_active);
@@ -1199,18 +1556,26 @@ pub(super) fn refresh_action_sensitivity(ui: &Ui) {
     }
     if let Some(a) = app.lookup_action("layers-merge")
         && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
-            sa.set_enabled(selected_count >= 2);
+            sa.set_enabled(selected_count >= 2 || ui.single_selected_group().is_some());
+        }
+    if let Some(a) = app.lookup_action("layers-flatten")
+        && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
+            sa.set_enabled(!flattenable_layers(ui).is_empty());
         }
     if let Some(a) = app.lookup_action("layer-group")
         && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
             sa.set_enabled(selected_count >= 1);
         }
-    for name in &["group-ungroup", "group-delete", "group-duplicate"] {
+    for name in &["group-ungroup", "group-delete"] {
         if let Some(a) = app.lookup_action(name)
             && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
                 sa.set_enabled(has_active_group);
             }
     }
+    if let Some(a) = app.lookup_action("group-duplicate")
+        && let Ok(sa) = a.downcast::<gio::SimpleAction>() {
+            sa.set_enabled(has_active_group || group_to_clone);
+        }
 }
 
 
@@ -1230,7 +1595,7 @@ pub(super) fn install_context_menu(area: &gtk::DrawingArea, ui: &Ui) {
             Some("app.layer-alpha-lock"),
         );
         menu.append(Some("Rename Layer"), Some("app.rename"));
-        menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
+        menu.append(Some("Clone Layer"), Some("app.layer-duplicate"));
         menu.append(Some("Copy Layer"), Some("app.copy"));
         menu.append(Some("Delete Layer"), Some("app.layer-delete"));
         menu
@@ -1248,7 +1613,7 @@ pub(super) fn install_context_menu(area: &gtk::DrawingArea, ui: &Ui) {
             Some("app.layer-clip"),
         );
         menu.append(Some("Rename Layer"), Some("app.rename"));
-        menu.append(Some("Duplicate Layer"), Some("app.layer-duplicate"));
+        menu.append(Some("Clone Layer"), Some("app.layer-duplicate"));
         menu.append(Some("Copy Layer"), Some("app.copy"));
         menu.append(Some("Delete Layer"), Some("app.layer-delete"));
         menu
@@ -1339,6 +1704,42 @@ mod tests {
         let out = composite_centered(&src, 4, 4, 2, 2);
         assert_eq!(out.len(), 2 * 2 * 4);
         assert!(out.iter().all(|&b| b == 255), "the centre 2x2 survives");
+    }
+
+    fn layer(id: &str, clipped: bool, visible: bool) -> Layer {
+        Layer {
+            id: id.into(),
+            clipped,
+            visible,
+            ..Layer::new(id)
+        }
+    }
+
+    #[test]
+    fn only_visible_clips_stacked_directly_on_the_group_are_orphaned() {
+        let group = LayerNode::Group(GroupData {
+            id: "g".into(),
+            name: "g".into(),
+            expanded: true,
+            visible: true,
+            children: vec![LayerNode::Layer("inner".into())],
+            masked_leaves: std::collections::HashSet::new(),
+        });
+        let tree = vec![
+            LayerNode::Layer("clip_far".into()),
+            LayerNode::Layer("plain".into()),
+            LayerNode::Layer("clip_hidden".into()),
+            LayerNode::Layer("clip_near".into()),
+            group,
+        ];
+        let snapshot = vec![
+            layer("clip_far", true, true),
+            layer("plain", false, true),
+            layer("clip_hidden", true, false),
+            layer("clip_near", true, true),
+            layer("inner", false, true),
+        ];
+        assert_eq!(clipped_above_group(&tree, "g", &snapshot), ["clip_near"]);
     }
 
     #[test]

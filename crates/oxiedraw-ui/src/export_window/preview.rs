@@ -12,24 +12,10 @@ pub(super) fn build_preview_surface(
     h: u32,
     surface_ref: &Rc<RefCell<Option<gtk::cairo::ImageSurface>>>,
 ) {
-    use gtk::cairo;
-    let mut surface = match cairo::ImageSurface::create(cairo::Format::ARgb32, w as i32, h as i32) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(error = %e, "export preview: create ImageSurface failed");
-            return;
-        }
+    let Some(surface) = crate::widgets::shapes::surface_from_bgra(pixels, w, h) else {
+        tracing::error!(w, h, "export preview: building the preview surface failed");
+        return;
     };
-    {
-        let stride = surface.stride() as usize;
-        if let Ok(mut data) = surface.data() {
-            for row in 0..h as usize {
-                let src = row * w as usize * 4;
-                let dst = row * stride;
-                data[dst..dst + w as usize * 4].copy_from_slice(&pixels[src..src + w as usize * 4]);
-            }
-        }
-    }
     *surface_ref.borrow_mut() = Some(surface);
 }
 

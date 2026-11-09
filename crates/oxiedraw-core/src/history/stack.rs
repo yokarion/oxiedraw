@@ -446,6 +446,20 @@ fn apply_direction(
                 Ok(())
             }
         },
+        HistoryAction::LayerKindChange {
+            layer_id,
+            before,
+            after,
+        } => {
+            if let Some(idx) = find_layer_idx(canvas, layer_id) {
+                let kind = match direction {
+                    Direction::Forward => after,
+                    Direction::Backward => before,
+                };
+                canvas.set_layer_kind(idx, kind.clone())?;
+            }
+            Ok(())
+        }
         HistoryAction::LayerMerge {
             survivor_idx,
             survivor_pre,
