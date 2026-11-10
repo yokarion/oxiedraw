@@ -160,6 +160,10 @@ const ICON_WET_TEXTURED_SOFT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/icons/builtin-brush-icons/wet_textured_soft.png"
 ));
+const ICON_BLUR: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/icons/builtin-brush-icons/blur.png"
+));
 
 // Predefined brush-tip + texture images extracted from Krita's default
 // resource bundle (`Krita_4_Default_Resources.bundle`), converted to plain
@@ -221,7 +225,29 @@ pub enum BrushFamily {
         tip: Option<Rc<PatternData>>,
         grain: Option<Rc<PatternData>>,
         smear_alpha: bool,
+        mode: SmudgeMode,
     },
+}
+
+/// Krita colorsmudge's smudge length mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SmudgeMode {
+    /// Drags the pixels under the previous dab onto the current one.
+    #[default]
+    Smearing,
+    /// Fills the dab with the single color under the previous dab's centre.
+    Dulling,
+}
+
+impl crate::enum_meta::EnumMeta for SmudgeMode {
+    const ALL: &'static [Self] = &[Self::Smearing, Self::Dulling];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Smearing => "Smearing",
+            Self::Dulling => "Dulling",
+        }
+    }
 }
 
 impl BrushFamily {
@@ -231,6 +257,7 @@ impl BrushFamily {
             tip: None,
             grain: None,
             smear_alpha: false,
+            mode: SmudgeMode::Smearing,
         }
     }
 
@@ -752,6 +779,7 @@ impl BrushPreset {
                 tip: Some(tip),
                 grain: Some(grain),
                 smear_alpha: true,
+                mode: SmudgeMode::Smearing,
             },
             default_size: 60.0,
             default_opacity: 1.0,
@@ -802,6 +830,61 @@ impl BrushPreset {
                 ..Dynamics::default()
             },
             icon: Some(ICON_WET_TEXTURED_SOFT.to_vec()),
+            preview: None,
+            source_path: None,
+        }
+    }
+
+    /// Blur: a smearing smudge brush with scatter and no paint, so every dab
+    /// lays down a randomly offset copy of the area under it.
+    pub fn blur(id: BrushPresetId) -> Self {
+        let constant = |value: f32| Mapping {
+            source: DynSource::Pressure,
+            curve: Curve::flat(1.0),
+            range: (0.0, value),
+            invert: false,
+        };
+        Self {
+            id,
+            name: "Blur".into(),
+            family: BrushFamily::Smudge {
+                tip: None,
+                grain: None,
+                smear_alpha: true,
+                mode: SmudgeMode::Smearing,
+            },
+            default_size: 60.0,
+            default_opacity: 1.0,
+            spacing_ratio: 0.02,
+            stabilizer: 0.0,
+            speed_smoothing: 0.0,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
+            hardness: 0.33,
+            tip: TipShape::Round,
+            texture_scale: 0.0,
+            texture_strength: 0.0,
+            texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
+            dynamics: Dynamics {
+                opacity: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::smooth_from_points(vec![
+                        (0.0, 0.0),
+                        (0.572_864, 0.336_683),
+                        (1.0, 0.934_498),
+                    ])
+                    .expect("krita curve valid"),
+                    range: (0.0, 1.0),
+                    invert: false,
+                }),
+                smudge_rate: Some(constant(0.6)),
+                scatter: Some(constant(4.8)),
+                ..Dynamics::default()
+            },
+            icon: Some(ICON_BLUR.to_vec()),
             preview: None,
             source_path: None,
         }

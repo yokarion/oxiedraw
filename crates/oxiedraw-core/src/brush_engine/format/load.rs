@@ -108,10 +108,12 @@ impl BrushPackage {
                 tip,
                 grain,
                 smear_alpha,
+                mode,
             } => BrushFamily::Smudge {
                 tip: tip.as_deref().map(resolve).transpose()?.map(Rc::new),
                 grain: grain.as_deref().map(resolve).transpose()?.map(Rc::new),
                 smear_alpha: *smear_alpha,
+                mode: *mode,
             },
             FamilyDoc::Textured { pattern } => {
                 BrushFamily::Textured(Rc::new(resolve(pattern)?))

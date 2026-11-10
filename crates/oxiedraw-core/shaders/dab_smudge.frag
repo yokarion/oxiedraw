@@ -1,6 +1,6 @@
 #version 450
 
-// Color-smudge dab (Krita colorsmudge, smearing mode). Rendered as a
+// Color-smudge dab (Krita colorsmudge, smearing or dulling). Rendered as a
 // fullscreen triangle scissored to the dab's bounding box; the tip mask is
 // the round falloff or a stamped image tip, times the canvas-anchored grain.
 // `u_scratch` is a copy of the target layer taken just before this dab: read
@@ -35,6 +35,7 @@ layout(push_constant) uniform Push {
     uint tip_slice;
     uint grain_slice;
     uint smear_alpha; // 1: Krita smear alpha, transparency smears too
+    uint dulling;     // 1: Krita dulling, one color picked at the previous centre
 } push;
 
 // Matches renderer::dab::NO_SLICE and pattern_atlas::ATLAS_SLICE_DIM.
@@ -98,7 +99,8 @@ void main() {
     if (rate <= 0.0) {
         discard;
     }
-    vec2 src_uv = clamp((pos - push.delta) * push.inv_size, vec2(0.0), vec2(1.0));
+    vec2 src = push.dulling != 0u ? push.center - push.delta : pos - push.delta;
+    vec2 src_uv = clamp(src * push.inv_size, vec2(0.0), vec2(1.0));
     vec4 pickup = texture(u_scratch, src_uv);
     vec4 dst = texture(u_scratch, pos * push.inv_size);
     vec4 before = texture(u_before, pos * push.inv_size);

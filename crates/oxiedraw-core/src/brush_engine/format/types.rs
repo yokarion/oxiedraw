@@ -4,13 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use super::super::dynamics::{Curve, Dynamics};
 use super::super::preset::{
-    DEFAULT_AIRBRUSH_RATE, PaintMode, TextureAdjust, TexturingMode, TipShape,
+    DEFAULT_AIRBRUSH_RATE, PaintMode, SmudgeMode, TextureAdjust, TexturingMode, TipShape,
 };
 
-/// Bumped to 5 for the smudge tip/texture and `texture_adjust`. New
-/// fields are `#[serde(default)]`, so the loader still accepts older
-/// archives - see `load::load`.
-pub const SCHEMA_VERSION: u32 = 5;
+/// Bumped to 6 for the smudge mode. New fields are `#[serde(default)]`,
+/// so the loader still accepts older archives - see `load::load`.
+pub const SCHEMA_VERSION: u32 = 6;
 pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Manifest discriminator distinguishing brushes from other future TAR
 /// archive types so the loader can reject the wrong file early.
@@ -20,7 +19,7 @@ pub(super) const KIND: &str = "brush";
 /// whenever a builtin factory changes in a way that should reach existing
 /// installs (tuned spacing, new grain, etc.) without a schema change.
 /// `seed_missing` re-writes any builtin whose on-disk revision is older.
-pub const BUILTIN_REVISION: u32 = 15;
+pub const BUILTIN_REVISION: u32 = 16;
 
 /// `manifest.json` - fast metadata read for the brush picker so we can
 /// list brushes without fully deserialising `brush.json`.
@@ -62,6 +61,8 @@ pub enum FamilyDoc {
         grain: Option<String>,
         #[serde(default)]
         smear_alpha: bool,
+        #[serde(default)]
+        mode: SmudgeMode,
     },
 }
 

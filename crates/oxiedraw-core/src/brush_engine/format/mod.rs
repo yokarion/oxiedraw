@@ -197,7 +197,7 @@ mod tests {
         // The real Real Brush preset - exercises the Smudge family + the
         // smudge dynamics serialising through the archive.
         let preset = BrushPreset::real_brush(BrushPresetId(0));
-        assert!(matches!(preset.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false }));
+        assert!(matches!(preset.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false, .. }));
         let path = temp_path("smudge");
         super::save::save(&preset, &path).expect("save");
         let pkg = super::load::load(&path).expect("load");
@@ -205,7 +205,7 @@ mod tests {
         let restored = pkg.into_preset(BrushPresetId(3), None).expect("into_preset");
         let _ = std::fs::remove_file(&path);
 
-        assert!(matches!(restored.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false }));
+        assert!(matches!(restored.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false, .. }));
         // Real Brush drives color rate + size by pressure; smudge rate is left
         // constant (its dynamic was removed to stop the deposit pulsing).
         assert!(restored.dynamics.color_rate.is_some());
@@ -225,6 +225,7 @@ mod tests {
             tip: Some(tip),
             grain: Some(grain),
             smear_alpha: true,
+            ..
         } = &restored.family
         else {
             panic!("expected a smear-alpha smudge with tip and texture")
@@ -261,8 +262,38 @@ mod tests {
         let doc: super::BrushDocument = serde_json::from_str(json).expect("early document parses");
         assert!(matches!(
             doc.family,
-            super::FamilyDoc::SmudgeOptions { tip: Some(_), grain: None, smear_alpha: false }
+            super::FamilyDoc::SmudgeOptions {
+                tip: Some(_),
+                grain: None,
+                smear_alpha: false,
+                mode: super::super::preset::SmudgeMode::Smearing,
+            }
         ));
+    }
+
+    #[test]
+    fn round_trip_smudge_keeps_dulling_mode() {
+        let mut preset = BrushPreset::blur(BrushPresetId(0));
+        if let BrushFamily::Smudge { mode, .. } = &mut preset.family {
+            *mode = super::super::preset::SmudgeMode::Dulling;
+        }
+        let path = temp_path("dulling");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(7), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(
+            restored.family,
+            BrushFamily::Smudge {
+                tip: None,
+                grain: None,
+                smear_alpha: true,
+                mode: super::super::preset::SmudgeMode::Dulling,
+            }
+        ));
+        assert!(restored.dynamics.scatter.is_some());
+        assert!(restored.dynamics.smudge_rate.is_some());
     }
 
     #[test]

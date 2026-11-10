@@ -43,6 +43,8 @@ pub struct SmudgeDab {
     pub grain_slice: u32,
     /// Krita's smear alpha: transparency smears instead of falling back to paint.
     pub smear_alpha: bool,
+    /// Krita's dulling mode: the whole dab takes the color under the previous centre.
+    pub dulling: bool,
 }
 
 impl SmudgeDab {
@@ -80,12 +82,13 @@ struct SmudgePush {
     tip_slice: u32,
     grain_slice: u32,
     smear_alpha: u32,
+    dulling: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<SmudgePush>() == SmudgePush::SIZE as usize);
 
 impl SmudgePush {
-    const SIZE: u32 = 104;
+    const SIZE: u32 = 108;
 
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: repr(C) POD of f32s.
@@ -363,6 +366,7 @@ impl VulkanRenderer {
                 tip_slice: d.tip_slice,
                 grain_slice: d.grain_slice,
                 smear_alpha: u32::from(d.smear_alpha),
+                dulling: u32::from(d.dulling),
             };
             self.cmd_begin_fullscreen_pass(render_pass, layer_fb, pipeline);
             unsafe {

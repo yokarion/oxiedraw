@@ -514,3 +514,42 @@ fn wet_textured_soft_tap_on_transparent_stays_light() {
     assert!(wet > 0 && wet <= 60, "smear-alpha tap alpha {wet}");
     assert!(real >= 150, "opaque-fallback tap alpha {real}");
 }
+
+/// Blur along a hard black/white edge softens it into greys, keeps the dark
+/// and light sides apart (a blur, not one averaged color) and lays down none
+/// of the (red) brush color.
+#[test]
+fn blur_softens_an_edge_without_paint() {
+    let size = Size::new(200, 100);
+    let w = size.width as usize;
+    let mut pixels = vec![255u8; w * size.height as usize * 4];
+    for px in pixels[..w * 50 * 4].chunks_exact_mut(4) {
+        px[..3].fill(0);
+    }
+    let (mut canvas, idx) = canvas_with_layer(size, &pixels);
+    let brush = BrushEngine::new();
+    select_brush(&brush, "Blur");
+    brush.size.set(40.0);
+    brush.opacity.set(1.0);
+    smudge_line(&mut canvas, &brush, Color::new(255, 0, 0), 50.0, 30.0, 170.0);
+
+    let mut buf = Vec::new();
+    canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
+    let mut greys = 0;
+    let mut max_tint = 0u8;
+    for y in 30..70 {
+        for x in 80..120 {
+            let (b, g, r) = (buf[(y * w + x) * 4], buf[(y * w + x) * 4 + 1], buf[(y * w + x) * 4 + 2]);
+            max_tint = max_tint.max(r.abs_diff(g)).max(r.abs_diff(b));
+            if (30..=225).contains(&g) {
+                greys += 1;
+            }
+        }
+    }
+    let column: Vec<u8> = (30..70).map(|y| buf[(y * w + 100) * 4 + 1]).collect();
+    println!("blur: grey pixels={greys} max tint={max_tint} column={column:?}");
+    assert!(greys > 200, "edge should blur into greys, got {greys}");
+    assert!(max_tint <= 2, "no brush color deposited, tint {max_tint}");
+    assert!(column[39] - column[0] > 150, "sides flattened: {column:?}");
+    assert!(column.windows(2).all(|p| p[1] + 8 >= p[0]), "profile not a ramp: {column:?}");
+}

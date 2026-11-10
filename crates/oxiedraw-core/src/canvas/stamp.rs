@@ -1,4 +1,4 @@
-use crate::brush_engine::{BrushFamily, Dab, PaintTarget};
+use crate::brush_engine::{BrushFamily, Dab, PaintTarget, SmudgeMode};
 use crate::guides::Symmetry;
 use crate::renderer::{DabFamily, DabInstance, NO_SLICE, RendererError, SmudgeDab, VulkanRenderer};
 
@@ -215,6 +215,7 @@ fn push_smudge_dab(out: &mut Vec<SmudgeDab>, prev: &mut Option<[f32; 2]>, dab: &
         tip_slice: look.tip_slice,
         grain_slice: look.grain_slice,
         smear_alpha: look.smear_alpha,
+        dulling: look.dulling,
     });
     *prev = Some(center);
 }
@@ -225,12 +226,14 @@ struct SmudgeLook {
     tip_slice: u32,
     grain_slice: u32,
     smear_alpha: bool,
+    dulling: bool,
 }
 
 const PLAIN_SMUDGE: SmudgeLook = SmudgeLook {
     tip_slice: NO_SLICE,
     grain_slice: NO_SLICE,
     smear_alpha: false,
+    dulling: false,
 };
 
 /// Resolve a smudge family for the GPU, uploading its images on first sight.
@@ -242,6 +245,7 @@ fn resolve_smudge_look(
         tip,
         grain,
         smear_alpha,
+        mode,
     } = family
     else {
         return Ok(PLAIN_SMUDGE);
@@ -258,6 +262,7 @@ fn resolve_smudge_look(
         tip_slice,
         grain_slice,
         smear_alpha: *smear_alpha,
+        dulling: *mode == SmudgeMode::Dulling,
     })
 }
 

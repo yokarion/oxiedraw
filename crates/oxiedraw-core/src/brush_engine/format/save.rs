@@ -5,7 +5,7 @@ use std::rc::Rc;
 use tar::{Builder, Header};
 
 use super::super::pattern::PatternData;
-use super::super::preset::{BrushFamily, BrushPreset, PaintMode};
+use super::super::preset::{BrushFamily, BrushPreset, PaintMode, SmudgeMode};
 use super::error::BrushError;
 use super::types::{
     APP_VERSION, BUILTIN_REVISION, BrushDocument, BrushManifest, FamilyDoc, KIND, SCHEMA_VERSION,
@@ -34,11 +34,13 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
             tip: None,
             grain: None,
             smear_alpha: false,
+            mode: SmudgeMode::Smearing,
         } => FamilyDoc::Smudge,
         BrushFamily::Smudge {
             tip,
             grain,
             smear_alpha,
+            mode,
         } => {
             let mut add = |name: &str, data: &Rc<PatternData>| {
                 pattern_payloads.push((name.to_string(), data.clone()));
@@ -48,6 +50,7 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
                 tip: tip.as_ref().map(|t| add("tip.png", t)),
                 grain: grain.as_ref().map(|g| add("grain.png", g)),
                 smear_alpha: *smear_alpha,
+                mode: *mode,
             }
         }
         BrushFamily::Textured(data) => {

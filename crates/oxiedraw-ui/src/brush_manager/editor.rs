@@ -16,8 +16,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use oxiedraw_core::brush_engine::{
     BrushEngine, BrushFamily, BrushPreset, BrushPresetId, BrushRegistry, Curve,
-    DEFAULT_AIRBRUSH_RATE, DynSource, Dynamics, Mapping, PaintMode, PatternData, TexturingMode,
-    format, preview_renderer,
+    DEFAULT_AIRBRUSH_RATE, DynSource, Dynamics, Mapping, PaintMode, PatternData, SmudgeMode,
+    TexturingMode, format, preview_renderer,
 };
 use oxiedraw_core::curves;
 use oxiedraw_core::enum_meta::EnumMeta;
@@ -167,6 +167,15 @@ pub(super) fn build(
     smear_alpha_row.add_suffix(&smear_alpha_switch);
     smear_alpha_row.set_visible(false);
     props_group.add(&smear_alpha_row);
+    let smudge_mode_row = adw::ActionRow::builder()
+        .title("Smudge mode")
+        .subtitle("Smearing drags the pixels, dulling spreads one picked color")
+        .build();
+    let smudge_mode_dropdown = gtk::DropDown::from_strings(&SmudgeMode::labels());
+    smudge_mode_dropdown.set_valign(gtk::Align::Center);
+    smudge_mode_row.add_suffix(&smudge_mode_dropdown);
+    smudge_mode_row.set_visible(false);
+    props_group.add(&smudge_mode_row);
 
     // Pattern row - only visible for the textured, image-tip and smudge families.
     let pattern_row = adw::ActionRow::builder().title("Pattern").build();
@@ -308,10 +317,12 @@ pub(super) fn build(
         let tip_thumb = tip_thumb.clone();
         let tip_clear_btn = tip_clear_btn.clone();
         let smear_alpha_row = smear_alpha_row.clone();
+        let smudge_mode_row = smudge_mode_row.clone();
         Rc::new(move |family: &BrushFamily| {
             apply_pattern_visibility(&texture_rows, &pattern_thumb, &pattern_clear_btn, family);
             apply_tip_visibility(&tip_row, &tip_thumb, &tip_clear_btn, family);
             smear_alpha_row.set_visible(family.is_smudge());
+            smudge_mode_row.set_visible(family.is_smudge());
         })
     };
 
@@ -493,6 +504,20 @@ pub(super) fn build(
                 });
             }
             glib::Propagation::Proceed
+        });
+    }
+    {
+        let edit_family = edit_family.clone();
+        let loading = loading.clone();
+        smudge_mode_dropdown.connect_selected_notify(move |d| {
+            if !loading.get() {
+                let selected = SmudgeMode::from_index(d.selected());
+                edit_family(&|brush| {
+                    if let BrushFamily::Smudge { mode, .. } = &mut brush.family {
+                        *mode = selected;
+                    }
+                });
+            }
         });
     }
     {
@@ -796,6 +821,7 @@ pub(super) fn build(
         let texture_contrast_scale = texture_contrast_scale.clone();
         let texture_invert_switch = texture_invert_switch.clone();
         let smear_alpha_switch = smear_alpha_switch.clone();
+        let smudge_mode_dropdown = smudge_mode_dropdown.clone();
         let size_scale = size_scale.clone();
         let opacity_scale = opacity_scale.clone();
         let spacing_scale = spacing_scale.clone();
@@ -843,6 +869,7 @@ pub(super) fn build(
             texture_contrast_scale.set_sensitive(enabled);
             texture_invert_switch.set_sensitive(enabled);
             smear_alpha_switch.set_sensitive(enabled);
+            smudge_mode_dropdown.set_sensitive(enabled);
             name_entry.set_sensitive(enabled);
             family_dropdown.set_sensitive(enabled);
             size_scale.set_sensitive(enabled);
@@ -878,6 +905,9 @@ pub(super) fn build(
                     p.family,
                     BrushFamily::Smudge { smear_alpha: true, .. }
                 ));
+                if let BrushFamily::Smudge { mode, .. } = &p.family {
+                    smudge_mode_dropdown.set_selected(mode.to_index());
+                }
                 size_scale.set_value(f64::from(p.default_size));
                 opacity_scale.set_value(f64::from(p.default_opacity));
                 spacing_scale.set_value(f64::from(p.spacing_ratio));
@@ -914,6 +944,7 @@ pub(super) fn build(
                 texture_contrast_scale.set_value(1.0);
                 texture_invert_switch.set_active(false);
                 smear_alpha_switch.set_active(false);
+                smudge_mode_dropdown.set_selected(0);
                 size_scale.set_value(0.0);
                 opacity_scale.set_value(0.0);
                 spacing_scale.set_value(0.0);

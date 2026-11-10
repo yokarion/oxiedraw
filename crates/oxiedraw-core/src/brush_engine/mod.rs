@@ -16,8 +16,8 @@ pub use dynamics::{Curve, DynSource, Dynamics, Mapping, SpawnInput, evaluate, ma
 pub use input::InputSample;
 pub use pattern::PatternData;
 pub use preset::{
-    BrushFamily, BrushPreset, DEFAULT_AIRBRUSH_RATE, PaintMode, TextureAdjust, TexturingMode,
-    TipShape,
+    BrushFamily, BrushPreset, DEFAULT_AIRBRUSH_RATE, PaintMode, SmudgeMode, TextureAdjust,
+    TexturingMode, TipShape,
 };
 pub use registry::BrushRegistry;
 pub use stamp::start_stroke;
@@ -112,6 +112,7 @@ impl BrushEngine {
         engine.add_brush(BrushPreset::comics(placeholder));
         engine.add_brush(BrushPreset::real_brush(placeholder));
         engine.add_brush(BrushPreset::wet_textured_soft(placeholder));
+        engine.add_brush(BrushPreset::blur(placeholder));
         engine.active.set(default_id);
         let default_preset_size = engine
             .brushes
