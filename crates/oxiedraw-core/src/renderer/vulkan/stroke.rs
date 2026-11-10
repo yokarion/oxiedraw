@@ -6,6 +6,7 @@ use ash::vk;
 use super::super::RendererError;
 use super::super::dab::{DabFamily, DabInstance, DabPushConstants};
 use super::VulkanRenderer;
+use crate::brush_engine::{Curve, PaintMode};
 
 impl VulkanRenderer {
     /// Rasterize `dabs` onto the canvas with the brush dab pipeline
@@ -49,21 +50,43 @@ impl VulkanRenderer {
         self.alpha_lock = locked;
     }
 
-    /// Set whether the in-flight stroke accumulates coverage (build-up,
-    /// OVER blend) instead of saturating (MAX). Call at the start of a
-    /// stroke. Reset to false by `begin_stroke` for ordinary brushes.
-    pub fn set_stroke_buildup(&mut self, buildup: bool) {
-        self.stroke_buildup = buildup;
+    /// Set how the in-flight stroke's dabs combine in the stroke buffer.
+    /// Call at the start of a stroke.
+    pub fn set_stroke_mode(&mut self, mode: PaintMode) {
+        self.stroke_mode = mode;
+    }
+
+    /// Shape soft-round dabs with `curve` (Krita's soft auto-brush) instead of
+    /// `hardness`, or go back to hardness with `None`. Call at stroke start.
+    pub fn set_stroke_falloff(&mut self, curve: Option<&Curve>) -> Result<(), RendererError> {
+        self.stroke_falloff = curve.is_some();
+        if let Some(curve) = curve
+            && self.falloff_lut.is_stale(curve)
+        {
+            // Earlier submits may still be reading the old table.
+            unsafe {
+                self.device
+                    .wait_for_fences(&self.ring_fences, true, u64::MAX)?;
+            }
+            self.falloff_lut.upload(curve)?;
+        }
+        Ok(())
     }
 
     /// The mask pipeline set the current stroke stamps with: OVER-blend
     /// for build-up, MAX-blend otherwise.
     pub(super) fn active_mask_pipelines(&self) -> &super::super::mask::MaskPipelineSet {
-        if self.stroke_buildup {
+        if self.stroke_mode == PaintMode::BuildUp {
             &self.mask_pipelines_buildup
         } else {
             &self.mask_pipelines
         }
+    }
+
+    /// Wash replays dabs in a shader, which only knows the soft-round tip;
+    /// other tips fall back to the normal mask blend.
+    pub(super) fn washes(&self, family: DabFamily) -> bool {
+        self.stroke_mode == PaintMode::Wash && matches!(family, DabFamily::SoftRound)
     }
 
     /// The tight integer AABB `(x, y, w, h)` of everything stamped since
@@ -121,10 +144,22 @@ impl VulkanRenderer {
         if dabs.is_empty() {
             return Ok(());
         }
+        let wash = self.washes(family);
+        // Before the upload: building the pass submits, which moves the ring
+        // slot the dabs must land in.
+        if wash {
+            self.ensure_wash_pass()?;
+        }
         self.accumulate_dirty(dabs);
         let slot = self.current_ring_slot();
         self.wait_ring_slot(slot)?;
         let n = self.dab_buffers.upload_instances(dabs, slot)?;
+        if wash {
+            return self.record_and_submit_async(|this| {
+                this.cmd_wash_pass(dabs);
+                Ok(())
+            });
+        }
         let pipe = self.active_mask_pipelines().get(family);
         let pipeline = pipe.pipeline;
         let layout = pipe.layout;
@@ -206,9 +241,15 @@ impl VulkanRenderer {
             inv_size,
             slice: family.slice(),
             tip_slice: family.tip_slice(),
+            falloff: u32::from(self.stroke_falloff),
         };
-        let atlas_set = self.pattern_atlas.descriptor_set();
-        let binds_atlas = family.binds_atlas();
+        // Textured pipelines read the pattern atlas at set 0, soft-round the
+        // falloff table; pixel binds nothing.
+        let set = match family {
+            DabFamily::Textured { .. } => Some(self.pattern_atlas.descriptor_set()),
+            DabFamily::SoftRound => Some(self.falloff_lut.set()),
+            DabFamily::Pixel => None,
+        };
         self.cmd_begin_fullscreen_pass(render_pass, framebuffer, pipeline);
         unsafe {
             self.device.cmd_push_constants(
@@ -218,13 +259,13 @@ impl VulkanRenderer {
                 0,
                 push.as_bytes(),
             );
-            if binds_atlas {
+            if let Some(set) = set {
                 self.device.cmd_bind_descriptor_sets(
                     self.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
                     0,
-                    &[atlas_set],
+                    &[set],
                     &[],
                 );
             }

@@ -60,6 +60,11 @@ pub struct Dab {
     /// Smudge family only: how much of the brush paint color is mixed into
     /// the deposited dab, `0..=1` (Krita "color rate").
     pub color_rate: f32,
+    /// Wash ceiling for this dab, `0..=1` (Krita dab opacity).
+    pub opacity: f32,
+    /// Krita's running average of the stroke's dab opacities, which keeps a
+    /// wash stroke from thinning out when pressure eases off.
+    pub average_opacity: f32,
 }
 
 impl Dab {
@@ -81,6 +86,8 @@ impl Dab {
             texturing_mode: 0.0,
             smudge_rate: 1.0,
             color_rate: 0.0,
+            opacity: 1.0,
+            average_opacity: 1.0,
         }
     }
 }

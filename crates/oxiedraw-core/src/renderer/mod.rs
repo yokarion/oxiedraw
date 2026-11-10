@@ -121,6 +121,7 @@ mod device;
 mod dmabuf;
 mod erase;
 mod error;
+mod falloff;
 mod fill_overlay;
 mod filters;
 mod gradient_overlay;

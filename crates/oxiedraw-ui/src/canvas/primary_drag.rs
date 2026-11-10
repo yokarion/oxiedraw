@@ -83,6 +83,11 @@ const LIQUIFY_MAX_STEPS: usize = 64;
 /// nudge doesn't commit to the wrong axis (helpful, not twitchy).
 const GUIDE_SNAP_LOCK_PX: f32 = 8.0;
 
+/// How long the pen must go without motion events before the airbrush sprays
+/// on the spot. Longer than a pen's report gap, so a moving stroke spreads its
+/// timed dabs along the path instead of piling them up at each sample.
+const AIRBRUSH_HOLD_MS: f64 = 20.0;
+
 /// Straight RGB (`0.0..=1.0` per channel) for a [`Color`], for seeding guide
 /// colors from the primary color.
 fn color_to_rgb(c: Color) -> (f32, f32, f32) {
@@ -136,6 +141,8 @@ pub(super) struct PrimaryDragHandler {
     stroke_shape_correction: RefCell<ShapeCorrectionSettings>,
     /// Segment dabs held back and stamped by time from the render pump.
     deferred_dabs: Rc<RefCell<DeferredDabs>>,
+    /// Event time of the last sample fed to the brush, real or airbrush.
+    airbrush_last_ms: Cell<u64>,
     // -- crop ------------------------------------------------------------
     crop: CropState,
     crop_handle: Rc<Cell<CropHandle>>,
@@ -815,7 +822,6 @@ impl PrimaryDragHandler {
 
         let opacity = self.brush_engine.opacity.get();
         let active_brush = self.brush_engine.active_brush();
-        let buildup = active_brush.buildup;
         // Color-smudge brushes paint straight into the layer during the drag,
         // so the layer must be snapshotted before the first dab for undo.
         let smudge = active_brush.family.is_smudge();
@@ -855,6 +861,11 @@ impl PrimaryDragHandler {
         self.arm_guide_snap(canvas_pos);
         let sample = sample_from(gesture, canvas_pos);
         self.stroke_points.borrow_mut().push(sample);
+        // Start the event clock now so an airbrush held still from pen-down
+        // keeps spraying before the first motion event.
+        #[allow(clippy::cast_precision_loss)]
+        self.deferred_dabs.borrow_mut().begin_sample(sample.time_ms as f64);
+        self.airbrush_last_ms.set(sample.time_ms);
 
         let mut canvas = self.canvas.borrow_mut();
 
@@ -896,10 +907,14 @@ impl PrimaryDragHandler {
         if !erase && !on_adjustment && !smudge {
             self.used_color.set(Some(color));
         }
-        // Build-up accumulates coverage in the stroke buffer (OVER-blend) so
-        // overlapping dabs darken, capped at the stroke opacity by the single
-        // commit composite. The render pump presents the live buffer.
-        canvas.set_stroke_buildup(buildup);
+        // Build-up and wash accumulate coverage in the stroke buffer, capped
+        // at the stroke opacity by the single commit composite. The render
+        // pump presents the live buffer.
+        if let Err(e) =
+            canvas.set_stroke_style(active_brush.paint_mode, active_brush.softness_curve.as_ref())
+        {
+            tracing::error!(error = %e, "set_stroke_style failed");
+        }
         // Route smudge brushes to the GPU smudge path. `set_smudge_stroke`
         // snapshots the pristine layer on the GPU (`smudge_before`); undo reads
         // just the dirty region back from it at pen-up, so there's no
@@ -935,7 +950,11 @@ impl PrimaryDragHandler {
 
         // Reset the 2 s idle timer - it fires only when movement stops.
         self.reset_idle_timer();
+        self.feed_brush(sample);
+    }
 
+    fn feed_brush(&self, sample: InputSample) {
+        self.airbrush_last_ms.set(sample.time_ms);
         // Smudge picks its colour up from the layer as it stamps, so it keeps
         // stamping straight away; the rest defer to the pump (see `stroke_tip`).
         let smudge = self.canvas.borrow().is_smudge_stroke();
@@ -952,6 +971,34 @@ impl PrimaryDragHandler {
         #[allow(clippy::cast_precision_loss)]
         deferred.begin_sample(sample.time_ms as f64);
         self.brush_engine.push_sample(sample, &mut *deferred);
+    }
+
+    /// Krita's airbrush timer: while the pen rests, feed the brush a copy of
+    /// the last sample stamped with the current time, so timed dabs keep
+    /// landing on the spot. Runs on the render pump, never its own timer.
+    fn airbrush_hold_tick(&self) {
+        if !self.brush_engine.is_drawing() {
+            return;
+        }
+        let Some(interval) = self.brush_engine.active_airbrush_interval_ms() else {
+            return;
+        };
+        let Some(now) = self.deferred_dabs.borrow().now_event_ms() else {
+            return;
+        };
+        let Some(last) = self.stroke_points.borrow().last().copied() else {
+            return;
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let since = |ms: u64| now - ms as f64;
+        if since(last.time_ms) < AIRBRUSH_HOLD_MS || since(self.airbrush_last_ms.get()) < f64::from(interval) {
+            return;
+        }
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        self.feed_brush(InputSample {
+            time_ms: now as u64,
+            ..last
+        });
     }
 
     fn release_due_dabs(&self) {
@@ -1158,10 +1205,10 @@ impl PrimaryDragHandler {
         if !sc.enabled {
             return;
         }
-        // Shape correction is not offered for build-up brushes - their
-        // overlap-accumulating look is the whole point, so snapping the
-        // path to a clean shape would misrepresent the stroke.
-        if self.brush_engine.active_buildup() {
+        // Shape correction is not offered for build-up, wash or airbrush
+        // brushes - their overlap-accumulating look is the whole point, so
+        // snapping the path to a clean shape would misrepresent the stroke.
+        if self.brush_engine.active_accumulates() {
             return;
         }
 
@@ -3247,6 +3294,7 @@ pub(super) fn install_primary_drag(
         pending_correction: Rc::new(RefCell::new(None)),
         stroke_shape_correction: RefCell::new(ShapeCorrectionSettings::default()),
         deferred_dabs: Rc::new(RefCell::new(DeferredDabs::new())),
+        airbrush_last_ms: Cell::new(0),
         crop: crop.clone(),
         crop_handle: Rc::new(Cell::new(CropHandle::None)),
         crop_start: Rc::new(Cell::new(Point::ZERO)),
@@ -3402,6 +3450,7 @@ pub(super) fn install_primary_drag(
         let weak = Rc::downgrade(&handler);
         *viewport.render_pump().stroke_tick_handle().borrow_mut() = Some(Box::new(move || {
             if let Some(h) = weak.upgrade() {
+                h.airbrush_hold_tick();
                 h.release_due_dabs();
             }
         }));

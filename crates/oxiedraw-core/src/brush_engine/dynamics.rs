@@ -127,11 +127,14 @@ impl DynSource {
     }
 }
 
-/// Piecewise-linear curve sampled in `0..=1` input space, output also
-/// in `0..=1`. Points must be sorted by `x` and bracket `0..=1`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Curve sampled in `0..=1` input space, output also in `0..=1`. Points must
+/// be sorted by `x`. Piecewise-linear by default; `smooth` curves are Krita's
+/// `KisCubicCurve` (natural cubic spline, clamped to the end points and `0..=1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Curve {
     points: Vec<(f32, f32)>,
+    #[serde(default)]
+    smooth: bool,
 }
 
 impl Curve {
@@ -139,6 +142,7 @@ impl Curve {
     pub fn linear() -> Self {
         Self {
             points: vec![(0.0, 0.0), (1.0, 1.0)],
+            smooth: false,
         }
     }
 
@@ -147,7 +151,52 @@ impl Curve {
         let y = y.clamp(0.0, 1.0);
         Self {
             points: vec![(0.0, y), (1.0, y)],
+            smooth: false,
         }
+    }
+
+    /// Smooth (spline) curve through `points`; same invariants as `from_points`.
+    pub fn smooth_from_points(points: Vec<(f32, f32)>) -> Option<Self> {
+        Self::from_points(points).map(|c| c.with_smooth(true))
+    }
+
+    #[must_use]
+    pub fn with_smooth(mut self, smooth: bool) -> Self {
+        self.smooth = smooth;
+        self
+    }
+
+    pub const fn is_smooth(&self) -> bool {
+        self.smooth
+    }
+
+    pub fn points(&self) -> &[(f32, f32)] {
+        &self.points
+    }
+
+    /// Natural-spline second derivatives at each point. All zero for a linear
+    /// curve, which makes the spline formula reduce to straight segments.
+    pub fn second_derivatives(&self) -> Vec<f32> {
+        let pts = &self.points;
+        let n = pts.len();
+        let mut d2 = vec![0.0; n];
+        if !self.smooth || n < 3 {
+            return d2;
+        }
+        let mut u = vec![0.0; n];
+        for i in 1..n - 1 {
+            let span = (pts[i + 1].0 - pts[i - 1].0).max(f32::EPSILON);
+            let sig = (pts[i].0 - pts[i - 1].0) / span;
+            let p = sig.mul_add(d2[i - 1], 2.0);
+            d2[i] = (sig - 1.0) / p;
+            let right = (pts[i + 1].1 - pts[i].1) / (pts[i + 1].0 - pts[i].0).max(f32::EPSILON);
+            let left = (pts[i].1 - pts[i - 1].1) / (pts[i].0 - pts[i - 1].0).max(f32::EPSILON);
+            u[i] = (6.0 * (right - left) / span - sig * u[i - 1]) / p;
+        }
+        for k in (0..n - 1).rev() {
+            d2[k] = d2[k].mul_add(d2[k + 1], u[k]);
+        }
+        d2
     }
 
     /// Build from an arbitrary point list. Returns `None` if the
@@ -166,11 +215,17 @@ impl Curve {
                 return None;
             }
         }
-        Some(Self { points })
+        Some(Self {
+            points,
+            smooth: false,
+        })
     }
 
     pub fn sample(&self, x: f32) -> f32 {
         let x = x.clamp(0.0, 1.0);
+        if self.smooth {
+            return sample_spline(&self.points, &self.second_derivatives(), x);
+        }
         let pts = &self.points;
         if x <= pts[0].0 {
             return pts[0].1;
@@ -195,6 +250,24 @@ impl Default for Curve {
     fn default() -> Self {
         Self::linear()
     }
+}
+
+/// Evaluate the spline given by `points` and their `d2`, clamped like
+/// `KisCubicCurve::value`.
+fn sample_spline(points: &[(f32, f32)], d2: &[f32], x: f32) -> f32 {
+    let n = points.len();
+    let x = x.clamp(points[0].0, points[n - 1].0);
+    let k = points
+        .partition_point(|p| p.0 <= x)
+        .saturating_sub(1)
+        .min(n - 2);
+    let (x0, y0) = points[k];
+    let (x1, y1) = points[k + 1];
+    let h = (x1 - x0).max(f32::EPSILON);
+    let a = (x1 - x) / h;
+    let b = (x - x0) / h;
+    let cubic = (a * a).mul_add(a, -a) * d2[k] + (b * b).mul_add(b, -b) * d2[k + 1];
+    (cubic * h * h).mul_add(1.0 / 6.0, a.mul_add(y0, b * y1)).clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -264,12 +337,17 @@ pub struct Dynamics {
     /// Smudge family: paint-color mix rate, `0..=1`.
     #[serde(default)]
     pub color_rate: Option<Mapping>,
+    /// Per-dab opacity, `0..=1` (Krita's Opacity option). The ceiling a wash
+    /// stroke builds toward; other paint modes multiply it into coverage.
+    #[serde(default)]
+    pub opacity: Option<Mapping>,
 }
 
 impl Dynamics {
     pub const fn any_active(&self) -> bool {
         self.size.is_some()
             || self.flow.is_some()
+            || self.opacity.is_some()
             || self.rotation.is_some()
             || self.scatter.is_some()
             || self.spacing.is_some()
@@ -297,6 +375,9 @@ pub fn evaluate(
     }
     if let Some(m) = &dynamics.flow {
         dab.flow = m.apply(input).clamp(0.0, 1.0);
+    }
+    if let Some(m) = &dynamics.opacity {
+        dab.opacity = m.apply(input).clamp(0.0, 1.0);
     }
     if let Some(m) = &dynamics.rotation {
         dab.rotation += m.apply(input);
@@ -361,6 +442,24 @@ mod tests {
         let c = Curve::from_points(vec![(0.0, 0.0), (0.5, 0.2), (1.0, 1.0)]).unwrap();
         assert!((c.sample(0.25) - 0.1).abs() < 1e-6);
         assert!((c.sample(0.75) - 0.6).abs() < 1e-6);
+    }
+
+    /// Reference values from Krita's own `KisCubicSpline` formulation (the
+    /// 4n x 4n system), for the Airbrush Soft softness and opacity curves.
+    #[test]
+    fn smooth_curves_match_krita_spline() {
+        let soft =
+            Curve::smooth_from_points(vec![(0.0, 0.399_11), (0.429_719, 0.118_523), (1.0, 0.0)])
+                .unwrap();
+        for (x, want) in [(0.0, 0.399_11), (0.1, 0.324_769), (0.25, 0.220_054), (0.5, 0.089_238), (0.75, 0.026_325), (0.9, 0.008_481), (1.0, 0.0)] {
+            assert!((soft.sample(x) - want).abs() < 1e-5, "soft({x}) = {}", soft.sample(x));
+        }
+        let opacity =
+            Curve::smooth_from_points(vec![(0.0, 0.0), (0.675_298, 0.578_529), (0.859_438, 1.0)])
+                .unwrap();
+        for (x, want) in [(0.1, 0.030_638), (0.25, 0.092_79), (0.5, 0.301_251), (0.75, 0.738_652), (0.9, 1.0), (1.0, 1.0)] {
+            assert!((opacity.sample(x) - want).abs() < 1e-5, "opacity({x}) = {}", opacity.sample(x));
+        }
     }
 
     #[test]

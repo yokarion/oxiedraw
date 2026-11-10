@@ -9,6 +9,17 @@ layout(location = 4) in float v_hardness;
 
 layout(location = 0) out vec4 out_color;
 
+layout(set = 0, binding = 0) uniform Falloff {
+    vec4 lut[256];
+} u_falloff;
+
+layout(push_constant) uniform Push {
+    vec2 inv_size;
+    uint slice;
+    uint tip_slice;
+    uint falloff;
+} push;
+
 // Round dab coverage, ported from Krita's KisCircleMaskGenerator::valueAt.
 // `hardness` is Krita's fade: solid core of radius fade*R, then a falloff
 // linear in squared distance to the edge; +1px per axis is the edge AA.
@@ -28,8 +39,34 @@ float round_coverage(vec2 local, float radius, float hardness) {
     return 1.0 - n * (nf - 1.0) / max(nf - n, 1e-6);
 }
 
+float falloff_at(float x) {
+    float p = clamp(x, 0.0, 1.0) * 1023.0;
+    int i = min(int(p), 1022);
+    float a = u_falloff.lut[i >> 2][i & 3];
+    float b = u_falloff.lut[(i + 1) >> 2][(i + 1) & 3];
+    return mix(a, b, p - float(i));
+}
+
+// Krita's KisCurveCircleMaskGenerator: the curve of squared distance, read
+// through its table of round(diameter * 4) + 2 samples, no edge AA.
+float curve_coverage(vec2 local, float radius) {
+    float r = max(radius, 1e-4);
+    float d = dot(local, local) / (r * r);
+    if (d > 1.0) {
+        return 0.0;
+    }
+    float res = floor(8.0 * r + 0.5);
+    float pos = d * res;
+    float i = floor(pos);
+    float a = falloff_at(i / (res + 1.0));
+    float b = falloff_at((i + 1.0) / (res + 1.0));
+    return clamp(mix(a, b, pos - i), 0.0, 1.0);
+}
+
 void main() {
-    float coverage = round_coverage(v_local, v_radius, v_hardness);
+    float coverage = push.falloff == 1u
+        ? curve_coverage(v_local, v_radius)
+        : round_coverage(v_local, v_radius, v_hardness);
     // R8_UNORM stroke buffer keeps only the R channel. Coverage * flow goes
     // there; combined across overlapping dabs by the MAX blend op so
     // the mask saturates instead of accumulating.

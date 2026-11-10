@@ -2,13 +2,13 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::dynamics::Dynamics;
-use super::super::preset::{TexturingMode, TipShape};
+use super::super::dynamics::{Curve, Dynamics};
+use super::super::preset::{DEFAULT_AIRBRUSH_RATE, PaintMode, TexturingMode, TipShape};
 
-/// Bumped to 3 when the image-tip family (stamped tip + separate grain) and
-/// `texturing_mode` landed. New fields are `#[serde(default)]`, so the loader
-/// still accepts older archives - see `load::load`.
-pub const SCHEMA_VERSION: u32 = 3;
+/// Bumped to 4 for `paint_mode`, `softness_curve` and the airbrush. New
+/// fields are `#[serde(default)]`, so the loader still accepts older
+/// archives - see `load::load`.
+pub const SCHEMA_VERSION: u32 = 4;
 pub(super) const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Manifest discriminator distinguishing brushes from other future TAR
 /// archive types so the loader can reject the wrong file early.
@@ -18,7 +18,7 @@ pub(super) const KIND: &str = "brush";
 /// whenever a builtin factory changes in a way that should reach existing
 /// installs (tuned spacing, new grain, etc.) without a schema change.
 /// `seed_missing` re-writes any builtin whose on-disk revision is older.
-pub const BUILTIN_REVISION: u32 = 11;
+pub const BUILTIN_REVISION: u32 = 13;
 
 /// `manifest.json` - fast metadata read for the brush picker so we can
 /// list brushes without fully deserialising `brush.json`.
@@ -63,8 +63,18 @@ pub struct BrushDocument {
     pub stabilizer: f32,
     #[serde(default)]
     pub speed_smoothing: f32,
+    /// Pre-schema-4 build-up flag; still written so older builds keep it.
     #[serde(default)]
     pub buildup: bool,
+    /// Wins over `buildup` when present.
+    #[serde(default)]
+    pub paint_mode: Option<PaintMode>,
+    #[serde(default)]
+    pub softness_curve: Option<Curve>,
+    #[serde(default)]
+    pub airbrush: bool,
+    #[serde(default = "default_airbrush_rate")]
+    pub airbrush_rate: f32,
     /// Edge falloff. Defaults to `1.0` (crisp) so pre-schema-2 archives
     /// keep their original hard edge.
     #[serde(default = "default_hardness")]
@@ -83,6 +93,10 @@ pub struct BrushDocument {
 
 fn default_hardness() -> f32 {
     1.0
+}
+
+const fn default_airbrush_rate() -> f32 {
+    DEFAULT_AIRBRUSH_RATE
 }
 
 /// Decoded archive contents. Patterns are RGBA8 (premultiplied) with

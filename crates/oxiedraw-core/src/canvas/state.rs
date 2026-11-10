@@ -2,7 +2,7 @@ use oxiedraw_utils::frame_profile::{self, Stage};
 use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
 use oxiedraw_utils::pixels::{crop_bgra8, transform_bgra8};
 
-use crate::brush_engine::{Dab, PaintTarget};
+use crate::brush_engine::{Curve, Dab, PaintMode, PaintTarget};
 use crate::color::Color;
 use crate::curves::Histogram;
 use crate::document::{
@@ -218,8 +218,7 @@ impl Canvas {
         self.renderer.set_alpha_lock(locked);
 
         self.renderer.set_stroke_erase(erase);
-        // Default to MAX-blend; a build-up brush opts in via
-        // `set_stroke_buildup(true)` right after this call.
+        // The paint mode and falloff persist until `set_stroke_style`.
         // Default to the mask path; a smudge brush opts in via
         // `set_smudge_stroke(true)` right after this call.
         self.is_smudge_stroke = false;
@@ -240,12 +239,17 @@ impl Canvas {
         Ok(())
     }
 
-    /// Opt the in-flight stroke into build-up (accumulating OVER-blend in
-    /// the stroke buffer). Call right after `begin_stroke`. The stroke then
-    /// builds up where it overlaps itself and caps at the stroke opacity on
-    /// the single commit composite - no per-event flushing needed.
-    pub fn set_stroke_buildup(&mut self, buildup: bool) {
-        self.renderer.set_stroke_buildup(buildup);
+    /// How the stroke's dabs combine in the stroke buffer, and the soft-round
+    /// falloff curve (`None` = shape by hardness). Call around `begin_stroke`;
+    /// both last until the next call. Whatever the mode, the stroke lands on
+    /// the layer in one composite at the stroke opacity.
+    pub fn set_stroke_style(
+        &mut self,
+        mode: PaintMode,
+        falloff: Option<&Curve>,
+    ) -> Result<(), RendererError> {
+        self.renderer.set_stroke_mode(mode);
+        self.renderer.set_stroke_falloff(falloff)
     }
 
     /// Opt the in-flight stroke into the color-smudge path. Call right after
@@ -2616,11 +2620,12 @@ impl Canvas {
             return Ok(());
         }
         self.renderer.clear_stroke()?;
-        // The dab pass picks its blend from the stroke's build-up flag, which
+        // The dab pass picks its blend and falloff from the stroke style, which
         // only a paint stroke ever sets. Left alone, the mask brush would
         // inherit whichever preset was painted with last: an OVER-blending
         // preset saturates one pass' coverage and the strength slider dies.
-        self.renderer.set_stroke_buildup(false);
+        self.renderer.set_stroke_mode(PaintMode::Normal);
+        self.renderer.set_stroke_falloff(None)?;
         let instances: Vec<DabInstance> = dabs.iter().map(DabInstance::from_dab).collect();
         self.renderer.stamp_mask(DabFamily::SoftRound, &instances)?;
         self.renderer.apply_mask_brush(mode, radius)?;
@@ -2966,15 +2971,17 @@ mod tests {
 
     /// A `BrushEngine` at `size` with crisp-edged presets.
     ///
-    /// Default Round is an airbrush (`hardness: 0.02`), so its strokes peak
-    /// around 0.93 between dab centres and never saturate. The tests below are
-    /// about compositing rather than falloff, so they pin the edge instead of
-    /// tracking whatever the default preset is tuned to.
+    /// The default preset is Krita's Airbrush Soft, whose strokes never
+    /// saturate. The tests below are about compositing rather than falloff, so
+    /// they pin a plain crisp edge instead of tracking the default preset.
     #[cfg(feature = "gpu-tests")]
     fn crisp_brush(size: f32) -> BrushEngine {
         let brush = BrushEngine::new();
         for preset in brush.brushes.borrow_mut().iter_mut() {
             preset.hardness = 1.0;
+            preset.softness_curve = None;
+            preset.paint_mode = crate::brush_engine::PaintMode::Normal;
+            preset.airbrush = false;
         }
         brush.size.set(size);
         brush.opacity.set(1.0);

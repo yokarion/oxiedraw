@@ -54,9 +54,17 @@ impl MaskPipeline {
     pub(super) fn new_round(
         device: &Device,
         render_pass: vk::RenderPass,
+        falloff_set_layout: vk::DescriptorSetLayout,
         blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
-        Self::build(device, render_pass, &[], DAB_VERT_SPV, MASK_FRAG_SPV, blend)
+        Self::build(
+            device,
+            render_pass,
+            &[falloff_set_layout],
+            DAB_VERT_SPV,
+            MASK_FRAG_SPV,
+            blend,
+        )
     }
 
     /// Pixel-art coverage mask (hard edge, integer-snapped centre).
@@ -136,8 +144,9 @@ impl MaskPipelineSet {
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
+        falloff_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RendererError> {
-        Self::with_blend(device, render_pass, atlas_set_layout, max_blend())
+        Self::with_blend(device, render_pass, atlas_set_layout, falloff_set_layout, max_blend())
     }
 
     /// The build-up mask set: OVER-blend coverage so overlapping dabs
@@ -146,17 +155,19 @@ impl MaskPipelineSet {
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
+        falloff_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RendererError> {
-        Self::with_blend(device, render_pass, atlas_set_layout, over_blend())
+        Self::with_blend(device, render_pass, atlas_set_layout, falloff_set_layout, over_blend())
     }
 
     fn with_blend(
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
+        falloff_set_layout: vk::DescriptorSetLayout,
         blend: vk::PipelineColorBlendAttachmentState,
     ) -> Result<Self, RendererError> {
-        let round = MaskPipeline::new_round(device, render_pass, blend)?;
+        let round = MaskPipeline::new_round(device, render_pass, falloff_set_layout, blend)?;
         let pixel = MaskPipeline::new_pixel(device, render_pass, blend)?;
         let textured = MaskPipeline::new_textured(device, render_pass, atlas_set_layout, blend)?;
         // Index order must match `DabFamily::kind_index`.
@@ -190,8 +201,9 @@ impl DabPipelineSet {
         device: &Device,
         render_pass: vk::RenderPass,
         atlas_set_layout: vk::DescriptorSetLayout,
+        falloff_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RendererError> {
-        let round = dab::DabPipeline::new_round(device, render_pass)?;
+        let round = dab::DabPipeline::new_round(device, render_pass, falloff_set_layout)?;
         let pixel = dab::DabPipeline::new_pixel(device, render_pass)?;
         let textured = dab::DabPipeline::new_textured(device, render_pass, atlas_set_layout)?;
         Ok(Self {

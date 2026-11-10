@@ -6,10 +6,33 @@ use crate::color::Color;
 
 use super::dynamics::{Dynamics, evaluate, make_spawn_input};
 use super::{
-    BrushFamily, BrushPreset, Dab, InputSample, PaintTarget, StrokeContext, StrokeRenderer,
+    BrushFamily, BrushPreset, Dab, InputSample, PaintMode, PaintTarget, StrokeContext,
+    StrokeRenderer,
 };
 
 const MIN_DAB_RADIUS: f32 = 0.5;
+
+/// Krita's floor on the airbrush interval (`MIN_TIMED_INTERVAL`).
+const MIN_TIMED_INTERVAL_MS: f32 = 0.5;
+
+/// Segment end with slack for summed fractions, so a dab due right at the end
+/// isn't lost to rounding.
+const SEGMENT_END: f32 = 1.0 + 1e-5;
+
+/// Milliseconds between airbrush dabs at `rate` dabs per second.
+pub(super) fn airbrush_interval_ms(rate: f32) -> f32 {
+    (1000.0 / rate.max(f32::EPSILON)).max(MIN_TIMED_INTERVAL_MS)
+}
+
+/// Krita's `KisPainter::blendAverageOpacity`: jump up to a higher opacity at
+/// once, ease down toward a lower one.
+fn blend_average_opacity(opacity: f32, average: f32) -> f32 {
+    if average < opacity {
+        opacity
+    } else {
+        0.1f32.mul_add(opacity, 0.9 * average)
+    }
+}
 
 /// Sample interval the preset EMA factors are tuned against. Motion event
 /// rate swings with hardware (GDK coalesces motion to the frame clock when
@@ -30,7 +53,7 @@ fn rate_adjusted_retention(retention: f32, dt_ms: f32) -> f32 {
 /// entry point for starting a stroke; replaces the per-brush
 /// `start_stroke` method.
 pub fn start_stroke(preset: &BrushPreset, ctx: StrokeContext) -> Box<dyn StrokeRenderer> {
-    Box::new(PresetStrokeRenderer::new(
+    let mut renderer = PresetStrokeRenderer::new(
         ctx,
         preset.family.clone(),
         preset.spacing_ratio,
@@ -38,7 +61,11 @@ pub fn start_stroke(preset: &BrushPreset, ctx: StrokeContext) -> Box<dyn StrokeR
         preset.speed_smoothing,
         preset.dynamics.clone(),
         DabStyle::from_preset(preset),
-    ))
+    );
+    renderer.airbrush_interval_ms = preset
+        .airbrush
+        .then(|| airbrush_interval_ms(preset.airbrush_rate));
+    Box::new(renderer)
 }
 
 /// Per-stroke tip + grain settings copied onto every dab so the GPU
@@ -51,6 +78,7 @@ pub(super) struct DabStyle {
     texture_scale: f32,
     texture_strength: f32,
     texturing_mode: f32,
+    wash: bool,
 }
 
 impl DabStyle {
@@ -61,6 +89,9 @@ impl DabStyle {
             texture_scale: preset.texture_scale,
             texture_strength: preset.texture_strength,
             texturing_mode: preset.texturing_mode.as_gpu(),
+            // The renderer washes only the soft-round tip; others fall back.
+            wash: preset.paint_mode == PaintMode::Wash
+                && matches!(preset.family, BrushFamily::SoftRound),
         }
     }
 
@@ -95,6 +126,10 @@ pub(super) struct PresetStrokeRenderer {
     /// motion event - a slow drag with spacing=1.0 still waits until
     /// the cursor has moved one full diameter before stamping again.
     dist_since_last_dab: f32,
+    /// Airbrush counterpart of `dist_since_last_dab`, in milliseconds.
+    time_since_last_dab: f32,
+    airbrush_interval_ms: Option<f32>,
+    average_opacity: f32,
     /// EMA-smoothed speed. Negative = uninitialized (first segment seeds it).
     smoothed_speed: f32,
     rng_state: u32,
@@ -131,6 +166,9 @@ impl PresetStrokeRenderer {
             dabs: Vec::new(),
             total_distance: 0.0,
             dist_since_last_dab: 0.0,
+            time_since_last_dab: 0.0,
+            airbrush_interval_ms: None,
+            average_opacity: 0.0,
             smoothed_speed: -1.0,
             rng_state,
         }
@@ -199,35 +237,34 @@ impl PresetStrokeRenderer {
         // Pixel family deliberately skips dynamics - the curves don't
         // line up with the integer grid. Empty `Dynamics` also skips
         // for the cheap path.
-        if matches!(self.family, BrushFamily::Pixel) || !self.dynamics.any_active() {
-            // Preserve a sensible minimum so a soft-round at pressure
-            // zero still renders something visible. Pixel family doesn't
-            // use dynamics at all, so no minimum is enforced - radius
-            // can drop to zero at pressure zero only if the legacy
-            // dab_radius logic was driving it (which is no longer the
-            // case for Pixel: it just uses ctx.size * 0.5).
-            return dab;
+        if !matches!(self.family, BrushFamily::Pixel) && self.dynamics.any_active() {
+            let (random, scatter_x, scatter_y) = self.next_random_triple();
+            let input = make_spawn_input(
+                pressure,
+                segment_speed_px_ms,
+                segment_direction_rad,
+                self.total_distance,
+                self.ctx.size,
+                random,
+                pen_rotation_rad,
+                tilt_x,
+                tilt_y,
+            );
+            evaluate(
+                &self.dynamics,
+                &input,
+                self.ctx.size,
+                (scatter_x, scatter_y),
+                &mut dab,
+            );
+            dab.radius = dab.radius.max(MIN_DAB_RADIUS);
         }
-        let (random, scatter_x, scatter_y) = self.next_random_triple();
-        let input = make_spawn_input(
-            pressure,
-            segment_speed_px_ms,
-            segment_direction_rad,
-            self.total_distance,
-            self.ctx.size,
-            random,
-            pen_rotation_rad,
-            tilt_x,
-            tilt_y,
-        );
-        evaluate(
-            &self.dynamics,
-            &input,
-            self.ctx.size,
-            (scatter_x, scatter_y),
-            &mut dab,
-        );
-        dab.radius = dab.radius.max(MIN_DAB_RADIUS);
+        if self.style.wash {
+            self.average_opacity = blend_average_opacity(dab.opacity, self.average_opacity);
+            dab.average_opacity = self.average_opacity;
+        } else {
+            fold_opacity_into_flow(&mut dab);
+        }
         dab
     }
 
@@ -275,14 +312,30 @@ impl PresetStrokeRenderer {
 
         self.dabs.clear();
 
-        // Walk along this segment, emitting a dab every `step` units.
-        // `dist_since_last_dab` carries the leftover sub-step distance
-        // from the previous segment so spacing is enforced across motion
-        // events, not within them.
-        let mut s = step - self.dist_since_last_dab;
-        while s <= chord {
-            let t = s / chord;
-            let pos = catmull_rom(p0.position, p1.position, p2.position, p3.position, t);
+        // Walk along this segment. Like Krita's `KisDistanceInformation`, a
+        // dab fires at whichever comes first - `step` of travel or, for an
+        // airbrush, the timing interval - and both counters restart there.
+        // The leftovers carry into the next segment.
+        let interval = self.airbrush_interval_ms.filter(|_| dt_ms > f32::EPSILON);
+        let mut t_prev = 0.0f32;
+        loop {
+            let by_distance = (chord > f32::EPSILON)
+                .then(|| t_prev + (step - self.dist_since_last_dab) / chord)
+                .filter(|&t| t <= SEGMENT_END);
+            let by_time = interval
+                .map(|ms| t_prev + (ms - self.time_since_last_dab) / dt_ms)
+                .filter(|&t| t <= SEGMENT_END);
+            let t = match (by_distance, by_time) {
+                (Some(d), Some(tm)) => d.min(tm),
+                (Some(t), None) | (None, Some(t)) => t,
+                (None, None) => break,
+            };
+            // A held-still pen has no spline to follow; stay on the point.
+            let pos = if chord > f32::EPSILON {
+                catmull_rom(p0.position, p1.position, p2.position, p3.position, t)
+            } else {
+                p1.position
+            };
             let pressure = (p2.pressure - p1.pressure).mul_add(t, p1.pressure);
             let dab = self.emit_dab(
                 pos,
@@ -294,13 +347,13 @@ impl PresetStrokeRenderer {
                 p2.tilt_y,
             );
             self.dabs.push(dab);
-            self.total_distance += step;
-            s += step;
+            self.total_distance += chord.mul_add(t - t_prev, self.dist_since_last_dab);
+            self.dist_since_last_dab = 0.0;
+            self.time_since_last_dab = 0.0;
+            t_prev = t;
         }
-        // `s - step` is the offset of the last fired dab (or `step -
-        // prev_dist_since_last_dab` if none fired). What's left over
-        // between that point and the segment end carries into the next.
-        self.dist_since_last_dab = chord - (s - step);
+        self.dist_since_last_dab += chord * (1.0 - t_prev).max(0.0);
+        self.time_since_last_dab += dt_ms * (1.0 - t_prev).max(0.0);
 
         if !self.dabs.is_empty() {
             target.paint_segment_dabs(&self.dabs, p1.time_ms, p2.time_ms);
@@ -559,9 +612,20 @@ fn emit_segment_dabs_preview(
             evaluate(&renderer.dynamics, &input, base_size, (rand, rand), &mut dab);
             dab.radius = dab.radius.max(MIN_DAB_RADIUS);
         }
+        if renderer.style.wash {
+            dab.average_opacity = blend_average_opacity(dab.opacity, renderer.average_opacity);
+        } else {
+            fold_opacity_into_flow(&mut dab);
+        }
         out.push(dab);
         s += step;
     }
+}
+
+/// Without a wash ceiling, opacity is just more coverage attenuation.
+fn fold_opacity_into_flow(dab: &mut Dab) {
+    dab.flow *= dab.opacity;
+    dab.opacity = 1.0;
 }
 
 fn u32_to_unit(x: u32) -> f32 {
@@ -598,4 +662,101 @@ fn catmull_rom(p0: Point, p1: Point, p2: Point, p3: Point, t: f32) -> Point {
         + (2.0 * p0.y - 5.0 * p1.y + 4.0 * p2.y - p3.y) * t2
         + (-p0.y + 3.0 * p1.y - 3.0 * p2.y + p3.y) * t3;
     Point::new(0.5 * cx, 0.5 * cy)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brush_engine::BrushPresetId;
+
+    #[derive(Default)]
+    struct Recorder {
+        dabs: Vec<Dab>,
+    }
+
+    impl PaintTarget for Recorder {
+        fn set_family(&mut self, _family: &BrushFamily) {}
+        fn paint_dabs(&mut self, dabs: &[Dab]) {
+            self.dabs.extend_from_slice(dabs);
+        }
+    }
+
+    fn sample(x: f32, time_ms: u64, pressure: f32) -> InputSample {
+        InputSample {
+            position: Point::new(x, 50.0),
+            pressure,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+            rotation: 0.0,
+            time_ms,
+        }
+    }
+
+    fn stroke(preset: &BrushPreset, samples: &[InputSample]) -> Vec<Dab> {
+        let ctx = StrokeContext {
+            preset: BrushPresetId(0),
+            color: Color::BLACK,
+            size: 40.0,
+            opacity: 1.0,
+        };
+        let mut renderer = start_stroke(preset, ctx);
+        let mut target = Recorder::default();
+        for &s in samples {
+            renderer.push(s, &mut target);
+        }
+        renderer.end(&mut target);
+        target.dabs
+    }
+
+    fn airbrushing() -> BrushPreset {
+        let mut preset = BrushPreset::airbrush_soft(BrushPresetId(0));
+        preset.airbrush = true;
+        preset.airbrush_rate = 1000.0;
+        preset
+    }
+
+    #[test]
+    fn airbrush_keeps_spraying_on_a_resting_pen() {
+        let dabs = stroke(&airbrushing(), &[sample(50.0, 0, 1.0), sample(50.0, 10, 1.0)]);
+        // The pen-down dab plus one per millisecond at 1000 dabs a second.
+        assert_eq!(dabs.len(), 11);
+        assert!(dabs.iter().all(|d| (d.center.x - 50.0).abs() < 1e-4));
+    }
+
+    #[test]
+    fn without_airbrush_a_resting_pen_lays_nothing_more() {
+        let preset = BrushPreset::airbrush_soft(BrushPresetId(0));
+        let dabs = stroke(&preset, &[sample(50.0, 0, 1.0), sample(50.0, 10, 1.0)]);
+        assert_eq!(dabs.len(), 1);
+    }
+
+    #[test]
+    fn airbrush_fires_on_time_before_the_spacing_distance() {
+        // 4 px in 10 ms: spacing (0.1 x 40 px) allows one dab, time ten.
+        let dabs = stroke(&airbrushing(), &[sample(50.0, 0, 1.0), sample(54.0, 10, 1.0)]);
+        assert_eq!(dabs.len(), 11);
+    }
+
+    #[test]
+    fn wash_dabs_ease_their_average_opacity_down() {
+        let dabs = stroke(&airbrushing(), &[sample(50.0, 0, 1.0), sample(50.0, 3, 0.5)]);
+        let first = dabs[0];
+        assert!((first.opacity - 1.0).abs() < 1e-6);
+        assert!((first.average_opacity - 1.0).abs() < 1e-6);
+        // Lighter pressure lowers the dab opacity at once, its average slowly.
+        let last = dabs[dabs.len() - 1];
+        assert!(last.opacity < 0.7);
+        assert!(last.average_opacity > 0.8);
+        assert!(last.average_opacity < first.average_opacity);
+    }
+
+    #[test]
+    fn without_wash_opacity_scales_flow() {
+        let mut preset = BrushPreset::airbrush_soft(BrushPresetId(0));
+        preset.paint_mode = PaintMode::Normal;
+        let dabs = stroke(&preset, &[sample(50.0, 0, 0.5)]);
+        let want = preset.dynamics.opacity.as_ref().map_or(1.0, |m| m.curve.sample(0.5));
+        assert!((dabs[0].flow - want).abs() < 1e-6);
+        assert!((dabs[0].opacity - 1.0).abs() < 1e-6);
+    }
 }

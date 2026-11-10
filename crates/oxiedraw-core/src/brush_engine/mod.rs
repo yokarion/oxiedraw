@@ -15,9 +15,12 @@ pub use cursor::{BrushCursor, compute_brush_cursor};
 pub use dynamics::{Curve, DynSource, Dynamics, Mapping, SpawnInput, evaluate, make_spawn_input};
 pub use input::InputSample;
 pub use pattern::PatternData;
-pub use preset::{BrushFamily, BrushPreset, TexturingMode, TipShape};
+pub use preset::{
+    BrushFamily, BrushPreset, DEFAULT_AIRBRUSH_RATE, PaintMode, TexturingMode, TipShape,
+};
 pub use registry::BrushRegistry;
 pub use stamp::start_stroke;
+use stamp::airbrush_interval_ms;
 
 use std::cell::{Cell, RefCell};
 use std::fmt;
@@ -98,7 +101,7 @@ impl BrushEngine {
         // Built-in factories; `add_brush` reassigns the id from the counter
         // so the literal `BrushPresetId(0)` passed here is just a placeholder.
         let placeholder = BrushPresetId(0);
-        let default_id = engine.add_brush(BrushPreset::default_round(placeholder));
+        let default_id = engine.add_brush(BrushPreset::airbrush_soft(placeholder));
         engine.add_brush(BrushPreset::ink_pen(placeholder));
         engine.add_brush(BrushPreset::pixel(placeholder));
         engine.add_brush(BrushPreset::scatter_dot(placeholder));
@@ -398,10 +401,18 @@ impl BrushEngine {
         f(preset)
     }
 
-    /// Whether the active brush accumulates coverage on overlap.
+    /// Whether the active brush's look depends on how dabs pile up over time
+    /// (build-up, wash, airbrush), which replaying a corrected path would lose.
     #[must_use]
-    pub fn active_buildup(&self) -> bool {
-        self.with_active_brush(|p| p.buildup)
+    pub fn active_accumulates(&self) -> bool {
+        self.with_active_brush(|p| p.paint_mode != PaintMode::Normal || p.airbrush)
+    }
+
+    /// Milliseconds between airbrush dabs for the active brush, `None` when it
+    /// doesn't airbrush. Krita clamps the interval to at least 0.5 ms.
+    #[must_use]
+    pub fn active_airbrush_interval_ms(&self) -> Option<f32> {
+        self.with_active_brush(|p| p.airbrush.then(|| airbrush_interval_ms(p.airbrush_rate)))
     }
 
     pub fn begin_stroke(&self, sample: InputSample, color: Color, target: &mut dyn PaintTarget) {

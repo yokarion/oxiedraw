@@ -24,7 +24,10 @@ use super::vulkan::RING_FRAMES;
 /// - `texture_scale`   64   f32 (global grain tile size in canvas px)
 /// - `texture_strength` 68  f32 (grain modulation 0..=1)
 /// - `texturing_mode`  72   f32 (0 multiply, 1 subtract)
-/// Total stride = 76, all components 4-byte aligned.
+/// - `opacity`         76   f32 (wash ceiling)
+/// - `average_opacity` 80   f32 (Krita's running average of `opacity`)
+/// Total stride = 84, all components 4-byte aligned. `wash.frag` reads the
+/// same layout as a float array, so keep the two in step.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct DabInstance {
@@ -40,13 +43,15 @@ pub struct DabInstance {
     pub texture_scale: f32,
     pub texture_strength: f32,
     pub texturing_mode: f32,
+    pub opacity: f32,
+    pub average_opacity: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<DabInstance>() == DAB_INSTANCE_STRIDE as usize);
 
-pub(super) const DAB_INSTANCE_STRIDE: u32 = 76;
+pub(super) const DAB_INSTANCE_STRIDE: u32 = 84;
 
-/// Maximum dabs uploadable in a single call. ~4.7 MB at 72 bytes each.
+/// Maximum dabs uploadable in a single call. ~5.5 MB at 84 bytes each.
 pub(super) const MAX_INSTANCES: u32 = 64 * 1024;
 
 const QUAD_VERTS: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
@@ -107,15 +112,17 @@ impl DabFamily {
     }
 }
 
-/// `vec2 inv_size + uint slice (grain) + uint tip_slice`, 16 bytes. Shared
-/// across every dab/mask pipeline so the renderer can push uniformly; the
-/// soft-round / pixel shaders only read the first 12 bytes.
+/// `vec2 inv_size + uint slice (grain) + uint tip_slice + uint falloff`,
+/// 20 bytes. Shared across every dab/mask pipeline so the renderer can push
+/// uniformly; each shader declares only the members it reads. `falloff` is 1
+/// when the soft-round tip follows the softness curve instead of `hardness`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub(super) struct DabPushConstants {
     pub inv_size: [f32; 2],
     pub slice: u32,
     pub tip_slice: u32,
+    pub falloff: u32,
 }
 
 impl Default for DabPushConstants {
@@ -124,12 +131,13 @@ impl Default for DabPushConstants {
             inv_size: [0.0, 0.0],
             slice: 0,
             tip_slice: NO_SLICE,
+            falloff: 0,
         }
     }
 }
 
 impl DabPushConstants {
-    pub(super) const SIZE: u32 = 16;
+    pub(super) const SIZE: u32 = 20;
 
     pub(super) const fn as_bytes(&self) -> &[u8] {
         // SAFETY: `repr(C)` POD with only f32/u32 fields.
@@ -162,6 +170,8 @@ impl DabInstance {
             texture_scale: dab.texture_scale,
             texture_strength: dab.texture_strength,
             texturing_mode: dab.texturing_mode,
+            opacity: dab.opacity,
+            average_opacity: dab.average_opacity,
         }
     }
 }
@@ -219,11 +229,12 @@ impl DabPipeline {
     pub(super) fn new_round(
         device: &Device,
         render_pass: vk::RenderPass,
+        falloff_set_layout: vk::DescriptorSetLayout,
     ) -> Result<Self, RendererError> {
         Self::build(
             device,
             render_pass,
-            &[],
+            &[falloff_set_layout],
             DAB_VERT_SPV,
             DAB_FRAG_SPV,
             premultiplied_over_blend(),
@@ -516,7 +527,7 @@ fn create_instance_buffer(
         allocator,
         "dab-instances",
         size,
-        vk::BufferUsageFlags::VERTEX_BUFFER,
+        vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::STORAGE_BUFFER,
         MemoryLocation::CpuToGpu,
     )
 }

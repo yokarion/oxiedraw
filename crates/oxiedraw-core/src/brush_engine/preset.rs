@@ -50,13 +50,39 @@ impl TexturingMode {
     }
 }
 
+/// How a stroke's dabs combine in the stroke buffer before the single
+/// composite onto the layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum PaintMode {
+    /// Overlapping dabs keep the highest coverage.
+    #[default]
+    Normal,
+    /// Overlapping dabs stack (OVER) toward full coverage.
+    BuildUp,
+    /// Krita's wash mode: dabs alpha-darken toward their opacity, so a
+    /// stroke builds up to the pen's opacity and never past it.
+    Wash,
+}
+
+impl crate::enum_meta::EnumMeta for PaintMode {
+    const ALL: &'static [Self] = &[Self::Normal, Self::BuildUp, Self::Wash];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Normal => "Normal",
+            Self::BuildUp => "Build up",
+            Self::Wash => "Wash",
+        }
+    }
+}
+
 // Built-in brush icons live in `data/icons/builtin-brush-icons/` at the
 // repo root. `include_bytes!` compiles them straight into the binary so
 // `seed_missing` can write them into each `.oxiebrush` archive on first
 // launch - no asset loading at runtime.
-const ICON_DEFAULT_ROUND: &[u8] = include_bytes!(concat!(
+const ICON_AIRBRUSH_SOFT: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/../../data/icons/builtin-brush-icons/default_brush.png"
+    "/../../data/icons/builtin-brush-icons/airbrush_soft.png"
 ));
 const ICON_INK_PEN: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -188,15 +214,19 @@ pub struct BrushPreset {
     /// EMA smoothing for the speed signal. `0.0` = baseline anti-jitter
     /// only; `1.0` = very heavy smoothing for calligraphic effects.
     pub speed_smoothing: f32,
-    /// Build-up (airbrush) mode. When true, every motion-event stamp is
-    /// composited into the active layer immediately so dragging back
-    /// over the same spot during a single stroke accumulates opacity
-    /// instead of saturating at the brush's MAX-blended dab.
-    pub buildup: bool,
+    /// How the stroke's dabs combine before the stroke lands on the layer.
+    pub paint_mode: PaintMode,
     /// Edge falloff, `0..=1`. `1.0` gives a crisp anti-aliased edge;
     /// lower values fade from nearer the centre for a soft/airbrush look.
     /// Applies to the soft-round tip and the procedural textured tip.
     pub hardness: f32,
+    /// Krita's "soft" auto-brush: coverage is this curve of the squared
+    /// distance from the dab centre. Replaces `hardness` on the soft-round tip.
+    pub softness_curve: Option<Curve>,
+    /// Krita's airbrush: keep laying dabs over time, `airbrush_rate` per
+    /// second, even while the pen holds still.
+    pub airbrush: bool,
+    pub airbrush_rate: f32,
     /// Footprint shape for the textured family. Ignored otherwise.
     pub tip: TipShape,
     /// Global grain tile size in canvas pixels. The textured shader
@@ -227,39 +257,57 @@ pub struct BrushPreset {
     pub source_path: Option<PathBuf>,
 }
 
+/// Krita's default when a preset doesn't store an airbrush rate.
+pub const DEFAULT_AIRBRUSH_RATE: f32 = 20.0;
+
 impl BrushPreset {
-    /// Default round brush, matching Krita's default paintbrush
-    /// (`b) Basic-2 Opacity`): a circle mask with fade 0.5 (solid core, soft
-    /// edge), tight 0.1 spacing, pressure driving both size and opacity.
-    pub fn default_round(id: BrushPresetId) -> Self {
+    /// Krita's `b) Airbrush Soft`: a 600 px "soft" auto-brush whose curve
+    /// peaks at 40% coverage, spacing 0.1, wash mode, and pressure driving
+    /// only opacity. The preset's legacy `AirbrushOption/*` keys are not read
+    /// by Krita 5, so it paints with the airbrush off.
+    pub fn airbrush_soft(id: BrushPresetId) -> Self {
+        let softness = Curve::smooth_from_points(vec![
+            (0.0, 0.399_11),
+            (0.429_719, 0.118_523),
+            (1.0, 0.0),
+        ])
+        .expect("softness curve valid");
+        let opacity = Curve::smooth_from_points(vec![
+            (0.0, 0.0),
+            (0.675_298, 0.578_529),
+            (0.859_438, 1.0),
+        ])
+        .expect("opacity curve valid");
         Self {
             id,
-            name: "Default Round".into(),
+            name: "Airbrush Soft".into(),
             family: BrushFamily::SoftRound,
-            default_size: 80.0,
+            default_size: 600.0,
             default_opacity: 1.0,
-            // Krita's default auto-brush spacing.
             spacing_ratio: 0.1,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
-            // Krita fade 0.5: a defined solid core with a soft falloff, not
-            // the old near-centre airbrush fade.
-            hardness: 0.5,
+            paint_mode: PaintMode::Wash,
+            hardness: 1.0,
+            softness_curve: Some(softness),
+            // Fix: Krita 5 ignores this preset's airbrush keys; spraying at
+            // 1000 dabs/s piled even the faint edge up to the opacity ceiling.
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             tip: TipShape::Round,
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
-            // Pressure drives both size AND opacity (Krita PressureSize +
-            // PressureOpacity, linear curves). Tying flow to pressure also
-            // stops low-pressure (small) dabs from punching full-opacity
-            // specks through the softer larger dabs via the MAX blend.
             dynamics: Dynamics {
-                size: Some(Mapping::pressure_linear()),
-                flow: Some(Mapping::pressure_linear()),
+                opacity: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: opacity,
+                    range: (0.0, 1.0),
+                    invert: false,
+                }),
                 ..Dynamics::default()
             },
-            icon: Some(ICON_DEFAULT_ROUND.to_vec()),
+            icon: Some(ICON_AIRBRUSH_SOFT.to_vec()),
             preview: None,
             source_path: None,
         }
@@ -276,7 +324,10 @@ impl BrushPreset {
             spacing_ratio: 0.05,
             stabilizer: 0.65,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             // Crisp edge - the ink pen stays sharp.
             hardness: 1.0,
             tip: TipShape::Round,
@@ -305,7 +356,10 @@ impl BrushPreset {
             spacing_ratio: 0.5,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: TipShape::Round,
             texture_scale: 0.0,
@@ -331,7 +385,10 @@ impl BrushPreset {
             spacing_ratio: 0.6,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: TipShape::Round,
             texture_scale: 0.0,
@@ -378,7 +435,10 @@ impl BrushPreset {
             spacing_ratio: 0.06,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             // Tip mask comes from the image, so procedural hardness/tip are
             // unused; keep neutral values.
             hardness: 1.0,
@@ -422,7 +482,10 @@ impl BrushPreset {
             spacing_ratio: 0.1,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             // Fairly crisp tip so the paper tooth reads as distinct grains
             // (soft touch) and a dry, textured edge (firm) rather than a fuzzy
             // grey band. The texture supplies the break-up, not the tip.
@@ -507,7 +570,10 @@ impl BrushPreset {
             spacing_ratio: 0.08,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             hardness: 0.6,
             tip: TipShape::Round,
             texture_scale: 160.0,
@@ -546,7 +612,10 @@ impl BrushPreset {
             spacing_ratio: 0.07,
             stabilizer: 0.2,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             // Krita mask fade 0.5.
             hardness: 0.5,
             tip: TipShape::Round,
@@ -586,7 +655,10 @@ impl BrushPreset {
             spacing_ratio: 0.0,
             stabilizer: 0.0,
             speed_smoothing: 0.5,
-            buildup: false,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: TipShape::Round,
             texture_scale: 0.0,

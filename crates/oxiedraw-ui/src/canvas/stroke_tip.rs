@@ -64,6 +64,11 @@ impl DeferredDabs {
         self.now_ms = event_ms;
     }
 
+    /// Now, on the event clock, once a sample has been seen.
+    pub(super) fn now_event_ms(&self) -> Option<f64> {
+        self.clock.now_event_ms()
+    }
+
     pub(super) fn take_due(&mut self) -> Vec<DueRun> {
         let now = self.clock.now_event_ms();
         now.map_or_else(Vec::new, |now| self.take_until(now))

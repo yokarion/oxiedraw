@@ -5,7 +5,7 @@ use std::rc::Rc;
 use tar::{Builder, Header};
 
 use super::super::pattern::PatternData;
-use super::super::preset::{BrushFamily, BrushPreset};
+use super::super::preset::{BrushFamily, BrushPreset, PaintMode};
 use super::error::BrushError;
 use super::types::{
     APP_VERSION, BUILTIN_REVISION, BrushDocument, BrushManifest, FamilyDoc, KIND, SCHEMA_VERSION,
@@ -58,7 +58,11 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
         spacing_ratio: preset.spacing_ratio,
         stabilizer: preset.stabilizer,
         speed_smoothing: preset.speed_smoothing,
-        buildup: preset.buildup,
+        buildup: preset.paint_mode == PaintMode::BuildUp,
+        paint_mode: Some(preset.paint_mode),
+        softness_curve: preset.softness_curve.clone(),
+        airbrush: preset.airbrush,
+        airbrush_rate: preset.airbrush_rate,
         hardness: preset.hardness,
         tip: preset.tip,
         texture_scale: preset.texture_scale,

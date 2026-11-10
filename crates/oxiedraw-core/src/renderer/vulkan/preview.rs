@@ -55,6 +55,12 @@ impl VulkanRenderer {
         opacity: f32,
         visibilities: &[bool],
     ) -> Result<(), RendererError> {
+        let wash = self.washes(family);
+        // Before the upload: building the pass submits, which moves the ring
+        // slot the dabs must land in.
+        if wash {
+            self.ensure_wash_pass()?;
+        }
         let n = if instances.is_empty() {
             0
         } else {
@@ -81,7 +87,11 @@ impl VulkanRenderer {
             this.cmd_frame_timing_begin();
             if n > 0 {
                 // Stamp the dab mask into the stroke buffer.
-                this.cmd_dab_pass(family, pipeline, layout, stroke_rp, stroke_fb, n);
+                if wash {
+                    this.cmd_wash_pass(instances);
+                } else {
+                    this.cmd_dab_pass(family, pipeline, layout, stroke_rp, stroke_fb, n);
+                }
                 // Make the mask writes visible to the preview composite's
                 // sampler reads (RADV drops this silently otherwise).
                 this.barrier(

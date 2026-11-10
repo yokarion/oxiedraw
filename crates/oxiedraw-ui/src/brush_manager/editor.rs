@@ -15,13 +15,17 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use oxiedraw_core::brush_engine::{
-    BrushEngine, BrushFamily, BrushPreset, BrushPresetId, BrushRegistry, Curve, DynSource,
-    Dynamics, Mapping, PatternData, format, preview_renderer,
+    BrushEngine, BrushFamily, BrushPreset, BrushPresetId, BrushRegistry, Curve,
+    DEFAULT_AIRBRUSH_RATE, DynSource, Dynamics, Mapping, PaintMode, PatternData, format,
+    preview_renderer,
 };
+use oxiedraw_core::curves;
+use oxiedraw_core::enum_meta::EnumMeta;
 use relm4::gtk;
 use relm4::gtk::glib;
 
 use crate::brush_picker::shared as picker;
+use crate::widgets::curve_editor::CurveEditor;
 
 use super::preview;
 
@@ -151,7 +155,7 @@ pub(super) fn build(
     pattern_row.set_visible(false);
     props_group.add(&pattern_row);
 
-    let (size_row, size_scale) = build_scale_row("Default size", 1.0, 200.0, 0.5);
+    let (size_row, size_scale) = build_scale_row("Default size", 1.0, 1000.0, 0.5);
     props_group.add(&size_row);
     let (opacity_row, opacity_scale) = build_scale_row("Default opacity", 0.0, 1.0, 0.01);
     props_group.add(&opacity_row);
@@ -166,6 +170,20 @@ pub(super) fn build(
     let (hardness_row, hardness_scale) = build_scale_row("Hardness", 0.0, 1.0, 0.01);
     hardness_row.set_subtitle("Edge softness - 1.0 crisp, low is a soft airbrush edge");
     props_group.add(&hardness_row);
+    // Soft round only: Krita's soft tip, which replaces hardness when on.
+    let softness_row = adw::ExpanderRow::builder()
+        .title("Softness curve")
+        .subtitle("Coverage from the centre (left) to the edge (right), replaces hardness")
+        .show_enable_switch(true)
+        .enable_expansion(false)
+        .build();
+    let softness_editor = CurveEditor::new();
+    softness_editor.widget.set_margin_top(8);
+    softness_editor.widget.set_margin_bottom(8);
+    softness_editor.widget.set_margin_start(12);
+    softness_editor.widget.set_margin_end(12);
+    softness_row.add_row(&softness_editor.widget);
+    props_group.add(&softness_row);
     // Textured-only: size of the global canvas-anchored pattern (px per
     // tile) and how strongly it gates coverage. Hidden for other families.
     let (pattern_size_row, pattern_size_scale) =
@@ -177,10 +195,25 @@ pub(super) fn build(
         build_scale_row("Pattern strength", 0.0, 1.0, 0.01);
     pattern_strength_row.set_visible(false);
     props_group.add(&pattern_strength_row);
-    let buildup_row = adw::SwitchRow::new();
-    buildup_row.set_title("Build up opacity");
-    buildup_row.set_subtitle("Paint over the same spot during one drag to stack opacity");
-    props_group.add(&buildup_row);
+    let paint_mode_row = adw::ActionRow::builder()
+        .title("Paint mode")
+        .subtitle("Build up stacks overlaps, wash builds up to the dab opacity (soft round only)")
+        .build();
+    let paint_mode_dropdown = gtk::DropDown::from_strings(&PaintMode::labels());
+    paint_mode_dropdown.set_valign(gtk::Align::Center);
+    paint_mode_row.add_suffix(&paint_mode_dropdown);
+    props_group.add(&paint_mode_row);
+    let airbrush_row = adw::ExpanderRow::builder()
+        .title("Airbrush")
+        .subtitle("Keep spraying while the pen holds still")
+        .show_enable_switch(true)
+        .enable_expansion(false)
+        .build();
+    let (airbrush_rate_row, airbrush_rate_scale) = build_scale_row("Rate", 1.0, 1000.0, 1.0);
+    airbrush_rate_row.set_subtitle("Dabs per second");
+    airbrush_rate_scale.set_digits(0);
+    airbrush_row.add_row(&airbrush_rate_row);
+    props_group.add(&airbrush_row);
     body.append(&props_group);
 
     // -- Name entry -> brush.name + shared selected_name ------------------
@@ -371,23 +404,63 @@ pub(super) fn build(
         &mark_dirty,
         |b, v| b.texture_strength = v as f32,
     );
-    {
+    wire_scale_to_field(
+        &airbrush_rate_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+        |b, v| b.airbrush_rate = v as f32,
+    );
+    let edit_brush = {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
         let mark_dirty = mark_dirty.clone();
-        buildup_row.connect_active_notify(move |r| {
+        Rc::new(move |apply: &dyn Fn(&mut BrushPreset)| {
             if loading.get() {
                 return;
             }
             let Some(id) = selected_id.get() else { return };
-            let v = r.is_active();
-            let mut brushes = brush_engine.brushes.borrow_mut();
-            if let Some(brush) = brushes.iter_mut().find(|p| p.id == id) {
-                brush.buildup = v;
+            if let Some(brush) = brush_engine.brushes.borrow_mut().iter_mut().find(|p| p.id == id) {
+                apply(brush);
             }
-            drop(brushes);
             mark_dirty();
+        })
+    };
+    {
+        let edit_brush = edit_brush.clone();
+        paint_mode_dropdown.connect_selected_notify(move |d| {
+            let mode = PaintMode::from_index(d.selected());
+            edit_brush(&|b| b.paint_mode = mode);
+        });
+    }
+    {
+        let edit_brush = edit_brush.clone();
+        airbrush_row.connect_enable_expansion_notify(move |row| {
+            let on = row.enables_expansion();
+            edit_brush(&|b| b.airbrush = on);
+        });
+    }
+    {
+        let edit_brush = edit_brush.clone();
+        let editor = softness_editor.clone();
+        let hardness_row = hardness_row.clone();
+        softness_row.connect_enable_expansion_notify(move |row| {
+            let on = row.enables_expansion();
+            hardness_row.set_sensitive(!on);
+            let curve = on.then(default_softness_curve);
+            if let Some(c) = &curve {
+                editor.set_curve(to_editor_curve(c));
+            }
+            edit_brush(&|b| b.softness_curve.clone_from(&curve));
+        });
+    }
+    {
+        let edit_brush = edit_brush.clone();
+        softness_editor.connect_changed(move |curve| {
+            let curve = from_editor_curve(&curve);
+            edit_brush(&|b| b.softness_curve = Some(curve.clone()));
         });
     }
 
@@ -413,6 +486,16 @@ pub(super) fn build(
         &mark_dirty,
     );
     dyn_group.add(&flow_dyn.row);
+    let opacity_dyn = build_dynamics_row(
+        "Opacity",
+        "Per-dab opacity, the ceiling a wash stroke builds up to",
+        DynamicsField::Opacity,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+    );
+    dyn_group.add(&opacity_dyn.row);
     let rotation_dyn = build_dynamics_row(
         "Rotation",
         "Additive rotation, degrees",
@@ -466,11 +549,13 @@ pub(super) fn build(
     // Smudge rows follow the family dropdown, including while a brush loads.
     {
         let smudge_rows = [smudge_rate_dyn.row.clone(), color_rate_dyn.row.clone()];
+        let softness_row = softness_row.clone();
         let sync = move |d: &gtk::DropDown| {
             let smudge = d.selected() == family_to_dropdown_index(&BrushFamily::Smudge);
             for row in &smudge_rows {
                 row.set_visible(smudge);
             }
+            softness_row.set_visible(d.selected() == family_to_dropdown_index(&BrushFamily::SoftRound));
         };
         sync(&family_dropdown);
         family_dropdown.connect_selected_notify(sync);
@@ -519,7 +604,13 @@ pub(super) fn build(
         let pattern_strength_row = pattern_strength_row.clone();
         let pattern_size_scale = pattern_size_scale.clone();
         let pattern_strength_scale = pattern_strength_scale.clone();
-        let buildup_row = buildup_row.clone();
+        let paint_mode_dropdown = paint_mode_dropdown.clone();
+        let softness_row = softness_row.clone();
+        let softness_editor = softness_editor.clone();
+        let hardness_row = hardness_row.clone();
+        let airbrush_row = airbrush_row.clone();
+        let airbrush_rate_scale = airbrush_rate_scale.clone();
+        let opacity_dyn = opacity_dyn.clone();
         let delete_btn = delete_btn.clone();
         let choose_btn = choose_btn.clone();
         let set_preview = set_preview.clone();
@@ -556,9 +647,12 @@ pub(super) fn build(
             hardness_scale.set_sensitive(enabled);
             pattern_size_scale.set_sensitive(enabled);
             pattern_strength_scale.set_sensitive(enabled);
-            buildup_row.set_sensitive(enabled);
+            paint_mode_dropdown.set_sensitive(enabled);
+            softness_row.set_sensitive(enabled);
+            airbrush_row.set_sensitive(enabled);
             size_dyn.row.set_sensitive(enabled);
             flow_dyn.row.set_sensitive(enabled);
+            opacity_dyn.row.set_sensitive(enabled);
             rotation_dyn.row.set_sensitive(enabled);
             scatter_dyn.row.set_sensitive(enabled);
             spacing_dyn.row.set_sensitive(enabled);
@@ -584,9 +678,17 @@ pub(super) fn build(
                 hardness_scale.set_value(f64::from(p.hardness));
                 pattern_size_scale.set_value(f64::from(p.texture_scale.max(16.0)));
                 pattern_strength_scale.set_value(f64::from(p.texture_strength));
-                buildup_row.set_active(p.buildup);
+                paint_mode_dropdown.set_selected(p.paint_mode.to_index());
+                softness_row.set_enable_expansion(p.softness_curve.is_some());
+                hardness_row.set_sensitive(p.softness_curve.is_none());
+                if let Some(c) = &p.softness_curve {
+                    softness_editor.set_curve(to_editor_curve(c));
+                }
+                airbrush_row.set_enable_expansion(p.airbrush);
+                airbrush_rate_scale.set_value(f64::from(p.airbrush_rate));
                 size_dyn.apply(p.dynamics.size.as_ref());
                 flow_dyn.apply(p.dynamics.flow.as_ref());
+                opacity_dyn.apply(p.dynamics.opacity.as_ref());
                 rotation_dyn.apply(p.dynamics.rotation.as_ref());
                 scatter_dyn.apply(p.dynamics.scatter.as_ref());
                 spacing_dyn.apply(p.dynamics.spacing.as_ref());
@@ -609,9 +711,14 @@ pub(super) fn build(
                 hardness_scale.set_value(1.0);
                 pattern_size_scale.set_value(200.0);
                 pattern_strength_scale.set_value(0.0);
-                buildup_row.set_active(false);
+                paint_mode_dropdown.set_selected(0);
+                softness_row.set_enable_expansion(false);
+                hardness_row.set_sensitive(true);
+                airbrush_row.set_enable_expansion(false);
+                airbrush_rate_scale.set_value(f64::from(DEFAULT_AIRBRUSH_RATE));
                 size_dyn.apply(None);
                 flow_dyn.apply(None);
+                opacity_dyn.apply(None);
                 rotation_dyn.apply(None);
                 scatter_dyn.apply(None);
                 spacing_dyn.apply(None);
@@ -678,16 +785,36 @@ pub(super) fn build(
         &hardness_scale,
         &pattern_size_scale,
         &pattern_strength_scale,
-        &size_dyn,
-        &flow_dyn,
-        &rotation_dyn,
-        &scatter_dyn,
-        &spacing_dyn,
-        &smudge_rate_dyn,
-        &color_rate_dyn,
+        &airbrush_rate_scale,
+        &[
+            &size_dyn,
+            &flow_dyn,
+            &opacity_dyn,
+            &rotation_dyn,
+            &scatter_dyn,
+            &spacing_dyn,
+            &smudge_rate_dyn,
+            &color_rate_dyn,
+        ],
         &loading,
         &live_preview,
     );
+    {
+        let live = live_preview.clone();
+        let loading = loading.clone();
+        let refresh = Rc::new(move || {
+            if !loading.get() {
+                live();
+            }
+        });
+        let r = refresh.clone();
+        paint_mode_dropdown.connect_selected_notify(move |_| r());
+        let r = refresh.clone();
+        airbrush_row.connect_enable_expansion_notify(move |_| r());
+        let r = refresh.clone();
+        softness_row.connect_enable_expansion_notify(move |_| r());
+        softness_editor.connect_changed(move |_| refresh());
+    }
 
     // -- Save: persist in-memory edits to disk ---------------------------
     let do_save: Rc<dyn Fn()> = {
@@ -817,6 +944,34 @@ fn ensure_discard_css() {
             );
         }
     });
+}
+
+/// Seed for a freshly enabled softness curve: full coverage at the centre
+/// fading straight to nothing at the edge.
+fn default_softness_curve() -> Curve {
+    Curve::smooth_from_points(vec![(0.0, 1.0), (1.0, 0.0)]).unwrap_or_default()
+}
+
+/// The curve widget works on 8-bit points; brush curves keep exact values
+/// until the user drags a point.
+fn to_editor_curve(curve: &Curve) -> curves::Curve {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let to_u8 = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let points: Vec<_> = curve
+        .points()
+        .iter()
+        .map(|&(x, y)| curves::CurvePoint::new(to_u8(x), to_u8(y)))
+        .collect();
+    curves::Curve::from_points(&points)
+}
+
+fn from_editor_curve(curve: &curves::Curve) -> Curve {
+    let points = curve
+        .points()
+        .iter()
+        .map(|p| (f32::from(p.x) / 255.0, f32::from(p.y) / 255.0))
+        .collect();
+    Curve::smooth_from_points(points).unwrap_or_else(default_softness_curve)
 }
 
 fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
@@ -968,6 +1123,7 @@ fn wire_scale_to_field(
 enum DynamicsField {
     Size,
     Flow,
+    Opacity,
     Rotation,
     Scatter,
     Spacing,
@@ -980,6 +1136,7 @@ impl DynamicsField {
         match self {
             Self::Size => &mut dynamics.size,
             Self::Flow => &mut dynamics.flow,
+            Self::Opacity => &mut dynamics.opacity,
             Self::Rotation => &mut dynamics.rotation,
             Self::Scatter => &mut dynamics.scatter,
             Self::Spacing => &mut dynamics.spacing,
@@ -991,7 +1148,7 @@ impl DynamicsField {
     /// Sensible "create when toggled on" default for each field.
     fn default_mapping(self, brush: &BrushPreset) -> Mapping {
         match self {
-            Self::Size => Mapping::pressure_linear(),
+            Self::Size | Self::Opacity => Mapping::pressure_linear(),
             Self::Flow => Mapping {
                 source: DynSource::Pressure,
                 curve: Curve::linear(),
@@ -1306,13 +1463,8 @@ fn install_live_preview(
     hardness_scale: &gtk::Scale,
     pattern_size_scale: &gtk::Scale,
     pattern_strength_scale: &gtk::Scale,
-    size_dyn: &DynamicsRowHandles,
-    flow_dyn: &DynamicsRowHandles,
-    rotation_dyn: &DynamicsRowHandles,
-    scatter_dyn: &DynamicsRowHandles,
-    spacing_dyn: &DynamicsRowHandles,
-    smudge_rate_dyn: &DynamicsRowHandles,
-    color_rate_dyn: &DynamicsRowHandles,
+    airbrush_rate_scale: &gtk::Scale,
+    dynamics_rows: &[&DynamicsRowHandles],
     loading: &Rc<Cell<bool>>,
     live_preview: &Rc<dyn Fn()>,
 ) {
@@ -1333,16 +1485,9 @@ fn install_live_preview(
     attach_scale(hardness_scale);
     attach_scale(pattern_size_scale);
     attach_scale(pattern_strength_scale);
+    attach_scale(airbrush_rate_scale);
 
-    for handles in [
-        size_dyn,
-        flow_dyn,
-        rotation_dyn,
-        scatter_dyn,
-        spacing_dyn,
-        smudge_rate_dyn,
-        color_rate_dyn,
-    ] {
+    for handles in dynamics_rows {
         let l = loading.clone();
         let live = live_preview.clone();
         handles.row.connect_enable_expansion_notify(move |_| {

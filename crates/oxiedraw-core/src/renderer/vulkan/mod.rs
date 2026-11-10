@@ -29,6 +29,7 @@ mod shape_ops;
 mod stroke;
 mod transform_ops;
 mod transform_preview;
+mod wash_ops;
 
 pub use gradient_ops::GradientKind;
 pub use selection_ops::MaskBrushMode;
@@ -52,7 +53,9 @@ use super::dab::DabBuffers;
 use super::device;
 use super::dmabuf::{DISPLAY_FORMAT, DmabufImage};
 use super::erase::ErasePreview;
+use super::falloff::FalloffLut;
 use super::present_convert::PresentConvertPipeline;
+use crate::brush_engine::PaintMode;
 use adjust_ops::{GroupAccumulator, MaskEditPreview};
 use super::fill_overlay::FillOverlayResources;
 use super::filters::FilterResources;
@@ -257,11 +260,15 @@ pub struct VulkanRenderer {
     pub(super) mask_pipelines: ManuallyDrop<MaskPipelineSet>,
     /// Build-up variant: OVER-blend coverage so a build-up stroke
     /// accumulates in the stroke buffer and caps at the stroke opacity on
-    /// the single final composite. Selected when `stroke_buildup` is set.
+    /// the single final composite. Selected in `PaintMode::BuildUp`.
     pub(super) mask_pipelines_buildup: ManuallyDrop<MaskPipelineSet>,
-    /// Whether the in-flight stroke uses build-up (OVER) mask blending.
-    /// Set at stroke start; defaults to false (MAX blend).
-    pub(super) stroke_buildup: bool,
+    /// How the in-flight stroke's dabs combine. Set at stroke start.
+    pub(super) stroke_mode: PaintMode,
+    /// Whether soft-round dabs follow `falloff_lut` instead of `hardness`.
+    pub(super) stroke_falloff: bool,
+    pub(super) falloff_lut: ManuallyDrop<FalloffLut>,
+    /// Built on the first wash stroke.
+    pub(super) wash_pass: Option<wash_ops::WashPass>,
     /// Cache mapping pattern data identity (raw `*const PatternData`)
     /// to its atlas slot. Lets `upload_pattern` no-op on re-uploads of
     /// the same `Rc<PatternData>`.
@@ -535,20 +542,24 @@ impl VulkanRenderer {
         )?;
         let dab_buffers = DabBuffers::new(&dev.device, &mut allocator)?;
         let pattern_atlas = PatternAtlas::new(&dev.device, &mut allocator)?;
+        let falloff_lut = FalloffLut::new(&dev.device, &mut allocator)?;
         let dab_pipelines = DabPipelineSet::new(
             &dev.device,
             canvas_target.render_pass,
             pattern_atlas.descriptor_set_layout(),
+            falloff_lut.set_layout(),
         )?;
         let mask_pipelines = MaskPipelineSet::new(
             &dev.device,
             stroke_target.render_pass,
             pattern_atlas.descriptor_set_layout(),
+            falloff_lut.set_layout(),
         )?;
         let mask_pipelines_buildup = MaskPipelineSet::new_buildup(
             &dev.device,
             stroke_target.render_pass,
             pattern_atlas.descriptor_set_layout(),
+            falloff_lut.set_layout(),
         )?;
         let selection = SelectionResources::new(&dev.device, &mut allocator, extent, stroke.view)?;
         let fill_overlay = FillOverlayResources::new(
@@ -697,7 +708,10 @@ impl VulkanRenderer {
             dab_pipelines: ManuallyDrop::new(dab_pipelines),
             mask_pipelines: ManuallyDrop::new(mask_pipelines),
             mask_pipelines_buildup: ManuallyDrop::new(mask_pipelines_buildup),
-            stroke_buildup: false,
+            stroke_mode: PaintMode::Normal,
+            stroke_falloff: false,
+            falloff_lut: ManuallyDrop::new(falloff_lut),
+            wash_pass: None,
             pattern_cache: std::collections::HashMap::new(),
             composite_pipeline: ManuallyDrop::new(composite_pipeline),
             layer_composite_pipeline: ManuallyDrop::new(layer_composite_pipeline),
@@ -1481,6 +1495,9 @@ impl Drop for VulkanRenderer {
             if let Some(smudge) = self.smudge_pipeline.take() {
                 smudge.destroy(&self.device);
             }
+            if let Some(wash) = self.wash_pass.take() {
+                wash.destroy(&self.device, &mut self.allocator);
+            }
             if let Some(overlay) = self.pattern_overlay.take() {
                 overlay.destroy(&self.device, &mut self.allocator);
             }
@@ -1503,6 +1520,7 @@ impl Drop for VulkanRenderer {
             ManuallyDrop::take(&mut self.mask_pipelines).destroy(&self.device);
             ManuallyDrop::take(&mut self.mask_pipelines_buildup).destroy(&self.device);
             ManuallyDrop::take(&mut self.dab_pipelines).destroy(&self.device);
+            ManuallyDrop::take(&mut self.falloff_lut).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.pattern_atlas).destroy(&self.device, &mut self.allocator);
             ManuallyDrop::take(&mut self.dab_buffers).destroy(&self.device, &mut self.allocator);
             for fb in self.display_framebuffers.drain(..) {
@@ -1640,6 +1658,8 @@ mod tests {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: 0.0,
+            opacity: 1.0,
+            average_opacity: 1.0,
         }
     }
 

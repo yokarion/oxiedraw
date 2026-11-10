@@ -39,7 +39,10 @@ mod tests {
             spacing_ratio: 0.4,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: super::super::preset::PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: super::super::preset::DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: super::super::preset::TipShape::Round,
             texture_scale: 0.0,
@@ -100,7 +103,10 @@ mod tests {
             spacing_ratio: 0.1,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: super::super::preset::PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: super::super::preset::DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: super::super::preset::TipShape::Round,
             texture_scale: 0.0,
@@ -153,7 +159,10 @@ mod tests {
             spacing_ratio: 0.06,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: super::super::preset::PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: super::super::preset::DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: super::super::preset::TipShape::Round,
             texture_scale: 512.0,
@@ -197,6 +206,55 @@ mod tests {
         // constant (its dynamic was removed to stop the deposit pulsing).
         assert!(restored.dynamics.color_rate.is_some());
         assert!(restored.dynamics.size.is_some());
+    }
+
+    #[test]
+    fn round_trip_airbrush_soft_keeps_wash_curve_and_airbrush() {
+        let mut preset = BrushPreset::airbrush_soft(BrushPresetId(0));
+        preset.airbrush = true;
+        preset.airbrush_rate = 1000.0;
+        let path = temp_path("airbrush");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(5), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(restored.paint_mode, super::super::preset::PaintMode::Wash);
+        assert_eq!(restored.softness_curve, preset.softness_curve);
+        assert!(restored.softness_curve.as_ref().is_some_and(Curve::is_smooth));
+        assert!(restored.airbrush);
+        assert!((restored.airbrush_rate - 1000.0).abs() < 1e-3);
+        let opacity = restored.dynamics.opacity.expect("opacity dynamic");
+        assert!(opacity.curve.is_smooth());
+        assert_eq!(opacity.curve, preset.dynamics.opacity.expect("source opacity").curve);
+    }
+
+    /// Archives written before schema 4 only carry the build-up flag.
+    #[test]
+    fn legacy_buildup_flag_maps_to_build_up_mode() {
+        let doc: super::BrushDocument = serde_json::from_str(
+            r#"{"family":"SoftRound","default_size":10.0,"default_opacity":1.0,
+                "spacing_ratio":0.1,"stabilizer":0.0,"buildup":true,"dynamics":{}}"#,
+        )
+        .expect("parse");
+        let pkg = super::BrushPackage {
+            manifest: super::BrushManifest {
+                schema_version: 3,
+                app_version: String::new(),
+                kind: "brush".into(),
+                name: "Old".into(),
+                builtin_revision: 0,
+            },
+            document: doc,
+            patterns: std::collections::HashMap::new(),
+            icon: None,
+            preview: None,
+        };
+        let preset = pkg.into_preset(BrushPresetId(1), None).expect("into_preset");
+        assert_eq!(preset.paint_mode, super::super::preset::PaintMode::BuildUp);
+        assert!(!preset.airbrush);
+        assert!(preset.softness_curve.is_none());
+        assert!((preset.airbrush_rate - super::super::preset::DEFAULT_AIRBRUSH_RATE).abs() < 1e-6);
     }
 
     #[test]

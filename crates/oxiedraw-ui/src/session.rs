@@ -119,7 +119,7 @@ impl GlobalState {
                     .as_deref()
                     .and_then(|name| brushes.iter().find(|p| p.name == name))
                     .or_else(|| brushes.iter().find(|p| p.name == "Ink Pen"))
-                    .or_else(|| brushes.iter().find(|p| p.name == "Default Round"))
+                    .or_else(|| brushes.iter().find(|p| p.name == "Airbrush Soft"))
                     .or_else(|| brushes.first());
                 if let Some(preset) = target {
                     brush_engine.set_active(preset.id);

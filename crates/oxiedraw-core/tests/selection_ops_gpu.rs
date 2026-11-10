@@ -10,7 +10,7 @@
 
 #![allow(clippy::unwrap_used)]
 
-use oxiedraw_core::brush_engine::Dab;
+use oxiedraw_core::brush_engine::{Dab, PaintMode};
 use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::renderer::MaskBrushMode;
 use oxiedraw_core::selection::{
@@ -335,7 +335,8 @@ fn mask_brush_ignores_the_last_paint_preset() {
     let coverage_after = |buildup: bool| {
         let mut canvas = Canvas::headless(SIZE).unwrap();
         // Stand in for a paint stroke with a build-up preset.
-        canvas.set_stroke_buildup(buildup);
+        let mode = if buildup { PaintMode::BuildUp } else { PaintMode::Normal };
+        canvas.set_stroke_style(mode, None).unwrap();
         canvas.begin_mask_brush().unwrap();
         canvas
             .stamp_mask_brush(&dabs, MaskBrushMode::Add, 5.0)

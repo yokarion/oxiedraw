@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use super::super::brush::BrushPresetId;
 use super::super::pattern::PatternData;
-use super::super::preset::{BrushFamily, BrushPreset};
+use super::super::preset::{BrushFamily, BrushPreset, PaintMode};
 use super::error::BrushError;
 use super::types::{
     BrushDocument, BrushManifest, BrushPackage, FamilyDoc, KIND, SCHEMA_VERSION,
@@ -128,7 +128,14 @@ impl BrushPackage {
             spacing_ratio: self.document.spacing_ratio,
             stabilizer: self.document.stabilizer,
             speed_smoothing: self.document.speed_smoothing,
-            buildup: self.document.buildup,
+            paint_mode: self.document.paint_mode.unwrap_or(if self.document.buildup {
+                PaintMode::BuildUp
+            } else {
+                PaintMode::Normal
+            }),
+            softness_curve: self.document.softness_curve,
+            airbrush: self.document.airbrush,
+            airbrush_rate: self.document.airbrush_rate,
             hardness: self.document.hardness,
             tip: self.document.tip,
             texture_scale: self.document.texture_scale,

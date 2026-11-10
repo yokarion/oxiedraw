@@ -1,5 +1,5 @@
 //! GPU smoke tests for the built-in brushes' rendering paths (Krita-accurate
-//! Default Round + the Chalk image-tip/texture path).
+//! Airbrush Soft + the Chalk image-tip/texture path).
 
 #![allow(clippy::unwrap_used)]
 // Diagnostic prints for the --nocapture runs of these GPU tests.
@@ -50,7 +50,10 @@ fn paint_pressure(name: &str, size: Size, pressure: f32) -> (Vec<u8>, usize) {
 
     let white = Color::new(255, 255, 255);
     canvas.begin_stroke(white, 1.0, false).unwrap();
-    canvas.set_stroke_buildup(brush.active_brush().buildup);
+    let preset = brush.active_brush();
+    canvas
+        .set_stroke_style(preset.paint_mode, preset.softness_curve.as_ref())
+        .unwrap();
     let y = (size.height / 2) as f32;
     canvas
         .stamp(|t| brush.begin_stroke(sample_p(24.0, y, 0, pressure), white, t))
@@ -92,18 +95,153 @@ fn covered_pixels(buf: &[u8]) -> usize {
     buf.chunks_exact(4).filter(|px| px[3] > 20).count()
 }
 
+const SPOT: Size = Size::new(64, 64);
+/// Centre of pixel (32, 32), so the dab's squared distance there is zero.
+const CENTRE: f32 = 32.5;
+
+/// Hold Airbrush Soft still on `SPOT` for `hold_ms` with its airbrush switched
+/// on, painting or erasing the active layer; returns the layer's alpha.
+fn airbrush_spot(pressure: f32, hold_ms: u64, erase: bool) -> Vec<u8> {
+    let mut canvas = Canvas::headless(SPOT).unwrap();
+    let idx = canvas.add_layer("l").unwrap();
+    canvas.layers().set_active(Some(idx));
+    if erase {
+        canvas.clear([1.0, 1.0, 1.0, 1.0]).unwrap();
+    }
+    let brush = BrushEngine::new();
+    select(&brush, "Airbrush Soft");
+    for p in brush.brushes.borrow_mut().iter_mut() {
+        p.airbrush = true;
+        p.airbrush_rate = 1000.0;
+    }
+    brush.size.set(40.0);
+    let preset = brush.active_brush();
+    let white = Color::new(255, 255, 255);
+    canvas.begin_stroke(white, 1.0, erase).unwrap();
+    canvas
+        .set_stroke_style(preset.paint_mode, preset.softness_curve.as_ref())
+        .unwrap();
+    canvas
+        .stamp(|t| brush.begin_stroke(sample_p(CENTRE, CENTRE, 0, pressure), white, t))
+        .unwrap();
+    if hold_ms > 0 {
+        canvas
+            .stamp(|t| brush.push_sample(sample_p(CENTRE, CENTRE, hold_ms, pressure), t))
+            .unwrap();
+    }
+    canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+    canvas.commit_stroke().unwrap();
+    let mut buf = Vec::new();
+    canvas
+        .read_layer_region_into(idx, 0, 0, SPOT.width, SPOT.height, &mut buf)
+        .unwrap();
+    buf.chunks_exact(4).map(|px| px[3]).collect()
+}
+
+fn alpha_at(alpha: &[u8], x: usize, y: usize) -> u8 {
+    alpha[y * SPOT.width as usize + x]
+}
+
+/// One dab, worked through Krita's 8-bit maths by hand: the soft curve starts
+/// at 0.39911 -> 102, opacity(1.0) = 255, and alpha-darken from empty gives
+/// lerp(0, 255, 102) = 102. At pressure 0.5 the opacity curve gives
+/// 0.301251 -> 77 and lerp(0, 77, 102) = 31.
 #[test]
-fn default_round_deposits_a_solid_stroke() {
+fn airbrush_soft_dab_matches_krita_alpha() {
+    assert_eq!(alpha_at(&airbrush_spot(1.0, 0, false), 32, 32), 102);
+    assert_eq!(alpha_at(&airbrush_spot(0.5, 0, false), 32, 32), 31);
+}
+
+/// Krita's wash: held still, the airbrush keeps spraying, and the coverage
+/// builds up to the pen's opacity and stops there. Krita's 8-bit lerp rounds
+/// the last step away (lerp(76, 77, 102) == 76), so the centre settles one
+/// below the ceiling.
+#[test]
+fn airbrush_soft_builds_up_to_the_pressure_ceiling() {
+    let single = airbrush_spot(0.5, 0, false);
+    let held = airbrush_spot(0.5, 600, false);
+    assert_eq!(alpha_at(&held, 32, 32), 76, "centre settles under opacity(0.5)");
+    assert!(held.iter().all(|&a| a <= 77), "wash went past its ceiling");
+    let edge = (alpha_at(&single, 46, 32), alpha_at(&held, 46, 32));
+    assert!(edge.1 > edge.0, "holding still didn't build up the edge: {edge:?}");
+    assert_eq!(alpha_at(&airbrush_spot(1.0, 600, false), 32, 32), 254);
+}
+
+/// Like Krita, a moving stroke keeps the soft curve's falloff across its
+/// width: dabs land only every 0.1 diameter, so the faint edge never piles up
+/// to the opacity ceiling the way a 1000 dab/s airbrush made it.
+#[test]
+fn airbrush_soft_stroke_stays_soft_across_its_width() {
     let size = Size::new(200, 60);
-    let (buf, _w) = paint("Default Round", size);
-    let covered = covered_pixels(&buf);
-    println!("Default Round covered pixels: {covered}");
-    assert!(covered > 1500, "default round stroke too sparse: {covered}");
+    let (buf, w) = paint("Airbrush Soft", size);
+    let alpha = |y: usize| buf[(y * w + 100) * 4 + 3];
+    // Brush size 28: 11 px off the centre line is 0.8 of the radius.
+    let (centre, edge) = (alpha(30), alpha(41));
+    println!("airbrush soft cross-section: centre {centre}, 0.8R {edge}");
+    assert!(centre > 150, "centre too faint: {centre}");
+    assert!(u32::from(edge) * 3 < u32::from(centre), "edge too solid: {edge} vs {centre}");
+}
+
+/// The drag path stamps, previews and presents in one submit; its wash must
+/// land the same pixels as the plain stamp path.
+#[test]
+fn airbrush_soft_drag_path_matches_plain_stamping() {
+    let run = |present: bool| {
+        let mut canvas = Canvas::headless(SPOT).unwrap();
+        let idx = canvas.add_layer("l").unwrap();
+        canvas.layers().set_active(Some(idx));
+        let brush = BrushEngine::new();
+        select(&brush, "Airbrush Soft");
+        brush.size.set(40.0);
+        let preset = brush.active_brush();
+        let white = Color::new(255, 255, 255);
+        canvas.begin_stroke(white, 1.0, false).unwrap();
+        canvas
+            .set_stroke_style(preset.paint_mode, preset.softness_curve.as_ref())
+            .unwrap();
+        canvas
+            .stamp(|t| brush.begin_stroke(sample_p(20.0, 32.0, 0, 0.8), white, t))
+            .unwrap();
+        for i in 1..=12u64 {
+            let s = sample_p(20.0 + 2.0 * i as f32, 32.0, i * 4, 0.8);
+            if present {
+                canvas.stamp_and_present(|t| brush.push_sample(s, t)).unwrap();
+            } else {
+                canvas.stamp(|t| brush.push_sample(s, t)).unwrap();
+            }
+        }
+        canvas.stamp(|t| brush.end_stroke(t)).unwrap();
+        canvas.commit_stroke().unwrap();
+        let mut buf = Vec::new();
+        canvas
+            .read_layer_region_into(idx, 0, 0, SPOT.width, SPOT.height, &mut buf)
+            .unwrap();
+        buf
+    };
+    let plain = run(false);
+    assert!(plain.chunks_exact(4).any(|px| px[3] > 100), "stroke painted nothing");
+    assert_eq!(plain, run(true));
+}
+
+/// The eraser runs the same stroke and takes away exactly the alpha the brush
+/// would have laid down.
+#[test]
+fn airbrush_soft_erases_what_it_paints() {
+    for pressure in [0.4, 1.0] {
+        let painted = airbrush_spot(pressure, 200, false);
+        let erased = airbrush_spot(pressure, 200, true);
+        for (p, e) in painted.iter().zip(&erased) {
+            assert!(
+                (i32::from(*p) + i32::from(*e) - 255).abs() <= 1,
+                "painted {p} but erasing left {e} at pressure {pressure}"
+            );
+        }
+    }
 }
 
 /// Chalk uses the image tip + SUBTRACT paper texture, so its stroke must have
 /// broken/grainy coverage - both solid and holey pixels inside its footprint,
-/// unlike the solid Default Round.
+/// unlike a solid round brush.
 #[test]
 fn chalk_stroke_is_grainy() {
     let size = Size::new(220, 60);

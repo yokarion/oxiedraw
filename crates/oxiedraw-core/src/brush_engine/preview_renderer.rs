@@ -111,6 +111,7 @@ fn render_into(canvas: &mut Canvas, preset: &BrushPreset) -> Result<(), crate::r
     };
 
     canvas.begin_stroke(ctx.color, ctx.opacity, false)?;
+    canvas.set_stroke_style(preset.paint_mode, preset.softness_curve.as_ref())?;
     // Smudge brushes paint through the dedicated GPU path, not the mask
     // pipelines, so route the preview stroke there too (otherwise it would
     // render as a plain soft-round mask via the family resolver).

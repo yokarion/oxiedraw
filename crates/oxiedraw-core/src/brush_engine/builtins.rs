@@ -22,7 +22,7 @@ const PLACEHOLDER_ID: BrushPresetId = BrushPresetId(0);
 /// existence checks.
 fn builtins() -> [(&'static str, Factory); 9] {
     [
-        ("default_round.oxiebrush", BrushPreset::default_round),
+        ("airbrush_soft.oxiebrush", BrushPreset::airbrush_soft),
         ("ink_pen.oxiebrush", BrushPreset::ink_pen),
         ("pixel.oxiebrush", BrushPreset::pixel),
         ("scatter_dot.oxiebrush", BrushPreset::scatter_dot),
@@ -33,6 +33,9 @@ fn builtins() -> [(&'static str, Factory); 9] {
         ("real_brush.oxiebrush", BrushPreset::real_brush),
     ]
 }
+
+/// Builtins that were replaced; `seed_missing` removes their archives.
+const RETIRED: [&str; 1] = ["default_round.oxiebrush"];
 
 /// Absolute paths every builtin archive *would* live at under `dir`.
 /// Useful for the repopulate UI to compute the missing set.
@@ -49,6 +52,12 @@ pub fn builtin_paths(dir: &Path) -> Vec<PathBuf> {
 /// files written by stage-5 installs from sticking around forever.
 pub fn seed_missing(dir: &Path) -> Result<usize, BrushError> {
     std::fs::create_dir_all(dir)?;
+    for name in RETIRED {
+        let path = dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+    }
     let mut written = 0;
     for (name, factory) in builtins() {
         let path = dir.join(name);
@@ -101,5 +110,26 @@ pub fn seed_all(dir: &Path) -> Result<usize, BrushError> {
 /// Returned so the engine can stay functional in headless / corrupt
 /// installs.
 pub fn fallback_brush() -> BrushPreset {
-    BrushPreset::default_round(PLACEHOLDER_ID)
+    BrushPreset::airbrush_soft(PLACEHOLDER_ID)
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seeding_replaces_default_round_with_airbrush_soft() {
+        let dir = std::env::temp_dir().join(format!("oxiedraw-seed-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("default_round.oxiebrush");
+        std::fs::write(&old, b"stale").unwrap();
+
+        seed_missing(&dir).unwrap();
+
+        assert!(!old.exists());
+        let pkg = format::load(&dir.join("airbrush_soft.oxiebrush")).unwrap();
+        assert_eq!(pkg.manifest.name, "Airbrush Soft");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

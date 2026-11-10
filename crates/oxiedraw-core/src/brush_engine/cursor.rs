@@ -378,8 +378,9 @@ mod tests {
         }
     }
 
-    fn default_round_preset() -> BrushPreset {
-        BrushPreset::default_round(BrushPresetId(0))
+    /// A soft-round preset with pressure-driven size.
+    fn soft_round_preset() -> BrushPreset {
+        BrushPreset::ink_pen(BrushPresetId(0))
     }
 
     /// 16x4 mask: solid filled horizontal stripe two rows thick. After
@@ -412,7 +413,10 @@ mod tests {
             spacing_ratio: 0.1,
             stabilizer: 0.0,
             speed_smoothing: 0.0,
-            buildup: false,
+            paint_mode: crate::brush_engine::PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: crate::brush_engine::DEFAULT_AIRBRUSH_RATE,
             hardness: 1.0,
             tip: crate::brush_engine::TipShape::Round,
             texture_scale: 0.0,
@@ -450,8 +454,8 @@ mod tests {
     }
 
     #[test]
-    fn default_round_outline_is_a_circle() {
-        let preset = default_round_preset();
+    fn soft_round_outline_is_a_circle() {
+        let preset = soft_round_preset();
         let c = compute_brush_cursor(&preset, baseline_ctx(), baseline_input(), 20.0);
         let (min_x, max_x, min_y, max_y) = bounds(&c);
         let width = max_x - min_x;
@@ -462,7 +466,7 @@ mod tests {
 
     #[test]
     fn size_changes_outline_radius() {
-        let preset = default_round_preset();
+        let preset = soft_round_preset();
         let small = compute_brush_cursor(
             &preset,
             StrokeContext { size: 10.0, ..baseline_ctx() },
@@ -482,7 +486,7 @@ mod tests {
 
     #[test]
     fn pressure_input_drives_size_dynamics() {
-        let preset = default_round_preset();
+        let preset = soft_round_preset();
         let light = compute_brush_cursor(
             &preset,
             baseline_ctx(),
@@ -646,8 +650,8 @@ mod tests {
 
     #[test]
     fn scatter_dilates_outline_envelope_on_soft_round() {
-        let preset_no_scatter = default_round_preset();
-        let mut preset_scatter = default_round_preset();
+        let preset_no_scatter = soft_round_preset();
+        let mut preset_scatter = soft_round_preset();
         preset_scatter.dynamics.scatter = Some(Mapping {
             source: DynSource::Random,
             curve: Curve::linear(),
@@ -714,6 +718,8 @@ mod tests {
             texturing_mode: 0.0,
             smudge_rate: 1.0,
             color_rate: 0.0,
+            opacity: 1.0,
+            average_opacity: 1.0,
         };
         let outline = ellipse_outline(&dab);
         let (mut xmin, mut xmax, mut ymin, mut ymax) =
@@ -797,7 +803,7 @@ mod tests {
         assert!(w > h * 1.3 && w < h * 1.8, "textured mask must reflect non-circular aspect, got {w}x{h}");
         // A round dab on the same preset (no texture) would be 20x20.
         let round = compute_brush_cursor(
-            &default_round_preset(),
+            &soft_round_preset(),
             baseline_ctx(),
             baseline_input(),
             20.0,
@@ -815,7 +821,7 @@ mod tests {
         // Clean baseline preset: SoftRound, no dynamics. Each case
         // below mutates exactly one input axis or preset field.
         let baseline_preset = {
-            let mut p = default_round_preset();
+            let mut p = soft_round_preset();
             p.dynamics = Dynamics::default();
             p
         };
