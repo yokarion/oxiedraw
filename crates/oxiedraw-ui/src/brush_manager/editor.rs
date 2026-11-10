@@ -16,8 +16,8 @@ use std::rc::Rc;
 use adw::prelude::*;
 use oxiedraw_core::brush_engine::{
     BrushEngine, BrushFamily, BrushPreset, BrushPresetId, BrushRegistry, Curve,
-    DEFAULT_AIRBRUSH_RATE, DynSource, Dynamics, Mapping, PaintMode, PatternData, format,
-    preview_renderer,
+    DEFAULT_AIRBRUSH_RATE, DynSource, Dynamics, Mapping, PaintMode, PatternData, TexturingMode,
+    format, preview_renderer,
 };
 use oxiedraw_core::curves;
 use oxiedraw_core::enum_meta::EnumMeta;
@@ -144,11 +144,37 @@ pub(super) fn build(
     family_row.add_suffix(&family_dropdown);
     props_group.add(&family_row);
 
-    // Pattern row - only visible when family is Textured.
+    // Smudge only: stamped image tip, replaces the round hardness tip.
+    let tip_row = adw::ActionRow::builder()
+        .title("Brush tip")
+        .subtitle("Grayscale image, dark paints")
+        .build();
+    let tip_thumb = gtk::Image::builder().pixel_size(36).build();
+    tip_thumb.set_icon_name(Some("image-x-generic-symbolic"));
+    tip_row.add_prefix(&tip_thumb);
+    let tip_clear_btn = clear_button("Use the round tip");
+    tip_row.add_suffix(&tip_clear_btn);
+    let tip_btn = gtk::Button::with_label("Choose tip...");
+    tip_btn.add_css_class("flat");
+    tip_row.add_suffix(&tip_btn);
+    tip_row.set_visible(false);
+    props_group.add(&tip_row);
+    let smear_alpha_row = adw::ActionRow::builder()
+        .title("Smear alpha")
+        .subtitle("Drag transparency along too, instead of filling it with the brush color")
+        .build();
+    let smear_alpha_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    smear_alpha_row.add_suffix(&smear_alpha_switch);
+    smear_alpha_row.set_visible(false);
+    props_group.add(&smear_alpha_row);
+
+    // Pattern row - only visible for the textured, image-tip and smudge families.
     let pattern_row = adw::ActionRow::builder().title("Pattern").build();
     let pattern_thumb = gtk::Image::builder().pixel_size(36).build();
     pattern_thumb.set_icon_name(Some("image-x-generic-symbolic"));
     pattern_row.add_prefix(&pattern_thumb);
+    let pattern_clear_btn = clear_button("Remove the texture");
+    pattern_row.add_suffix(&pattern_clear_btn);
     let pattern_btn = gtk::Button::with_label("Choose pattern...");
     pattern_btn.add_css_class("flat");
     pattern_row.add_suffix(&pattern_btn);
@@ -195,6 +221,37 @@ pub(super) fn build(
         build_scale_row("Pattern strength", 0.0, 1.0, 0.01);
     pattern_strength_row.set_visible(false);
     props_group.add(&pattern_strength_row);
+    let texture_mode_row = adw::ActionRow::builder()
+        .title("Pattern mode")
+        .subtitle("Multiply darkens coverage, subtract carves holes")
+        .build();
+    let texture_mode_dropdown = gtk::DropDown::from_strings(&TexturingMode::labels());
+    texture_mode_dropdown.set_valign(gtk::Align::Center);
+    texture_mode_row.add_suffix(&texture_mode_dropdown);
+    props_group.add(&texture_mode_row);
+    let (texture_brightness_row, texture_brightness_scale) =
+        build_scale_row("Pattern brightness", -1.0, 1.0, 0.01);
+    props_group.add(&texture_brightness_row);
+    let (texture_contrast_row, texture_contrast_scale) =
+        build_scale_row("Pattern contrast", 0.0, 2.0, 0.01);
+    props_group.add(&texture_contrast_row);
+    let texture_invert_row = adw::ActionRow::builder().title("Invert pattern").build();
+    let texture_invert_switch = gtk::Switch::builder().valign(gtk::Align::Center).build();
+    texture_invert_row.add_suffix(&texture_invert_switch);
+    props_group.add(&texture_invert_row);
+    // Every row that only applies when the family has a pattern.
+    let texture_rows: Rc<[gtk::Widget]> = Rc::new([
+        pattern_row.clone().upcast(),
+        pattern_size_row.clone().upcast(),
+        pattern_strength_row.clone().upcast(),
+        texture_mode_row.upcast(),
+        texture_brightness_row.upcast(),
+        texture_contrast_row.upcast(),
+        texture_invert_row.upcast(),
+    ]);
+    for row in texture_rows.iter() {
+        row.set_visible(false);
+    }
     let paint_mode_row = adw::ActionRow::builder()
         .title("Paint mode")
         .subtitle("Build up stacks overlaps, wash builds up to the dab opacity (soft round only)")
@@ -242,16 +299,45 @@ pub(super) fn build(
         });
     }
 
+    // Rows that depend on the family's tip / pattern images.
+    let refresh_family_rows: Rc<dyn Fn(&BrushFamily)> = {
+        let texture_rows = texture_rows.clone();
+        let pattern_thumb = pattern_thumb.clone();
+        let pattern_clear_btn = pattern_clear_btn.clone();
+        let tip_row = tip_row.clone();
+        let tip_thumb = tip_thumb.clone();
+        let tip_clear_btn = tip_clear_btn.clone();
+        let smear_alpha_row = smear_alpha_row.clone();
+        Rc::new(move |family: &BrushFamily| {
+            apply_pattern_visibility(&texture_rows, &pattern_thumb, &pattern_clear_btn, family);
+            apply_tip_visibility(&tip_row, &tip_thumb, &tip_clear_btn, family);
+            smear_alpha_row.set_visible(family.is_smudge());
+        })
+    };
+
+    // Built here so tip / pattern edits can refresh it; appended under the body.
+    let (preview_area, set_preview) = preview::build();
+    let live_preview: Rc<dyn Fn()> = {
+        let brush_engine = brush_engine.clone();
+        let selected_id = selected_id.clone();
+        let set_preview = set_preview.clone();
+        Rc::new(move || {
+            if let Some(id) = selected_id.get() {
+                let brushes = brush_engine.brushes.borrow();
+                if let Some(p) = brushes.iter().find(|p| p.id == id) {
+                    set_preview(Some(p));
+                }
+            }
+        })
+    };
+
     // -- Family dropdown -> brush.family ----------------------------------
     {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let loading = loading.clone();
         let mark_dirty = mark_dirty.clone();
-        let pattern_row = pattern_row.clone();
-        let pattern_thumb = pattern_thumb.clone();
-        let pattern_size_row = pattern_size_row.clone();
-        let pattern_strength_row = pattern_strength_row.clone();
+        let refresh_family_rows = refresh_family_rows.clone();
         let pattern_size_scale = pattern_size_scale.clone();
         let pattern_strength_scale = pattern_strength_scale.clone();
         let loading_for_family = loading.clone();
@@ -266,7 +352,10 @@ pub(super) fn build(
             brush.family = match idx {
                 0 => BrushFamily::SoftRound,
                 1 => BrushFamily::Pixel,
-                3 => BrushFamily::Smudge,
+                3 => match &brush.family {
+                    BrushFamily::Smudge { .. } => brush.family.clone(),
+                    _ => BrushFamily::smudge(),
+                },
                 _ => match &brush.family {
                     BrushFamily::Textured(rc) => BrushFamily::Textured(rc.clone()),
                     // First-time switch to Textured: seed with the
@@ -287,53 +376,131 @@ pub(super) fn build(
             }
             let updated_family = brush.family.clone();
             drop(brushes);
-            apply_pattern_visibility(
-                &pattern_row,
-                &pattern_thumb,
-                &pattern_size_row,
-                &pattern_strength_row,
-                &updated_family,
-            );
+            refresh_family_rows(&updated_family);
             mark_dirty();
         });
     }
 
-    // -- Pattern picker -> brush.family (Textured) ------------------------
-    {
+    // Apply an edit to the selected brush's family, then refresh its rows.
+    let edit_family: Rc<dyn Fn(&dyn Fn(&mut BrushPreset))> = {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
         let mark_dirty = mark_dirty.clone();
+        let refresh_family_rows = refresh_family_rows.clone();
+        let live_preview = live_preview.clone();
+        Rc::new(move |apply: &dyn Fn(&mut BrushPreset)| {
+            let Some(id) = selected_id.get() else { return };
+            let mut brushes = brush_engine.brushes.borrow_mut();
+            let Some(brush) = brushes.iter_mut().find(|p| p.id == id) else { return };
+            apply(brush);
+            let family = brush.family.clone();
+            drop(brushes);
+            refresh_family_rows(&family);
+            mark_dirty();
+            live_preview();
+        })
+    };
+
+    // -- Pattern picker -> brush.family -----------------------------------
+    {
+        let edit_family = edit_family.clone();
+        let brush_engine = brush_engine.clone();
+        let selected_id = selected_id.clone();
         let parent = parent.clone();
-        let pattern_thumb_for_btn = pattern_thumb.clone();
         pattern_btn.connect_clicked(move |_| {
             let Some(id) = selected_id.get() else { return };
-            let brush_engine = brush_engine.clone();
-            let mark_dirty = mark_dirty.clone();
-            let pattern_thumb = pattern_thumb_for_btn.clone();
+            // Smudge textures follow Krita (grey over white); the textured
+            // family keeps its alpha-mask patterns.
+            let smudge = brush_engine
+                .brushes
+                .borrow()
+                .iter()
+                .any(|p| p.id == id && p.family.is_smudge());
+            let decode: fn(&[u8]) -> Result<PatternData, String> = if smudge {
+                |bytes| PatternData::texture_from_png_bytes(bytes, 0.0, 1.0, false)
+            } else {
+                PatternData::from_png_bytes
+            };
+            let edit_family = edit_family.clone();
             let parent_for_cb = parent.clone();
-            choose_pattern(&parent, move |result| {
+            choose_png(&parent, "Choose brush pattern", decode, move |result| match result {
+                Ok(data) => {
+                    let rc = Rc::new(data);
+                    edit_family(&|brush| {
+                        if let BrushFamily::Smudge { grain, .. } = &mut brush.family {
+                            *grain = Some(rc.clone());
+                            if brush.texture_scale <= 0.0 {
+                                brush.texture_scale = 200.0;
+                                brush.texture_strength = 1.0;
+                            }
+                        } else {
+                            brush.family = BrushFamily::Textured(rc.clone());
+                        }
+                    });
+                }
+                Err(Some(e)) => {
+                    super::show_simple_error(&parent_for_cb, "Couldn't load pattern", &e);
+                }
+                Err(None) => { /* user cancelled */ }
+            });
+        });
+    }
+    {
+        let edit_family = edit_family.clone();
+        pattern_clear_btn.connect_clicked(move |_| {
+            edit_family(&|brush| {
+                if let BrushFamily::Smudge { grain, .. } = &mut brush.family {
+                    *grain = None;
+                }
+            });
+        });
+    }
+
+    // -- Tip picker -> brush.family (Smudge) ------------------------------
+    {
+        let edit_family = edit_family.clone();
+        let parent = parent.clone();
+        tip_btn.connect_clicked(move |_| {
+            let edit_family = edit_family.clone();
+            let parent_for_cb = parent.clone();
+            choose_png(&parent, "Choose brush tip", PatternData::tip_from_png_bytes, move |result| {
                 match result {
                     Ok(data) => {
                         let rc = Rc::new(data);
-                        if let Some(brush) = brush_engine
-                            .brushes
-                            .borrow_mut()
-                            .iter_mut()
-                            .find(|p| p.id == id)
-                        {
-                            brush.family = BrushFamily::Textured(rc.clone());
-                        }
-                        apply_pattern_thumb(&pattern_thumb, &rc);
-                        mark_dirty();
+                        edit_family(&|brush| {
+                            if let BrushFamily::Smudge { tip, .. } = &mut brush.family {
+                                *tip = Some(rc.clone());
+                            }
+                        });
                     }
                     Err(Some(e)) => {
-                        super::show_simple_error(
-                            &parent_for_cb,
-                            "Couldn't load pattern",
-                            &e,
-                        );
+                        super::show_simple_error(&parent_for_cb, "Couldn't load brush tip", &e);
                     }
                     Err(None) => { /* user cancelled */ }
+                }
+            });
+        });
+    }
+    {
+        let edit_family = edit_family.clone();
+        let loading = loading.clone();
+        smear_alpha_switch.connect_state_set(move |_, state| {
+            if !loading.get() {
+                edit_family(&|brush| {
+                    if let BrushFamily::Smudge { smear_alpha, .. } = &mut brush.family {
+                        *smear_alpha = state;
+                    }
+                });
+            }
+            glib::Propagation::Proceed
+        });
+    }
+    {
+        let edit_family = edit_family.clone();
+        tip_clear_btn.connect_clicked(move |_| {
+            edit_family(&|brush| {
+                if let BrushFamily::Smudge { tip, .. } = &mut brush.family {
+                    *tip = None;
                 }
             });
         });
@@ -412,6 +579,22 @@ pub(super) fn build(
         &mark_dirty,
         |b, v| b.airbrush_rate = v as f32,
     );
+    wire_scale_to_field(
+        &texture_brightness_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+        |b, v| b.texture_adjust.brightness = v as f32,
+    );
+    wire_scale_to_field(
+        &texture_contrast_scale,
+        &brush_engine,
+        &selected_id,
+        &loading,
+        &mark_dirty,
+        |b, v| b.texture_adjust.contrast = v as f32,
+    );
     let edit_brush = {
         let brush_engine = brush_engine.clone();
         let selected_id = selected_id.clone();
@@ -433,6 +616,20 @@ pub(super) fn build(
         paint_mode_dropdown.connect_selected_notify(move |d| {
             let mode = PaintMode::from_index(d.selected());
             edit_brush(&|b| b.paint_mode = mode);
+        });
+    }
+    {
+        let edit_brush = edit_brush.clone();
+        texture_mode_dropdown.connect_selected_notify(move |d| {
+            let mode = TexturingMode::from_index(d.selected());
+            edit_brush(&|b| b.texturing_mode = mode);
+        });
+    }
+    {
+        let edit_brush = edit_brush.clone();
+        texture_invert_switch.connect_state_set(move |_, state| {
+            edit_brush(&|b| b.texture_adjust.invert = state);
+            glib::Propagation::Proceed
         });
     }
     {
@@ -459,7 +656,7 @@ pub(super) fn build(
     {
         let edit_brush = edit_brush.clone();
         softness_editor.connect_changed(move |curve| {
-            let curve = from_editor_curve(&curve);
+            let curve = from_editor_curve(&curve).unwrap_or_else(default_softness_curve);
             edit_brush(&|b| b.softness_curve = Some(curve.clone()));
         });
     }
@@ -551,7 +748,7 @@ pub(super) fn build(
         let smudge_rows = [smudge_rate_dyn.row.clone(), color_rate_dyn.row.clone()];
         let softness_row = softness_row.clone();
         let sync = move |d: &gtk::DropDown| {
-            let smudge = d.selected() == family_to_dropdown_index(&BrushFamily::Smudge);
+            let smudge = d.selected() == family_to_dropdown_index(&BrushFamily::smudge());
             for row in &smudge_rows {
                 row.set_visible(smudge);
             }
@@ -574,7 +771,6 @@ pub(super) fn build(
     outer.append(&scrolled);
 
     // -- Preview ---------------------------------------------------------
-    let (preview_area, set_preview) = preview::build();
     let preview_frame = gtk::Frame::builder().build();
     preview_frame.set_child(Some(&preview_area));
     preview_frame.set_margin_start(24);
@@ -591,17 +787,21 @@ pub(super) fn build(
         let name_entry = name_entry.clone();
         let icon_image = icon_image.clone();
         let family_dropdown = family_dropdown.clone();
-        let pattern_row = pattern_row.clone();
+        let refresh_family_rows = refresh_family_rows.clone();
         let pattern_thumb = pattern_thumb.clone();
         let pattern_btn = pattern_btn.clone();
+        let tip_btn = tip_btn.clone();
+        let texture_mode_dropdown = texture_mode_dropdown.clone();
+        let texture_brightness_scale = texture_brightness_scale.clone();
+        let texture_contrast_scale = texture_contrast_scale.clone();
+        let texture_invert_switch = texture_invert_switch.clone();
+        let smear_alpha_switch = smear_alpha_switch.clone();
         let size_scale = size_scale.clone();
         let opacity_scale = opacity_scale.clone();
         let spacing_scale = spacing_scale.clone();
         let stabilizer_scale = stabilizer_scale.clone();
         let speed_smoothing_scale = speed_smoothing_scale.clone();
         let hardness_scale = hardness_scale.clone();
-        let pattern_size_row = pattern_size_row.clone();
-        let pattern_strength_row = pattern_strength_row.clone();
         let pattern_size_scale = pattern_size_scale.clone();
         let pattern_strength_scale = pattern_strength_scale.clone();
         let paint_mode_dropdown = paint_mode_dropdown.clone();
@@ -637,6 +837,12 @@ pub(super) fn build(
             delete_btn.set_sensitive(enabled);
             choose_btn.set_sensitive(enabled);
             pattern_btn.set_sensitive(enabled);
+            tip_btn.set_sensitive(enabled);
+            texture_mode_dropdown.set_sensitive(enabled);
+            texture_brightness_scale.set_sensitive(enabled);
+            texture_contrast_scale.set_sensitive(enabled);
+            texture_invert_switch.set_sensitive(enabled);
+            smear_alpha_switch.set_sensitive(enabled);
             name_entry.set_sensitive(enabled);
             family_dropdown.set_sensitive(enabled);
             size_scale.set_sensitive(enabled);
@@ -663,13 +869,15 @@ pub(super) fn build(
                 name_entry.set_text(&p.name);
                 picker::apply_icon_to_image(&icon_image, p, FALLBACK_ICON);
                 family_dropdown.set_selected(family_to_dropdown_index(&p.family));
-                apply_pattern_visibility(
-                    &pattern_row,
-                    &pattern_thumb,
-                    &pattern_size_row,
-                    &pattern_strength_row,
-                    &p.family,
-                );
+                refresh_family_rows(&p.family);
+                texture_mode_dropdown.set_selected(p.texturing_mode.to_index());
+                texture_brightness_scale.set_value(f64::from(p.texture_adjust.brightness));
+                texture_contrast_scale.set_value(f64::from(p.texture_adjust.contrast));
+                texture_invert_switch.set_active(p.texture_adjust.invert);
+                smear_alpha_switch.set_active(matches!(
+                    p.family,
+                    BrushFamily::Smudge { smear_alpha: true, .. }
+                ));
                 size_scale.set_value(f64::from(p.default_size));
                 opacity_scale.set_value(f64::from(p.default_opacity));
                 spacing_scale.set_value(f64::from(p.spacing_ratio));
@@ -699,10 +907,13 @@ pub(super) fn build(
                 name_entry.set_text("");
                 icon_image.set_icon_name(Some(FALLBACK_ICON));
                 family_dropdown.set_selected(0);
-                pattern_row.set_visible(false);
-                pattern_size_row.set_visible(false);
-                pattern_strength_row.set_visible(false);
+                refresh_family_rows(&BrushFamily::SoftRound);
                 pattern_thumb.set_icon_name(Some("image-x-generic-symbolic"));
+                texture_mode_dropdown.set_selected(0);
+                texture_brightness_scale.set_value(0.0);
+                texture_contrast_scale.set_value(1.0);
+                texture_invert_switch.set_active(false);
+                smear_alpha_switch.set_active(false);
                 size_scale.set_value(0.0);
                 opacity_scale.set_value(0.0);
                 spacing_scale.set_value(0.0);
@@ -758,34 +969,22 @@ pub(super) fn build(
         });
     }
 
-    // After any widget edit, re-render the preview from the *current*
-    // in-memory brush state so the user sees the change instantly,
-    // independent of when it's saved to disk.
-    let live_preview: Rc<dyn Fn()> = {
-        let brush_engine = brush_engine.clone();
-        let selected_id = selected_id.clone();
-        let set_preview = set_preview.clone();
-        Rc::new(move || {
-            if let Some(id) = selected_id.get() {
-                let brushes = brush_engine.brushes.borrow();
-                if let Some(p) = brushes.iter().find(|p| p.id == id) {
-                    set_preview(Some(p));
-                }
-            }
-        })
-    };
     // Hook live preview into every editable widget via the
     // value-changed channel they already fire on.
     install_live_preview(
-        &size_scale,
-        &opacity_scale,
-        &spacing_scale,
-        &stabilizer_scale,
-        &speed_smoothing_scale,
-        &hardness_scale,
-        &pattern_size_scale,
-        &pattern_strength_scale,
-        &airbrush_rate_scale,
+        &[
+            &size_scale,
+            &opacity_scale,
+            &spacing_scale,
+            &stabilizer_scale,
+            &speed_smoothing_scale,
+            &hardness_scale,
+            &pattern_size_scale,
+            &pattern_strength_scale,
+            &texture_brightness_scale,
+            &texture_contrast_scale,
+            &airbrush_rate_scale,
+        ],
         &[
             &size_dyn,
             &flow_dyn,
@@ -809,6 +1008,13 @@ pub(super) fn build(
         });
         let r = refresh.clone();
         paint_mode_dropdown.connect_selected_notify(move |_| r());
+        let r = refresh.clone();
+        texture_mode_dropdown.connect_selected_notify(move |_| r());
+        let r = refresh.clone();
+        texture_invert_switch.connect_state_set(move |_, _| {
+            r();
+            glib::Propagation::Proceed
+        });
         let r = refresh.clone();
         airbrush_row.connect_enable_expansion_notify(move |_| r());
         let r = refresh.clone();
@@ -965,13 +1171,13 @@ fn to_editor_curve(curve: &Curve) -> curves::Curve {
     curves::Curve::from_points(&points)
 }
 
-fn from_editor_curve(curve: &curves::Curve) -> Curve {
+fn from_editor_curve(curve: &curves::Curve) -> Option<Curve> {
     let points = curve
         .points()
         .iter()
         .map(|p| (f32::from(p.x) / 255.0, f32::from(p.y) / 255.0))
         .collect();
-    Curve::smooth_from_points(points).unwrap_or_else(default_softness_curve)
+    Curve::smooth_from_points(points)
 }
 
 fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
@@ -981,7 +1187,7 @@ fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
         // Image-tip brushes (built-in chalk) share the "Textured" slot in the
         // editor dropdown; the tip itself isn't user-editable yet.
         BrushFamily::Textured(_) | BrushFamily::ImageTip { .. } => 2,
-        BrushFamily::Smudge => 3,
+        BrushFamily::Smudge { .. } => 3,
     }
 }
 
@@ -990,19 +1196,19 @@ fn family_to_dropdown_index(family: &BrushFamily) -> u32 {
 // ---------------------------------------------------------------------------
 
 fn apply_pattern_visibility(
-    row: &adw::ActionRow,
+    rows: &[gtk::Widget],
     thumb: &gtk::Image,
-    size_row: &adw::ActionRow,
-    strength_row: &adw::ActionRow,
+    clear_btn: &gtk::Button,
     family: &BrushFamily,
 ) {
     let textured = matches!(
         family,
-        BrushFamily::Textured(_) | BrushFamily::ImageTip { .. }
+        BrushFamily::Textured(_) | BrushFamily::ImageTip { .. } | BrushFamily::Smudge { .. }
     );
-    row.set_visible(textured);
-    size_row.set_visible(textured);
-    strength_row.set_visible(textured);
+    for row in rows {
+        row.set_visible(textured);
+    }
+    clear_btn.set_visible(family.is_smudge() && family.grain().is_some());
     match family {
         BrushFamily::Textured(rc) => apply_pattern_thumb(thumb, rc),
         // Show the grain texture thumb; fall back to the tip if there's no
@@ -1010,8 +1216,40 @@ fn apply_pattern_visibility(
         BrushFamily::ImageTip { tip, grain } => {
             apply_pattern_thumb(thumb, grain.as_ref().unwrap_or(tip));
         }
+        BrushFamily::Smudge { grain, .. } => apply_optional_thumb(thumb, grain.as_deref()),
         _ => {}
     }
+}
+
+fn apply_tip_visibility(
+    row: &adw::ActionRow,
+    thumb: &gtk::Image,
+    clear_btn: &gtk::Button,
+    family: &BrushFamily,
+) {
+    let tip = match family {
+        BrushFamily::Smudge { tip, .. } => tip.as_deref(),
+        _ => None,
+    };
+    row.set_visible(family.is_smudge());
+    clear_btn.set_visible(tip.is_some());
+    apply_optional_thumb(thumb, tip);
+}
+
+fn apply_optional_thumb(thumb: &gtk::Image, data: Option<&PatternData>) {
+    match data {
+        Some(d) => apply_pattern_thumb(thumb, d),
+        None => thumb.set_icon_name(Some("image-x-generic-symbolic")),
+    }
+}
+
+fn clear_button(tooltip: &str) -> gtk::Button {
+    let button = gtk::Button::from_icon_name("edit-clear-symbolic");
+    button.add_css_class("flat");
+    button.set_valign(gtk::Align::Center);
+    button.set_tooltip_text(Some(tooltip));
+    button.set_visible(false);
+    button
 }
 
 fn apply_pattern_thumb(thumb: &gtk::Image, data: &PatternData) {
@@ -1028,12 +1266,17 @@ fn apply_pattern_thumb(thumb: &gtk::Image, data: &PatternData) {
     thumb.set_paintable(Some(&texture));
 }
 
-/// Open a `gtk::FileDialog` filtered to PNG. The callback fires with:
-/// - `Ok(PatternData)` on success (decoded + premultiplied),
+/// Open a `gtk::FileDialog` filtered to PNG and decode the pick with `decode`.
+/// The callback fires with:
+/// - `Ok(PatternData)` on success,
 /// - `Err(Some(msg))` on read / decode failure,
 /// - `Err(None)` when the user cancels.
-fn choose_pattern<F>(parent: &gtk::Window, callback: F)
-where
+fn choose_png<F>(
+    parent: &gtk::Window,
+    title: &str,
+    decode: fn(&[u8]) -> Result<PatternData, String>,
+    callback: F,
+) where
     F: FnOnce(Result<PatternData, Option<String>>) + 'static,
 {
     let filter = gtk::FileFilter::new();
@@ -1042,7 +1285,7 @@ where
     let filters = gtk::gio::ListStore::new::<gtk::FileFilter>();
     filters.append(&filter);
     let dialog = gtk::FileDialog::builder()
-        .title("Choose brush pattern")
+        .title(title)
         .modal(true)
         .filters(&filters)
         .build();
@@ -1058,18 +1301,12 @@ where
                 callback(Err(Some("file has no local path".into())));
                 return;
             };
-            match decode_pattern_file(&path) {
-                Ok(d) => callback(Ok(d)),
-                Err(e) => callback(Err(Some(e))),
-            }
+            let decoded = std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| decode(&bytes));
+            callback(decoded.map_err(Some));
         },
     );
-}
-
-/// Read + decode a PNG file into a `PatternData` ready for the atlas.
-fn decode_pattern_file(path: &std::path::Path) -> Result<PatternData, String> {
-    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    PatternData::from_png_bytes(&bytes)
 }
 
 // ---------------------------------------------------------------------------
@@ -1206,6 +1443,7 @@ struct DynamicsRowHandles {
     min_spin: gtk::SpinButton,
     max_spin: gtk::SpinButton,
     invert_switch: gtk::Switch,
+    curve_editor: CurveEditor,
     loading: Rc<Cell<bool>>,
 }
 
@@ -1229,6 +1467,7 @@ impl DynamicsRowHandles {
             self.min_spin.set_value(lo_d);
             self.max_spin.set_value(hi_d);
             self.invert_switch.set_active(m.invert);
+            self.curve_editor.set_curve(to_editor_curve(&m.curve));
         }
         self.loading.set(false);
     }
@@ -1300,6 +1539,14 @@ fn build_dynamics_row(
     invert_row.add_suffix(&invert_switch);
     row.add_row(&invert_row);
 
+    // Response curve: source (left to right) to the min..max range (bottom to top).
+    let curve_editor = CurveEditor::new();
+    curve_editor.widget.set_margin_top(8);
+    curve_editor.widget.set_margin_bottom(8);
+    curve_editor.widget.set_margin_start(12);
+    curve_editor.widget.set_margin_end(12);
+    row.add_row(&curve_editor.widget);
+
     let handles = DynamicsRowHandles {
         row,
         field,
@@ -1307,6 +1554,7 @@ fn build_dynamics_row(
         min_spin,
         max_spin,
         invert_switch,
+        curve_editor,
         loading: loading.clone(),
     };
 
@@ -1410,6 +1658,28 @@ fn build_dynamics_row(
         });
     }
 
+    // -- Response curve --------------------------------------------------
+    {
+        let brush_engine = brush_engine.clone();
+        let selected_id = selected_id.clone();
+        let loading = loading.clone();
+        let mark_dirty = mark_dirty.clone();
+        handles.curve_editor.connect_changed(move |curve| {
+            if loading.get() {
+                return;
+            }
+            let Some(id) = selected_id.get() else { return };
+            let curve = from_editor_curve(&curve).unwrap_or_default();
+            let mut brushes = brush_engine.brushes.borrow_mut();
+            if let Some(brush) = brushes.iter_mut().find(|p| p.id == id)
+                && let Some(m) = field.get_mut(&mut brush.dynamics) {
+                    m.curve = curve;
+                }
+            drop(brushes);
+            mark_dirty();
+        });
+    }
+
     handles
 }
 
@@ -1453,41 +1723,30 @@ fn wire_range_spin(
 // Live preview wiring
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_arguments)]
 fn install_live_preview(
-    size_scale: &gtk::Scale,
-    opacity_scale: &gtk::Scale,
-    spacing_scale: &gtk::Scale,
-    stabilizer_scale: &gtk::Scale,
-    speed_smoothing_scale: &gtk::Scale,
-    hardness_scale: &gtk::Scale,
-    pattern_size_scale: &gtk::Scale,
-    pattern_strength_scale: &gtk::Scale,
-    airbrush_rate_scale: &gtk::Scale,
+    scales: &[&gtk::Scale],
     dynamics_rows: &[&DynamicsRowHandles],
     loading: &Rc<Cell<bool>>,
     live_preview: &Rc<dyn Fn()>,
 ) {
-    let attach_scale = |s: &gtk::Scale| {
+    for scale in scales {
         let loading = loading.clone();
         let live = live_preview.clone();
-        s.connect_value_changed(move |_| {
+        scale.connect_value_changed(move |_| {
             if !loading.get() {
                 live();
             }
         });
-    };
-    attach_scale(size_scale);
-    attach_scale(opacity_scale);
-    attach_scale(spacing_scale);
-    attach_scale(stabilizer_scale);
-    attach_scale(speed_smoothing_scale);
-    attach_scale(hardness_scale);
-    attach_scale(pattern_size_scale);
-    attach_scale(pattern_strength_scale);
-    attach_scale(airbrush_rate_scale);
+    }
 
     for handles in dynamics_rows {
+        let l = loading.clone();
+        let live = live_preview.clone();
+        handles.curve_editor.connect_changed(move |_| {
+            if !l.get() {
+                live();
+            }
+        });
         let l = loading.clone();
         let live = live_preview.clone();
         handles.row.connect_enable_expansion_notify(move |_| {

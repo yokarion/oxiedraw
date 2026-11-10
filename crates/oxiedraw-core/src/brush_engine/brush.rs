@@ -54,8 +54,11 @@ pub struct Dab {
     /// Texture composite mode: `0.0` multiply, `1.0` subtract. See
     /// `TexturingMode`.
     pub texturing_mode: f32,
-    /// Smudge family only: how much of the picked-up color under the dab
-    /// carries into the smudge color, `0..=1` (Krita "smudge rate").
+    /// Texture brightness/contrast/invert as `clamp(grain * gain + bias)`.
+    pub texture_gain: f32,
+    pub texture_bias: f32,
+    /// Smudge family only: deposit strength of the smear, `0..=1` (Krita
+    /// "smudge rate" in smearing mode).
     pub smudge_rate: f32,
     /// Smudge family only: how much of the brush paint color is mixed into
     /// the deposited dab, `0..=1` (Krita "color rate").
@@ -84,6 +87,8 @@ impl Dab {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: 0.0,
+            texture_gain: 1.0,
+            texture_bias: 0.0,
             smudge_rate: 1.0,
             color_rate: 0.0,
             opacity: 1.0,

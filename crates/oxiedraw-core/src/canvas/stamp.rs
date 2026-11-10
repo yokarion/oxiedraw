@@ -160,6 +160,7 @@ pub(super) struct SmudgeStamp<'a> {
     paint_linear: [f32; 4],
     opacity: f32,
     prev_center: Option<[f32; 2]>,
+    look: SmudgeLook,
     error: Option<RendererError>,
     scratch: Vec<SmudgeDab>,
 }
@@ -178,6 +179,7 @@ impl<'a> SmudgeStamp<'a> {
             paint_linear,
             opacity,
             prev_center,
+            look: PLAIN_SMUDGE,
             error: None,
             scratch: Vec::new(),
         }
@@ -192,7 +194,7 @@ impl<'a> SmudgeStamp<'a> {
 
 /// Convert a brush `Dab` into a `SmudgeDab`, computing the drag vector against
 /// (and advancing) the running previous centre. Shared by both smudge adapters.
-fn push_smudge_dab(out: &mut Vec<SmudgeDab>, prev: &mut Option<[f32; 2]>, dab: &Dab) {
+fn push_smudge_dab(out: &mut Vec<SmudgeDab>, prev: &mut Option<[f32; 2]>, dab: &Dab, look: SmudgeLook) {
     let center = [dab.center.x, dab.center.y];
     let p = prev.unwrap_or(center);
     out.push(SmudgeDab {
@@ -202,13 +204,73 @@ fn push_smudge_dab(out: &mut Vec<SmudgeDab>, prev: &mut Option<[f32; 2]>, dab: &
         hardness: dab.hardness,
         smudge_rate: dab.smudge_rate,
         color_rate: dab.color_rate,
+        flow: dab.flow,
+        rotation: dab.rotation,
+        aspect: dab.aspect,
+        texture_scale: dab.texture_scale,
+        texture_strength: dab.texture_strength,
+        texturing_mode: dab.texturing_mode,
+        texture_gain: dab.texture_gain,
+        texture_bias: dab.texture_bias,
+        tip_slice: look.tip_slice,
+        grain_slice: look.grain_slice,
+        smear_alpha: look.smear_alpha,
     });
     *prev = Some(center);
 }
 
+/// A smudge family's per-stroke settings with its images resolved to atlas slices.
+#[derive(Debug, Clone, Copy)]
+struct SmudgeLook {
+    tip_slice: u32,
+    grain_slice: u32,
+    smear_alpha: bool,
+}
+
+const PLAIN_SMUDGE: SmudgeLook = SmudgeLook {
+    tip_slice: NO_SLICE,
+    grain_slice: NO_SLICE,
+    smear_alpha: false,
+};
+
+/// Resolve a smudge family for the GPU, uploading its images on first sight.
+fn resolve_smudge_look(
+    renderer: &mut VulkanRenderer,
+    family: &BrushFamily,
+) -> Result<SmudgeLook, RendererError> {
+    let BrushFamily::Smudge {
+        tip,
+        grain,
+        smear_alpha,
+    } = family
+    else {
+        return Ok(PLAIN_SMUDGE);
+    };
+    let tip_slice = match tip {
+        Some(t) => renderer.upload_pattern(t)?,
+        None => NO_SLICE,
+    };
+    let grain_slice = match grain {
+        Some(g) => renderer.upload_pattern(g)?,
+        None => NO_SLICE,
+    };
+    Ok(SmudgeLook {
+        tip_slice,
+        grain_slice,
+        smear_alpha: *smear_alpha,
+    })
+}
+
 impl PaintTarget for SmudgeStamp<'_> {
-    // The tip is always a round mask; the smudge family carries no pattern.
-    fn set_family(&mut self, _family: &BrushFamily) {}
+    fn set_family(&mut self, family: &BrushFamily) {
+        if self.error.is_some() {
+            return;
+        }
+        match resolve_smudge_look(self.renderer, family) {
+            Ok(look) => self.look = look,
+            Err(e) => self.error = Some(e),
+        }
+    }
 
     fn paint_dabs(&mut self, dabs: &[Dab]) {
         if self.error.is_some() || dabs.is_empty() {
@@ -217,7 +279,7 @@ impl PaintTarget for SmudgeStamp<'_> {
         self.scratch.clear();
         self.scratch.reserve(dabs.len());
         for dab in dabs {
-            push_smudge_dab(&mut self.scratch, &mut self.prev_center, dab);
+            push_smudge_dab(&mut self.scratch, &mut self.prev_center, dab, self.look);
         }
         if let Err(e) =
             self.renderer
@@ -232,32 +294,52 @@ impl PaintTarget for SmudgeStamp<'_> {
 /// motion event (dabs + recomposite + present) can go in one async submit -
 /// matching the normal brush's hot path. Tracks `prev_center` across
 /// `paint_dabs` calls for the drag vectors; the caller persists it.
-pub(super) struct SmudgeBatchStamp {
+pub(super) struct SmudgeBatchStamp<'a> {
+    renderer: &'a mut VulkanRenderer,
     prev_center: Option<[f32; 2]>,
+    look: SmudgeLook,
+    error: Option<RendererError>,
     dabs: Vec<SmudgeDab>,
 }
 
-impl SmudgeBatchStamp {
-    pub(super) const fn new(prev_center: Option<[f32; 2]>) -> Self {
+impl<'a> SmudgeBatchStamp<'a> {
+    pub(super) const fn new(renderer: &'a mut VulkanRenderer, prev_center: Option<[f32; 2]>) -> Self {
         Self {
+            renderer,
             prev_center,
+            look: PLAIN_SMUDGE,
+            error: None,
             dabs: Vec::new(),
         }
     }
 
-    /// The accumulated dabs plus the updated previous-centre.
-    pub(super) fn into_dabs(self) -> (Vec<SmudgeDab>, Option<[f32; 2]>) {
-        (self.dabs, self.prev_center)
+    /// The accumulated dabs plus the updated previous-centre, or the first
+    /// pattern upload error.
+    pub(super) fn into_dabs(
+        self,
+    ) -> Result<(Vec<SmudgeDab>, Option<[f32; 2]>), RendererError> {
+        match self.error {
+            Some(e) => Err(e),
+            None => Ok((self.dabs, self.prev_center)),
+        }
     }
 }
 
-impl PaintTarget for SmudgeBatchStamp {
-    fn set_family(&mut self, _family: &BrushFamily) {}
+impl PaintTarget for SmudgeBatchStamp<'_> {
+    fn set_family(&mut self, family: &BrushFamily) {
+        if self.error.is_some() {
+            return;
+        }
+        match resolve_smudge_look(self.renderer, family) {
+            Ok(look) => self.look = look,
+            Err(e) => self.error = Some(e),
+        }
+    }
 
     fn paint_dabs(&mut self, dabs: &[Dab]) {
         self.dabs.reserve(dabs.len());
         for dab in dabs {
-            push_smudge_dab(&mut self.dabs, &mut self.prev_center, dab);
+            push_smudge_dab(&mut self.dabs, &mut self.prev_center, dab, self.look);
         }
     }
 }
@@ -273,7 +355,7 @@ fn resolve_family(
         // Smudge is painted by the dedicated GPU path, not `stamp_mask`; it
         // never reaches this resolver in practice (canvas routes smudge brushes
         // to `SmudgeStamp`), but map it to a round mask to stay exhaustive.
-        BrushFamily::SoftRound | BrushFamily::Smudge => Ok(DabFamily::SoftRound),
+        BrushFamily::SoftRound | BrushFamily::Smudge { .. } => Ok(DabFamily::SoftRound),
         BrushFamily::Pixel => Ok(DabFamily::Pixel),
         BrushFamily::Textured(grain) => {
             let grain_slice = renderer.upload_pattern(grain)?;

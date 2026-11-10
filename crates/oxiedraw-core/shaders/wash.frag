@@ -19,7 +19,7 @@ layout(push_constant) uniform Push {
     uint falloff;
 } pc;
 
-const uint STRIDE = 21u;
+const uint STRIDE = 23u;
 
 float round_coverage(vec2 local, float radius, float hardness) {
     float r = max(radius, 1e-4);

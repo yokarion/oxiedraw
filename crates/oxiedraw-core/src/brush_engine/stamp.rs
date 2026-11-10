@@ -78,17 +78,22 @@ pub(super) struct DabStyle {
     texture_scale: f32,
     texture_strength: f32,
     texturing_mode: f32,
+    texture_gain: f32,
+    texture_bias: f32,
     wash: bool,
 }
 
 impl DabStyle {
     fn from_preset(preset: &BrushPreset) -> Self {
+        let (texture_gain, texture_bias) = preset.texture_adjust.gain_bias();
         Self {
             hardness: preset.hardness,
             tip: preset.tip.as_gpu(),
             texture_scale: preset.texture_scale,
             texture_strength: preset.texture_strength,
             texturing_mode: preset.texturing_mode.as_gpu(),
+            texture_gain,
+            texture_bias,
             // The renderer washes only the soft-round tip; others fall back.
             wash: preset.paint_mode == PaintMode::Wash
                 && matches!(preset.family, BrushFamily::SoftRound),
@@ -101,6 +106,8 @@ impl DabStyle {
         dab.texture_scale = self.texture_scale;
         dab.texture_strength = self.texture_strength;
         dab.texturing_mode = self.texturing_mode;
+        dab.texture_gain = self.texture_gain;
+        dab.texture_bias = self.texture_bias;
     }
 }
 

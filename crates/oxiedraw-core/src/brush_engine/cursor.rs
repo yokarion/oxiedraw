@@ -3,12 +3,16 @@
 //! Computes the outline of the area the active brush would touch at the current
 //! input state, for the UI's custom cursor. It reuses the dab construction from
 //! `stamp::PresetStrokeRenderer` so the cursor mirrors what gets painted:
-//! ellipse for `SoftRound`, circle for `Pixel`, and a marching-squares contour
-//! of the alpha mask (threshold 0.5) for `Textured`. With a `scatter` mapping
-//! active the outline is dilated by the maximum scatter distance so it shows
-//! the envelope of possible dab placements, not a single dot.
+//! ellipse for round tips, circle for `Pixel`, and the marching-squares contour
+//! of the mask (threshold 0.5) for image tips and stamped patterns. Contours
+//! are traced once per pattern and cached, since the cursor is rebuilt on every
+//! pointer move. With a `scatter` mapping active the outline is dilated by the
+//! maximum scatter distance so it shows the envelope of possible dab placements.
 
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::f32::consts::TAU;
+use std::rc::{Rc, Weak};
 
 use oxiedraw_utils::geometry::Point;
 
@@ -28,6 +32,23 @@ const ELLIPSE_SEGMENTS: usize = 64;
 
 /// Alpha threshold used to extract a textured brush's footprint.
 const MASK_THRESHOLD: f32 = 0.5;
+
+/// Longest side a mask is traced at; larger masks are box-downsampled first.
+const OUTLINE_MAX_DIM: usize = 128;
+
+/// Outline simplification tolerance, in traced mask pixels.
+const OUTLINE_SIMPLIFY: f32 = 0.35;
+
+const OUTLINE_CACHE_SIZE: usize = 8;
+
+struct CachedOutline {
+    source: Weak<PatternData>,
+    strokes: Rc<[Vec<Point>]>,
+}
+
+thread_local! {
+    static OUTLINE_CACHE: RefCell<Vec<CachedOutline>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Outline geometry of a single brush dab, ready for the UI to stroke
 /// in widget space. Coordinates are canvas pixels relative to the
@@ -68,7 +89,7 @@ pub fn compute_brush_cursor(
     let dab = build_preview_dab(preset, ctx, input, base_size_for_dynamics);
 
     let strokes = match &preset.family {
-        BrushFamily::SoftRound => {
+        BrushFamily::SoftRound | BrushFamily::Smudge { tip: None, .. } => {
             let outline = ellipse_outline(&dab);
             vec![expand_outward(&outline, dab.center, scatter_max)]
         }
@@ -94,23 +115,176 @@ pub fn compute_brush_cursor(
                 };
                 vec![expand_outward(&outline, dab.center, scatter_max)]
             } else {
-                textured_outline(pattern, &dab, scatter_max)
+                mask_cursor(pattern, &dab, scatter_max)
             }
         }
-        BrushFamily::ImageTip { .. } => {
-            // The stamped tip fills the dab quad; approximate its footprint
-            // by the dab's bounding ellipse rather than tracing the tip mask.
-            let outline = ellipse_outline(&dab);
-            vec![expand_outward(&outline, dab.center, scatter_max)]
-        }
-        BrushFamily::Smudge => {
-            // Round tip shaped by hardness - same footprint as soft round.
-            let outline = ellipse_outline(&dab);
-            vec![expand_outward(&outline, dab.center, scatter_max)]
-        }
+        BrushFamily::ImageTip { tip, .. }
+        | BrushFamily::Smudge {
+            tip: Some(tip), ..
+        } => mask_cursor(tip, &dab, scatter_max),
     };
 
     BrushCursor { strokes }
+}
+
+/// The cached mask contour placed on `dab`, falling back to the dab ellipse
+/// when the mask has no contour.
+fn mask_cursor(mask: &Rc<PatternData>, dab: &Dab, scatter_max: f32) -> Vec<Vec<Point>> {
+    let outline = mask_outline(mask);
+    if outline.is_empty() {
+        return vec![expand_outward(&ellipse_outline(dab), dab.center, scatter_max)];
+    }
+    let rx = dab.radius.max(MIN_DAB_RADIUS);
+    let ry = rx * dab.aspect;
+    let (sin_r, cos_r) = dab.rotation.sin_cos();
+    outline
+        .iter()
+        .map(|line| {
+            line.iter()
+                .map(|q| {
+                    let (lx, ly) = (q.x * rx, q.y * ry);
+                    let p = Point::new(
+                        lx.mul_add(cos_r, -(ly * sin_r)) + dab.center.x,
+                        lx.mul_add(sin_r, ly * cos_r) + dab.center.y,
+                    );
+                    if scatter_max > 0.0 { dilate_point(p, dab.center, scatter_max) } else { p }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Contour of `mask`'s alpha in unit dab space (`-1..1` across the dab quad),
+/// traced on first use and cached per pattern allocation.
+fn mask_outline(mask: &Rc<PatternData>) -> Rc<[Vec<Point>]> {
+    OUTLINE_CACHE.with_borrow_mut(|cache| {
+        cache.retain(|e| e.source.strong_count() > 0);
+        if let Some(e) = cache.iter().find(|e| std::ptr::eq(e.source.as_ptr(), Rc::as_ptr(mask))) {
+            return Rc::clone(&e.strokes);
+        }
+        let strokes: Rc<[Vec<Point>]> = trace_mask_outline(mask).into();
+        if cache.len() >= OUTLINE_CACHE_SIZE {
+            cache.remove(0);
+        }
+        cache.push(CachedOutline {
+            source: Rc::downgrade(mask),
+            strokes: Rc::clone(&strokes),
+        });
+        strokes
+    })
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn trace_mask_outline(mask: &PatternData) -> Vec<Vec<Point>> {
+    let (w, h) = (mask.width as usize, mask.height as usize);
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let step = w.max(h).div_ceil(OUTLINE_MAX_DIM);
+    let (gw, gh) = (w.div_ceil(step), h.div_ceil(step));
+    // A zero border closes every contour.
+    let pw = gw + 2;
+    let mut grid = vec![0.0f32; pw * (gh + 2)];
+    for gy in 0..gh {
+        for gx in 0..gw {
+            let (mut sum, mut count) = (0u32, 0u32);
+            for y in gy * step..((gy + 1) * step).min(h) {
+                for x in gx * step..((gx + 1) * step).min(w) {
+                    sum += u32::from(mask.rgba[(y * w + x) * 4 + 3]);
+                    count += 1;
+                }
+            }
+            grid[(gy + 1) * pw + gx + 1] = sum as f32 / (count.max(1) as f32 * 255.0);
+        }
+    }
+    let segments = marching_squares(pw, gh + 2, |x, y| grid[y * pw + x], MASK_THRESHOLD);
+    let to_unit = |p: &Point| {
+        Point::new(
+            ((p.x - 0.5) / gw as f32).mul_add(2.0, -1.0),
+            ((p.y - 0.5) / gh as f32).mul_add(2.0, -1.0),
+        )
+    };
+    stitch_segments(&segments)
+        .iter()
+        .map(|line| simplify_polyline(line, OUTLINE_SIMPLIFY).iter().map(to_unit).collect())
+        .collect()
+}
+
+/// Join marching-squares segments into polylines. Shared edge points are
+/// computed from the same samples, so they match bit for bit.
+fn stitch_segments(segments: &[(Point, Point)]) -> Vec<Vec<Point>> {
+    let key = |p: Point| (p.x.to_bits(), p.y.to_bits());
+    let mut by_end: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+    for (i, (a, b)) in segments.iter().enumerate() {
+        by_end.entry(key(*a)).or_default().push(i);
+        by_end.entry(key(*b)).or_default().push(i);
+    }
+    let mut used = vec![false; segments.len()];
+    let mut lines = Vec::new();
+    for start in 0..segments.len() {
+        if used[start] {
+            continue;
+        }
+        used[start] = true;
+        let mut line = VecDeque::from([segments[start].0, segments[start].1]);
+        for forward in [true, false] {
+            loop {
+                let end = if forward { line.back() } else { line.front() };
+                let Some(&end) = end else { break };
+                let next = by_end
+                    .get(&key(end))
+                    .and_then(|ids| ids.iter().copied().find(|&i| !used[i]));
+                let Some(next) = next else { break };
+                used[next] = true;
+                let (a, b) = segments[next];
+                let other = if key(a) == key(end) { b } else { a };
+                if forward {
+                    line.push_back(other);
+                } else {
+                    line.push_front(other);
+                }
+            }
+        }
+        lines.push(line.into());
+    }
+    lines
+}
+
+/// Ramer-Douglas-Peucker simplification.
+fn simplify_polyline(line: &[Point], epsilon: f32) -> Vec<Point> {
+    if line.len() < 3 {
+        return line.to_vec();
+    }
+    let mut keep = vec![false; line.len()];
+    keep[0] = true;
+    keep[line.len() - 1] = true;
+    let mut spans = vec![(0, line.len() - 1)];
+    while let Some((first, last)) = spans.pop() {
+        let mut worst = (0.0f32, 0usize);
+        for (i, p) in line.iter().enumerate().take(last).skip(first + 1) {
+            let d = distance_to_segment(*p, line[first], line[last]);
+            if d > worst.0 {
+                worst = (d, i);
+            }
+        }
+        if worst.0 > epsilon {
+            keep[worst.1] = true;
+            spans.push((first, worst.1));
+            spans.push((worst.1, last));
+        }
+    }
+    line.iter().zip(keep).filter_map(|(p, k)| k.then_some(*p)).collect()
+}
+
+fn distance_to_segment(p: Point, a: Point, b: Point) -> f32 {
+    let (dx, dy) = (b.x - a.x, b.y - a.y);
+    let len_sq = dx.mul_add(dx, dy * dy);
+    let t = if len_sq > 1e-12 {
+        ((p.x - a.x).mul_add(dx, (p.y - a.y) * dy) / len_sq).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p.x - t.mul_add(dx, a.x)).hypot(p.y - t.mul_add(dy, a.y))
 }
 
 /// Construct the dab the engine would emit for a single sample,
@@ -217,72 +391,17 @@ fn dilate_point(p: Point, center: Point, expand: f32) -> Point {
     Point::new(nx.mul_add(expand, p.x), ny.mul_add(expand, p.y))
 }
 
-/// Trace the alpha-0.5 contour of `pattern` via marching squares,
-/// scale it to the dab's diameter, rotate by `dab.rotation`, translate
-/// to `dab.center`, then dilate by `scatter_max`. Returns a list of
-/// short polylines - cairo strokes them as separate segments; visually
-/// they form a continuous contour.
-fn textured_outline(
-    pattern: &PatternData,
-    dab: &Dab,
-    scatter_max: f32,
-) -> Vec<Vec<Point>> {
-    let segments = marching_squares_pattern(pattern, MASK_THRESHOLD);
-    if segments.is_empty() {
-        return Vec::new();
-    }
-
-    // Pattern is `w x h` premultiplied RGBA. Scale so the pattern's
-    // full extent maps to the dab's bounding box.
-    #[allow(clippy::cast_precision_loss)]
-    let pw = pattern.width as f32;
-    #[allow(clippy::cast_precision_loss)]
-    let ph = pattern.height as f32;
-    let diameter = (dab.radius * 2.0).max(MIN_DAB_RADIUS * 2.0);
-    let scale_x = diameter / pw;
-    let scale_y = (diameter * dab.aspect) / ph;
-    let cx_p = pw * 0.5;
-    let cy_p = ph * 0.5;
-    let (sin_r, cos_r) = dab.rotation.sin_cos();
-
-    let transform = |pp: Point| -> Point {
-        let lx = (pp.x - cx_p) * scale_x;
-        let ly = (pp.y - cy_p) * scale_y;
-        let x = lx.mul_add(cos_r, -(ly * sin_r)) + dab.center.x;
-        let y = lx.mul_add(sin_r, ly * cos_r) + dab.center.y;
-        Point::new(x, y)
-    };
-
-    segments
-        .into_iter()
-        .map(|(a, b)| {
-            let mut ta = transform(a);
-            let mut tb = transform(b);
-            if scatter_max > 0.0 {
-                ta = dilate_point(ta, dab.center, scatter_max);
-                tb = dilate_point(tb, dab.center, scatter_max);
-            }
-            vec![ta, tb]
-        })
-        .collect()
-}
-
-/// Marching squares on a premultiplied-RGBA pattern, returning a list
-/// of (start, end) line segments in pattern-pixel coordinates. The
-/// contour threshold is `MASK_THRESHOLD`. Segments are not stitched -
-/// callers either stroke them independently or stitch via endpoint
-/// matching as needed.
-fn marching_squares_pattern(pattern: &PatternData, threshold: f32) -> Vec<(Point, Point)> {
-    let w = pattern.width as usize;
-    let h = pattern.height as usize;
+/// Marching squares over a `w x h` grid of `alpha_at` values, returning
+/// unstitched (start, end) line segments in grid coordinates.
+fn marching_squares(
+    w: usize,
+    h: usize,
+    alpha_at: impl Fn(usize, usize) -> f32,
+    threshold: f32,
+) -> Vec<(Point, Point)> {
     if w < 2 || h < 2 {
         return Vec::new();
     }
-    #[allow(clippy::cast_precision_loss)]
-    let alpha_at = |x: usize, y: usize| -> f32 {
-        let i = (y * w + x) * 4 + 3;
-        f32::from(pattern.rgba[i]) / 255.0
-    };
     let mut segments: Vec<(Point, Point)> = Vec::new();
     let interp = |a: f32, b: f32| -> f32 {
         // Guard against the rare a == b case; the contour passes
@@ -422,6 +541,7 @@ mod tests {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: crate::brush_engine::TexturingMode::Multiply,
+            texture_adjust: crate::brush_engine::TextureAdjust::default(),
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -716,6 +836,8 @@ mod tests {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: 0.0,
+            texture_gain: 1.0,
+            texture_bias: 0.0,
             smudge_rate: 1.0,
             color_rate: 0.0,
             opacity: 1.0,
@@ -1005,6 +1127,43 @@ mod tests {
                 signature(mutated),
                 "property `{name}` must affect the brush cursor outline"
             );
+        }
+    }
+
+    #[test]
+    fn image_tip_cursor_traces_the_tip_and_is_cached() {
+        let preset = BrushPreset::wet_textured_soft(BrushPresetId(0));
+        let BrushFamily::Smudge { tip: Some(tip), .. } = &preset.family else {
+            panic!("wet textured soft has a tip")
+        };
+        assert!(Rc::ptr_eq(&mask_outline(tip), &mask_outline(tip)));
+        let ctx = StrokeContext { size: 60.0, ..baseline_ctx() };
+        let cursor = compute_brush_cursor(&preset, ctx, baseline_input(), 60.0);
+        assert!(cursor.strokes.len() >= 8, "one contour per bristle, got {}", cursor.strokes.len());
+        let (xmin, xmax, ymin, ymax) = bounds(&cursor);
+        assert!(xmin >= -30.5 && xmax <= 30.5 && ymin >= -30.5 && ymax <= 30.5);
+    }
+
+    #[test]
+    fn builtin_cursor_outlines_stay_small() {
+        let presets = [
+            BrushPreset::airbrush_soft(BrushPresetId(0)),
+            BrushPreset::ink_pen(BrushPresetId(0)),
+            BrushPreset::pixel(BrushPresetId(0)),
+            BrushPreset::scatter_dot(BrushPresetId(0)),
+            BrushPreset::speed_brush(BrushPresetId(0)),
+            BrushPreset::chalk(BrushPresetId(0)),
+            BrushPreset::charcoal_pencil(BrushPresetId(0)),
+            BrushPreset::comics(BrushPresetId(0)),
+            BrushPreset::real_brush(BrushPresetId(0)),
+            BrushPreset::wet_textured_soft(BrushPresetId(0)),
+        ];
+        for preset in &presets {
+            let ctx = StrokeContext { size: 200.0, ..baseline_ctx() };
+            let cursor = compute_brush_cursor(preset, ctx, baseline_input(), 200.0);
+            let points: usize = cursor.strokes.iter().map(Vec::len).sum();
+            assert!(!cursor.is_empty(), "{} has no cursor", preset.name);
+            assert!(points <= 1500, "{} cursor has {points} points", preset.name);
         }
     }
 }

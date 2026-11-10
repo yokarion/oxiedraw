@@ -19,6 +19,8 @@ layout(location = 9) in float a_tip;             // 0 = round, 1 = square
 layout(location = 10) in float a_texture_scale;  // grain tile size in canvas px
 layout(location = 11) in float a_texture_strength;
 layout(location = 12) in float a_texturing_mode; // 0 multiply, 1 subtract
+layout(location = 13) in float a_texture_gain;
+layout(location = 14) in float a_texture_bias;
 
 layout(push_constant) uniform Push {
     vec2 inv_size;
@@ -36,6 +38,7 @@ layout(location = 7) out float v_tex_strength;
 layout(location = 8) out float v_radius;         // canvas pixels, for edge AA
 layout(location = 9) out vec2 v_tip_uv;          // stamped-tip sample coords [0,1]
 layout(location = 10) out float v_tex_mode;      // 0 multiply, 1 subtract
+layout(location = 11) out vec2 v_tex_adjust;     // grain gain, bias
 
 void main() {
     // Apply aspect (squish on Y) then rotation, then radius scale.
@@ -61,4 +64,5 @@ void main() {
     // is stamped in dab-local space, so it scales/rotates with the dab.
     v_tip_uv = a_quad * 0.5 + 0.5;
     v_tex_mode = a_texturing_mode;
+    v_tex_adjust = vec2(a_texture_gain, a_texture_bias);
 }

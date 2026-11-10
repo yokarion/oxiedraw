@@ -385,3 +385,132 @@ fn low_pressure_smudge_beading_profile() {
     // Beading shows up as a large min/max spread along a nominally uniform line.
     assert!(u32::from(max - min) < 40, "beading: alpha spread {} too large", max - min);
 }
+
+fn select_brush(brush: &BrushEngine, name: &str) {
+    let id = brush
+        .brushes
+        .borrow()
+        .iter()
+        .find(|p| p.name == name)
+        .map(|p| p.id)
+        .expect("preset exists");
+    brush.active.set(id);
+}
+
+/// Mean luma per row over the middle of a horizontal stroke on an opaque layer.
+fn row_profile(name: &str, pressure: f32) -> Vec<f32> {
+    let size = Size::new(320, 100);
+    let white = vec![255u8; (size.width * size.height) as usize * 4];
+    let (mut canvas, idx) = canvas_with_layer(size, &white);
+    let brush = BrushEngine::new();
+    select_brush(&brush, name);
+    brush.size.set(60.0);
+    brush.opacity.set(1.0);
+    smudge_line_p(&mut canvas, &brush, Color::new(0, 0, 0), 50.0, 30.0, 290.0, pressure);
+
+    let mut buf = Vec::new();
+    canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
+    let w = size.width as usize;
+    (0..size.height as usize)
+        .map(|y| {
+            let sum: u32 = (120..260)
+                .map(|x| {
+                    let i = (y * w + x) * 4;
+                    (u32::from(buf[i]) + u32::from(buf[i + 1]) + u32::from(buf[i + 2])) / 3
+                })
+                .sum();
+            sum as f32 / 140.0
+        })
+        .collect()
+}
+
+/// Local minima of a profile that dip at least `depth` below both neighbours' peaks.
+fn streak_count(profile: &[f32], depth: f32) -> usize {
+    let mut count = 0;
+    let mut peak = profile[0];
+    let mut low = profile[0];
+    let mut descending = false;
+    for &v in &profile[1..] {
+        if descending {
+            if v < low {
+                low = v;
+            } else if v - low >= depth {
+                count += 1;
+                descending = false;
+                peak = v;
+            }
+        } else if v > peak {
+            peak = v;
+        } else if peak - v >= depth {
+            descending = true;
+            low = v;
+        }
+    }
+    count + usize::from(descending)
+}
+
+/// Krita's Wet Textured Soft: the grouped-bristle tip drags separate streaks
+/// through the paper grain, and a light touch barely marks the canvas.
+#[test]
+fn wet_textured_soft_paints_streaks_that_follow_pressure() {
+    let darkest = |profile: &[f32]| profile.iter().copied().fold(255.0, f32::min);
+    let firm = row_profile("Wet Textured Soft", 1.0);
+    let light = row_profile("Wet Textured Soft", 0.2);
+    let round = row_profile("Real Brush", 1.0);
+    println!(
+        "firm darkest={:.1} streaks={} | light darkest={:.1} | real brush streaks={}",
+        darkest(&firm),
+        streak_count(&firm, 3.0),
+        darkest(&light),
+        streak_count(&round, 3.0)
+    );
+    assert!(streak_count(&firm, 3.0) >= 4, "bristle tip should leave separate streaks");
+    assert_eq!(streak_count(&round, 3.0), 1, "round tip leaves one smooth band");
+    assert!(darkest(&firm) < 200.0, "firm stroke deposits paint");
+    assert!(darkest(&light) > darkest(&firm) + 60.0, "light pressure stays faint");
+}
+
+/// Rows inside the dab quad but outside the bristles stay untouched; the tip
+/// used to be sampled with undefined derivatives at the quad edge, which drew
+/// faint square borders around every dab.
+#[test]
+fn wet_textured_soft_leaves_no_square_dab_borders() {
+    let profile = row_profile("Wet Textured Soft", 1.0);
+    for y in [20, 21, 78, 79] {
+        assert!(profile[y] > 254.9, "row {y} reads {}", profile[y]);
+    }
+}
+
+/// Max alpha of one full-pressure black tap on a transparent layer.
+fn tap_alpha(name: &str) -> u8 {
+    let size = Size::new(100, 100);
+    let mut canvas = Canvas::headless(size).unwrap();
+    let idx = canvas.add_layer("smudge").unwrap();
+    canvas.layers().set_active(Some(idx));
+    let brush = BrushEngine::new();
+    select_brush(&brush, name);
+    brush.size.set(60.0);
+    brush.opacity.set(1.0);
+    let black = Color::new(0, 0, 0);
+    canvas.begin_stroke(black, 1.0, false).unwrap();
+    canvas.set_smudge_stroke(true).unwrap();
+    canvas
+        .stamp(|tg| brush.begin_stroke(sample_p(50.0, 50.0, 0, 1.0), black, tg))
+        .unwrap();
+    canvas.stamp(|tg| brush.end_stroke(tg)).unwrap();
+    canvas.commit_stroke().unwrap();
+    let mut buf = Vec::new();
+    canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
+    buf.chunks_exact(4).map(|p| p[3]).max().unwrap()
+}
+
+/// Smear alpha: on a transparent layer a dab only lays down Krita's 20%
+/// color rate; the opaque-fallback smudge lays down the full brush color.
+#[test]
+fn wet_textured_soft_tap_on_transparent_stays_light() {
+    let wet = tap_alpha("Wet Textured Soft");
+    let real = tap_alpha("Real Brush");
+    println!("tap max alpha: wet textured soft {wet}, real brush {real}");
+    assert!(wet > 0 && wet <= 60, "smear-alpha tap alpha {wet}");
+    assert!(real >= 150, "opaque-fallback tap alpha {real}");
+}

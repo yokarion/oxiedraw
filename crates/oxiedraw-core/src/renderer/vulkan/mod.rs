@@ -1660,6 +1660,8 @@ mod tests {
             texturing_mode: 0.0,
             opacity: 1.0,
             average_opacity: 1.0,
+            texture_gain: 1.0,
+            texture_bias: 0.0,
         }
     }
 

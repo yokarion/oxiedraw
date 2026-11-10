@@ -635,6 +635,7 @@ fn create_new_brush(
         texture_scale: 0.0,
         texture_strength: 0.0,
         texturing_mode: oxiedraw_core::brush_engine::TexturingMode::Multiply,
+        texture_adjust: oxiedraw_core::brush_engine::TextureAdjust::default(),
         dynamics: oxiedraw_core::brush_engine::Dynamics::default(),
         icon: None,
         preview: None,

@@ -414,24 +414,35 @@ pub(super) fn build_mip_chain(src: &[u8], src_w: u32, src_h: u32) -> (Vec<u8>, V
     (packed, offsets)
 }
 
+/// Bilinear resize with wrap-around edges, matching the REPEAT sampler.
+// Fix: nearest-neighbour upscaling turned small tips into blocky, pixelated dabs.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
 fn resize_to_atlas(src: &[u8], src_w: u32, src_h: u32) -> Vec<u8> {
     let dim = ATLAS_SLICE_DIM;
+    if src_w == dim && src_h == dim {
+        return src.to_vec();
+    }
     let mut out = vec![0u8; (dim * dim * 4) as usize];
     if src_w == 0 || src_h == 0 {
         return out;
     }
-    let sx_step = src_w as f32 / dim as f32;
-    let sy_step = src_h as f32 / dim as f32;
+    let taps = |dst: u32, src_len: u32| {
+        let pos = (dst as f32 + 0.5).mul_add(src_len as f32 / dim as f32, -0.5);
+        let base = pos.floor();
+        let wrap = |i: f32| (i as i64).rem_euclid(i64::from(src_len)) as u32;
+        (wrap(base), wrap(base + 1.0), pos - base)
+    };
     for y in 0..dim {
+        let (y0, y1, fy) = taps(y, src_h);
         for x in 0..dim {
-            let sx = ((x as f32) * sx_step) as u32;
-            let sy = ((y as f32) * sy_step) as u32;
-            let sx = sx.min(src_w - 1);
-            let sy = sy.min(src_h - 1);
-            let i_src = ((sy * src_w + sx) * 4) as usize;
+            let (x0, x1, fx) = taps(x, src_w);
+            let at = |sx: u32, sy: u32, c: usize| f32::from(src[((sy * src_w + sx) * 4) as usize + c]);
             let i_dst = ((y * dim + x) * 4) as usize;
-            out[i_dst..i_dst + 4].copy_from_slice(&src[i_src..i_src + 4]);
+            for c in 0..4 {
+                let top = (at(x1, y0, c) - at(x0, y0, c)).mul_add(fx, at(x0, y0, c));
+                let bottom = (at(x1, y1, c) - at(x0, y1, c)).mul_add(fx, at(x0, y1, c));
+                out[i_dst + c] = (bottom - top).mul_add(fy, top).round() as u8;
+            }
         }
     }
     out

@@ -26,7 +26,9 @@ use super::vulkan::RING_FRAMES;
 /// - `texturing_mode`  72   f32 (0 multiply, 1 subtract)
 /// - `opacity`         76   f32 (wash ceiling)
 /// - `average_opacity` 80   f32 (Krita's running average of `opacity`)
-/// Total stride = 84, all components 4-byte aligned. `wash.frag` reads the
+/// - `texture_gain`    84   f32 (grain brightness/contrast/invert as gain)
+/// - `texture_bias`    88   f32 (... and bias)
+/// Total stride = 92, all components 4-byte aligned. `wash.frag` reads the
 /// same layout as a float array, so keep the two in step.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -45,13 +47,15 @@ pub struct DabInstance {
     pub texturing_mode: f32,
     pub opacity: f32,
     pub average_opacity: f32,
+    pub texture_gain: f32,
+    pub texture_bias: f32,
 }
 
 const _: () = assert!(std::mem::size_of::<DabInstance>() == DAB_INSTANCE_STRIDE as usize);
 
-pub(super) const DAB_INSTANCE_STRIDE: u32 = 84;
+pub(super) const DAB_INSTANCE_STRIDE: u32 = 92;
 
-/// Maximum dabs uploadable in a single call. ~5.5 MB at 84 bytes each.
+/// Maximum dabs uploadable in a single call. ~6 MB at 92 bytes each.
 pub(super) const MAX_INSTANCES: u32 = 64 * 1024;
 
 const QUAD_VERTS: [[f32; 2]; 4] = [[-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0], [1.0, 1.0]];
@@ -172,6 +176,8 @@ impl DabInstance {
             texturing_mode: dab.texturing_mode,
             opacity: dab.opacity,
             average_opacity: dab.average_opacity,
+            texture_gain: dab.texture_gain,
+            texture_bias: dab.texture_bias,
         }
     }
 }
@@ -429,6 +435,16 @@ pub(super) fn build_dab_instanced_pipeline(
             .binding(1)
             .format(vk::Format::R32_SFLOAT)
             .offset(72), // texturing_mode
+        vk::VertexInputAttributeDescription::default()
+            .location(13)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(84), // texture_gain
+        vk::VertexInputAttributeDescription::default()
+            .location(14)
+            .binding(1)
+            .format(vk::Format::R32_SFLOAT)
+            .offset(88), // texture_bias
     ];
     let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
         .vertex_binding_descriptions(&bindings)

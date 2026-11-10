@@ -160,7 +160,7 @@ fn draw_dab(
             cr.rectangle(snapped_x - r, snapped_y - r, r * 2.0, r * 2.0);
             cr.fill().ok();
         }
-        BrushFamily::SoftRound | BrushFamily::Smudge => {
+        BrushFamily::SoftRound | BrushFamily::Smudge { .. } => {
             // Radial gradient with a ~1 px feather, matching the
             // `1 - smoothstep(r - aa, r, d)` in dab.frag.
             let gradient = cairo::RadialGradient::new(x, y, 0.0, x, y, r);

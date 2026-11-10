@@ -1537,9 +1537,9 @@ impl Canvas {
                 return self.present();
             }
             let (dabs, prev) = {
-                let mut batch = SmudgeBatchStamp::new(self.smudge_prev_center);
+                let mut batch = SmudgeBatchStamp::new(&mut self.renderer, self.smudge_prev_center);
                 paint(&mut batch);
-                batch.into_dabs()
+                batch.into_dabs()?
             };
             self.smudge_prev_center = prev;
             let mut paint_linear = [0.0f32; 4];

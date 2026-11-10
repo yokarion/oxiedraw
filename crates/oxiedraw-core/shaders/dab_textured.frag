@@ -11,6 +11,7 @@ layout(location = 7) in float v_tex_strength;
 layout(location = 8) in float v_radius;
 layout(location = 9) in vec2 v_tip_uv;
 layout(location = 10) in float v_tex_mode;      // 0 multiply, 1 subtract
+layout(location = 11) in vec2 v_tex_adjust;     // grain gain, bias
 
 layout(set = 0, binding = 0) uniform sampler2DArray u_atlas;
 
@@ -62,8 +63,8 @@ float base_coverage() {
 }
 
 // Apply the canvas-anchored texture pattern to `coverage`, matching Krita's
-// texture option: MULTIPLY darkens, SUBTRACT carves holes. `g` is the baked
-// pattern mask (brightness/contrast already applied on the CPU).
+// texture option: MULTIPLY darkens, SUBTRACT carves holes. `g` is the pattern
+// mask with the brush's brightness/contrast/invert applied as gain + bias.
 float apply_texture(float coverage) {
     if (push.slice == NO_SLICE || v_tex_scale <= 0.0 || v_tex_strength <= 0.0) {
         return coverage;
@@ -71,6 +72,7 @@ float apply_texture(float coverage) {
     vec2 uv = v_canvas_px / v_tex_scale;
     // Force the base mip so the canvas-minified grain stays crisp.
     float g = textureLod(u_atlas, vec3(uv, float(push.slice)), 0.0).a;
+    g = clamp(g * v_tex_adjust.x + v_tex_adjust.y, 0.0, 1.0);
     if (v_tex_mode > 0.5) {
         return max(0.0, coverage - g * v_tex_strength);
     }

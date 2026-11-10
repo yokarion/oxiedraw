@@ -103,7 +103,16 @@ impl BrushPackage {
         let family = match &self.document.family {
             FamilyDoc::SoftRound => BrushFamily::SoftRound,
             FamilyDoc::Pixel => BrushFamily::Pixel,
-            FamilyDoc::Smudge => BrushFamily::Smudge,
+            FamilyDoc::Smudge => BrushFamily::smudge(),
+            FamilyDoc::SmudgeOptions {
+                tip,
+                grain,
+                smear_alpha,
+            } => BrushFamily::Smudge {
+                tip: tip.as_deref().map(resolve).transpose()?.map(Rc::new),
+                grain: grain.as_deref().map(resolve).transpose()?.map(Rc::new),
+                smear_alpha: *smear_alpha,
+            },
             FamilyDoc::Textured { pattern } => {
                 BrushFamily::Textured(Rc::new(resolve(pattern)?))
             }
@@ -141,6 +150,7 @@ impl BrushPackage {
             texture_scale: self.document.texture_scale,
             texture_strength: self.document.texture_strength,
             texturing_mode: self.document.texturing_mode,
+            texture_adjust: self.document.texture_adjust,
             dynamics: self.document.dynamics,
             icon: self.icon,
             preview: self.preview,

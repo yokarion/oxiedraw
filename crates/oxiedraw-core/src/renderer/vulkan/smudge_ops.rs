@@ -12,7 +12,8 @@ use ash::vk;
 use std::mem::ManuallyDrop;
 
 use super::super::RendererError;
-use super::super::pass::{FullscreenPass, linear_clamp_sampler, over_blend};
+use super::super::dab::NO_SLICE;
+use super::super::pass::{FullscreenPass, linear_clamp_sampler, replace_blend};
 use super::super::resources::Image;
 use super::{CANVAS_FORMAT, VulkanRenderer, create_sampled_image_set};
 
@@ -21,6 +22,7 @@ const DAB_SMUDGE_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dab
 
 /// One smudge dab handed to [`VulkanRenderer::smudge_dabs`]. All lengths are
 /// canvas pixels; `delta` is `center - previous_center` (the drag vector).
+/// `tip_slice` / `grain_slice` are pattern-atlas slices or `NO_SLICE`.
 #[derive(Debug, Clone, Copy)]
 pub struct SmudgeDab {
     pub center: [f32; 2],
@@ -29,6 +31,29 @@ pub struct SmudgeDab {
     pub hardness: f32,
     pub smudge_rate: f32,
     pub color_rate: f32,
+    pub flow: f32,
+    pub rotation: f32,
+    pub aspect: f32,
+    pub texture_scale: f32,
+    pub texture_strength: f32,
+    pub texturing_mode: f32,
+    pub texture_gain: f32,
+    pub texture_bias: f32,
+    pub tip_slice: u32,
+    pub grain_slice: u32,
+    /// Krita's smear alpha: transparency smears instead of falling back to paint.
+    pub smear_alpha: bool,
+}
+
+impl SmudgeDab {
+    /// Half-extent of the written area; a rotated image tip fills its quad corners.
+    fn reach(&self) -> f32 {
+        if self.tip_slice == NO_SLICE {
+            self.radius
+        } else {
+            self.radius * std::f32::consts::SQRT_2
+        }
+    }
 }
 
 /// Push constants for `dab_smudge.frag`. Layout must match the shader.
@@ -44,10 +69,23 @@ struct SmudgePush {
     smudge_rate: f32,
     color_rate: f32,
     opacity: f32,
+    flow: f32,
+    rotation: f32,
+    aspect: f32,
+    texture_scale: f32,
+    texture_strength: f32,
+    texturing_mode: f32,
+    texture_gain: f32,
+    texture_bias: f32,
+    tip_slice: u32,
+    grain_slice: u32,
+    smear_alpha: u32,
 }
 
+const _: () = assert!(std::mem::size_of::<SmudgePush>() == SmudgePush::SIZE as usize);
+
 impl SmudgePush {
-    const SIZE: u32 = 60;
+    const SIZE: u32 = 104;
 
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: repr(C) POD of f32s.
@@ -85,14 +123,15 @@ impl SmudgePipeline {
 
 impl VulkanRenderer {
     /// Build the smudge pipeline on first use (most sessions never smudge).
-    /// Two descriptor sets, both the layer-composite single-sampler layout:
-    /// set 0 = `blend_scratch` (per-dab layer copy), set 1 = `smudge_before`.
+    /// Sets 0 and 1 use the layer-composite single-sampler layout: set 0 =
+    /// `blend_scratch` (per-dab layer copy), set 1 = `smudge_before`. Set 2 is
+    /// the pattern atlas (image tip + grain).
     fn ensure_smudge_pipeline(&mut self) -> Result<(), RendererError> {
         if self.smudge_pipeline.is_some() {
             return Ok(());
         }
         let set_layout = self.layer_composite_pipeline.descriptor_set_layout;
-        let set_layouts = [set_layout, set_layout];
+        let set_layouts = [set_layout, set_layout, self.pattern_atlas.descriptor_set_layout()];
         let push_ranges = [vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::FRAGMENT)
             .offset(0)
@@ -106,7 +145,7 @@ impl VulkanRenderer {
             frag_spv: DAB_SMUDGE_FRAG_SPV,
             render_pass: self.canvas_target.render_pass,
             layout,
-            blend: over_blend(),
+            blend: replace_blend(),
         }
         .build(&self.device)?;
         // Fix: linear pickup; the layers' nearest sampler snapped the drag to whole pixels (streaks).
@@ -286,6 +325,7 @@ impl VulkanRenderer {
         let smudge = self.smudge_pipeline.as_ref().expect("pipeline ensured");
         let (layout, pipeline, scratch_set) = (smudge.layout, smudge.pipeline, smudge.scratch_set);
         let before_set = self.smudge_before.as_ref().expect("before ensured").2;
+        let atlas_set = self.pattern_atlas.descriptor_set();
         let layer_fb = self.layer_stack.slots[layer_idx].framebuffer;
         let layer_img = self.layer_stack.slots[layer_idx].image.handle;
         let scratch_img = self.blend_scratch.handle;
@@ -297,7 +337,7 @@ impl VulkanRenderer {
             // Skip dabs whose copy/render rect collapses to nothing (e.g. a
             // centre dragged off-canvas): a zero-extent copy region / render
             // area is an invalid Vulkan command.
-            let Some(scissor) = smudge_copy_scissor(d.center, d.delta, d.radius, size) else {
+            let Some(scissor) = smudge_copy_scissor(d.center, d.delta, d.reach(), size) else {
                 continue;
             };
             self.clip = Some(scissor);
@@ -312,6 +352,17 @@ impl VulkanRenderer {
                 smudge_rate: d.smudge_rate,
                 color_rate: d.color_rate,
                 opacity,
+                flow: d.flow,
+                rotation: d.rotation,
+                aspect: d.aspect,
+                texture_scale: d.texture_scale,
+                texture_strength: d.texture_strength,
+                texturing_mode: d.texturing_mode,
+                texture_gain: d.texture_gain,
+                texture_bias: d.texture_bias,
+                tip_slice: d.tip_slice,
+                grain_slice: d.grain_slice,
+                smear_alpha: u32::from(d.smear_alpha),
             };
             self.cmd_begin_fullscreen_pass(render_pass, layer_fb, pipeline);
             unsafe {
@@ -320,7 +371,7 @@ impl VulkanRenderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     layout,
                     0,
-                    &[scratch_set, before_set],
+                    &[scratch_set, before_set, atlas_set],
                     &[],
                 );
                 self.device.cmd_push_constants(
@@ -342,7 +393,7 @@ impl VulkanRenderer {
     fn finish_smudge_dabs(&mut self, layer_idx: usize, dabs: &[SmudgeDab]) {
         self.layer_stack.touch(layer_idx);
         for d in dabs {
-            self.accumulate_smudge_dirty(d.center, d.radius);
+            self.accumulate_smudge_dirty(d.center, d.reach());
         }
     }
 
@@ -373,7 +424,7 @@ impl VulkanRenderer {
 fn present_scissor(dabs: &[SmudgeDab], size: oxiedraw_utils::geometry::Size) -> Option<vk::Rect2D> {
     let (mut x0, mut y0, mut x1, mut y1) = (f32::MAX, f32::MAX, f32::MIN, f32::MIN);
     for d in dabs {
-        let h = d.radius + 2.0;
+        let h = d.reach() + 2.0;
         x0 = x0.min(d.center[0] - h);
         y0 = y0.min(d.center[1] - h);
         x1 = x1.max(d.center[0] + h);

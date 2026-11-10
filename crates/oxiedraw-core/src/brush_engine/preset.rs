@@ -50,6 +50,46 @@ impl TexturingMode {
     }
 }
 
+impl crate::enum_meta::EnumMeta for TexturingMode {
+    const ALL: &'static [Self] = &[Self::Multiply, Self::Subtract];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Multiply => "Multiply",
+            Self::Subtract => "Subtract",
+        }
+    }
+}
+
+/// Krita's texture brightness / contrast / invert, applied to the grain at
+/// sample time so they stay editable.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextureAdjust {
+    pub brightness: f32,
+    pub contrast: f32,
+    pub invert: bool,
+}
+
+impl Default for TextureAdjust {
+    fn default() -> Self {
+        Self {
+            brightness: 0.0,
+            contrast: 1.0,
+            invert: false,
+        }
+    }
+}
+
+impl TextureAdjust {
+    /// The adjustment as `clamp(grain * gain + bias, 0, 1)`, the form the
+    /// shaders evaluate.
+    pub fn gain_bias(self) -> (f32, f32) {
+        let gain = self.contrast;
+        let bias = 0.5 - self.contrast * (self.brightness + 0.5);
+        if self.invert { (-gain, 1.0 - bias) } else { (gain, bias) }
+    }
+}
+
 /// How a stroke's dabs combine in the stroke buffer before the single
 /// composite onto the layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -116,6 +156,10 @@ const ICON_CHARCOAL_PENCIL: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/icons/builtin-brush-icons/charcoal_pencil.png"
 ));
+const ICON_WET_TEXTURED_SOFT: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/icons/builtin-brush-icons/wet_textured_soft.png"
+));
 
 // Predefined brush-tip + texture images extracted from Krita's default
 // resource bundle (`Krita_4_Default_Resources.bundle`), converted to plain
@@ -128,6 +172,14 @@ const TIP_OIL_BRISTLE: &[u8] = include_bytes!(concat!(
 const TEXTURE_DRAWED_DOTTED: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../data/builtin-brush-assets/10_drawed_dotted.png"
+));
+const TIP_BRISTLES_GROUPED: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/builtin-brush-assets/bristles_grouped.png"
+));
+const TEXTURE_PAPER_SOFT_GRAIN: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../data/builtin-brush-assets/paper_soft_grain.png"
 ));
 
 /// Side length of the synthesised grain tiles. Matches the pattern atlas
@@ -161,18 +213,33 @@ pub enum BrushFamily {
     /// Color-smudge brush (Krita colorsmudge): each dab picks up the color
     /// under it from the layer, blends it with the carried smudge color, and
     /// deposits it (plus a little paint). Painted by a dedicated GPU path, not
-    /// the mask pipelines, so it carries no pattern data - the tip is a round
-    /// mask shaped by `hardness`.
-    Smudge,
+    /// the mask pipelines. `tip` stamps an image tip instead of the round
+    /// `hardness` mask; `grain` is a canvas-anchored texture on the coverage.
+    /// `smear_alpha` is Krita's smear alpha: transparency is dragged along
+    /// like color instead of being filled with the brush color.
+    Smudge {
+        tip: Option<Rc<PatternData>>,
+        grain: Option<Rc<PatternData>>,
+        smear_alpha: bool,
+    },
 }
 
 impl BrushFamily {
+    /// Plain round smudge with no tip image or texture.
+    pub const fn smudge() -> Self {
+        Self::Smudge {
+            tip: None,
+            grain: None,
+            smear_alpha: false,
+        }
+    }
+
     /// Stable discriminator used to index renderer mask-pipeline arrays.
     /// `ImageTip` reuses the textured pipeline (slot 2); `Smudge` doesn't use
     /// the mask pipelines at all (it has its own GPU path) - map it to slot 0.
     pub const fn kind_index(&self) -> usize {
         match self {
-            Self::SoftRound | Self::Smudge => 0,
+            Self::SoftRound | Self::Smudge { .. } => 0,
             Self::Pixel => 1,
             Self::Textured(_) | Self::ImageTip { .. } => 2,
         }
@@ -181,7 +248,16 @@ impl BrushFamily {
     /// True for the color-smudge family, which is painted by the dedicated
     /// GPU smudge path rather than the stroke-buffer mask pipelines.
     pub const fn is_smudge(&self) -> bool {
-        matches!(self, Self::Smudge)
+        matches!(self, Self::Smudge { .. })
+    }
+
+    /// The canvas-anchored texture, if the family has one.
+    pub const fn grain(&self) -> Option<&Rc<PatternData>> {
+        match self {
+            Self::Textured(grain) => Some(grain),
+            Self::ImageTip { grain, .. } | Self::Smudge { grain, .. } => grain.as_ref(),
+            Self::SoftRound | Self::Pixel => None,
+        }
     }
 
     /// Short name for logs. `Debug` would dump the whole pattern bitmap.
@@ -191,7 +267,7 @@ impl BrushFamily {
             Self::Pixel => "pixel",
             Self::Textured(_) => "textured",
             Self::ImageTip { .. } => "image-tip",
-            Self::Smudge => "smudge",
+            Self::Smudge { .. } => "smudge",
         }
     }
 
@@ -239,6 +315,7 @@ pub struct BrushPreset {
     pub texture_strength: f32,
     /// How the grain/texture pattern composites onto dab coverage.
     pub texturing_mode: TexturingMode,
+    pub texture_adjust: TextureAdjust,
     pub dynamics: Dynamics,
     /// Optional custom icon shown in the brush picker. Raw PNG bytes,
     /// decoded lazily by the UI. `None` -> picker uses a generic placeholder.
@@ -298,6 +375,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 opacity: Some(Mapping {
                     source: DynSource::Pressure,
@@ -334,6 +412,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -365,6 +444,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics::default(),
             icon: Some(ICON_PIXEL.to_vec()),
             preview: None,
@@ -394,6 +474,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 scatter: Some(Mapping {
@@ -448,6 +529,7 @@ impl BrushPreset {
             texture_scale: 512.0,
             texture_strength: 1.0,
             texturing_mode: TexturingMode::Subtract,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -495,6 +577,7 @@ impl BrushPreset {
             texture_scale: 180.0,
             texture_strength: 1.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 // Pressure -> size: the tip ramps from a near-zero hairline at
                 // no pressure up to full radius at 80% pressure, then holds flat.
@@ -579,6 +662,7 @@ impl BrushPreset {
             texture_scale: 160.0,
             texture_strength: 1.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping::pressure_linear()),
                 ..Dynamics::default()
@@ -605,7 +689,7 @@ impl BrushPreset {
         Self {
             id,
             name: "Real Brush".into(),
-            family: BrushFamily::Smudge,
+            family: BrushFamily::smudge(),
             default_size: 60.0,
             default_opacity: 1.0,
             // Krita Wet Paint spacing.
@@ -622,6 +706,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             // Pressure drives size + the three smudge parameters (Krita has
             // PressureSize / PressureSmudgeRate / PressureColorRate /
             // PressureSmudgeRadius all on). Light touch smears faintly; firmer
@@ -637,6 +722,86 @@ impl BrushPreset {
                 ..Dynamics::default()
             },
             icon: Some(ICON_REAL_BRUSH.to_vec()),
+            preview: None,
+            source_path: None,
+        }
+    }
+
+    /// Krita's `i) Wet Textured Soft`: a colorsmudge brush in smearing mode
+    /// stamping the `bristles_grouped` tip through the paper-grain texture.
+    /// Krita values: tip scale 0.9375 of 64 px, spacing 0.07, texture scale
+    /// 1.61 of 280 px, brightness -0.25, MULTIPLY, colour rate 0.2.
+    pub fn wet_textured_soft(id: BrushPresetId) -> Self {
+        let tip = Rc::new(
+            PatternData::tip_from_png_bytes(TIP_BRISTLES_GROUPED).expect("built-in tip decodes"),
+        );
+        let grain = Rc::new(
+            PatternData::texture_from_png_bytes(TEXTURE_PAPER_SOFT_GRAIN, 0.0, 1.0, false)
+                .expect("built-in texture decodes"),
+        );
+        let pressure_curve = |points: Vec<(f32, f32)>| Mapping {
+            source: DynSource::Pressure,
+            curve: Curve::smooth_from_points(points).expect("krita curve valid"),
+            range: (0.0, 1.0),
+            invert: false,
+        };
+        Self {
+            id,
+            name: "Wet Textured Soft".into(),
+            family: BrushFamily::Smudge {
+                tip: Some(tip),
+                grain: Some(grain),
+                smear_alpha: true,
+            },
+            default_size: 60.0,
+            default_opacity: 1.0,
+            spacing_ratio: 0.07,
+            stabilizer: 0.0,
+            speed_smoothing: 0.0,
+            paint_mode: PaintMode::Normal,
+            softness_curve: None,
+            airbrush: false,
+            airbrush_rate: DEFAULT_AIRBRUSH_RATE,
+            hardness: 1.0,
+            tip: TipShape::Round,
+            texture_scale: 450.8,
+            texture_strength: 1.0,
+            texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust {
+                brightness: -0.25,
+                contrast: 1.0,
+                invert: false,
+            },
+            dynamics: Dynamics {
+                size: Some(pressure_curve(vec![
+                    (0.0, 0.122_271),
+                    (0.136_546, 0.290_033),
+                    (0.269_076, 0.803_493),
+                    (0.333_333, 0.921_397),
+                    (0.397_59, 0.956_332),
+                    (1.0, 1.0),
+                ])),
+                opacity: Some(pressure_curve(vec![
+                    (0.0, 0.152_61),
+                    (0.060_241, 0.261_044),
+                    (0.887_55, 1.0),
+                ])),
+                smudge_rate: Some(pressure_curve(vec![
+                    (0.0, 0.080_321_3),
+                    (0.128_515, 0.285_14),
+                    (0.706_827, 1.0),
+                    (1.0, 1.0),
+                ])),
+                // Krita's colour rate is constant (sensor off) and capped at 0.2.
+                color_rate: Some(Mapping {
+                    source: DynSource::Pressure,
+                    curve: Curve::flat(1.0),
+                    range: (0.0, 0.2),
+                    invert: false,
+                }),
+                ..Dynamics::default()
+            },
+            icon: Some(ICON_WET_TEXTURED_SOFT.to_vec()),
             preview: None,
             source_path: None,
         }
@@ -664,6 +829,7 @@ impl BrushPreset {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: TexturingMode::Multiply,
+            texture_adjust: TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,
@@ -678,6 +844,32 @@ impl BrushPreset {
             icon: Some(ICON_SPEED_BRUSH.to_vec()),
             preview: None,
             source_path: None,
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::TextureAdjust;
+
+    fn krita_texture(grey: f32, adjust: TextureAdjust) -> f32 {
+        let m = ((grey - adjust.brightness - 0.5) * adjust.contrast + 0.5).clamp(0.0, 1.0);
+        if adjust.invert { 1.0 - m } else { m }
+    }
+
+    #[test]
+    fn texture_gain_bias_matches_krita_mask() {
+        for (brightness, contrast, invert) in
+            [(0.0, 1.0, false), (-0.25, 1.0, false), (0.55, 0.6, false), (0.3, 1.7, true)]
+        {
+            let adjust = TextureAdjust { brightness, contrast, invert };
+            let (gain, bias) = adjust.gain_bias();
+            for step in 0..=20u8 {
+                let grey = f32::from(step) / 20.0;
+                let shader = grey.mul_add(gain, bias).clamp(0.0, 1.0);
+                assert!((shader - krita_texture(grey, adjust)).abs() < 1e-5);
+            }
         }
     }
 }

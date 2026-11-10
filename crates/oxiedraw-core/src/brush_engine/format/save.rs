@@ -30,7 +30,26 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
     let family_doc = match &preset.family {
         BrushFamily::SoftRound => FamilyDoc::SoftRound,
         BrushFamily::Pixel => FamilyDoc::Pixel,
-        BrushFamily::Smudge => FamilyDoc::Smudge,
+        BrushFamily::Smudge {
+            tip: None,
+            grain: None,
+            smear_alpha: false,
+        } => FamilyDoc::Smudge,
+        BrushFamily::Smudge {
+            tip,
+            grain,
+            smear_alpha,
+        } => {
+            let mut add = |name: &str, data: &Rc<PatternData>| {
+                pattern_payloads.push((name.to_string(), data.clone()));
+                name.to_string()
+            };
+            FamilyDoc::SmudgeOptions {
+                tip: tip.as_ref().map(|t| add("tip.png", t)),
+                grain: grain.as_ref().map(|g| add("grain.png", g)),
+                smear_alpha: *smear_alpha,
+            }
+        }
         BrushFamily::Textured(data) => {
             let filename = "pattern.png".to_string();
             pattern_payloads.push((filename.clone(), data.clone()));
@@ -68,6 +87,7 @@ pub fn save(preset: &BrushPreset, path: &Path) -> Result<(), BrushError> {
         texture_scale: preset.texture_scale,
         texture_strength: preset.texture_strength,
         texturing_mode: preset.texturing_mode,
+        texture_adjust: preset.texture_adjust,
         dynamics: preset.dynamics.clone(),
     };
     append_json(&mut archive, "brush.json", &document)?;

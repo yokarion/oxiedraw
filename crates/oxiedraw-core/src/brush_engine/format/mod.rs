@@ -48,6 +48,7 @@ mod tests {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: super::super::preset::TexturingMode::Multiply,
+            texture_adjust: super::super::preset::TextureAdjust::default(),
             dynamics: Dynamics {
                 size: Some(Mapping {
                     source: DynSource::Speed,
@@ -112,6 +113,7 @@ mod tests {
             texture_scale: 0.0,
             texture_strength: 0.0,
             texturing_mode: super::super::preset::TexturingMode::Multiply,
+            texture_adjust: super::super::preset::TextureAdjust::default(),
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -168,6 +170,7 @@ mod tests {
             texture_scale: 512.0,
             texture_strength: 1.0,
             texturing_mode: super::super::preset::TexturingMode::Subtract,
+            texture_adjust: super::super::preset::TextureAdjust::default(),
             dynamics: Dynamics::default(),
             icon: None,
             preview: None,
@@ -194,18 +197,72 @@ mod tests {
         // The real Real Brush preset - exercises the Smudge family + the
         // smudge dynamics serialising through the archive.
         let preset = BrushPreset::real_brush(BrushPresetId(0));
-        assert!(matches!(preset.family, BrushFamily::Smudge));
+        assert!(matches!(preset.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false }));
         let path = temp_path("smudge");
         super::save::save(&preset, &path).expect("save");
         let pkg = super::load::load(&path).expect("load");
+        assert!(matches!(pkg.document.family, super::FamilyDoc::Smudge));
         let restored = pkg.into_preset(BrushPresetId(3), None).expect("into_preset");
         let _ = std::fs::remove_file(&path);
 
-        assert!(matches!(restored.family, BrushFamily::Smudge));
+        assert!(matches!(restored.family, BrushFamily::Smudge { tip: None, grain: None, smear_alpha: false }));
         // Real Brush drives color rate + size by pressure; smudge rate is left
         // constant (its dynamic was removed to stop the deposit pulsing).
         assert!(restored.dynamics.color_rate.is_some());
         assert!(restored.dynamics.size.is_some());
+    }
+
+    #[test]
+    fn round_trip_wet_textured_soft_keeps_tip_texture_and_curves() {
+        let preset = BrushPreset::wet_textured_soft(BrushPresetId(0));
+        let path = temp_path("wet-textured-soft");
+        super::save::save(&preset, &path).expect("save");
+        let pkg = super::load::load(&path).expect("load");
+        let restored = pkg.into_preset(BrushPresetId(6), None).expect("into_preset");
+        let _ = std::fs::remove_file(&path);
+
+        let BrushFamily::Smudge {
+            tip: Some(tip),
+            grain: Some(grain),
+            smear_alpha: true,
+        } = &restored.family
+        else {
+            panic!("expected a smear-alpha smudge with tip and texture")
+        };
+        assert_eq!((tip.width, tip.height), (64, 64));
+        assert_eq!((grain.width, grain.height), (280, 280));
+        assert_eq!(restored.texture_adjust, preset.texture_adjust);
+        assert!((restored.texture_scale - 450.8).abs() < 1e-3);
+        for (got, want) in [
+            (&restored.dynamics.size, &preset.dynamics.size),
+            (&restored.dynamics.opacity, &preset.dynamics.opacity),
+            (&restored.dynamics.smudge_rate, &preset.dynamics.smudge_rate),
+        ] {
+            let (got, want) = (got.as_ref().expect("dynamic kept"), want.as_ref().expect("source dynamic"));
+            assert_eq!(got.curve, want.curve);
+            assert!(got.curve.is_smooth());
+        }
+    }
+
+    #[test]
+    fn schema_4_smudge_archive_still_loads() {
+        let json = r#"{"family":"Smudge","default_size":60.0,"default_opacity":1.0,
+            "spacing_ratio":0.07,"stabilizer":0.0,"dynamics":{}}"#;
+        let doc: super::BrushDocument = serde_json::from_str(json).expect("old document parses");
+        assert!(matches!(doc.family, super::FamilyDoc::Smudge));
+        assert_eq!(doc.texture_adjust, super::super::preset::TextureAdjust::default());
+    }
+
+    #[test]
+    fn early_smudge_textured_archive_still_loads() {
+        let json = r#"{"family":{"SmudgeTextured":{"tip":"tip.png","grain":null}},
+            "default_size":60.0,"default_opacity":1.0,"spacing_ratio":0.07,
+            "stabilizer":0.0,"dynamics":{}}"#;
+        let doc: super::BrushDocument = serde_json::from_str(json).expect("early document parses");
+        assert!(matches!(
+            doc.family,
+            super::FamilyDoc::SmudgeOptions { tip: Some(_), grain: None, smear_alpha: false }
+        ));
     }
 
     #[test]

@@ -11,6 +11,7 @@ layout(location = 7) in float v_tex_strength;
 layout(location = 8) in float v_radius;
 layout(location = 9) in vec2 v_tip_uv;
 layout(location = 10) in float v_tex_mode;      // 0 multiply, 1 subtract
+layout(location = 11) in vec2 v_tex_adjust;     // grain gain, bias
 
 layout(set = 0, binding = 0) uniform sampler2DArray u_atlas;
 
@@ -61,7 +62,7 @@ float base_coverage() {
     return tip_coverage(v_tip, v_hardness, v_tip_kind, v_radius);
 }
 
-// Canvas-anchored texture pattern (baked brightness/contrast), applied to
+// Canvas-anchored texture pattern (brightness/contrast as gain + bias), applied to
 // coverage the way Krita's texture option does: MULTIPLY darkens, SUBTRACT
 // carves holes. Force base mip so the minified grain stays crisp.
 float apply_texture(float coverage) {
@@ -70,6 +71,7 @@ float apply_texture(float coverage) {
     }
     vec2 uv = v_canvas_px / v_tex_scale;
     float g = textureLod(u_atlas, vec3(uv, float(push.slice)), 0.0).a;
+    g = clamp(g * v_tex_adjust.x + v_tex_adjust.y, 0.0, 1.0);
     if (v_tex_mode > 0.5) {
         return max(0.0, coverage - g * v_tex_strength);
     }

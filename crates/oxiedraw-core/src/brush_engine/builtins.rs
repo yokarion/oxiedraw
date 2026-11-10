@@ -20,7 +20,7 @@ const PLACEHOLDER_ID: BrushPresetId = BrushPresetId(0);
 /// `(filename, factory)` pairs. Filename is stable across releases so
 /// `seed_missing` can detect "this builtin is gone" via filesystem
 /// existence checks.
-fn builtins() -> [(&'static str, Factory); 9] {
+fn builtins() -> [(&'static str, Factory); 10] {
     [
         ("airbrush_soft.oxiebrush", BrushPreset::airbrush_soft),
         ("ink_pen.oxiebrush", BrushPreset::ink_pen),
@@ -31,6 +31,7 @@ fn builtins() -> [(&'static str, Factory); 9] {
         ("charcoal_pencil.oxiebrush", BrushPreset::charcoal_pencil),
         ("comics_halftone.oxiebrush", BrushPreset::comics),
         ("real_brush.oxiebrush", BrushPreset::real_brush),
+        ("wet_textured_soft.oxiebrush", BrushPreset::wet_textured_soft),
     ]
 }
 
