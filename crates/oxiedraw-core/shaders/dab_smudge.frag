@@ -36,6 +36,7 @@ layout(push_constant) uniform Push {
     uint grain_slice;
     uint smear_alpha; // 1: Krita smear alpha, transparency smears too
     uint dulling;     // 1: Krita dulling, one color picked at the previous centre
+    uint alpha_lock;  // 1: keep the layer's alpha, recolor only
 } push;
 
 // Matches renderer::dab::NO_SLICE and pattern_atlas::ATLAS_SLICE_DIM.
@@ -126,4 +127,9 @@ void main() {
     out_color = push.smear_alpha != 0u
         ? mix(dst, target, rate)
         : target * rate + dst * (1.0 - target.a * rate);
+
+    // Fix: smudge writes the layer directly, so alpha lock is applied here.
+    if (push.alpha_lock != 0u) {
+        out_color = out_color.a > 1e-6 ? vec4(out_color.rgb * (dst.a / out_color.a), dst.a) : dst;
+    }
 }

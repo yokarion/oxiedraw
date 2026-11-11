@@ -515,6 +515,42 @@ fn wet_textured_soft_tap_on_transparent_stays_light() {
     assert!(real >= 150, "opaque-fallback tap alpha {real}");
 }
 
+/// Smudging across the edge of an alpha-locked layer recolors the opaque half
+/// and leaves the transparent half empty.
+#[test]
+fn smudge_respects_alpha_lock() {
+    let size = Size::new(200, 100);
+    let w = size.width as usize;
+    let mut pixels = vec![0u8; w * size.height as usize * 4];
+    for row in pixels.chunks_exact_mut(w * 4) {
+        for px in row[..100 * 4].chunks_exact_mut(4) {
+            px.copy_from_slice(&[0, 0, 255, 255]);
+        }
+    }
+    let (mut canvas, idx) = canvas_with_layer(size, &pixels);
+    canvas.set_layer_alpha_locked(idx, true);
+    let brush = BrushEngine::new();
+    select_brush(&brush, "Wet Textured Soft");
+    brush.size.set(60.0);
+    brush.opacity.set(1.0);
+    smudge_line(&mut canvas, &brush, Color::new(0, 0, 255), 50.0, 40.0, 180.0);
+
+    let mut buf = Vec::new();
+    canvas.read_layer_region_into(idx, 0, 0, size.width, size.height, &mut buf).unwrap();
+    let mut recolored = 0;
+    for y in 0..size.height as usize {
+        for x in 0..w {
+            let px = &buf[(y * w + x) * 4..(y * w + x) * 4 + 4];
+            let expected_alpha = if x < 100 { 255 } else { 0 };
+            assert_eq!(px[3], expected_alpha, "alpha changed at ({x}, {y}): {px:?}");
+            if x < 100 && px[0] > 0 {
+                recolored += 1;
+            }
+        }
+    }
+    assert!(recolored > 0, "locked smudge should still recolor the opaque half");
+}
+
 /// Blur along a hard black/white edge softens it into greys, keeps the dark
 /// and light sides apart (a blur, not one averaged color) and lays down none
 /// of the (red) brush color.

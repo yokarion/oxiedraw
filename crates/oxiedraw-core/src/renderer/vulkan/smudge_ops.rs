@@ -83,12 +83,13 @@ struct SmudgePush {
     grain_slice: u32,
     smear_alpha: u32,
     dulling: u32,
+    alpha_lock: u32,
 }
 
 const _: () = assert!(std::mem::size_of::<SmudgePush>() == SmudgePush::SIZE as usize);
 
 impl SmudgePush {
-    const SIZE: u32 = 108;
+    const SIZE: u32 = 112;
 
     fn as_bytes(&self) -> &[u8] {
         // SAFETY: repr(C) POD of f32s.
@@ -367,6 +368,7 @@ impl VulkanRenderer {
                 grain_slice: d.grain_slice,
                 smear_alpha: u32::from(d.smear_alpha),
                 dulling: u32::from(d.dulling),
+                alpha_lock: u32::from(self.alpha_lock),
             };
             self.cmd_begin_fullscreen_pass(render_pass, layer_fb, pipeline);
             unsafe {
