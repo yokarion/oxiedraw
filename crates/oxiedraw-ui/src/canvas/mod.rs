@@ -950,11 +950,9 @@ fn install_motion(
         hover_pump.poke();
         frame_profile::note_input();
 
-        let tool = if crate::input::eraser_erases(ctrl.current_event().as_ref()) {
-            Tool::Brush
-        } else {
-            tools_c.active.get()
-        };
+        let pen_erases = crate::input::eraser_erases(ctrl.current_event().as_ref());
+        brush_engine.set_pen_erasing(pen_erases);
+        let tool = if pen_erases { Tool::Brush } else { tools_c.active.get() };
 
         // Only the Gradient tool draws the ramp cursor; clear it otherwise.
         if !matches!(tool, Tool::Fill(FillTool::Gradient)) {

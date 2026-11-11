@@ -331,6 +331,8 @@ mod tests {
                 gradient: None,
                 view_rotation: 0.0,
                 guide: None,
+                brushes: crate::brush_engine::BrushMemory::default(),
+                palette: crate::palettes::DocumentPalette::default(),
             },
             layer_pixels: HashMap::new(),
             components: vec![ComponentData {

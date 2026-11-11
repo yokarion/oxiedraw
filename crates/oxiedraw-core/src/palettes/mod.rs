@@ -1,8 +1,9 @@
 //! Colour palettes: the recent list, the user's custom swatches and the named
 //! preset palettes behind the palette dock.
 //!
-//! Everything persists as one JSON document ([`PaletteStore`]); where that file
-//! lives is the UI's business. The shipped palettes are compiled in and
+//! Presets persist as one JSON document ([`PaletteStore`]); where that file
+//! lives is the UI's business. Recent and Custom belong to the project
+//! ([`DocumentPalette`]). The shipped palettes are compiled in and
 //! read-only, so anything in [`PaletteStore::palettes`] is the user's own and
 //! is all that gets written back. [`PaletteState`] is the shared handle the
 //! panels mutate, with the same callback-on-change shape as
@@ -103,16 +104,51 @@ pub fn sort_colors(colors: &mut [Color], key: SortKey) {
     }
 }
 
+/// The Recent and Custom swatches, saved in the project rather than globally.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentPalette {
+    #[serde(default, with = "hex_colors")]
+    pub recent: Vec<Color>,
+    #[serde(default, with = "hex_colors")]
+    pub custom: Vec<Color>,
+}
+
+impl DocumentPalette {
+    /// Move `color` to the front of the recent list, dropping the oldest once
+    /// it is full. Returns whether anything moved.
+    pub fn push_recent(&mut self, color: Color) -> bool {
+        if self.recent.first() == Some(&color) {
+            return false;
+        }
+        self.recent.retain(|c| *c != color);
+        self.recent.insert(0, color);
+        self.recent.truncate(RECENT_CAPACITY);
+        true
+    }
+
+    /// Append to the custom swatches. Returns false when it is already there,
+    /// which the panel reports rather than silently duplicating.
+    pub fn add_custom(&mut self, color: Color) -> bool {
+        if self.custom.contains(&color) {
+            return false;
+        }
+        self.custom.push(color);
+        true
+    }
+}
+
+/// Name of the preset that the old global Custom swatches move into.
+pub const LEGACY_CUSTOM_NAME: &str = "Custom";
+
 /// Everything the palette dock persists. Each field is salvaged on its own, so
 /// one unreadable entry costs that entry rather than the file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaletteStore {
     #[serde(default = "default_version")]
     pub version: u32,
-    #[serde(default, with = "hex_colors")]
-    pub recent: Vec<Color>,
-    #[serde(default, with = "hex_colors")]
-    pub custom: Vec<Color>,
+    /// Custom swatches from before they moved into the project. Never written.
+    #[serde(rename = "custom", default, with = "hex_colors", skip_serializing)]
+    legacy_custom: Vec<Color>,
     /// User palettes. The built-ins are merged in front of these on load and
     /// stripped again on save.
     #[serde(default, deserialize_with = "salvaged_palettes")]
@@ -164,8 +200,7 @@ impl Default for PaletteStore {
     fn default() -> Self {
         let mut store = Self {
             version: STORE_VERSION,
-            recent: Vec::new(),
-            custom: Vec::new(),
+            legacy_custom: Vec::new(),
             palettes: Vec::new(),
             active_preset: DEFAULT_PRESET.to_string(),
             favorites: Vec::new(),
@@ -208,7 +243,6 @@ impl PaletteStore {
         merged.append(&mut self.palettes);
         self.palettes = merged;
 
-        self.recent.truncate(RECENT_CAPACITY);
         self.favorites.retain(|name| self.palettes.iter().any(|p| &p.name == name));
         if !self.palettes.iter().any(|p| p.name == self.active_preset) {
             self.active_preset = self
@@ -218,25 +252,14 @@ impl PaletteStore {
         }
     }
 
-    /// Move `color` to the front of the recent list, dropping the oldest once
-    /// it is full. Returns whether anything moved.
-    pub fn push_recent(&mut self, color: Color) -> bool {
-        if self.recent.first() == Some(&color) {
+    /// Turn Custom swatches from a pre-project-palette file into a preset, so
+    /// they are not lost. Returns whether the file needs writing back.
+    pub fn migrate_legacy_swatches(&mut self) -> bool {
+        let custom = std::mem::take(&mut self.legacy_custom);
+        if custom.is_empty() {
             return false;
         }
-        self.recent.retain(|c| *c != color);
-        self.recent.insert(0, color);
-        self.recent.truncate(RECENT_CAPACITY);
-        true
-    }
-
-    /// Append to the custom swatches. Returns false when it is already there,
-    /// which the panel reports rather than silently duplicating.
-    pub fn add_custom(&mut self, color: Color) -> bool {
-        if self.custom.contains(&color) {
-            return false;
-        }
-        self.custom.push(color);
+        self.add_palette(LEGACY_CUSTOM_NAME, custom);
         true
     }
 
@@ -355,7 +378,11 @@ pub fn reorder<T>(items: &mut Vec<T>, from: usize, to: usize) -> bool {
 #[derive(Clone)]
 pub struct PaletteState {
     store: Rc<RefCell<PaletteStore>>,
+    /// The active document's swatches, swapped in by `set_document`.
+    document: Rc<RefCell<Rc<RefCell<DocumentPalette>>>>,
     changed: Rc<RefCell<Vec<(ObserverId, Rc<dyn Fn()>)>>>,
+    /// Fired only for store edits, which are what `palettes.json` holds.
+    store_changed: Rc<RefCell<Vec<Rc<dyn Fn()>>>>,
     next_observer: Rc<Cell<ObserverId>>,
 }
 
@@ -365,10 +392,12 @@ pub type ObserverId = u64;
 
 impl std::fmt::Debug for PaletteState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let document = self.document.borrow();
+        let swatches = document.borrow();
         f.debug_struct("PaletteState")
             .field("palettes", &self.store.borrow().palettes.len())
-            .field("recent", &self.store.borrow().recent.len())
-            .field("custom", &self.store.borrow().custom.len())
+            .field("recent", &swatches.recent.len())
+            .field("custom", &swatches.custom.len())
             .finish_non_exhaustive()
     }
 }
@@ -383,13 +412,27 @@ impl PaletteState {
     pub fn new(store: PaletteStore) -> Self {
         Self {
             store: Rc::new(RefCell::new(store)),
+            document: Rc::new(RefCell::new(Rc::new(RefCell::new(DocumentPalette::default())))),
             changed: Rc::new(RefCell::new(Vec::new())),
+            store_changed: Rc::new(RefCell::new(Vec::new())),
             next_observer: Rc::new(Cell::new(0)),
         }
     }
 
+    pub fn set_document(&self, document: Rc<RefCell<DocumentPalette>>) {
+        document.borrow_mut().recent.truncate(RECENT_CAPACITY);
+        *self.document.borrow_mut() = document;
+        self.notify_changed();
+    }
+
     pub fn store(&self) -> Ref<'_, PaletteStore> {
         self.store.borrow()
+    }
+
+    pub fn with_swatches<R>(&self, read: impl FnOnce(&DocumentPalette) -> R) -> R {
+        let document = Rc::clone(&self.document.borrow());
+        let swatches = document.borrow();
+        read(&swatches)
     }
 
     /// Run `change` against the store, notifying observers when it reports one.
@@ -400,13 +443,34 @@ impl PaletteState {
     {
         let result = change(&mut self.store.borrow_mut());
         if result.changed() {
+            let savers: Vec<Rc<dyn Fn()>> = self.store_changed.borrow().clone();
+            for cb in savers {
+                cb();
+            }
+            self.notify_changed();
+        }
+        result
+    }
+
+    /// Same as [`Self::edit`], for the active document's swatches.
+    pub fn edit_swatches<R>(&self, change: impl FnOnce(&mut DocumentPalette) -> R) -> R
+    where
+        R: Changed,
+    {
+        let document = Rc::clone(&self.document.borrow());
+        let result = change(&mut document.borrow_mut());
+        if result.changed() {
             self.notify_changed();
         }
         result
     }
 
     pub fn push_recent(&self, color: Color) {
-        self.edit(|store| store.push_recent(color));
+        self.edit_swatches(|swatches| swatches.push_recent(color));
+    }
+
+    pub fn connect_store_changed(&self, cb: Rc<dyn Fn()>) {
+        self.store_changed.borrow_mut().push(cb);
     }
 
     /// Observers are cloned out first, so one may connect or disconnect - as
@@ -511,40 +575,40 @@ mod tests {
 
     #[test]
     fn recent_moves_a_repeat_pick_to_the_front_without_duplicating_it() {
-        let mut store = PaletteStore::default();
-        assert!(store.push_recent(color(1, 0, 0)));
-        assert!(store.push_recent(color(2, 0, 0)));
-        assert!(store.push_recent(color(1, 0, 0)));
-        assert_eq!(store.recent, vec![color(1, 0, 0), color(2, 0, 0)]);
+        let mut swatches = DocumentPalette::default();
+        assert!(swatches.push_recent(color(1, 0, 0)));
+        assert!(swatches.push_recent(color(2, 0, 0)));
+        assert!(swatches.push_recent(color(1, 0, 0)));
+        assert_eq!(swatches.recent, vec![color(1, 0, 0), color(2, 0, 0)]);
         assert!(
-            !store.push_recent(color(1, 0, 0)),
+            !swatches.push_recent(color(1, 0, 0)),
             "re-picking the newest colour changes nothing"
         );
     }
 
     #[test]
     fn recent_drops_the_oldest_once_it_is_full() {
-        let mut store = PaletteStore::default();
+        let mut swatches = DocumentPalette::default();
         for i in 0..(RECENT_CAPACITY + 4) {
-            store.push_recent(color(i as u8, 0, 0));
+            swatches.push_recent(color(i as u8, 0, 0));
         }
-        assert_eq!(store.recent.len(), RECENT_CAPACITY);
-        assert_eq!(store.recent[0], color((RECENT_CAPACITY + 3) as u8, 0, 0));
-        assert!(!store.recent.contains(&color(0, 0, 0)));
+        assert_eq!(swatches.recent.len(), RECENT_CAPACITY);
+        assert_eq!(swatches.recent[0], color((RECENT_CAPACITY + 3) as u8, 0, 0));
+        assert!(!swatches.recent.contains(&color(0, 0, 0)));
     }
 
     #[test]
     fn custom_swatches_are_added_once_and_reorder_in_place() {
-        let mut store = PaletteStore::default();
-        assert!(store.add_custom(color(10, 20, 30)));
-        assert!(!store.add_custom(color(10, 20, 30)), "already saved");
-        store.add_custom(color(40, 50, 60));
-        store.add_custom(color(70, 80, 90));
+        let mut swatches = DocumentPalette::default();
+        assert!(swatches.add_custom(color(10, 20, 30)));
+        assert!(!swatches.add_custom(color(10, 20, 30)), "already saved");
+        swatches.add_custom(color(40, 50, 60));
+        swatches.add_custom(color(70, 80, 90));
 
-        assert!(reorder(&mut store.custom, 2, 0));
-        assert_eq!(store.custom[0], color(70, 80, 90));
-        assert!(!reorder(&mut store.custom, 1, 1));
-        assert!(!reorder(&mut store.custom, 0, 9));
+        assert!(reorder(&mut swatches.custom, 2, 0));
+        assert_eq!(swatches.custom[0], color(70, 80, 90));
+        assert!(!reorder(&mut swatches.custom, 1, 1));
+        assert!(!reorder(&mut swatches.custom, 0, 9));
     }
 
     #[test]
@@ -568,17 +632,58 @@ mod tests {
         let name = store.add_palette("Mine", vec![color(0x11, 0x22, 0x33)]);
         store.set_favorite(&name, true);
         store.active_preset = name.clone();
-        store.push_recent(color(0xff, 0x00, 0x00));
+        store.legacy_custom = vec![color(0x00, 0xff, 0x00)];
 
         let json = store.to_json().unwrap();
         assert!(json.contains("\"#112233\""), "colours store as hex: {json}");
-        assert!(json.contains("\"#ff0000\""));
+        assert!(!json.contains("\"#00ff00\""), "custom belongs to the project");
 
         let back = PaletteStore::from_json(&json).unwrap();
         assert_eq!(back.palette(&name).unwrap().colors, vec![color(0x11, 0x22, 0x33)]);
         assert!(back.is_favorite(&name));
         assert_eq!(back.active_preset, name);
-        assert_eq!(back.recent, vec![color(0xff, 0, 0)]);
+    }
+
+    #[test]
+    fn legacy_custom_swatches_become_a_preset() {
+        let json = r##"{ "recent": ["#ff0000"], "custom": ["#010203", "#040506"] }"##;
+        let mut store = PaletteStore::from_json(json).unwrap();
+        assert!(store.migrate_legacy_swatches());
+        assert_eq!(
+            store.palette(LEGACY_CUSTOM_NAME).unwrap().colors,
+            vec![color(1, 2, 3), color(4, 5, 6)]
+        );
+        assert!(!store.migrate_legacy_swatches());
+    }
+
+    #[test]
+    fn state_edits_the_active_document_and_saves_only_store_edits() {
+        let state = PaletteState::default();
+        let saves = Rc::new(Cell::new(0));
+        {
+            let saves = Rc::clone(&saves);
+            state.connect_store_changed(Rc::new(move || saves.set(saves.get() + 1)));
+        }
+        let doc_a = Rc::new(RefCell::new(DocumentPalette {
+            recent: vec![color(1, 1, 1)],
+            custom: vec![color(2, 2, 2)],
+        }));
+        let doc_b = Rc::new(RefCell::new(DocumentPalette::default()));
+
+        state.set_document(Rc::clone(&doc_a));
+        assert_eq!(state.with_swatches(|s| s.custom.clone()), vec![color(2, 2, 2)]);
+        state.edit_swatches(|s| s.add_custom(color(3, 3, 3)));
+        assert_eq!(doc_a.borrow().custom, vec![color(2, 2, 2), color(3, 3, 3)]);
+
+        state.set_document(Rc::clone(&doc_b));
+        assert!(state.with_swatches(|s| s.recent.is_empty() && s.custom.is_empty()));
+        state.push_recent(color(9, 9, 9));
+        assert_eq!(doc_b.borrow().recent, vec![color(9, 9, 9)]);
+        assert_eq!(doc_a.borrow().recent, vec![color(1, 1, 1)]);
+        assert_eq!(saves.get(), 0);
+
+        state.edit(|store| store.set_favorite(DEFAULT_PRESET, true));
+        assert_eq!(saves.get(), 1);
     }
 
     #[test]
@@ -633,7 +738,7 @@ mod tests {
             r##"{ "version": 1, "active_preset": "Deleted", "custom": ["#ffffff", "nonsense"] }"##;
         let store = PaletteStore::from_json(json).unwrap();
         assert_eq!(store.active_preset, DEFAULT_PRESET);
-        assert_eq!(store.custom, vec![Color::WHITE], "unparseable entries drop");
+        assert_eq!(store.legacy_custom, vec![Color::WHITE], "unparseable entries drop");
     }
 
     #[test]
@@ -649,7 +754,7 @@ mod tests {
             ]
         }"##;
         let store = PaletteStore::from_json(json).expect("still parses");
-        assert_eq!(store.custom, vec![color(1, 2, 3)], "kept despite the bad field");
+        assert_eq!(store.legacy_custom, vec![color(1, 2, 3)], "kept despite the bad field");
         assert!(store.favorites.is_empty(), "unreadable field falls back");
         assert!(store.palette("Good").is_some(), "the sound palette survives");
         assert!(store.palette("Broken").is_none());
@@ -671,7 +776,7 @@ mod tests {
     fn a_non_ascii_hex_value_is_dropped_not_fatal() {
         let json = r##"{ "custom": ["#€abc", "#0a0b0c"] }"##;
         let store = PaletteStore::from_json(json).expect("parses");
-        assert_eq!(store.custom, vec![color(0x0a, 0x0b, 0x0c)]);
+        assert_eq!(store.legacy_custom, vec![color(0x0a, 0x0b, 0x0c)]);
     }
 
     #[test]
@@ -704,7 +809,7 @@ mod tests {
         assert_eq!(hits.get(), 1);
         state.push_recent(Color::WHITE);
         assert_eq!(hits.get(), 1, "a repeat of the newest colour is not a change");
-        state.edit(|store| store.add_custom(Color::BLACK));
+        state.edit_swatches(|swatches| swatches.add_custom(Color::BLACK));
         assert_eq!(hits.get(), 2);
     }
 }

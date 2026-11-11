@@ -87,11 +87,10 @@ impl Panel {
     /// The colours the current tab shows, and whether the user may rearrange
     /// them (Recent is chronological, and a built-in preset is read-only).
     fn visible_colors(&self) -> (Vec<Color>, bool) {
-        let store = self.palettes.store();
         match self.tab.get() {
-            Tab::Recent => (store.recent.clone(), false),
-            Tab::Custom => (store.custom.clone(), true),
-            Tab::Presets => store.active_palette().map_or_else(
+            Tab::Recent => (self.palettes.with_swatches(|s| s.recent.clone()), false),
+            Tab::Custom => (self.palettes.with_swatches(|s| s.custom.clone()), true),
+            Tab::Presets => self.palettes.store().active_palette().map_or_else(
                 || (Vec::new(), false),
                 |palette| (palette.colors.clone(), !palette.builtin),
             ),
@@ -108,7 +107,7 @@ impl Panel {
 
     fn add_active_color(&self) {
         let color = self.colors.current();
-        if self.palettes.edit(|store| store.add_custom(color)) {
+        if self.palettes.edit_swatches(|swatches| swatches.add_custom(color)) {
             self.toaster.info(&format!("Added {} to Custom", color.to_hex()));
         } else {
             self.toaster.info(&format!("{} is already in Custom", color.to_hex()));
@@ -118,30 +117,30 @@ impl Panel {
     /// Sort the list on show, if it is theirs to rearrange - the menu entries
     /// are insensitive otherwise.
     fn sort(&self, key: SortKey) {
-        let tab = self.tab.get();
-        self.palettes.edit(|store| match tab {
+        match self.tab.get() {
             Tab::Custom => {
-                sort_colors(&mut store.custom, key);
-                true
+                self.palettes.edit_swatches(|swatches| sort_colors(&mut swatches.custom, key));
             }
             Tab::Presets => {
-                let name = store.active_preset.clone();
-                store.palette_mut(&name).is_some_and(|palette| {
-                    if palette.builtin {
-                        return false;
-                    }
-                    sort_colors(&mut palette.colors, key);
-                    true
-                })
+                self.palettes.edit(|store| {
+                    let name = store.active_preset.clone();
+                    store.palette_mut(&name).is_some_and(|palette| {
+                        if palette.builtin {
+                            return false;
+                        }
+                        sort_colors(&mut palette.colors, key);
+                        true
+                    })
+                });
             }
-            Tab::Recent => false,
-        });
+            Tab::Recent => {}
+        }
     }
 
     /// Turn the Custom list into a preset of its own, named like the layout
     /// bar's duplicate does: created first, renamed afterwards.
     fn save_custom_as_palette(&self) {
-        let colors = self.palettes.store().custom.clone();
+        let colors = self.palettes.with_swatches(|s| s.custom.clone());
         if colors.is_empty() {
             self.toaster.info("Custom is empty - save some swatches first");
             return;
@@ -158,10 +157,10 @@ impl Panel {
 
     fn copy_preset_to_custom(&self) {
         let colors = self.visible_colors().0;
-        let added = self.palettes.edit(|store| {
+        let added = self.palettes.edit_swatches(|swatches| {
             colors
                 .iter()
-                .filter(|color| store.add_custom(**color))
+                .filter(|color| swatches.add_custom(**color))
                 .count()
         });
         self.toaster.info(&match added {
@@ -173,34 +172,37 @@ impl Panel {
     }
 
     fn move_swatch(&self, from: usize, to: usize) {
-        let tab = self.tab.get();
-        self.palettes.edit(|store| match tab {
-            Tab::Custom => reorder(&mut store.custom, from, to),
-            Tab::Presets => {
-                let name = store.active_preset.clone();
-                store.palette_mut(&name).is_some_and(|palette| {
-                    !palette.builtin && reorder(&mut palette.colors, from, to)
-                })
+        match self.tab.get() {
+            Tab::Custom => {
+                self.palettes
+                    .edit_swatches(|swatches| reorder(&mut swatches.custom, from, to));
             }
-            Tab::Recent => false,
-        });
+            Tab::Presets => {
+                self.palettes.edit(|store| {
+                    let name = store.active_preset.clone();
+                    store.palette_mut(&name).is_some_and(|palette| {
+                        !palette.builtin && reorder(&mut palette.colors, from, to)
+                    })
+                });
+            }
+            Tab::Recent => {}
+        }
     }
 
     fn remove_swatch(&self, index: usize) {
-        let tab = self.tab.get();
-        let removed = self.palettes.edit(|store| match tab {
-            Tab::Custom => {
-                (index < store.custom.len()).then(|| store.custom.remove(index))
-            }
-            Tab::Presets => {
+        let removed = match self.tab.get() {
+            Tab::Custom => self.palettes.edit_swatches(|swatches| {
+                (index < swatches.custom.len()).then(|| swatches.custom.remove(index))
+            }),
+            Tab::Presets => self.palettes.edit(|store| {
                 let name = store.active_preset.clone();
                 store.palette_mut(&name).and_then(|palette| {
                     (!palette.builtin && index < palette.colors.len())
                         .then(|| palette.colors.remove(index))
                 })
-            }
+            }),
             Tab::Recent => None,
-        });
+        };
         if let Some(color) = removed {
             self.toaster.info(&format!("Removed {}", color.to_hex()));
         }
@@ -228,7 +230,7 @@ impl Panel {
             action.set_enabled(editable && colors.len() > 1);
         }
         self.save_custom_action
-            .set_enabled(!self.palettes.store().custom.is_empty());
+            .set_enabled(self.palettes.with_swatches(|s| !s.custom.is_empty()));
 
         if tab == Tab::Presets {
             self.sync_preset_dropdown();

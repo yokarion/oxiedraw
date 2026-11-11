@@ -370,17 +370,36 @@ pub(crate) fn build_size_slider(brush_engine: &BrushEngine, width: i32) -> gtk::
             }
         },
     );
-    // Skipped when the thumb already maps to the size, so the slider being
-    // dragged doesn't snap its own thumb under the pointer.
+    follow_engine(
+        &scale,
+        brush_engine,
+        programmatic,
+        |engine| engine.size.get(),
+        size_pos_to_value,
+        size_value_to_pos,
+    );
+    scale
+}
+
+// Skipped when the thumb already maps to the value, so the slider being
+// dragged doesn't snap its own thumb under the pointer.
+fn follow_engine(
+    scale: &gtk::Scale,
+    brush_engine: &BrushEngine,
+    programmatic: Rc<Cell<bool>>,
+    read: fn(&BrushEngine) -> f32,
+    pos_to_value: fn(f64) -> f64,
+    value_to_pos: fn(f64) -> f64,
+) {
     let sync: Rc<dyn Fn(&gtk::Scale)> = {
-        let size = brush_engine.size.clone();
+        let brush_engine = brush_engine.clone();
         Rc::new(move |s| {
-            let current = f64::from(size.get());
-            if (size_pos_to_value(s.value()) - current).abs() < f64::EPSILON {
+            let current = f64::from(read(&brush_engine));
+            if (pos_to_value(s.value()) - current).abs() < f64::from(f32::EPSILON) {
                 return;
             }
             programmatic.set(true);
-            s.set_value(size_value_to_pos(current));
+            s.set_value(value_to_pos(current));
             programmatic.set(false);
         })
     };
@@ -390,15 +409,14 @@ pub(crate) fn build_size_slider(brush_engine: &BrushEngine, width: i32) -> gtk::
     }
     let listener = {
         let weak = scale.downgrade();
-        brush_engine.connect_size_changed(Rc::new(move || {
+        brush_engine.connect_settings_changed(Rc::new(move || {
             if let Some(s) = weak.upgrade() {
                 sync(&s);
             }
         }))
     };
     let brush_engine = brush_engine.clone();
-    scale.connect_destroy(move |_| brush_engine.disconnect_size_changed(listener));
-    scale
+    scale.connect_destroy(move |_| brush_engine.disconnect_settings_changed(listener));
 }
 
 fn segmented_pos_to_value(pos: f64, segments: &[(f64, f64, f64, f64)]) -> f64 {
@@ -437,8 +455,8 @@ fn size_value_to_pos(size: f64) -> f64 {
 }
 
 fn build_opacity_slider(brush_engine: &BrushEngine) -> gtk::Scale {
-    let opacity = brush_engine.opacity.clone();
-    slider::build(
+    let programmatic = Rc::new(Cell::new(false));
+    let scale = slider::build(
         (0.0, 1.0),
         OPACITY_STEP,
         f64::from(brush_engine.opacity.get()),
@@ -448,11 +466,27 @@ fn build_opacity_slider(brush_engine: &BrushEngine) -> gtk::Scale {
             let pct = (value * 100.0).round() as i32;
             format!("{pct:>3}%")
         },
-        move |value| {
-            #[allow(clippy::cast_possible_truncation)]
-            opacity.set(value as f32);
+        {
+            let programmatic = Rc::clone(&programmatic);
+            let brush_engine = brush_engine.clone();
+            move |value| {
+                if programmatic.get() {
+                    return;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                brush_engine.set_opacity(value as f32);
+            }
         },
-    )
+    );
+    follow_engine(
+        &scale,
+        brush_engine,
+        programmatic,
+        |engine| engine.opacity.get(),
+        std::convert::identity,
+        std::convert::identity,
+    );
+    scale
 }
 
 fn build_guide_page() -> gtk::Box {

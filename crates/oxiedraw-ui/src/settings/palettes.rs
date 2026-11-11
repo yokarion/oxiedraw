@@ -1,4 +1,4 @@
-//! Loading and saving `palettes.json`, the palette dock's whole persistence.
+//! Loading and saving `palettes.json`, the palette dock's preset persistence.
 //!
 //! Kept apart from `settings.json`: the palette file is written on every
 //! swatch the user adds or drags, and folding that into the settings blob
@@ -36,7 +36,12 @@ pub(crate) fn load() -> PaletteStore {
         }
     };
     match PaletteStore::from_json(&text) {
-        Ok(store) => store,
+        Ok(mut store) => {
+            if store.migrate_legacy_swatches() {
+                save(&store);
+            }
+            store
+        }
         Err(e) => {
             // Starting from defaults would be fine on its own, but the next
             // swatch would save them straight over the file. Move it aside so
@@ -98,7 +103,7 @@ pub(crate) fn install_autosave(state: &PaletteState) -> Rc<dyn Fn()> {
     {
         let owner = state.clone();
         let queued = Rc::clone(&queued);
-        state.connect_changed(Box::new(move || {
+        state.connect_store_changed(Rc::new(move || {
             if queued.replace(true) {
                 return;
             }

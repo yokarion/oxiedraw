@@ -370,6 +370,7 @@ impl PrimaryDragHandler {
     fn on_begin(&self, gesture: &gtk::GestureDrag, x: f64, y: f64) {
         self.pen_eraser
             .set(gesture.current_event().as_ref().is_some_and(crate::input::is_eraser));
+        self.brush_engine.set_pen_erasing(self.pen_eraser.get());
         // A fill gesture ends on the button coming up, which normally
         // arrives as a motion event - but a release outside the window
         // never delivers one, leaving the fill committed and unrecorded.

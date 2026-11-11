@@ -34,8 +34,11 @@ use crate::text::fonts::FontMeta;
 /// builds refuse the file cleanly.
 /// v14 adds the timelapse recording (`recording.json` + `recording/seg-*.bin`),
 /// so an older build can't open the file and drop the recording on its next save.
-pub const SCHEMA_VERSION: u32 = 14;
-pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14];
+/// v15 adds the remembered brush sizes/opacities (`brushes`) and the Recent and
+/// Custom swatches (`palette`). Absent in pre-v15 files (defaults, no swatches).
+pub const SCHEMA_VERSION: u32 = 15;
+pub const SUPPORTED_SCHEMA_VERSIONS: &[u32] =
+    &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Top-level archive metadata written to `manifest.json`.
@@ -119,6 +122,10 @@ pub struct DocumentData {
     /// Drawing guide (symmetry / grid / perspective). Absent (pre-v10) = none.
     #[serde(default)]
     pub guide: Option<crate::guides::GuideConfig>,
+    #[serde(default)]
+    pub brushes: crate::brush_engine::BrushMemory,
+    #[serde(default)]
+    pub palette: crate::palettes::DocumentPalette,
 }
 
 /// The complete in-memory representation of an `.oxiedrawproj` archive.

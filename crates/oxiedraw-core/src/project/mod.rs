@@ -228,6 +228,45 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn swatches_and_brush_memory_round_trip() {
+        use crate::brush_engine::BrushMemory;
+        use crate::color::Color;
+        use crate::palettes::DocumentPalette;
+
+        let size = Size::new(16, 16);
+        let mut canvas = Canvas::headless(size).expect("canvas");
+        let props = DocumentProperties { canvas: size, dpi: 96.0 };
+        let palette = DocumentPalette {
+            recent: vec![Color::new(1, 2, 3)],
+            custom: vec![Color::new(4, 5, 6), Color::WHITE],
+        };
+        let mut brushes = BrushMemory::default();
+        brushes.record("Ink Pen", false, 9.0, 0.5);
+        brushes.record("Ink Pen", true, 60.0, 1.0);
+
+        let snap = save::snapshot(
+            &mut canvas,
+            &props,
+            &crate::components::ComponentLibrary::new(),
+            &crate::text::fonts::FontRegistry::new(),
+            None,
+            0.0,
+            None,
+        )
+        .expect("snapshot")
+        .with_swatches_and_brushes(palette.clone(), brushes.clone());
+        let path = std::env::temp_dir().join("oxiedraw_swatches_round_trip.oxiedrawproj");
+        save::write_snapshot(&snap, &path, 0).expect("write");
+
+        let project = load::load(&path).expect("load");
+        assert_eq!(project.document.palette, palette);
+        assert_eq!(project.document.brushes, brushes);
+
+        std::fs::remove_file(&path).ok();
+    }
+
     /// A pre-v7 `document.json` (no `layer_tree` field) deserializes with an
     /// empty tree, so older projects load as flat.
     #[test]
@@ -242,6 +281,7 @@ mod tests {
         let doc: super::format::DocumentData =
             serde_json::from_str(json).expect("pre-v7 document must still parse");
         assert!(doc.layer_tree.is_empty(), "missing tree must default to flat");
+        assert!(doc.palette.custom.is_empty() && doc.brushes.draw.sizes.is_empty());
     }
 
     /// Loading a project saved at one canvas size into a canvas of a different

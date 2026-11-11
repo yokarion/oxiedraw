@@ -4,9 +4,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tar::{Builder, Header};
 
+use crate::brush_engine::BrushMemory;
 use crate::canvas::Canvas;
 use crate::components::ComponentLibrary;
 use crate::document::DocumentProperties;
+use crate::palettes::DocumentPalette;
 use crate::recording::RecordingManifest;
 use crate::recording::segments::{RecordingPayload, write_to_archive};
 use crate::text::fonts::{FontMeta, FontRegistry};
@@ -43,6 +45,17 @@ impl ProjectSnapshot {
     #[must_use]
     pub fn with_recording(mut self, recording: Option<RecordingPayload>) -> Self {
         self.recording = recording;
+        self
+    }
+
+    #[must_use]
+    pub fn with_swatches_and_brushes(
+        mut self,
+        palette: DocumentPalette,
+        brushes: BrushMemory,
+    ) -> Self {
+        self.doc.palette = palette;
+        self.doc.brushes = brushes;
         self
     }
 }
@@ -86,6 +99,8 @@ pub fn snapshot(
         gradient,
         view_rotation,
         guide,
+        brushes: BrushMemory::default(),
+        palette: DocumentPalette::default(),
     };
 
     let mut layer_pixels = Vec::with_capacity(layer_snapshot.len());
@@ -432,6 +447,8 @@ mod tests {
             gradient: None,
             view_rotation: 0.0,
             guide: None,
+            brushes: BrushMemory::default(),
+            palette: DocumentPalette::default(),
         }
     }
 

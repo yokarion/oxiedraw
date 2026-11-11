@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
-use oxiedraw_core::brush_engine::BrushEngine;
+use oxiedraw_core::brush_engine::{BrushEngine, BrushMemory};
 use oxiedraw_core::canvas::Canvas;
-use oxiedraw_core::color::ColorState;
+use oxiedraw_core::color::{Color, ColorState};
 use oxiedraw_core::components::{ComponentLayer, ComponentLibrary};
 use oxiedraw_core::liquify::LiquifyState;
-use oxiedraw_core::palettes::PaletteState;
+use oxiedraw_core::palettes::{DocumentPalette, PaletteState};
 use oxiedraw_core::document::{
     ComponentInstance, Document, DocumentProperties, LayerKind, Placement,
 };
@@ -77,12 +77,17 @@ impl GlobalState {
             let palettes = palettes.clone();
             colors.connect_used(Box::new(move |color| palettes.push_recent(color)));
         }
+        let brush_engine = BrushEngine::new();
+        let tools = ToolState {
+            eraser: Rc::clone(&brush_engine.erasing),
+            ..ToolState::new()
+        };
         Self {
-            brush_engine: BrushEngine::new(),
+            brush_engine,
             colors,
             palettes,
             flush_palettes,
-            tools: ToolState::new(),
+            tools,
             clipboard: Rc::new(RefCell::new(None)),
             toaster: crate::toaster::Toaster::new(),
             text_engine: Rc::new(RefCell::new(oxiedraw_core::text::fonts::TextEngine::empty())),
@@ -121,10 +126,11 @@ impl GlobalState {
                     .or_else(|| brushes.iter().find(|p| p.name == "Ink Pen"))
                     .or_else(|| brushes.iter().find(|p| p.name == "Airbrush Soft"))
                     .or_else(|| brushes.first());
-                if let Some(preset) = target {
-                    brush_engine.set_active(preset.id);
-                    brush_engine.set_size(preset.default_size);
-                    brush_engine.opacity.set(preset.default_opacity);
+                let target = target.map(|preset| preset.id);
+                drop(brushes);
+                if let Some(id) = target {
+                    brush_engine.set_active(id);
+                    brush_engine.recall();
                 }
             }
             brush_engine.backfill_missing_previews();
@@ -192,7 +198,15 @@ pub(crate) struct DocumentSession {
     pub(crate) recovery_file: RefCell<Option<PathBuf>>,
     pub(crate) last_autosave_len: Cell<Option<usize>>,
     pub(crate) recording: Rc<crate::recording::Recorder>,
+    pub(crate) brush_memory: Rc<RefCell<BrushMemory>>,
+    pub(crate) swatches: Rc<RefCell<DocumentPalette>>,
+    /// Custom swatches as last saved; editing them is an unsaved change.
+    saved_custom: Rc<RefCell<Vec<Color>>>,
     _alive: Rc<()>,
+}
+
+fn custom_unsaved(swatches: &RefCell<DocumentPalette>, saved: &RefCell<Vec<Color>>) -> bool {
+    swatches.borrow().custom != *saved.borrow()
 }
 
 fn snapshot_crop_layers(canvas: &Rc<RefCell<Canvas>>) -> ((u32, u32), Vec<CropLayer>) {
@@ -1223,10 +1237,15 @@ impl DocumentSession {
             crate::recording::Recorder::new(viewport.clone(), blocked)
         };
 
+        let swatches = Rc::new(RefCell::new(DocumentPalette::default()));
+        let saved_custom = Rc::new(RefCell::new(Vec::new()));
+
         {
             let weak = Rc::downgrade(&alive);
             let history = Rc::clone(&history);
             let saved = Rc::clone(&saved_marker);
+            let swatches = Rc::clone(&swatches);
+            let saved_custom = Rc::clone(&saved_custom);
             let title = Rc::clone(&title);
             let tab_page = Rc::clone(&tab_page);
             let recording = Rc::downgrade(&recording);
@@ -1237,7 +1256,8 @@ impl DocumentSession {
                     return glib::ControlFlow::Break;
                 }
                 let dirty = history.borrow().undo_len() != saved.get()
-                    || recording.upgrade().is_some_and(|r| r.is_dirty());
+                    || recording.upgrade().is_some_and(|r| r.is_dirty())
+                    || custom_unsaved(&swatches, &saved_custom);
                 if dirty != last_dirty.get() {
                     last_dirty.set(dirty);
                     if let Some(page) = tab_page.borrow().as_ref() {
@@ -1301,16 +1321,24 @@ impl DocumentSession {
             recovery_file: RefCell::new(None),
             last_autosave_len: Cell::new(None),
             recording,
+            brush_memory: Rc::new(RefCell::new(BrushMemory::default())),
+            swatches,
+            saved_custom,
             _alive: alive,
         })
     }
 
     pub(crate) fn is_dirty(&self) -> bool {
-        self.history.borrow().undo_len() != self.saved_marker.get() || self.recording.is_dirty()
+        self.history.borrow().undo_len() != self.saved_marker.get()
+            || self.recording.is_dirty()
+            || custom_unsaved(&self.swatches, &self.saved_custom)
     }
 
-    pub(crate) fn mark_saved(&self) {
+    /// `written_custom` is the Custom list the file holds, which edits made
+    /// during a background save are not part of.
+    pub(crate) fn mark_saved(&self, written_custom: Vec<Color>) {
         self.saved_marker.set(self.history.borrow().undo_len());
+        *self.saved_custom.borrow_mut() = written_custom;
     }
 
     pub(crate) fn change_counter(&self) -> usize {

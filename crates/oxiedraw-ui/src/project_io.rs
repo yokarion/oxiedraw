@@ -145,6 +145,8 @@ fn write_project(
     // Phase 1 (main thread): read the layers back from the GPU into a Send-able
     // snapshot. This is the only part that needs the Vulkan canvas.
     let props = session.current_properties();
+    let swatches = session.swatches.borrow().clone();
+    let written_custom = swatches.custom.clone();
     let snapshot_started = std::time::Instant::now();
     let snapshot = {
         // Full GPU readback of every layer, on the main thread - the one part of
@@ -170,7 +172,9 @@ fn write_project(
             view_rotation,
             guide,
         ) {
-            Ok(s) => s.with_recording(Some(recording)),
+            Ok(s) => s
+                .with_recording(Some(recording))
+                .with_swatches_and_brushes(swatches, session.brush_memory.borrow().clone()),
             Err(e) => {
                 if kind == SaveKind::Manual {
                     show_error(window, "Save Failed", &e.to_string());
@@ -226,7 +230,7 @@ fn write_project(
                     *session.title.borrow_mut() = stem.to_string_lossy().into_owned();
                 }
                 session.recording.saved_to(&path, recording, &recording_ticket);
-                session.mark_saved();
+                session.mark_saved(written_custom.clone());
                 session.refresh_tab_title();
                 // The document now lives in a real file; drop any recovery copy.
                 session.clear_recovery();
@@ -236,7 +240,7 @@ fn write_project(
             (Ok(recording), SaveKind::Autosave) => {
                 tracing::debug!(path = %path.display(), "autosaved project");
                 session.recording.saved_to(&path, recording, &recording_ticket);
-                session.mark_saved();
+                session.mark_saved(written_custom.clone());
                 session.refresh_tab_title();
             }
             (Ok(_), SaveKind::Recovery) => {

@@ -201,6 +201,10 @@ impl TabManager {
             );
         }
         *self.active.borrow_mut() = Some(Rc::clone(session));
+        self.global
+            .brush_engine
+            .set_memory(Rc::clone(&session.brush_memory));
+        self.global.palettes.set_document(Rc::clone(&session.swatches));
         self.fill_document_panels();
         (session.reinstall_actions)();
         self.global
@@ -390,11 +394,14 @@ impl TabManager {
             .clone_from(&project.document.guide);
         session.guide.notify_changed();
 
+        session.brush_memory.borrow_mut().clone_from(&project.document.brushes);
+        session.swatches.borrow_mut().clone_from(&project.document.palette);
+
         *session.components.borrow_mut() = project::load::build_components(&project);
         (session.refresh_components)();
         session.recording.adopt(project.recording, &path);
         *session.file_path.borrow_mut() = Some(path);
-        session.mark_saved();
+        session.mark_saved(project.document.palette.custom.clone());
         (session.refresh_layers)();
         session.viewport.resync_canvas_size();
         session.viewport.redraw_handle().request();
@@ -623,7 +630,7 @@ impl TabManager {
                 gio::SimpleAction::new_stateful("eraser-toggle", None, &false.to_variant());
             action.connect_change_state(move |action, state| {
                 let on = state.and_then(glib::Variant::get::<bool>).unwrap_or(false);
-                manager.global.tools.eraser.set(on);
+                manager.global.brush_engine.set_erasing(on);
                 action.set_state(&on.to_variant());
             });
             app.add_action(&action);

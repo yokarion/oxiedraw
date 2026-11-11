@@ -4,6 +4,7 @@ pub mod cursor;
 mod dynamics;
 pub mod format;
 mod input;
+mod memory;
 mod pattern;
 mod preset;
 pub mod preview_renderer;
@@ -14,6 +15,7 @@ pub use brush::{BrushPresetId, Dab, PaintTarget, StrokeContext, StrokeRenderer};
 pub use cursor::{BrushCursor, compute_brush_cursor};
 pub use dynamics::{Curve, DynSource, Dynamics, Mapping, SpawnInput, evaluate, make_spawn_input};
 pub use input::InputSample;
+pub use memory::{BrushMemory, ModeSettings};
 pub use pattern::PatternData;
 pub use preset::{
     BrushFamily, BrushPreset, DEFAULT_AIRBRUSH_RATE, PaintMode, SmudgeMode, TextureAdjust,
@@ -38,6 +40,12 @@ pub struct BrushEngine {
     pub active: Rc<Cell<BrushPresetId>>,
     pub size: Rc<Cell<f32>>,
     pub opacity: Rc<Cell<f32>>,
+    /// Eraser mode; shared with `ToolState::eraser`. Write it via `set_erasing`.
+    pub erasing: Rc<Cell<bool>>,
+    /// The pen's eraser end is in use, which erases without the toggle.
+    pen_erasing: Rc<Cell<bool>>,
+    /// The active document's memory, swapped in by `set_memory`.
+    memory: Rc<RefCell<Rc<RefCell<BrushMemory>>>>,
     in_flight_stroke: Rc<RefCell<Option<Box<dyn StrokeRenderer>>>>,
     /// Color + opacity of the in-flight stroke. Exposed so the canvas
     /// can composite the stroke-buffer mask at the right tint without
@@ -59,11 +67,11 @@ pub struct BrushEngine {
     /// of `clear -> add -> add -> ...` flicker.
     suppress_notify_depth: Rc<Cell<u32>>,
     notify_pending: Rc<Cell<bool>>,
-    size_listeners: Rc<RefCell<Vec<(SizeListenerId, Rc<dyn Fn()>)>>>,
+    settings_listeners: Rc<RefCell<Vec<(SettingsListenerId, Rc<dyn Fn()>)>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SizeListenerId(u32);
+pub struct SettingsListenerId(u32);
 
 /// Opaque handle returned by `connect_brushes_changed` so the caller
 /// can detach the listener via `disconnect_brushes_changed`.
@@ -77,6 +85,7 @@ impl fmt::Debug for BrushEngine {
             .field("active", &self.active.get())
             .field("size", &self.size.get())
             .field("opacity", &self.opacity.get())
+            .field("erasing", &self.erasing.get())
             .field("in_stroke", &self.in_flight_stroke.borrow().is_some())
             .field("stroke_ctx", &self.stroke_ctx.get())
             .finish_non_exhaustive()
@@ -90,6 +99,9 @@ impl BrushEngine {
             active: Rc::new(Cell::new(BrushPresetId(0))),
             size: Rc::new(Cell::new(12.0)),
             opacity: Rc::new(Cell::new(1.0)),
+            erasing: Rc::new(Cell::new(false)),
+            pen_erasing: Rc::new(Cell::new(false)),
+            memory: Rc::new(RefCell::new(Rc::new(RefCell::new(BrushMemory::default())))),
             in_flight_stroke: Rc::new(RefCell::new(None)),
             stroke_ctx: Rc::new(Cell::new(None)),
             next_id: Rc::new(Cell::new(0)),
@@ -97,7 +109,7 @@ impl BrushEngine {
             next_listener_id: Rc::new(Cell::new(0)),
             suppress_notify_depth: Rc::new(Cell::new(0)),
             notify_pending: Rc::new(Cell::new(false)),
-            size_listeners: Rc::new(RefCell::new(Vec::new())),
+            settings_listeners: Rc::new(RefCell::new(Vec::new())),
         };
         // Built-in factories; `add_brush` reassigns the id from the counter
         // so the literal `BrushPresetId(0)` passed here is just a placeholder.
@@ -124,11 +136,89 @@ impl BrushEngine {
         engine
     }
 
-    // Writers go through here so every size slider follows the change.
+    // Writers go through here so every slider follows the change.
     pub fn set_size(&self, size: f32) {
         self.size.set(size);
+        self.remember();
+        self.notify_settings_changed();
+    }
+
+    pub fn set_opacity(&self, opacity: f32) {
+        self.opacity.set(opacity);
+        self.remember();
+        self.notify_settings_changed();
+    }
+
+    pub fn set_erasing(&self, on: bool) {
+        let before = self.erase_mode();
+        self.erasing.set(on);
+        if self.erase_mode() != before {
+            self.recall();
+        }
+    }
+
+    // Left alone mid-stroke so a stroke never changes size under the pen.
+    pub fn set_pen_erasing(&self, on: bool) {
+        if self.is_drawing() {
+            return;
+        }
+        let before = self.erase_mode();
+        self.pen_erasing.set(on);
+        if self.erase_mode() != before {
+            self.recall();
+        }
+    }
+
+    fn erase_mode(&self) -> bool {
+        self.erasing.get() || self.pen_erasing.get()
+    }
+
+    pub fn set_memory(&self, memory: Rc<RefCell<BrushMemory>>) {
+        *self.memory.borrow_mut() = memory;
+        self.recall();
+    }
+
+    /// Load the remembered size and opacity for the active brush and mode,
+    /// falling back to the preset defaults.
+    pub fn recall(&self) {
+        let erasing = self.erase_mode();
+        let recalled = {
+            let memory = self.memory.borrow();
+            let memory = memory.borrow();
+            self.brushes
+                .borrow()
+                .iter()
+                .find(|p| p.id == self.active.get())
+                .map(|p| {
+                    (
+                        memory.size(&p.name, erasing).unwrap_or(p.default_size),
+                        memory.opacity(erasing).unwrap_or(p.default_opacity),
+                    )
+                })
+        };
+        let Some((size, opacity)) = recalled else { return };
+        self.size.set(size);
+        self.opacity.set(opacity);
+        self.remember();
+        self.notify_settings_changed();
+    }
+
+    fn remember(&self) {
+        let brushes = self.brushes.borrow();
+        let Some(preset) = brushes.iter().find(|p| p.id == self.active.get()) else {
+            return;
+        };
+        self.memory.borrow().borrow_mut().record(
+            &preset.name,
+            self.erase_mode(),
+            self.size.get(),
+            self.opacity.get(),
+        );
+    }
+
+    fn notify_settings_changed(&self) {
         let snapshot: Vec<Rc<dyn Fn()>> = self
-            .size_listeners
+            .settings_listeners
             .borrow()
             .iter()
             .map(|(_, cb)| Rc::clone(cb))
@@ -138,16 +228,17 @@ impl BrushEngine {
         }
     }
 
-    pub fn connect_size_changed(&self, listener: Rc<dyn Fn()>) -> SizeListenerId {
-        let id = SizeListenerId(self.next_listener_id.get());
+    /// Fires after the size or opacity changes.
+    pub fn connect_settings_changed(&self, listener: Rc<dyn Fn()>) -> SettingsListenerId {
+        let id = SettingsListenerId(self.next_listener_id.get());
         self.next_listener_id
             .set(self.next_listener_id.get().wrapping_add(1));
-        self.size_listeners.borrow_mut().push((id, listener));
+        self.settings_listeners.borrow_mut().push((id, listener));
         id
     }
 
-    pub fn disconnect_size_changed(&self, id: SizeListenerId) {
-        self.size_listeners.borrow_mut().retain(|(i, _)| *i != id);
+    pub fn disconnect_settings_changed(&self, id: SettingsListenerId) {
+        self.settings_listeners.borrow_mut().retain(|(i, _)| *i != id);
     }
 
     /// Append a preset to the registry, assigning it a fresh id.
@@ -377,6 +468,7 @@ impl BrushEngine {
                 "brush selected"
             );
         }
+        self.recall();
     }
 
     /// Clone of the currently selected brush. A preset carries its icon and
