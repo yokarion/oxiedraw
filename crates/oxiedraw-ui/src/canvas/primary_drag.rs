@@ -903,9 +903,10 @@ impl PrimaryDragHandler {
             tracing::error!(error = %e, "canvas.begin_stroke failed");
             return;
         }
-        // Erasing paints no colour, a mask stroke paints a grey stand-in, and
-        // smudge pushes the pixels already on the layer around.
-        if !erase && !on_adjustment && !smudge {
+        // Erasing paints no colour, a mask stroke paints a grey stand-in, and a
+        // smudge brush without paint only moves pixels. Fix: wet smudge brushes
+        // (Real Brush, Wet Textured Soft) paint the colour, so they count too.
+        if !erase && !on_adjustment && active_brush.paints_color() {
             self.used_color.set(Some(color));
         }
         // Build-up and wash accumulate coverage in the stroke buffer, capped

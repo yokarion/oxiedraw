@@ -365,6 +365,13 @@ pub struct BrushPreset {
 pub const DEFAULT_AIRBRUSH_RATE: f32 = 20.0;
 
 impl BrushPreset {
+    /// Whether a stroke lays down the paint colour. A smudge brush only does
+    /// when it mixes paint in; without a colour rate it just moves pixels.
+    #[must_use]
+    pub const fn paints_color(&self) -> bool {
+        !self.family.is_smudge() || self.dynamics.color_rate.is_some()
+    }
+
     /// Krita's `b) Airbrush Soft`: a 600 px "soft" auto-brush whose curve
     /// peaks at 40% coverage, spacing 0.1, wash mode, and pressure driving
     /// only opacity. The preset's legacy `AirbrushOption/*` keys are not read
@@ -934,7 +941,17 @@ impl BrushPreset {
 
 #[cfg(test)]
 mod tests {
-    use super::TextureAdjust;
+    use super::{BrushPreset, TextureAdjust};
+    use crate::brush_engine::BrushPresetId;
+
+    #[test]
+    fn only_paintless_smudge_skips_the_colour() {
+        let id = BrushPresetId(0);
+        assert!(BrushPreset::ink_pen(id).paints_color());
+        assert!(BrushPreset::real_brush(id).paints_color());
+        assert!(BrushPreset::wet_textured_soft(id).paints_color());
+        assert!(!BrushPreset::blur(id).paints_color());
+    }
 
     fn krita_texture(grey: f32, adjust: TextureAdjust) -> f32 {
         let m = ((grey - adjust.brightness - 0.5) * adjust.contrast + 0.5).clamp(0.0, 1.0);
