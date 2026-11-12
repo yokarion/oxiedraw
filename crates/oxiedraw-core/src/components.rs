@@ -152,9 +152,11 @@ impl Component {
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Replace the layers (and active selection) with the given set - used when
-    /// leaving edit mode - then rebuild the master.
-    pub fn set_layers(&mut self, layers: Vec<ComponentLayer>, active: Option<usize>) {
+    /// Replace the size, layers and active selection - used when leaving edit
+    /// mode - then rebuild the master.
+    pub fn set_layers(&mut self, size: Size, layers: Vec<ComponentLayer>, active: Option<usize>) {
+        // Fix: take the edit canvas size so a resized component keeps it.
+        self.size = size;
         self.layers = layers;
         self.active_layer = active;
         self.rebuild_master();
@@ -624,6 +626,7 @@ mod tests {
         let mut c = Component::with_size("X", Size::new(2, 2));
         let v0 = c.version;
         c.set_layers(
+            Size::new(2, 2),
             vec![ComponentLayer {
                 id: "l".into(),
                 name: "l".into(),
@@ -636,5 +639,26 @@ mod tests {
         );
         assert!(c.version > v0);
         assert_eq!(&c.master[0..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn set_layers_takes_resized_canvas() {
+        let mut c = Component::with_size("X", Size::new(2, 2));
+        c.set_layers(
+            Size::new(3, 1),
+            vec![ComponentLayer {
+                id: "l".into(),
+                name: "l".into(),
+                visible: true,
+                blend: BlendMode::Normal,
+                opacity: 1.0,
+                pixels: solid(3, 1, [0, 255, 0, 255]),
+            }],
+            Some(0),
+        );
+        assert_eq!(c.size, Size::new(3, 1));
+        assert_eq!(c.master.len(), 3 * 4);
+        assert_eq!(c.layer_tuples()[0].5.len(), 3 * 4);
+        assert_eq!(&c.master[8..12], &[0, 255, 0, 255]);
     }
 }

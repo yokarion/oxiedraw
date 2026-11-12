@@ -563,10 +563,14 @@ fn install_key_handler(
             let _ = session.text_edit.handle_key(keyval, state);
             return glib::Propagation::Stop;
         }
-        if keyval == gdk::Key::Escape && session.escape_component_edit() {
+        let active = tools.active.get();
+        // Fix: a pending tool edit takes Esc before it can leave the component.
+        if keyval == gdk::Key::Escape
+            && !session.tool_edit_pending(active)
+            && session.escape_component_edit()
+        {
             return glib::Propagation::Stop;
         }
-        let active = tools.active.get();
 
         if matches!(keyval, gdk::Key::Delete | gdk::Key::KP_Delete)
             && !focus_is_text_editable(&manager.root)

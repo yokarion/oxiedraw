@@ -897,7 +897,10 @@ impl DocumentSession {
                 let set_component_edit = Rc::clone(&set_component_edit);
                 let saved_marker = Rc::clone(&saved_marker);
                 let accent_widget = layers_widget.clone().upcast::<gtk::Widget>();
+                let prepare_flatten = Rc::clone(&prepare_flatten);
                 Rc::new(move |id: String| {
+                    // Fix: pending tool edits held stale slot state across the canvas swap.
+                    prepare_flatten();
                     do_enter_component_edit(
                         id,
                         &viewport,
@@ -923,7 +926,9 @@ impl DocumentSession {
                 let refresh_components = Rc::clone(&refresh_components);
                 let set_component_edit = Rc::clone(&set_component_edit);
                 let saved_marker = Rc::clone(&saved_marker);
+                let prepare_flatten = Rc::clone(&prepare_flatten);
                 Rc::new(move || {
+                    prepare_flatten();
                     do_exit_component_edit(
                         &viewport,
                         &history,
@@ -1574,6 +1579,17 @@ impl DocumentSession {
         self.edit_mode.borrow().is_some()
     }
 
+    // Whether `tool` holds an unconfirmed edit that Esc should cancel.
+    pub(crate) fn tool_edit_pending(&self, tool: Tool) -> bool {
+        match tool {
+            Tool::Transform => self.transform.has_targets() || self.transform.rect.get().is_some(),
+            Tool::Liquify => self.viewport.canvas().borrow().liquify_active(),
+            Tool::Pattern => self.pattern_edit.has_curve(),
+            Tool::Crop => self.crop.rect.get().is_some(),
+            _ => false,
+        }
+    }
+
     pub(crate) fn escape_component_edit(&self) -> bool {
         if self.is_editing_component() {
             (self.exit_component_edit)();
@@ -1747,10 +1763,12 @@ fn do_exit_component_edit(
         return;
     };
 
-    let (_size, comp_layers, comp_active) = capture_canvas(viewport);
+    let (comp_size, comp_layers, comp_active) = capture_canvas(viewport);
+    let mut old_comp_size = comp_size;
     {
         let mut lib = components.borrow_mut();
         if let Some(component) = lib.get_mut(&ctx.component_id) {
+            old_comp_size = component.size;
             let layers: Vec<ComponentLayer> = comp_layers
                 .into_iter()
                 .map(|l| ComponentLayer {
@@ -1762,7 +1780,7 @@ fn do_exit_component_edit(
                     pixels: l.pixels,
                 })
                 .collect();
-            component.set_layers(layers, comp_active);
+            component.set_layers(comp_size, layers, comp_active);
         }
     }
 
@@ -1784,7 +1802,11 @@ fn do_exit_component_edit(
     viewport.load_layers_resized(ctx.main_size, &main_tuples, ctx.main_active);
     {
         let canvas = viewport.canvas();
-        let kinds: Vec<_> = ctx.main_layers.iter().map(|l| l.kind.clone()).collect();
+        let kinds: Vec<_> = ctx
+            .main_layers
+            .iter()
+            .map(|l| scale_instance_kind(l.kind.clone(), &ctx.component_id, old_comp_size, comp_size))
+            .collect();
         if let Err(e) = canvas.borrow_mut().restore_layer_kinds(&kinds) {
             tracing::error!(error = %e, "restoring layer kinds after component edit failed");
         }
@@ -1802,6 +1824,19 @@ fn do_exit_component_edit(
     refresh_components();
     viewport.redraw_handle().request();
     set_component_edit(None);
+}
+
+// Scales an instance's placement by the component resize so its content keeps its on-canvas scale.
+#[allow(clippy::cast_precision_loss)]
+fn scale_instance_kind(kind: LayerKind, component_id: &str, old: Size, new: Size) -> LayerKind {
+    match kind {
+        LayerKind::Component(mut inst) if inst.component_id == component_id && old != new => {
+            inst.placement.w *= new.width as f32 / old.width as f32;
+            inst.placement.h *= new.height as f32 / old.height as f32;
+            LayerKind::Component(inst)
+        }
+        other => other,
+    }
 }
 
 fn rerender_component_instances(

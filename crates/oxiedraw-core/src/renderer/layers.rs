@@ -9,6 +9,8 @@
 //! `oxiedraw_core::document::LayerState` - index *i* in both refers to
 //! the same logical layer.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use ash::{Device, vk};
 use gpu_allocator::vulkan::Allocator;
 
@@ -33,6 +35,13 @@ pub(super) const BLEND_PUSH_BYTES: u32 = 12;
 /// keeps the allocator dead-simple; can be made elastic later. Each layer
 /// costs one canvas-sized image in VRAM, so this is the real memory ceiling.
 pub const MAX_LAYERS: u32 = 256;
+
+static NEXT_CONTENT_VERSION: AtomicU64 = AtomicU64::new(1);
+
+// Fix: process-unique versions, so reordered or swapped stacks never match a stale thumbnail.
+fn next_content_version() -> u64 {
+    NEXT_CONTENT_VERSION.fetch_add(1, Ordering::Relaxed)
+}
 
 /// Pipeline that samples one premultiplied BGRA layer image and blends
 /// it onto the bound render target (canvas) with premultiplied OVER.
@@ -158,9 +167,9 @@ pub(super) struct LayerSlot {
     pub image: Image,
     pub framebuffer: vk::Framebuffer,
     pub descriptor_set: vk::DescriptorSet,
-    /// Bumped on every write to this slot's image. Lets the layers panel
-    /// re-read only the layers that actually changed (it travels with the slot
-    /// through reorder; new slots start at 0).
+    /// Unique id of this slot's current image content, renewed on every write.
+    /// Lets the layers panel re-read only the layers that actually changed (it
+    /// travels with the slot through reorder).
     pub content_version: u64,
     /// Blend-mode index (matches `layer_blend.frag`) used when this layer is
     /// composited. Travels with the slot through reorder; new slots start at 0
@@ -189,10 +198,10 @@ impl LayerStack {
         })
     }
 
-    /// Mark slot `idx`'s image as changed (cheap monotonic counter).
+    /// Mark slot `idx`'s image as changed.
     pub(super) fn touch(&mut self, idx: usize) {
         if let Some(slot) = self.slots.get_mut(idx) {
-            slot.content_version = slot.content_version.wrapping_add(1);
+            slot.content_version = next_content_version();
         }
     }
 
@@ -267,7 +276,7 @@ impl LayerStack {
             image,
             framebuffer,
             descriptor_set,
-            content_version: 0,
+            content_version: next_content_version(),
             blend_mode: 0,
             opacity: 1.0,
             adjustment: None,

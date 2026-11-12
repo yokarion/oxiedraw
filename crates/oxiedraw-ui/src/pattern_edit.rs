@@ -1062,6 +1062,10 @@ impl PatternEdit {
         self.drawing.get()
     }
 
+    pub(crate) fn has_curve(&self) -> bool {
+        self.live.borrow().is_some()
+    }
+
     /// Returns the new index, so the caller can start dragging it straight away.
     fn insert_node(&self, before: usize, at: Point) -> Option<usize> {
         let mut live = self.live.borrow_mut();

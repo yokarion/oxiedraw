@@ -3837,6 +3837,33 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn layer_content_versions_follow_reorder_and_replace() {
+        let size = Size::new(4, 4);
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+        let blank = vec![0u8; (size.width * size.height * 4) as usize];
+        let a = canvas.add_layer_with_pixels("A", &blank).expect("add layer");
+        let b = canvas.add_layer_with_pixels("B", &blank).expect("add layer");
+        let (va, vb) = (canvas.layer_content_version(a), canvas.layer_content_version(b));
+        assert_ne!(va, vb);
+
+        canvas.reorder_layer(a, b).expect("reorder");
+        assert_eq!(canvas.layer_content_version(a), vb);
+        assert_eq!(canvas.layer_content_version(b), va);
+
+        let entry = |name: &str| {
+            (name.to_string(), name.to_string(), true, BlendMode::Normal, 1.0, blank.clone())
+        };
+        canvas
+            .resize_and_replace_layers(size, &[entry("C"), entry("D"), entry("E")], Some(0))
+            .expect("replace");
+        for idx in 0..3 {
+            let v = canvas.layer_content_version(idx);
+            assert!(v != va && v != vb, "replaced slots must not reuse old versions");
+        }
+    }
+
     /// In-flight preview with the stroke on a *lower* layer and an opaque
     /// layer above it. Exercises the cached below-stack composite, the
     /// above-layer re-composite, and (by reading twice) cache reuse.
