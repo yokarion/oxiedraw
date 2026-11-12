@@ -255,3 +255,28 @@ fn cancelling_leaves_the_layer_alone() {
         "cancelling wrote to the layer"
     );
 }
+
+/// A half-covered white edge, as the tool tints it, lands on black as linear
+/// 50% grey (sRGB 188), not the dark gamma-space 128.
+#[test]
+fn a_soft_white_edge_lands_as_linear_grey() {
+    let mut canvas = Canvas::headless(SIZE).unwrap();
+    let target = canvas
+        .add_layer_with_pixels("layer", &filled(0, 0, 0, 255))
+        .unwrap();
+
+    let (x, y, w, h) = BLOCK;
+    let edge: Vec<u8> = (0..(w * h) as usize)
+        .flat_map(|_| [188, 188, 188, 128])
+        .collect();
+    canvas.set_pattern_overlay(target, x, y, w, h, &edge).unwrap();
+    canvas.commit_pattern(target).unwrap();
+
+    let layer = canvas.read_layer(target).unwrap();
+    let i = ((8 * SIZE.width + 8) * 4) as usize;
+    let pixel = &layer[i..i + 4];
+    assert_eq!(pixel[3], 255);
+    for &channel in &pixel[0..3] {
+        assert!(channel.abs_diff(188) <= 1, "edge landed as {pixel:?}");
+    }
+}

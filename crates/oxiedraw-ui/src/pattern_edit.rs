@@ -18,6 +18,7 @@ use oxiedraw_core::guides::{GuideState, Symmetry};
 use oxiedraw_core::history::{HistoryAction, HistoryStack, LayerPatch};
 use oxiedraw_core::patterns::{PatternState, symmetry_copies};
 use oxiedraw_patterns::{Bindings, CoverageTile, PatternRequest, RasterOptions, Side, SpineNode};
+use oxiedraw_utils::color::linear_to_srgb;
 use oxiedraw_utils::geometry::{Point, Size};
 
 use crate::canvas::RedrawHandle;
@@ -933,6 +934,8 @@ impl PatternEdit {
         self.history
             .borrow_mut()
             .record(HistoryAction::Pattern { layer_id, patch });
+        // Fix: applied pattern color goes to Recent
+        self.colors.notify_used(self.colors.current());
 
         let Some(applied) = self.take_live() else {
             return false;
@@ -1164,8 +1167,8 @@ fn nearest_on_polyline(points: &[Point], at: Point) -> Option<(usize, Point, f32
 /// per-pixel limit the bake applies (see [`PreviewClip`]), or the preview shows
 /// fur that vanishes when it is applied.
 ///
-/// Layer images are premultiplied sRGB BGRA, so these bytes go in the same way
-/// a layer's own pixels do and the GPU handles the linear conversion.
+/// Layer images store linear premultiplied color, sRGB-encoded. The color is
+/// premultiplied in linear light here; the GPU only decodes the sRGB bytes.
 fn tint(
     tile: &CoverageTile,
     color: Color,
@@ -1182,11 +1185,12 @@ fn tint(
     }
     let (width, height) = ((x1 - x0) as u32, (y1 - y0) as u32);
     let mut bgra = vec![0_u8; (width as usize) * (height as usize) * 4];
-    let (r, g, b) = (
-        u32::from(color.r),
-        u32::from(color.g),
-        u32::from(color.b),
-    );
+    // Fix: premultiply in linear light
+    let [r, g, b] = color.to_linear_rgb();
+    let premul: [[u8; 3]; 256] = std::array::from_fn(|a| {
+        let a = a as f32 / 255.0;
+        [linear_to_srgb(b * a), linear_to_srgb(g * a), linear_to_srgb(r * a)]
+    });
     for y in y0..y1 {
         for x in x0..x1 {
             let mut a = u32::from(tile.coverage_at(x, y));
@@ -1199,9 +1203,7 @@ fn tint(
                 continue;
             }
             let i = ((y - y0) as usize * width as usize + (x - x0) as usize) * 4;
-            bgra[i] = ((b * a + 127) / 255) as u8;
-            bgra[i + 1] = ((g * a + 127) / 255) as u8;
-            bgra[i + 2] = ((r * a + 127) / 255) as u8;
+            bgra[i..i + 3].copy_from_slice(&premul[a as usize]);
             bgra[i + 3] = a as u8;
         }
     }
@@ -1228,6 +1230,7 @@ struct PatternPixels {
 #[allow(clippy::float_cmp)]
 mod tests {
     use super::*;
+    use oxiedraw_utils::color::srgb_to_linear;
 
     fn draw(samples: &[Point]) -> Vec<Point> {
         let mut builder = CurveBuilder::new(samples[0]);
@@ -1589,8 +1592,33 @@ mod tests {
         let canvas = Size::new(8, 8);
         let out = tint(&tile(0, 0, 4, 4, 128), Color::new(255, 0, 0), None, canvas)
             .expect("a block");
-        // Premultiplied BGRA: red at half coverage, blue and green empty.
-        assert_eq!(&out.bgra[0..4], &[0, 0, 128, 128]);
+        // Linear-premultiplied, sRGB-encoded: what the GPU stroke writes.
+        assert_eq!(&out.bgra[0..4], &[0, 0, 188, 128]);
+    }
+
+    #[test]
+    fn white_edges_stay_white_at_every_coverage() {
+        let canvas = Size::new(1, 1);
+        let mut previous = 0;
+        for coverage in 1..=255_u8 {
+            let out = tint(&tile(0, 0, 1, 1, coverage), Color::new(255, 255, 255), None, canvas)
+                .expect("a block");
+            let [b, g, r, a] = [out.bgra[0], out.bgra[1], out.bgra[2], out.bgra[3]];
+            assert_eq!(a, coverage);
+            assert!(b == g && g == r, "white picked up a tint at {coverage}");
+            assert!(b >= previous, "color dropped as coverage rose at {coverage}");
+            previous = b;
+            let straight = srgb_to_linear(b) / (f32::from(a) / 255.0);
+            assert!((straight - 1.0).abs() < 0.05, "coverage {coverage} decodes to {straight}");
+        }
+    }
+
+    #[test]
+    fn a_clipped_edge_is_premultiplied_in_linear_light() {
+        let canvas = Size::new(1, 1);
+        let out = tint(&tile(0, 0, 1, 1, 255), Color::new(255, 255, 255), Some(&[128]), canvas)
+            .expect("a block");
+        assert_eq!(&out.bgra[0..4], &[188, 188, 188, 128]);
     }
 
     // The selection is applied here rather than on the GPU, so the preview and
