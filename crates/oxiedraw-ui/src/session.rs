@@ -887,6 +887,13 @@ impl DocumentSession {
         };
         set_tool_window(global.tools.active.get());
 
+        let recording = {
+            let transform = transform.clone();
+            let blocked: Rc<dyn Fn() -> bool> =
+                Rc::new(move || transform.has_targets() || transform.rect.get().is_some());
+            crate::recording::Recorder::new(viewport.clone(), blocked)
+        };
+
         {
             let enter: Rc<dyn Fn(String)> = {
                 let viewport = viewport.clone();
@@ -898,6 +905,8 @@ impl DocumentSession {
                 let saved_marker = Rc::clone(&saved_marker);
                 let accent_widget = layers_widget.clone().upcast::<gtk::Widget>();
                 let prepare_flatten = Rc::clone(&prepare_flatten);
+                let recording = Rc::clone(&recording);
+                let toaster = global.toaster.clone();
                 Rc::new(move |id: String| {
                     // Fix: pending tool edits held stale slot state across the canvas swap.
                     prepare_flatten();
@@ -912,6 +921,8 @@ impl DocumentSession {
                         &saved_marker,
                         &accent_widget,
                         history_capacity,
+                        &recording,
+                        &toaster,
                     );
                 })
             };
@@ -927,8 +938,10 @@ impl DocumentSession {
                 let set_component_edit = Rc::clone(&set_component_edit);
                 let saved_marker = Rc::clone(&saved_marker);
                 let prepare_flatten = Rc::clone(&prepare_flatten);
+                let recording = Rc::clone(&recording);
                 Rc::new(move || {
                     prepare_flatten();
+                    recording.leave_component();
                     do_exit_component_edit(
                         &viewport,
                         &history,
@@ -1232,15 +1245,6 @@ impl DocumentSession {
         let title = Rc::new(RefCell::new(title.into()));
         let tab_page: Rc<RefCell<Option<adw::TabPage>>> = Rc::new(RefCell::new(None));
         let alive = Rc::new(());
-
-        let recording = {
-            let edit_mode = Rc::clone(&edit_mode);
-            let transform = transform.clone();
-            let blocked: Rc<dyn Fn() -> bool> = Rc::new(move || {
-                edit_mode.borrow().is_some() || transform.has_targets() || transform.rect.get().is_some()
-            });
-            crate::recording::Recorder::new(viewport.clone(), blocked)
-        };
 
         let swatches = Rc::new(RefCell::new(DocumentPalette::default()));
         let saved_custom = Rc::new(RefCell::new(Vec::new()));
@@ -1713,6 +1717,8 @@ fn do_enter_component_edit(
     saved_marker: &Rc<Cell<usize>>,
     accent_widget: &gtk::Widget,
     history_capacity: usize,
+    recording: &crate::recording::Recorder,
+    toaster: &crate::toaster::Toaster,
 ) {
     if edit_mode.borrow().is_some() {
         return;
@@ -1724,6 +1730,9 @@ fn do_enter_component_edit(
     }) else {
         return;
     };
+    if !recording.enter_component(&component_id, size) {
+        toaster.info("Edits to this component won't be recorded: layers above it use blend modes, adjustments or clipping.");
+    }
 
     let (main_size, main_layers, main_active) = capture_canvas(viewport);
     let fresh = HistoryStack::new(HistoryConfig {

@@ -41,10 +41,20 @@ pub(super) fn show(parent: &adw::ApplicationWindow, session: &Rc<DocumentSession
              no extra frames pile up, and the paused time won't be visible in the final output.",
         ),
     );
+    let (components_row, components) = switch_row(
+        "Record component edits",
+        settings.components,
+        Some(
+            "Drawing inside a component is recorded as it looks on the main canvas. Uses extra \
+             memory while a component is open. Not possible when layers above the component use \
+             blend modes, adjustments or clipping.",
+        ),
+    );
     let scaling = combo_row("Canvas scaling", &CanvasScale::labels(), settings.scale.to_index());
     scaling.set_subtitle("Size of the recorded frames. Smaller frames keep the project file smaller");
     recording_group.add(&frequency);
     recording_group.add(&skip_row);
+    recording_group.add(&components_row);
     recording_group.add(&scaling);
     page.add(&recording_group);
 
@@ -102,6 +112,7 @@ pub(super) fn show(parent: &adw::ApplicationWindow, session: &Rc<DocumentSession
         let recorder = Rc::clone(&recorder);
         let (frequency, scaling) = (frequency.clone(), scaling.clone());
         let (skip, mid_stroke, auto_start) = (skip.clone(), mid_stroke.clone(), auto_start.clone());
+        let components = components.clone();
         Rc::new(move || {
             let settings = RecordingSettings {
                 frequency: Frequency::from_index(frequency.selected()),
@@ -109,6 +120,7 @@ pub(super) fn show(parent: &adw::ApplicationWindow, session: &Rc<DocumentSession
                 scale: CanvasScale::from_index(scaling.selected()),
                 mid_stroke: mid_stroke.is_active(),
                 auto_start: auto_start.is_active(),
+                components: components.is_active(),
             };
             sync_sensitivity(settings.frequency);
             recorder.set_settings(settings);
@@ -118,7 +130,7 @@ pub(super) fn show(parent: &adw::ApplicationWindow, session: &Rc<DocumentSession
         let apply = Rc::clone(&apply);
         row.connect_selected_notify(move |_| apply());
     }
-    for switch in [&skip, &mid_stroke, &auto_start] {
+    for switch in [&skip, &components, &mid_stroke, &auto_start] {
         let apply = Rc::clone(&apply);
         switch.connect_active_notify(move |_| apply());
     }

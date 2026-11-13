@@ -318,7 +318,7 @@ impl ComponentLibrary {
 
 /// Composite visible layers bottom-to-top into a fresh `w x h` BGRA8 buffer,
 /// honoring each layer's blend mode + opacity. Matches the GPU `layer_blend.frag`
-/// (blend math in linear light) so the master looks like the edit-mode preview.
+/// so the master looks like the edit-mode preview.
 /// Layers that mismatch the expected length are skipped.
 #[must_use]
 pub fn flatten(layers: &[ComponentLayer], w: u32, h: u32) -> Vec<u8> {
@@ -357,48 +357,65 @@ fn blend_layer_over(dst: &mut [u8], src: &[u8], mode: BlendMode, opacity: f32) {
     for px in 0..n {
         let o = px * 4;
         // Premultiplied linear samples (sRGB decode mimics the GPU sampler).
-        let sa = f32::from(src[o + 3]) / 255.0 * opacity;
-        let da = f32::from(dst[o + 3]) / 255.0;
         let s = [
             srgb_to_linear(f32::from(src[o]) / 255.0) * opacity,
             srgb_to_linear(f32::from(src[o + 1]) / 255.0) * opacity,
             srgb_to_linear(f32::from(src[o + 2]) / 255.0) * opacity,
+            f32::from(src[o + 3]) / 255.0 * opacity,
         ];
         let d = [
             srgb_to_linear(f32::from(dst[o]) / 255.0),
             srgb_to_linear(f32::from(dst[o + 1]) / 255.0),
             srgb_to_linear(f32::from(dst[o + 2]) / 255.0),
+            f32::from(dst[o + 3]) / 255.0,
         ];
-        // Unpremultiply for the blend math.
-        let unpre = |c: f32, a: f32| if a > 0.0 { c / a } else { 0.0 };
+        let blended = blend_premul_linear(d, s, mode);
         let mut out = [0u8; 4];
         for ch in 0..3 {
-            let sc = unpre(s[ch], sa);
-            let dc = unpre(d[ch], da);
-            let blended = match mode {
-                BlendMode::Normal => sc,
-                BlendMode::Multiply => sc * dc,
-                BlendMode::Addition => (sc + dc).min(1.0),
-                BlendMode::Darken => sc.min(dc),
-                BlendMode::Screen => sc + dc - sc * dc,
-                BlendMode::Overlay => {
-                    if dc <= 0.5 {
-                        2.0 * dc * sc
-                    } else {
-                        1.0 - 2.0 * (1.0 - dc) * (1.0 - sc)
-                    }
-                }
-            };
-            // Source color mixed toward the blended color by backdrop alpha,
-            // then standard premultiplied src-over.
-            let src_color = sc + (blended - sc) * da;
-            let out_lin = src_color * sa + d[ch] * (1.0 - sa);
-            out[ch] = (linear_to_srgb(out_lin).clamp(0.0, 1.0) * 255.0).round() as u8;
+            out[ch] = (linear_to_srgb(blended[ch]).clamp(0.0, 1.0) * 255.0).round() as u8;
         }
-        let out_a = sa + da * (1.0 - sa);
-        out[3] = (out_a.clamp(0.0, 1.0) * 255.0).round() as u8;
+        out[3] = (blended[3].clamp(0.0, 1.0) * 255.0).round() as u8;
         dst[o..o + 4].copy_from_slice(&out);
     }
+}
+
+// Premultiplied linear BGRA `src` over `dst` with `mode`, as layer_blend.frag does it.
+pub(crate) fn blend_premul_linear(d: [f32; 4], s: [f32; 4], mode: BlendMode) -> [f32; 4] {
+    let (sa, da) = (s[3], d[3]);
+    if mode == BlendMode::Normal {
+        return std::array::from_fn(|c| d[c].mul_add(1.0 - sa, s[c]));
+    }
+    // Unpremultiply for the blend math.
+    let unpre = |c: f32, a: f32| if a > 0.0 { c / a } else { 0.0 };
+    let gamma = |c: f32| linear_to_srgb(c.clamp(0.0, 1.0));
+    let linear = |c: f32| srgb_to_linear(c.clamp(0.0, 1.0));
+    let mut out = [0.0; 4];
+    for ch in 0..3 {
+        let sc = unpre(s[ch], sa);
+        let dc = unpre(d[ch], da);
+        let (sg, dg) = (gamma(sc), gamma(dc));
+        // Fix: separable modes blend gamma-encoded values like the shader, not linear ones.
+        let blended = match mode {
+            BlendMode::Normal => sc,
+            BlendMode::Multiply => linear(sg * dg),
+            BlendMode::Addition => linear((sg + dg).min(1.0)),
+            BlendMode::Darken => sc.min(dc),
+            BlendMode::Screen => linear(sg + dg - sg * dg),
+            BlendMode::Overlay => {
+                if dg < 0.5 {
+                    linear(2.0 * dg * sg)
+                } else {
+                    linear(1.0 - 2.0 * (1.0 - dg) * (1.0 - sg))
+                }
+            }
+        };
+        // Source color mixed toward the blended color by backdrop alpha,
+        // then standard premultiplied src-over.
+        let src_color = sc + (blended - sc) * da;
+        out[ch] = src_color * sa + dc * da * (1.0 - sa);
+    }
+    out[3] = sa + da * (1.0 - sa);
+    out
 }
 
 /// Affine-resample a master texture into a `canvas_w x canvas_h` slot at

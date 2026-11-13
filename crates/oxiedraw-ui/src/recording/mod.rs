@@ -15,12 +15,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
+use oxiedraw_core::canvas::Canvas;
 use oxiedraw_core::recording::codec::Frame;
+use oxiedraw_core::recording::component::ComponentBackdrop;
 use oxiedraw_core::recording::segments::{
     FreshFrames, RecordingPayload, SegmentSource, entry_path, find_in_archive,
 };
 use oxiedraw_core::recording::spool::{CapturedFrame, FrameSink, SpoolProgress};
 use oxiedraw_core::recording::{RecordingError, RecordingManifest, RecordingSettings, SegmentEntry, now_ms};
+use oxiedraw_utils::geometry::Size;
 use relm4::gtk::{gio, glib};
 
 use crate::canvas::Viewport;
@@ -36,9 +39,12 @@ const CLEAR_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) struct Recorder {
     viewport: Viewport,
-    /// True while the canvas holds something other than the document (a
-    /// component being edited, pixels lifted by the transform tool).
+    /// True while the canvas holds pixels lifted by the transform tool.
     blocked: Rc<dyn Fn() -> bool>,
+    /// A component is open in place of the document.
+    in_component: Cell<bool>,
+    /// Puts the open component back into the document for each frame.
+    component: RefCell<Option<ComponentBackdrop>>,
     settings: Cell<RecordingSettings>,
     recording: Cell<bool>,
     sink: RefCell<Option<FrameSink>>,
@@ -52,8 +58,9 @@ pub(crate) struct Recorder {
     generation: Cell<u64>,
     last_version: Cell<Option<u64>>,
     last_capture: Cell<Option<Instant>>,
-    /// The readback the GPU is working on: `(capture time, halvings, version)`.
-    in_flight: Cell<Option<(u64, u8, u64)>>,
+    /// The readback the GPU is working on: `(capture time, halvings, version,
+    /// from the open component)`.
+    in_flight: Cell<Option<(u64, u8, u64, bool)>>,
     /// Counts settings changes and deletes; saved state is the value a
     /// completed save was built from.
     edits: Cell<u64>,
@@ -85,6 +92,8 @@ impl Recorder {
         Rc::new(Self {
             viewport,
             blocked,
+            in_component: Cell::new(false),
+            component: RefCell::new(None),
             settings: Cell::new(RecordingSettings::default()),
             recording: Cell::new(false),
             sink: RefCell::new(None),
@@ -292,6 +301,47 @@ impl Recorder {
         Ok(sources)
     }
 
+    /// Call before the canvas swaps to a component. False when its edits can't
+    /// be recorded because of the layers above its instances.
+    pub(crate) fn enter_component(&self, component_id: &str, component_size: Size) -> bool {
+        self.in_component.set(true);
+        if !self.recording.get() || !self.settings.get().components {
+            return true;
+        }
+        let canvas = self.viewport.canvas();
+        let Ok(mut canvas) = canvas.try_borrow_mut() else {
+            return true;
+        };
+        // The swap rebuilds the renderer, which drops a capture in flight.
+        self.collect(&mut canvas, true);
+        match canvas.component_backdrop(component_id, component_size) {
+            Ok(Some(backdrop)) => {
+                *self.component.borrow_mut() = Some(backdrop);
+                true
+            }
+            Ok(None) => false,
+            Err(e) => {
+                tracing::warn!(err = %e, "recording: component backdrop failed");
+                true
+            }
+        }
+    }
+
+    /// Call before the canvas swaps back from a component.
+    pub(crate) fn leave_component(&self) {
+        let canvas = self.viewport.canvas();
+        if let Ok(mut canvas) = canvas.try_borrow_mut() {
+            self.collect(&mut canvas, true);
+        }
+        self.component.borrow_mut().take();
+        self.in_component.set(false);
+    }
+
+    fn capture_blocked(&self, canvas: &Canvas) -> bool {
+        let component_off = self.component.borrow().is_none() || !self.settings.get().components;
+        (self.in_component.get() && component_off) || (self.blocked)() || canvas.capture_blocked()
+    }
+
     /// Stop for good: the encoder thread exits and deletes its spool.
     pub(crate) fn shutdown(&self) {
         self.recording.set(false);
@@ -339,7 +389,7 @@ impl Recorder {
                 && (changed || !settings.skip_unchanged)
                 && (!drawing || settings.mid_stroke)
         });
-        if !due || (self.blocked)() || canvas.capture_blocked() {
+        if !due || self.capture_blocked(&canvas) {
             return;
         }
         if !changed {
@@ -355,13 +405,16 @@ impl Recorder {
         }
     }
 
-    fn begin(&self, canvas: &mut oxiedraw_core::canvas::Canvas) -> bool {
+    fn begin(&self, canvas: &mut Canvas) -> bool {
         let halvings = self.settings.get().scale.halvings();
-        match canvas.begin_frame_capture(u32::from(halvings)) {
+        let from_component = self.component.borrow().is_some();
+        // A component is captured whole and scaled once it sits in the document.
+        let capture_halvings = if from_component { 0 } else { halvings };
+        match canvas.begin_frame_capture(u32::from(capture_halvings)) {
             Ok(true) => {
                 // Read the version after the capture starts: it recomposites a
                 // pending liquify bake, which bumps it.
-                self.in_flight.set(Some((now_ms(), halvings, canvas.pixels_version())));
+                self.in_flight.set(Some((now_ms(), halvings, canvas.pixels_version(), from_component)));
                 true
             }
             Ok(false) => false,
@@ -372,8 +425,8 @@ impl Recorder {
         }
     }
 
-    fn collect(&self, canvas: &mut oxiedraw_core::canvas::Canvas, wait: bool) {
-        let Some((time_ms, halvings, version)) = self.in_flight.get() else {
+    fn collect(&self, canvas: &mut Canvas, wait: bool) {
+        let Some((time_ms, halvings, version, from_component)) = self.in_flight.get() else {
             return;
         };
         if !canvas.frame_capture_pending() {
@@ -384,9 +437,18 @@ impl Recorder {
         match canvas.take_frame_capture(&mut pixels, wait) {
             Ok(Some((width, height))) => {
                 self.in_flight.set(None);
+                let frame = if from_component {
+                    let mut component = self.component.borrow_mut();
+                    let Some(backdrop) = component.as_mut() else {
+                        return;
+                    };
+                    backdrop.frame(&pixels, Size::new(width, height), halvings)
+                } else {
+                    Frame { width, height, pixels }
+                };
                 let settings = self.settings.get();
                 let captured = CapturedFrame {
-                    frame: Frame { width, height, pixels },
+                    frame,
                     halvings,
                     time_ms,
                     // Per-stroke recording only fires on a change, so a frame
@@ -416,7 +478,7 @@ impl Recorder {
             return;
         };
         self.collect(&mut canvas, true);
-        if !self.recording.get() || canvas.is_drawing() || (self.blocked)() || canvas.capture_blocked() {
+        if !self.recording.get() || canvas.is_drawing() || self.capture_blocked(&canvas) {
             return;
         }
         if self.last_version.get() == Some(canvas.pixels_version()) {

@@ -7,6 +7,7 @@
 //! reads that index. [`export`] replays the frames into a video or PNG files.
 
 pub mod codec;
+pub mod component;
 pub mod export;
 pub mod segments;
 pub mod spool;
@@ -130,6 +131,8 @@ pub struct RecordingSettings {
     pub mid_stroke: bool,
     #[serde(default)]
     pub auto_start: bool,
+    #[serde(default = "crate::serde_defaults::default_true")]
+    pub components: bool,
 }
 
 impl Default for RecordingSettings {
@@ -140,6 +143,7 @@ impl Default for RecordingSettings {
             scale: CanvasScale::default(),
             mid_stroke: false,
             auto_start: false,
+            components: true,
         }
     }
 }

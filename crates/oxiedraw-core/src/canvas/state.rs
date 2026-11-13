@@ -10,6 +10,7 @@ use crate::document::{
 };
 use crate::effects::AdjustmentData;
 use crate::filters::FilterSpec;
+use crate::recording::component::{ComponentBackdrop, InstancePart, StackPart};
 use crate::renderer::{
     DabFamily, DabInstance, DmabufDescriptor, EdgesBuffer, GradientKind, MaskBrushMode,
     RendererError, SelectionBlendMode, ShapeKind, VulkanRenderer,
@@ -1777,6 +1778,54 @@ impl Canvas {
     /// bounding a region sits on top of the layer being filled (so the
     /// fill can go in solid underneath it) or below it (so the fill has
     /// to carry the soft edge itself).
+    /// Splits the stack around the visible instances of `component_id`, for
+    /// recording edits to it. `None` when the layers above them don't combine
+    /// into plain images (blend modes, adjustments, clipping, scoped folders).
+    pub fn component_backdrop(
+        &mut self,
+        component_id: &str,
+        component_size: Size,
+    ) -> Result<Option<ComponentBackdrop>, RendererError> {
+        let snapshot = self.layers.snapshot();
+        if self.scoped_steps(&snapshot).is_some() {
+            return Ok(None);
+        }
+        let instance = |layer: &crate::document::Layer| match &layer.kind {
+            LayerKind::Component(inst) if layer.visible && inst.component_id == component_id => {
+                Some(InstancePart { placement: inst.placement, blend: layer.blend, opacity: layer.opacity })
+            }
+            _ => None,
+        };
+        let first = snapshot.iter().position(|l| instance(l).is_some()).unwrap_or(snapshot.len());
+        let mut parts = Vec::new();
+        let mut run = Vec::new();
+        for (idx, layer) in snapshot.iter().enumerate().skip(first).filter(|(_, l)| l.visible) {
+            if let Some(part) = instance(layer) {
+                if !run.is_empty() {
+                    parts.push(StackPart::Layers(self.renderer.read_composite_steps(&run)?));
+                    run.clear();
+                }
+                parts.push(StackPart::Instance(part));
+            } else if layer.blend != BlendMode::Normal || layer.is_adjustment() {
+                return Ok(None);
+            } else {
+                run.push(CompositeStep::layer(idx));
+            }
+        }
+        if !run.is_empty() {
+            parts.push(StackPart::Layers(self.renderer.read_composite_steps(&run)?));
+        }
+        let below: Vec<CompositeStep> = snapshot[..first]
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| l.visible.then_some(CompositeStep::layer(i)))
+            .collect();
+        let below = self.renderer.read_composite_steps(&below)?;
+        self.sync_canvas_for_liquify()?;
+        let composite = self.renderer.read_canvas()?;
+        Ok(Some(ComponentBackdrop::new(self.size(), component_size, composite, below, parts)))
+    }
+
     pub fn read_layers_above(&mut self, target_idx: usize) -> Result<Vec<u8>, RendererError> {
         let visibilities = self.visibilities();
         let mut out = Vec::new();
@@ -3835,6 +3884,41 @@ mod tests {
             canvas.add_layer("over"),
             Err(RendererError::LayerLimit)
         ));
+    }
+
+
+    #[cfg(feature = "gpu-tests")]
+    #[test]
+    fn component_backdrop_frame_matches_the_gpu_composite() {
+        use crate::components::render_instance;
+        use crate::document::{ComponentInstance, Placement};
+        let size = Size::new(32, 24);
+        let comp = Size::new(16, 16);
+        let fill = |f: &dyn Fn(u32, u32) -> [u8; 4], s: Size| -> Vec<u8> {
+            (0..s.height).flat_map(|y| (0..s.width).flat_map(move |x| f(x, y))).collect()
+        };
+        let mut canvas = Canvas::headless(size).expect("canvas init");
+        canvas.restore_layer(0, &fill(&|x, _| [40, 90, (x * 8) as u8, 255], size)).expect("background");
+        let master = fill(&|x, y| if (x + y) % 3 == 0 { [0; 4] } else { [(x * 16) as u8, 200, (y * 16) as u8, 255] }, comp);
+        let placement = Placement::new(14.0, 11.0, 20.0, 14.0, 0.4);
+        let pixels = render_instance(&master, 16, 16, 32, 24, placement, TransformFilter::Bilinear);
+        let inst = canvas.add_layer_with_pixels("inst", &pixels).expect("instance");
+        let kind = LayerKind::Component(ComponentInstance { component_id: "c".into(), placement });
+        canvas.set_layer_kind(inst, kind).expect("kind");
+        canvas.set_layer_blend(inst, BlendMode::Multiply, 0.8).expect("blend");
+        let top = canvas
+            .add_layer_with_pixels("top", &fill(&|x, _| if x < 20 { [0, 180, 0, 255] } else { [0; 4] }, size))
+            .expect("top");
+        canvas.set_layer_blend(top, BlendMode::Normal, 0.5).expect("opacity");
+
+        let expected = canvas.read_pixels().expect("composite");
+        let mut backdrop = canvas.component_backdrop("c", comp).expect("readback").expect("exact stack");
+        let frame = backdrop.frame(&master, comp, 0);
+        let worst = frame.pixels.iter().zip(&expected).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(0);
+        assert!(worst <= 1, "frame differs from the GPU composite by {worst}");
+
+        canvas.set_layer_blend(top, BlendMode::Screen, 0.5).expect("screen");
+        assert!(canvas.component_backdrop("c", comp).expect("readback").is_none());
     }
 
     #[cfg(feature = "gpu-tests")]
