@@ -395,15 +395,17 @@ fn build_card(
         let library = Rc::clone(library);
         let refresh_slot = Rc::clone(refresh_slot);
         let history = Rc::clone(history);
-        let area_w = area.clone();
+        // Fix: a strong ref here kept every rebuilt card and its image alive.
+        let area_w = area.downgrade();
         let id = id.to_string();
         let act = gio::SimpleAction::new("rename", None);
         act.connect_activate(move |_, _| {
+            let Some(area) = area_w.upgrade() else { return };
             let current = library
                 .borrow()
                 .get(&id)
                 .map_or_else(String::new, |c| c.name.clone());
-            show_rename_popover(&area_w, &id, &current, &library, &refresh_slot, &history);
+            show_rename_popover(&area, &id, &current, &library, &refresh_slot, &history);
         });
         actions.add_action(&act);
     }
@@ -601,4 +603,41 @@ fn lookup_accent(widget: &impl IsA<gtk::Widget>) -> (f64, f64, f64) {
                 f64::from(c.blue()),
             )
         })
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use oxiedraw_core::history::HistoryConfig;
+
+    use super::*;
+
+    fn first_area(root: &gtk::Widget) -> Option<gtk::DrawingArea> {
+        if let Some(area) = root.downcast_ref::<gtk::DrawingArea>() {
+            return Some(area.clone());
+        }
+        let mut child = root.first_child();
+        while let Some(c) = child {
+            if let Some(area) = first_area(&c) {
+                return Some(area);
+            }
+            child = c.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    fn a_rebuilt_card_is_freed() {
+        // Needs a display; skipped where there is none.
+        if gtk::init().is_err() {
+            return;
+        }
+        let library = Rc::new(RefCell::new(ComponentLibrary::new()));
+        library.borrow_mut().add_new("A");
+        let history = Rc::new(RefCell::new(HistoryStack::new(HistoryConfig::default())));
+        let (page, refresh, _) = build(library, Rc::new(|_| {}), history);
+        let old = first_area(page.upcast_ref()).unwrap().downgrade();
+        refresh();
+        assert!(old.upgrade().is_none(), "the old card outlived the rebuild");
+    }
 }
