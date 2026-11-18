@@ -101,11 +101,15 @@ const EDGE_CLIMB_LIMIT: u8 = 8;
 /// number the GPU overlay uses to hide the fill during the reveal
 /// animation, so preview and pixels always agree.
 ///
+/// `seed_share[i]` is how much of an edge pixel is seed color in the
+/// target layer. Only a [`FillPaint::Over`] fill with edges has it.
+///
 /// `paint` says how that share is combined with the layer.
 pub struct FillResult {
     pub sorted_indices: Vec<u32>,
     pub distance_mask: Vec<u8>,
     pub coverage: Vec<u8>,
+    pub seed_share: Vec<u8>,
     pub paint: FillPaint,
 }
 
@@ -193,6 +197,7 @@ pub fn flood_fill(
             sorted_indices: Vec::new(),
             distance_mask: vec![255_u8; n],
             coverage: vec![0_u8; n],
+            seed_share: Vec::new(),
             paint: FillPaint::Behind,
         });
     }
@@ -309,21 +314,27 @@ pub fn flood_fill(
         coverage[idx as usize] = 255;
     }
 
+    let mut seed_share = Vec::new();
     if opts.auto_edge {
         let band_start = sorted.len();
-        let roots = climb_edge(pixels, w, h, seed, mask, &visited, &mut sorted);
+        climb_edge(pixels, w, h, seed, mask, &visited, &mut sorted);
+        if matches!(paint, FillPaint::Over { .. }) {
+            seed_share = vec![0_u8; n];
+        }
         set_edge_coverage(
-            EdgeCoverage {
+            &EdgeCoverage {
                 sample: pixels,
                 target: source.target,
                 occluders: source.occluders.filter(|o| o.len() >= n * 4),
+                width: w,
+                height: h,
                 seed,
                 tolerance,
                 paint,
             },
             &sorted[band_start..],
-            &roots,
             &mut coverage,
+            &mut seed_share,
         );
     }
 
@@ -353,6 +364,7 @@ pub fn flood_fill(
         sorted_indices,
         distance_mask,
         coverage,
+        seed_share,
         paint,
     })
 }
@@ -366,11 +378,6 @@ pub fn flood_fill(
 /// yields one pixel, a soft one yields several, and neither needs a
 /// radius from the user. [`EDGE_CLIMB_LIMIT`] only bounds a boundary so
 /// blurred it has no clear crest.
-///
-/// Returns the *root* of each climbed pixel - the region pixel its walk
-/// set out from - parallel to the pixels appended to `sorted`. Weighing
-/// the band needs it: a region can be bounded by a black outline on one
-/// side and a pale one on the other, and those are two different ramps.
 fn climb_edge(
     pixels: &[u8],
     w: u32,
@@ -379,23 +386,14 @@ fn climb_edge(
     mask: Option<&[u8]>,
     visited: &[std::sync::atomic::AtomicU8],
     sorted: &mut Vec<u32>,
-) -> Vec<u32> {
+) {
     use std::sync::atomic::Ordering;
 
-    let band_start = sorted.len();
-    let mut roots: Vec<u32> = Vec::new();
     let mut start = 0_usize;
     let mut end = sorted.len();
     for _ in 0..EDGE_CLIMB_LIMIT {
         for i in start..end {
             let idx = sorted[i];
-            // The first ring sets out from the region itself; every ring
-            // after it inherits whichever boundary pixel started the walk.
-            let root = if i >= band_start {
-                roots[i - band_start]
-            } else {
-                idx
-            };
             let y = idx / w;
             let x = idx - y * w;
             let x0 = x.saturating_sub(1);
@@ -420,7 +418,6 @@ fn climb_edge(
                     }
                     visited[nu].store(1, Ordering::Relaxed);
                     sorted.push(ni);
-                    roots.push(root);
                 }
             }
         }
@@ -430,7 +427,6 @@ fn climb_edge(
             break;
         }
     }
-    roots
 }
 
 /// Everything [`set_edge_coverage`] needs to weigh a climbed pixel.
@@ -438,9 +434,50 @@ struct EdgeCoverage<'a> {
     sample: &'a [u8],
     target: &'a [u8],
     occluders: Option<&'a [u8]>,
+    width: u32,
+    height: u32,
     seed: [u8; 4],
     tolerance: u8,
     paint: FillPaint,
+}
+
+/// The crest of each climbed pixel's ramp, as `(sample, target)`.
+///
+/// `heights` is each pixel's own `(sample, target)` distance from the
+/// seed. A pixel's ramp is every climbed pixel it can reach by stepping
+/// further from the seed, so the crest is the highest of those. Taking
+/// the pixels highest first hands each one a finished crest to pass down.
+fn ramp_crests(ctx: &EdgeCoverage, band: &[u32], heights: &[(u32, f32)]) -> Vec<(u32, f32)> {
+    let (w, h) = (ctx.width, ctx.height);
+    // Band position + 1 of every climbed pixel; 0 is "not in the band".
+    let mut place = vec![0_u32; w as usize * h as usize];
+    #[allow(clippy::cast_possible_truncation)]
+    for (i, &idx) in band.iter().enumerate() {
+        place[idx as usize] = i as u32 + 1;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let mut order: Vec<u32> = (0..band.len() as u32).collect();
+    order.sort_unstable_by_key(|&i| std::cmp::Reverse(heights[i as usize].0));
+
+    let mut crests = heights.to_vec();
+    for &i in &order {
+        let idx = band[i as usize];
+        let height = heights[i as usize].0;
+        let crest = crests[i as usize];
+        let y = idx / w;
+        let x = idx - y * w;
+        for ny in y.saturating_sub(1)..=(y + 1).min(h - 1) {
+            for nx in x.saturating_sub(1)..=(x + 1).min(w - 1) {
+                let below = place[(ny * w + nx) as usize] as usize;
+                if below == 0 || heights[below - 1].0 >= height {
+                    continue;
+                }
+                let c = &mut crests[below - 1];
+                *c = (c.0.max(crest.0), c.1.max(crest.1));
+            }
+        }
+    }
+    crests
 }
 
 /// Work out how much of each climbed pixel the fill color is entitled
@@ -448,10 +485,10 @@ struct EdgeCoverage<'a> {
 ///
 /// Each one is part boundary, part region: `t` is the boundary's share,
 /// read off how far up the ramp the pixel sits, so the fill's share is
-/// `1 - t`. The ramp is measured per walk, keyed by the root `climb_edge`
-/// handed back, because the boundaries around one region need not be the
-/// same color - scaling a pale outline against a black one elsewhere
-/// would read it as barely a boundary at all and paint most of it over.
+/// `1 - t`. The ramp is measured per pixel, see [`ramp_crests`], because
+/// the boundaries around one region need not be the same color - scaling
+/// a pale outline against a black one elsewhere would read it as barely
+/// a boundary at all and paint most of it over.
 /// What else varies is who is going to cover that pixel.
 /// Anything sitting on top of the fill - the target layer's own line
 /// art, or a layer above it - already contributes its share of the
@@ -461,28 +498,56 @@ struct EdgeCoverage<'a> {
 ///
 /// [`FillPaint::Over`] is the odd one out: the pixel is a mixture of the
 /// seed color and the boundary, and the paint step swaps the seed's
-/// share for the fill color, so the share is all it needs.
-fn set_edge_coverage(ctx: EdgeCoverage, band: &[u32], roots: &[u32], coverage: &mut [u8]) {
-    let root_of = |i: usize, idx: u32| roots.get(i).copied().unwrap_or(idx);
-    let mut crests: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    for (i, &idx) in band.iter().enumerate() {
-        let d = pixel_diff(ctx.sample, idx as usize, ctx.seed);
-        crests
-            .entry(root_of(i, idx))
-            .and_modify(|c| *c = (*c).max(d))
-            .or_insert(d);
+/// share for the fill color. It also needs `seed_share`, the seed color
+/// the target pixel really holds, measured on the target's own ramp.
+fn set_edge_coverage(ctx: &EdgeCoverage, band: &[u32], coverage: &mut [u8], seed_share: &mut [u8]) {
+    if band.is_empty() {
+        return;
     }
-    let over = matches!(ctx.paint, FillPaint::Over { .. });
+    let target_seed = match ctx.paint {
+        FillPaint::Over { seed } => Some(linear_pixel(&seed)),
+        FillPaint::Behind => None,
+    };
+    let heights: Vec<(u32, f32)> = band
+        .iter()
+        .map(|&idx| {
+            let d = pixel_diff(ctx.sample, idx as usize, ctx.seed);
+            let held = target_seed.map_or(0.0, |seed| linear_diff(ctx.target, idx as usize, seed));
+            (d, held)
+        })
+        .collect();
+    // Fix: one crest per walk left a pixel unpainted when another walk
+    // had claimed the rest of its ramp.
+    let crests = ramp_crests(ctx, band, &heights);
+    let over = target_seed.is_some();
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let to_byte = |v: f32| (v * 255.0).round().clamp(0.0, 255.0) as u8;
 
     for (i, &idx) in band.iter().enumerate() {
-        let crest = crests.get(&root_of(i, idx)).copied().unwrap_or(0);
+        let (crest, target_crest) = crests[i];
+        let (raw, target_height) = heights[i];
         let floor = u32::from(ctx.tolerance).min(crest);
         let span = crest.saturating_sub(floor).max(1);
         let idx = idx as usize;
-        let d = pixel_diff(ctx.sample, idx, ctx.seed).saturating_sub(floor);
-        let boundary = (d as f32 / span as f32).clamp(0.0, 1.0);
+        let boundary = (raw.saturating_sub(floor) as f32 / span as f32).clamp(0.0, 1.0);
         let mut share = 1.0 - boundary;
-        if !over {
+        if over {
+            // Fix: the tolerance-stretched share is more seed than the pixel
+            // holds; unmixing that much pushed edge colors out of range.
+            let ramp = target_crest.max(FLAT_TARGET);
+            let held = 1.0 - (target_height / ramp).min(1.0);
+            // What the tolerance adds on top of the seed really there.
+            let plain = raw as f32 / crest.max(1) as f32;
+            let extra = if plain > 0.0 {
+                1.0 - (boundary / plain).min(1.0)
+            } else {
+                1.0
+            };
+            share = held + (1.0 - held) * extra;
+            if let Some(slot) = seed_share.get_mut(idx) {
+                *slot = to_byte(held);
+            }
+        } else {
             // How much of this pixel ends up on top of the fill.
             let above = ctx
                 .occluders
@@ -495,10 +560,7 @@ fn set_edge_coverage(ctx: EdgeCoverage, band: &[u32], roots: &[u32], coverage: &
                 share = (share / (1.0 - above)).min(1.0);
             }
         }
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        {
-            coverage[idx] = (share * 255.0).round().clamp(0.0, 255.0) as u8;
-        }
+        coverage[idx] = to_byte(share);
     }
 }
 
@@ -707,6 +769,29 @@ fn pixel_diff(pixels: &[u8], idx: usize, seed: [u8; 4]) -> u32 {
     (sum / 4).isqrt()
 }
 
+/// A target ramp flatter than this is noise, not a boundary.
+const FLAT_TARGET: f32 = 0.01;
+
+/// Decode a premultiplied BGRA8 pixel to linear light.
+#[inline]
+fn linear_pixel(px: &[u8]) -> [f32; 4] {
+    [
+        oxiedraw_utils::color::srgb_to_linear(px[0]),
+        oxiedraw_utils::color::srgb_to_linear(px[1]),
+        oxiedraw_utils::color::srgb_to_linear(px[2]),
+        f32::from(px[3]) / 255.0,
+    ]
+}
+
+/// [`pixel_diff`] in linear light, 0..=1. A blended edge is a straight
+/// ramp there, so the distance reads off the mix exactly.
+#[inline]
+fn linear_diff(pixels: &[u8], idx: usize, seed: [f32; 4]) -> f32 {
+    let px = linear_pixel(&pixels[idx * 4..idx * 4 + 4]);
+    let sum: f32 = px.iter().zip(seed).map(|(p, s)| (p - s) * (p - s)).sum();
+    (sum / 4.0).sqrt()
+}
+
 /// Paint `result` into a premultiplied BGRA8 layer buffer in place.
 ///
 /// Color maths runs in linear light because the layer images are
@@ -731,7 +816,8 @@ pub fn paint_fill(buffer: &mut [u8], result: &FillResult, color_bgr: [u8; 3]) {
         match result.paint {
             FillPaint::Behind => paint_behind(buffer, off, fill_linear, weight),
             FillPaint::Over { seed } => {
-                paint_over(buffer, off, color_bgr, fill_linear, seed, weight);
+                let held = result.seed_share.get(idx).copied().unwrap_or(weight);
+                paint_over(buffer, off, color_bgr, fill_linear, seed, [weight, held]);
             }
         }
     }
@@ -761,17 +847,20 @@ fn paint_behind(buffer: &mut [u8], off: usize, fill_linear: [f32; 3], weight: u8
 /// Replace the seed color's share of the pixel with the fill color.
 ///
 /// At full weight that is a plain overwrite. Below it the pixel is a
-/// mix of seed and boundary, so only the seed's part is swapped out -
-/// `dst + (fill - seed) * weight` - which rebuilds the identical blend
-/// around the new color and leaves the boundary's contribution alone.
+/// mix of seed and boundary: the seed it holds is taken out, what is
+/// left is the boundary, and the fill is laid in beside it. With
+/// `weight == held` that is `dst + (fill - seed) * weight`.
+///
+/// `shares` is `[weight, held]`: the fill's share and the seed's share.
 fn paint_over(
     buffer: &mut [u8],
     off: usize,
     color_bgr: [u8; 3],
     fill_linear: [f32; 3],
     seed: [u8; 4],
-    weight: u8,
+    shares: [u8; 2],
 ) {
+    let [weight, held] = shares;
     if weight == 255 {
         buffer[off] = color_bgr[0];
         buffer[off + 1] = color_bgr[1];
@@ -780,16 +869,20 @@ fn paint_over(
         return;
     }
     let share = f32::from(weight) / 255.0;
+    let held = f32::from(held.min(weight)) / 255.0;
+    // Scales the boundary down to the room the fill leaves it.
+    let keep = (1.0 - share) / (1.0 - held);
     for c in 0..3 {
         let dst = oxiedraw_utils::color::srgb_to_linear(buffer[off + c]);
         let seed_linear = oxiedraw_utils::color::srgb_to_linear(seed[c]);
+        let boundary = (dst - seed_linear * held).max(0.0);
         buffer[off + c] =
-            oxiedraw_utils::color::linear_to_srgb(dst + (fill_linear[c] - seed_linear) * share);
+            oxiedraw_utils::color::linear_to_srgb(boundary * keep + fill_linear[c] * share);
     }
-    let delta = (255.0 - f32::from(seed[3])) * share;
+    let boundary = (f32::from(buffer[off + 3]) - f32::from(seed[3]) * held).max(0.0);
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let added = delta.round().clamp(0.0, 255.0) as u8;
-    buffer[off + 3] = buffer[off + 3].saturating_add(added);
+    let alpha = (boundary * keep + 255.0 * share).round().clamp(0.0, 255.0) as u8;
+    buffer[off + 3] = alpha;
 }
 
 #[cfg(test)]
@@ -924,6 +1017,7 @@ mod tests {
             sorted_indices: vec![0, 2],
             distance_mask: vec![255; 3],
             coverage: vec![255, 0, 255],
+            seed_share: Vec::new(),
             paint: FillPaint::Over { seed: [0, 0, 0, 255] },
         };
         paint_fill(&mut buf, &result, [10, 20, 30]);
@@ -1155,5 +1249,73 @@ mod tests {
             "the white that used to show through is gone: {blended:?}"
         );
         assert_eq!(&buf[12..16], &[0, 0, 0, 255], "the line core is untouched");
+    }
+
+    /// A tolerance just under the outline's distance must not unmix more
+    /// seed than an edge pixel holds.
+    #[test]
+    fn over_paint_keeps_a_colored_edge_in_range() {
+        let purple = [0xf4, 0x89, 0x9d, 255];
+        let mut pixels = Vec::new();
+        for px in [[230, 230, 230, 255], [230, 230, 230, 255], [0xf4, 0x8b, 0x9e, 255], purple, purple] {
+            pixels.extend_from_slice(&px);
+        }
+        let opts = FillOptions {
+            tolerance: 57,
+            ..FillOptions::default()
+        };
+        let r = flood_fill(&FillSource::single(&pixels, None), 5, 1, 0, 0, opts).expect("seed");
+        let mut buf = pixels.clone();
+        paint_fill(&mut buf, &r, [purple[0], purple[1], purple[2]]);
+
+        for px in buf.chunks_exact(4) {
+            for c in 0..3 {
+                assert!(px[c].abs_diff(purple[c]) <= 3, "off-color pixel: {px:?}");
+            }
+        }
+    }
+
+    /// An edge pixel is still painted when a neighbouring walk claimed
+    /// the rest of its ramp.
+    #[test]
+    fn edge_pixel_is_measured_against_its_own_ramp() {
+        let mut pixels = grey_row(&[255, 128, 0]);
+        pixels.extend_from_slice(&grey_row(&[255, 255, 0]));
+        let r = flood_fill(
+            &FillSource::single(&pixels, None),
+            3,
+            2,
+            0,
+            0,
+            FillOptions::default(),
+        )
+        .expect("seed");
+        let mut buf = pixels.clone();
+        paint_fill(&mut buf, &r, [0, 0, 255]);
+
+        let blended = &buf[4..8];
+        assert!(
+            blended[0] < 128 && blended[1] < 128 && blended[2] > 0,
+            "the edge pixel was left unpainted: {blended:?}"
+        );
+    }
+
+    /// Replacing a color under an outline on a layer above goes in solid.
+    #[test]
+    fn over_paint_is_solid_under_an_outline_above() {
+        let target = grey_row(&[255, 255, 255, 255]);
+        let above = black_row(&[0, 0, 128, 255]);
+        let composite = grey_row(&[255, 255, 127, 0]);
+        let source = FillSource {
+            sample: &composite,
+            target: &target,
+            occluders: Some(&above),
+            mask: None,
+        };
+        let r = flood_fill(&source, 4, 1, 0, 0, FillOptions::default()).expect("seed");
+        let mut buf = target.clone();
+        paint_fill(&mut buf, &r, [0, 0, 255]);
+
+        assert_eq!(&buf[8..12], &[0, 0, 255, 255], "no seed color left under the line");
     }
 }
