@@ -208,8 +208,18 @@ fn build_selection_page(
     row.append(&modes);
     row.append(&dim_sep());
     row.append(&brush_controls);
+    row.append(&build_invert_selection_button());
 
     (row, marquee_btn)
+}
+
+fn build_invert_selection_button() -> gtk::Button {
+    gtk::Button::builder()
+        .label("Invert")
+        .tooltip_text("Swap selected and unselected areas")
+        .valign(gtk::Align::Center)
+        .action_name("app.select-inverse")
+        .build()
 }
 
 fn build_selection_modes(
