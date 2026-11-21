@@ -14,7 +14,7 @@ use oxiedraw_core::components::{ComponentLayer, ComponentLibrary};
 use oxiedraw_core::liquify::LiquifyState;
 use oxiedraw_core::palettes::{DocumentPalette, PaletteState};
 use oxiedraw_core::document::{
-    ComponentInstance, Document, DocumentProperties, LayerKind, Placement,
+    ComponentInstance, Document, DocumentProperties, LayerKind, LayerTreeNode, Placement,
 };
 use oxiedraw_core::history::{
     CropLayer, HistoryAction, HistoryConfig, HistoryStack, LayerPatch, PatchBounds,
@@ -1668,6 +1668,7 @@ pub(crate) struct ComponentEditContext {
     component_id: String,
     main_size: Size,
     main_layers: Vec<StashedLayer>,
+    main_tree: Vec<LayerTreeNode>,
     main_active: Option<usize>,
     main_history: HistoryStack,
     main_saved_marker: usize,
@@ -1680,15 +1681,18 @@ struct StashedLayer {
     kind: LayerKind,
     blend: oxiedraw_core::document::BlendMode,
     opacity: f32,
+    clipped: bool,
+    alpha_locked: bool,
     pixels: Vec<u8>,
 }
 
-fn capture_canvas(viewport: &Viewport) -> (Size, Vec<StashedLayer>, Option<usize>) {
+fn capture_canvas(viewport: &Viewport) -> (Size, Vec<StashedLayer>, Vec<LayerTreeNode>, Option<usize>) {
     let canvas = viewport.canvas();
     let mut c = canvas.borrow_mut();
     let size = c.size();
     let snap = c.layers().snapshot();
     let active = c.layers().active();
+    let tree = c.layer_tree().to_vec();
     let mut layers = Vec::with_capacity(snap.len());
     for (i, l) in snap.iter().enumerate() {
         let pixels = c.read_layer(i).unwrap_or_default();
@@ -1699,10 +1703,21 @@ fn capture_canvas(viewport: &Viewport) -> (Size, Vec<StashedLayer>, Option<usize
             kind: l.kind.clone(),
             blend: l.blend,
             opacity: l.opacity,
+            clipped: l.clipped,
+            alpha_locked: l.alpha_locked,
             pixels,
         });
     }
-    (size, layers, active)
+    (size, layers, tree, active)
+}
+
+// An empty tree lets the layers panel keep the other canvas's folders, so fall back to a flat one.
+fn tree_or_flat(tree: Vec<LayerTreeNode>, ids: impl Iterator<Item = String>) -> Vec<LayerTreeNode> {
+    if tree.is_empty() {
+        ids.map(LayerTreeNode::layer).collect()
+    } else {
+        tree
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1723,10 +1738,14 @@ fn do_enter_component_edit(
     if edit_mode.borrow().is_some() {
         return;
     }
-    let Some((name, size, tuples, active)) = ({
+    let Some((name, size, tuples, tree, flags, active)) = ({
         let lib = components.borrow();
-        lib.get(&component_id)
-            .map(|c| (c.name.clone(), c.size, c.layer_tuples(), c.active_layer))
+        lib.get(&component_id).map(|c| {
+            let tree = tree_or_flat(c.layer_tree.clone(), c.layers.iter().map(|l| l.id.clone()));
+            let flags: Vec<(bool, bool)> =
+                c.layers.iter().map(|l| (l.clipped, l.alpha_locked)).collect();
+            (c.name.clone(), c.size, c.layer_tuples(), tree, flags, c.active_layer)
+        })
     }) else {
         return;
     };
@@ -1734,7 +1753,7 @@ fn do_enter_component_edit(
         toaster.info("Edits to this component won't be recorded: layers above it use blend modes, adjustments or clipping.");
     }
 
-    let (main_size, main_layers, main_active) = capture_canvas(viewport);
+    let (main_size, main_layers, main_tree, main_active) = capture_canvas(viewport);
     let fresh = HistoryStack::new(HistoryConfig {
         capacity: history_capacity,
     });
@@ -1744,12 +1763,19 @@ fn do_enter_component_edit(
         component_id,
         main_size,
         main_layers,
+        main_tree,
         main_active,
         main_history,
         main_saved_marker,
     });
 
+    // Fix: swap the folder tree with the layers, or the panel prunes them out of their folders.
+    viewport.canvas().borrow_mut().set_layer_tree_quiet(tree);
     viewport.load_layers_resized(size, &tuples, active);
+    // Fix: replace_all_layers clears clipping and alpha lock, so re-apply the component's.
+    if let Err(e) = viewport.canvas().borrow_mut().restore_layer_flags(&flags) {
+        tracing::error!(error = %e, "restoring component layer flags failed");
+    }
     viewport
         .paintable()
         .set_edit_mode(&format!("Component - {name}"), true, accent_rgb(accent_widget));
@@ -1772,7 +1798,7 @@ fn do_exit_component_edit(
         return;
     };
 
-    let (comp_size, comp_layers, comp_active) = capture_canvas(viewport);
+    let (comp_size, comp_layers, comp_tree, comp_active) = capture_canvas(viewport);
     let mut old_comp_size = comp_size;
     {
         let mut lib = components.borrow_mut();
@@ -1786,14 +1812,16 @@ fn do_exit_component_edit(
                     visible: l.visible,
                     blend: l.blend,
                     opacity: l.opacity,
+                    clipped: l.clipped,
+                    alpha_locked: l.alpha_locked,
                     pixels: l.pixels,
                 })
                 .collect();
-            component.set_layers(comp_size, layers, comp_active);
+            component.set_layers(comp_size, layers, comp_tree, comp_active);
         }
     }
 
-    // replace_all_layers resets every kind to Raster, so re-apply them after.
+    // replace_all_layers resets every kind and flag, so re-apply them after.
     let main_tuples: Vec<(String, String, bool, oxiedraw_core::document::BlendMode, f32, Vec<u8>)> =
         ctx.main_layers
             .iter()
@@ -1808,6 +1836,8 @@ fn do_exit_component_edit(
                 )
             })
             .collect();
+    let main_tree = tree_or_flat(ctx.main_tree, ctx.main_layers.iter().map(|l| l.id.clone()));
+    viewport.canvas().borrow_mut().set_layer_tree_quiet(main_tree);
     viewport.load_layers_resized(ctx.main_size, &main_tuples, ctx.main_active);
     {
         let canvas = viewport.canvas();
@@ -1818,6 +1848,11 @@ fn do_exit_component_edit(
             .collect();
         if let Err(e) = canvas.borrow_mut().restore_layer_kinds(&kinds) {
             tracing::error!(error = %e, "restoring layer kinds after component edit failed");
+        }
+        let flags: Vec<(bool, bool)> =
+            ctx.main_layers.iter().map(|l| (l.clipped, l.alpha_locked)).collect();
+        if let Err(e) = canvas.borrow_mut().restore_layer_flags(&flags) {
+            tracing::error!(error = %e, "restoring layer flags after component edit failed");
         }
     }
 

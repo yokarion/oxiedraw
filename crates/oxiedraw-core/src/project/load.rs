@@ -192,6 +192,8 @@ pub fn build_components(project: &OxieProject) -> ComponentLibrary {
                     visible: l.visible,
                     blend: l.blend,
                     opacity: l.opacity,
+                    clipped: l.clipped,
+                    alpha_locked: l.alpha_locked,
                     pixels: project.component_pixels.get(&key).cloned().unwrap_or_default(),
                 }
             })
@@ -201,6 +203,7 @@ pub fn build_components(project: &OxieProject) -> ComponentLibrary {
             comp.name.clone(),
             Size::new(comp.width, comp.height),
             layers,
+            comp.layer_tree.clone(),
             comp.active_layer,
         ));
     }
@@ -307,7 +310,7 @@ fn decode_png(bytes: &[u8], expected_w: u32, expected_h: u32) -> Result<Vec<u8>,
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::document::BlendMode;
+    use crate::document::{BlendMode, LayerGroup, LayerTreeNode};
     use crate::project::format::{
         ComponentLayerEntry, DocumentData, Manifest, APP_VERSION, SCHEMA_VERSION,
     };
@@ -315,6 +318,12 @@ mod tests {
     #[test]
     fn build_components_reconstructs_library() {
         let pixels = vec![9u8; 2 * 2 * 4];
+        let folder_tree = vec![LayerTreeNode::Group(LayerGroup {
+            id: "g1".to_string(),
+            name: "Folder".to_string(),
+            expanded: true,
+            children: vec![LayerTreeNode::layer("l1")],
+        })];
         let project = OxieProject {
             manifest: Manifest {
                 schema_version: SCHEMA_VERSION,
@@ -347,7 +356,10 @@ mod tests {
                     visible: true,
                     blend: BlendMode::Normal,
                     opacity: 1.0,
+                    clipped: false,
+                    alpha_locked: true,
                 }],
+                layer_tree: folder_tree.clone(),
             }],
             component_pixels: HashMap::from([("c1/l1".to_string(), pixels.clone())]),
             fonts: Vec::new(),
@@ -363,6 +375,8 @@ mod tests {
         assert_eq!(c.active_layer, Some(0));
         assert_eq!(c.layers.len(), 1);
         assert_eq!(c.layers[0].pixels, pixels);
+        assert_eq!(c.layer_tree, folder_tree);
+        assert!(c.layers[0].alpha_locked);
         // Master is the flattened render; a single opaque layer reproduces it.
         assert_eq!(c.master, pixels);
     }

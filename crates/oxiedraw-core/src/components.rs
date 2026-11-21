@@ -6,13 +6,16 @@
 //! from that master at an arbitrary [`Placement`], so they stay crisp when
 //! rescaled and update live when the component is edited.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use oxiedraw_utils::geometry::{Size, TransformFilter, TransformRect};
 use oxiedraw_utils::pixels::transform_bgra8;
 use serde::{Deserialize, Serialize};
 
-use crate::document::{BlendMode, Placement};
+use crate::document::{
+    build_composite_steps, BlendMode, CompositeStep, LayerGroup, LayerTreeNode, Placement,
+};
 
 /// Default edit canvas for a freshly created component.
 pub const DEFAULT_COMPONENT_SIZE: Size = Size {
@@ -52,6 +55,10 @@ pub struct ComponentLayer {
     pub blend: BlendMode,
     #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
+    #[serde(default)]
+    pub clipped: bool,
+    #[serde(default)]
+    pub alpha_locked: bool,
     pub pixels: Vec<u8>,
 }
 
@@ -64,6 +71,8 @@ pub struct ComponentSnapshot {
     pub width: u32,
     pub height: u32,
     pub layers: Vec<ComponentLayer>,
+    #[serde(default)]
+    pub layer_tree: Vec<LayerTreeNode>,
     pub active_layer: Option<usize>,
 }
 
@@ -75,6 +84,7 @@ impl ComponentSnapshot {
             self.name,
             Size { width: self.width, height: self.height },
             self.layers,
+            self.layer_tree,
             self.active_layer,
         )
     }
@@ -87,6 +97,8 @@ pub struct Component {
     pub name: String,
     pub size: Size,
     pub layers: Vec<ComponentLayer>,
+    /// Folder structure over `layers`, same layout as `Canvas::layer_tree`.
+    pub layer_tree: Vec<LayerTreeNode>,
     pub active_layer: Option<usize>,
     /// Flattened BGRA8 render of all visible layers at `size`. Source texture
     /// for every instance and the card preview.
@@ -116,8 +128,11 @@ impl Component {
                 visible: true,
                 blend: BlendMode::Normal,
                 opacity: 1.0,
+                clipped: false,
+                alpha_locked: false,
                 pixels: blank.clone(),
             }],
+            layer_tree: Vec::new(),
             active_layer: Some(0),
             master: blank,
             version: 0,
@@ -131,6 +146,7 @@ impl Component {
         name: String,
         size: Size,
         layers: Vec<ComponentLayer>,
+        layer_tree: Vec<LayerTreeNode>,
         active_layer: Option<usize>,
     ) -> Self {
         let mut c = Self {
@@ -138,6 +154,7 @@ impl Component {
             name,
             size,
             layers,
+            layer_tree,
             active_layer,
             master: Vec::new(),
             version: 0,
@@ -148,16 +165,24 @@ impl Component {
 
     /// Re-flatten all visible layers into the cached master and bump version.
     pub fn rebuild_master(&mut self) {
-        self.master = flatten(&self.layers, self.size.width, self.size.height);
+        self.master = flatten(&self.layers, &self.layer_tree, self.size.width, self.size.height);
         self.version = self.version.wrapping_add(1);
     }
 
-    /// Replace the size, layers and active selection - used when leaving edit
-    /// mode - then rebuild the master.
-    pub fn set_layers(&mut self, size: Size, layers: Vec<ComponentLayer>, active: Option<usize>) {
+    /// Replace the size, layers, folders and active selection - used when
+    /// leaving edit mode - then rebuild the master.
+    pub fn set_layers(
+        &mut self,
+        size: Size,
+        layers: Vec<ComponentLayer>,
+        layer_tree: Vec<LayerTreeNode>,
+        active: Option<usize>,
+    ) {
         // Fix: take the edit canvas size so a resized component keeps it.
         self.size = size;
         self.layers = layers;
+        // Fix: keep the folders so leaving edit mode does not ungroup the layers.
+        self.layer_tree = layer_tree;
         self.active_layer = active;
         self.rebuild_master();
     }
@@ -171,6 +196,7 @@ impl Component {
             width: self.size.width,
             height: self.size.height,
             layers: self.layers.clone(),
+            layer_tree: self.layer_tree.clone(),
             active_layer: self.active_layer,
         }
     }
@@ -290,7 +316,7 @@ impl ComponentLibrary {
         let pos = self.components.iter().position(|c| c.id == id)?;
         let src = &self.components[pos];
         let new_id = generate_component_id();
-        let layers = src
+        let layers: Vec<ComponentLayer> = src
             .layers
             .iter()
             .map(|l| ComponentLayer {
@@ -299,14 +325,24 @@ impl ComponentLibrary {
                 visible: l.visible,
                 blend: l.blend,
                 opacity: l.opacity,
+                clipped: l.clipped,
+                alpha_locked: l.alpha_locked,
                 pixels: l.pixels.clone(),
             })
             .collect();
+        let new_ids: HashMap<&str, &str> = src
+            .layers
+            .iter()
+            .zip(&layers)
+            .map(|(old, new)| (old.id.as_str(), new.id.as_str()))
+            .collect();
+        let layer_tree = remap_leaf_ids(&src.layer_tree, &new_ids);
         let copy = Component {
             id: new_id.clone(),
             name: format!("{} copy", src.name),
             size: src.size,
             layers,
+            layer_tree,
             active_layer: src.active_layer,
             master: src.master.clone(),
             version: 0,
@@ -316,21 +352,78 @@ impl ComponentLibrary {
     }
 }
 
+
+fn remap_leaf_ids(nodes: &[LayerTreeNode], new_ids: &HashMap<&str, &str>) -> Vec<LayerTreeNode> {
+    nodes
+        .iter()
+        .map(|node| match node {
+            LayerTreeNode::Layer { id } => {
+                LayerTreeNode::layer(new_ids.get(id.as_str()).copied().unwrap_or(id.as_str()))
+            }
+            LayerTreeNode::Group(group) => LayerTreeNode::Group(LayerGroup {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                expanded: group.expanded,
+                children: remap_leaf_ids(&group.children, new_ids),
+            }),
+        })
+        .collect()
+}
+
 /// Composite visible layers bottom-to-top into a fresh `w x h` BGRA8 buffer,
-/// honoring each layer's blend mode + opacity. Matches the GPU `layer_blend.frag`
+/// honoring blend mode, opacity, clipping and folders like the GPU composite,
 /// so the master looks like the edit-mode preview.
 /// Layers that mismatch the expected length are skipped.
 #[must_use]
-pub fn flatten(layers: &[ComponentLayer], w: u32, h: u32) -> Vec<u8> {
+pub fn flatten(layers: &[ComponentLayer], tree: &[LayerTreeNode], w: u32, h: u32) -> Vec<u8> {
     let n = (w * h * 4) as usize;
-    let mut out = vec![0u8; n];
-    for layer in layers {
-        if !layer.visible || layer.pixels.len() != n {
-            continue;
+    let drawable: Vec<usize> = (0..layers.len())
+        .filter(|&i| layers[i].visible && layers[i].pixels.len() == n)
+        .collect();
+    let mut stack = vec![vec![0u8; n]];
+    for step in flatten_steps(layers, tree, &drawable) {
+        match step {
+            CompositeStep::Layer { idx, clip_base } => {
+                let layer = &layers[idx];
+                let clip = clip_base.map(|base| layers[base].pixels.as_slice());
+                if let Some(acc) = stack.last_mut() {
+                    blend_layer_over(acc, &layer.pixels, clip, layer.blend, layer.opacity);
+                }
+            }
+            CompositeStep::EnterGroup => stack.push(vec![0u8; n]),
+            CompositeStep::ExitGroup => {
+                if stack.len() > 1
+                    && let Some(folder) = stack.pop()
+                    && let Some(parent) = stack.last_mut()
+                {
+                    blend_layer_over(parent, &folder, None, BlendMode::Normal, 1.0);
+                }
+            }
         }
-        blend_layer_over(&mut out, &layer.pixels, layer.blend, layer.opacity);
     }
-    out
+    stack.into_iter().next().unwrap_or_default()
+}
+
+// Same rule as Canvas::scoped_steps: folders only isolate once a layer is clipped.
+fn flatten_steps(
+    layers: &[ComponentLayer],
+    tree: &[LayerTreeNode],
+    drawable: &[usize],
+) -> Vec<CompositeStep> {
+    if !layers.iter().any(|l| l.clipped) {
+        return drawable.iter().map(|&i| CompositeStep::layer(i)).collect();
+    }
+    let index_of = |id: &str| layers.iter().position(|l| l.id == id);
+    let resolve = |id: &str| index_of(id).filter(|i| drawable.contains(i));
+    let clipped = |id: &str| index_of(id).is_some_and(|i| layers[i].clipped);
+    let flat_tree: Vec<LayerTreeNode>;
+    let tree = if tree.is_empty() {
+        flat_tree = layers.iter().map(|l| LayerTreeNode::layer(l.id.clone())).collect();
+        &flat_tree
+    } else {
+        tree
+    };
+    build_composite_steps(tree, &resolve, &clipped, drawable)
 }
 
 fn srgb_to_linear(c: f32) -> f32 {
@@ -349,19 +442,21 @@ fn linear_to_srgb(c: f32) -> f32 {
     }
 }
 
-// Blend `src` (premultiplied BGRA8) over `dst` in place using `mode` + `opacity`.
+// Blend `src` (premultiplied BGRA8) over `dst` in place using `mode` + `opacity`,
+// masked by the alpha of `clip` when set.
 // Mirrors layer_blend.frag: unpremultiply, blend in linear light, W3C src-over.
-fn blend_layer_over(dst: &mut [u8], src: &[u8], mode: BlendMode, opacity: f32) {
+fn blend_layer_over(dst: &mut [u8], src: &[u8], clip: Option<&[u8]>, mode: BlendMode, opacity: f32) {
     let opacity = opacity.clamp(0.0, 1.0);
     let n = dst.len().min(src.len()) / 4;
     for px in 0..n {
         let o = px * 4;
+        let gate = clip.map_or(opacity, |base| opacity * f32::from(base[o + 3]) / 255.0);
         // Premultiplied linear samples (sRGB decode mimics the GPU sampler).
         let s = [
-            srgb_to_linear(f32::from(src[o]) / 255.0) * opacity,
-            srgb_to_linear(f32::from(src[o + 1]) / 255.0) * opacity,
-            srgb_to_linear(f32::from(src[o + 2]) / 255.0) * opacity,
-            f32::from(src[o + 3]) / 255.0 * opacity,
+            srgb_to_linear(f32::from(src[o]) / 255.0) * gate,
+            srgb_to_linear(f32::from(src[o + 1]) / 255.0) * gate,
+            srgb_to_linear(f32::from(src[o + 2]) / 255.0) * gate,
+            f32::from(src[o + 3]) / 255.0 * gate,
         ];
         let d = [
             srgb_to_linear(f32::from(dst[o]) / 255.0),
@@ -483,6 +578,8 @@ mod tests {
             visible: true,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
             pixels: solid(w, h, [255, 0, 0, 255]), // blue
         };
         let top = ComponentLayer {
@@ -491,9 +588,11 @@ mod tests {
             visible: true,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
             pixels: solid(w, h, [0, 0, 255, 255]), // red
         };
-        let out = flatten(&[bottom, top], w, h);
+        let out = flatten(&[bottom, top], &[], w, h);
         // Opaque top fully covers: every pixel is red.
         assert_eq!(&out[0..4], &[0, 0, 255, 255]);
         assert_eq!(&out[4..8], &[0, 0, 255, 255]);
@@ -508,13 +607,15 @@ mod tests {
             visible: true,
             blend,
             opacity,
+            clipped: false,
+            alpha_locked: false,
             pixels: solid(w, h, [180, 180, 180, 255]),
         };
         let base = grey(BlendMode::Normal, 1.0);
 
         // Multiply of two mid-greys is darker than the plain (Normal) top.
-        let normal = flatten(&[base.clone(), grey(BlendMode::Normal, 1.0)], w, h);
-        let multiply = flatten(&[base.clone(), grey(BlendMode::Multiply, 1.0)], w, h);
+        let normal = flatten(&[base.clone(), grey(BlendMode::Normal, 1.0)], &[], w, h);
+        let multiply = flatten(&[base.clone(), grey(BlendMode::Multiply, 1.0)], &[], w, h);
         assert!(
             multiply[0] < normal[0],
             "multiply should darken the master: {} !< {}",
@@ -523,7 +624,7 @@ mod tests {
         );
 
         // A fully transparent (opacity 0) top leaves the base untouched.
-        let faded = flatten(&[base, grey(BlendMode::Multiply, 0.0)], w, h);
+        let faded = flatten(&[base, grey(BlendMode::Multiply, 0.0)], &[], w, h);
         assert_eq!(&faded[0..3], &[180, 180, 180], "opacity 0 top is invisible");
     }
 
@@ -537,6 +638,8 @@ mod tests {
             visible: true,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
             pixels: solid(w, h, [255, 0, 0, 255]),
         };
         let hidden = ComponentLayer {
@@ -545,10 +648,36 @@ mod tests {
             visible: false,
             blend: BlendMode::Normal,
             opacity: 1.0,
+            clipped: false,
+            alpha_locked: false,
             pixels: solid(w, h, [0, 0, 255, 255]),
         };
-        let out = flatten(&[bottom, hidden], w, h);
+        let out = flatten(&[bottom, hidden], &[], w, h);
         assert_eq!(&out[0..4], &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn flatten_clips_to_base_alpha() {
+        let (w, h) = (2, 1);
+        let layer = |id: &str, clipped, pixels| ComponentLayer {
+            id: id.into(),
+            name: id.into(),
+            visible: true,
+            blend: BlendMode::Normal,
+            opacity: 1.0,
+            clipped,
+            alpha_locked: false,
+            pixels,
+        };
+        let base = layer("b", false, vec![255, 0, 0, 255, 0, 0, 0, 0]);
+        let clipped = layer("c", true, solid(w, h, [0, 0, 255, 255]));
+        let out = flatten(&[base.clone(), clipped.clone()], &[], w, h);
+        assert_eq!(&out[0..4], &[0, 0, 255, 255], "clipped layer covers the base");
+        assert_eq!(&out[4..8], &[0, 0, 0, 0], "nothing outside the base");
+
+        let hidden_base = ComponentLayer { visible: false, ..base };
+        let out = flatten(&[hidden_base, clipped], &[], w, h);
+        assert!(out.iter().all(|&b| b == 0), "a hidden base hides its clip stack");
     }
 
     #[test]
@@ -650,8 +779,11 @@ mod tests {
                 visible: true,
                 blend: BlendMode::Normal,
                 opacity: 1.0,
+                clipped: false,
+                alpha_locked: false,
                 pixels: solid(2, 2, [0, 0, 255, 255]),
             }],
+            Vec::new(),
             Some(0),
         );
         assert!(c.version > v0);
@@ -669,13 +801,35 @@ mod tests {
                 visible: true,
                 blend: BlendMode::Normal,
                 opacity: 1.0,
+                clipped: false,
+                alpha_locked: false,
                 pixels: solid(3, 1, [0, 255, 0, 255]),
             }],
+            Vec::new(),
             Some(0),
         );
         assert_eq!(c.size, Size::new(3, 1));
         assert_eq!(c.master.len(), 3 * 4);
         assert_eq!(c.layer_tuples()[0].5.len(), 3 * 4);
         assert_eq!(&c.master[8..12], &[0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn duplicate_keeps_folders_on_new_layer_ids() {
+        let mut lib = ComponentLibrary::new();
+        let id = lib.add_new("X");
+        let src = lib.get_mut(&id).unwrap();
+        src.layer_tree = vec![LayerTreeNode::Group(LayerGroup {
+            id: "g1".into(),
+            name: "Folder".into(),
+            expanded: true,
+            children: vec![LayerTreeNode::layer(src.layers[0].id.clone())],
+        })];
+        let copy_id = lib.duplicate(&id).unwrap();
+        let copy = lib.get(&copy_id).unwrap();
+        let mut leaves = Vec::new();
+        crate::document::collect_leaf_ids(&copy.layer_tree, &mut leaves);
+        assert_eq!(leaves, vec![copy.layers[0].id.clone()]);
+        assert!(matches!(&copy.layer_tree[0], LayerTreeNode::Group(g) if g.name == "Folder"));
     }
 }

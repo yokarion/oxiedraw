@@ -87,6 +87,10 @@ pub struct ComponentLayerEntry {
     pub blend: BlendMode,
     #[serde(default = "crate::serde_defaults::default_opacity")]
     pub opacity: f32,
+    #[serde(default)]
+    pub clipped: bool,
+    #[serde(default)]
+    pub alpha_locked: bool,
 }
 
 /// A component definition written to `components.json`.
@@ -98,6 +102,9 @@ pub struct ComponentData {
     pub height: u32,
     pub active_layer: Option<usize>,
     pub layers: Vec<ComponentLayerEntry>,
+    /// Folder structure over `layers`. Absent in older files = flat.
+    #[serde(default)]
+    pub layer_tree: Vec<LayerTreeNode>,
 }
 
 /// Full document description written to `document.json`.

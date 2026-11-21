@@ -128,8 +128,11 @@ pub fn snapshot(
                     visible: l.visible,
                     blend: l.blend,
                     opacity: l.opacity,
+                    clipped: l.clipped,
+                    alpha_locked: l.alpha_locked,
                 })
                 .collect(),
+            layer_tree: c.layer_tree.clone(),
         });
         for l in &c.layers {
             component_layers.push((
